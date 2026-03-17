@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "crates/polyalpha-core",
+    "crates/polyalpha-data",
+    "crates/polyalpha-engine",
+    "crates/polyalpha-executor",
+    "crates/polyalpha-risk",
+    "crates/polyalpha-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+async-trait = "0.1"
+config = "0.14"
+rust_decimal = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+uuid = { version = "1", features = ["serde", "v4"] }

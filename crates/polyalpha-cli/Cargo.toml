@@ -1,0 +1,16 @@
+[package]
+name = "polyalpha-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+polyalpha-core = { path = "../polyalpha-core" }
+polyalpha-data = { path = "../polyalpha-data" }
+polyalpha-engine = { path = "../polyalpha-engine" }
+polyalpha-executor = { path = "../polyalpha-executor" }
+polyalpha-risk = { path = "../polyalpha-risk" }
+rust_decimal.workspace = true
+tokio.workspace = true
