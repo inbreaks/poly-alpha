@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use super::{CexBaseQty, Exchange, PolyShares, Price, Symbol, TokenSide, UsdNotional, VenueQuantity};
+use super::{
+    CexBaseQty, Exchange, PolyShares, Price, Symbol, TokenSide, UsdNotional, VenueQuantity,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(transparent)]

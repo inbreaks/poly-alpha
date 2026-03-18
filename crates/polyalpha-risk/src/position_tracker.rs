@@ -216,6 +216,9 @@ mod tests {
             position.quantity,
             VenueQuantity::CexBaseQty(CexBaseQty(Decimal::ZERO))
         );
-        assert_eq!(tracker.daily_realized_pnl(), UsdNotional(Decimal::new(-12, 0)));
+        assert_eq!(
+            tracker.daily_realized_pnl(),
+            UsdNotional(Decimal::new(-12, 0))
+        );
     }
 }

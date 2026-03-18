@@ -56,9 +56,9 @@ impl DataManager {
         emitted_at_ms: u64,
         rules: &SettlementRules,
     ) -> Result<usize> {
-        let event = self
-            .normalizer
-            .market_lifecycle(symbol, now_timestamp_secs, emitted_at_ms, rules)?;
+        let event =
+            self.normalizer
+                .market_lifecycle(symbol, now_timestamp_secs, emitted_at_ms, rules)?;
         self.publish(event)
     }
 }
@@ -68,8 +68,8 @@ mod tests {
     use rust_decimal::Decimal;
 
     use polyalpha_core::{
-        create_channels, Exchange, MarketConfig, MarketDataEvent, PolymarketIds, PolyShares,
-        Price, SymbolRegistry,
+        create_channels, Exchange, MarketConfig, MarketDataEvent, PolyShares, PolymarketIds, Price,
+        SymbolRegistry,
     };
 
     use super::*;

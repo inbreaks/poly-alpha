@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 
+use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use polyalpha_core::{
-    ArbSignalAction, ArbSignalEvent, CexOrderRequest, ClientOrderId, DmmQuoteState,
-    DmmQuoteUpdate, ExecutionEvent, Exchange, Fill, HedgeState, InstrumentKind, OrderExecutor,
-    OrderId, OrderRequest, OrderResponse, OrderSide, OrderStatus, OrderType, PolyOrderRequest,
-    PolyShares, Price, Result, Symbol, TimeInForce, TokenSide, UsdNotional, VenueQuantity,
+    cex_venue_symbol, ArbSignalAction, ArbSignalEvent, CexOrderRequest, ClientOrderId,
+    DmmQuoteState, DmmQuoteUpdate, Exchange, ExecutionEvent, Fill, HedgeState, InstrumentKind,
+    OrderExecutor, OrderId, OrderRequest, OrderResponse, OrderSide, OrderStatus, OrderType,
+    PolyOrderRequest, PolyShares, Price, Result, Symbol, SymbolRegistry, TimeInForce, TokenSide,
+    UsdNotional, VenueQuantity,
 };
-
-const DEFAULT_CEX_EXCHANGE: Exchange = Exchange::Binance;
 
 #[derive(Clone, Debug)]
 struct ActiveDmmOrders {
@@ -34,11 +34,20 @@ impl SessionBookkeeping {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct TrackedPosition {
+    poly_yes_shares: Decimal,
+    poly_no_shares: Decimal,
+    cex_base_qty: Decimal,
+}
+
 #[derive(Clone, Debug)]
 pub struct ExecutionManager<E: OrderExecutor> {
     executor: E,
+    symbol_registry: Option<SymbolRegistry>,
     dmm_quote_states: HashMap<Symbol, DmmQuoteState>,
     active_dmm_orders: HashMap<Symbol, ActiveDmmOrders>,
+    tracked_positions: HashMap<Symbol, TrackedPosition>,
     sessions: HashMap<Symbol, SessionBookkeeping>,
     next_client_order_seq: u64,
     next_fill_seq: u64,
@@ -48,8 +57,23 @@ impl<E: OrderExecutor> ExecutionManager<E> {
     pub fn new(executor: E) -> Self {
         Self {
             executor,
+            symbol_registry: None,
             dmm_quote_states: HashMap::new(),
             active_dmm_orders: HashMap::new(),
+            tracked_positions: HashMap::new(),
+            sessions: HashMap::new(),
+            next_client_order_seq: 1,
+            next_fill_seq: 1,
+        }
+    }
+
+    pub fn with_symbol_registry(executor: E, symbol_registry: SymbolRegistry) -> Self {
+        Self {
+            executor,
+            symbol_registry: Some(symbol_registry),
+            dmm_quote_states: HashMap::new(),
+            active_dmm_orders: HashMap::new(),
+            tracked_positions: HashMap::new(),
             sessions: HashMap::new(),
             next_client_order_seq: 1,
             next_fill_seq: 1,
@@ -58,6 +82,24 @@ impl<E: OrderExecutor> ExecutionManager<E> {
 
     pub fn dmm_quote_state(&self, symbol: &Symbol) -> Option<&DmmQuoteState> {
         self.dmm_quote_states.get(symbol)
+    }
+
+    pub fn hedge_state(&self, symbol: &Symbol) -> Option<HedgeState> {
+        self.sessions.get(symbol).map(|session| session.state)
+    }
+
+    pub fn last_signal_id(&self, symbol: &Symbol) -> Option<&str> {
+        self.sessions
+            .get(symbol)
+            .and_then(|session| session.last_signal_id.as_deref())
+    }
+
+    pub fn active_dmm_order_count(&self, symbol: &Symbol) -> usize {
+        if self.active_dmm_orders.contains_key(symbol) {
+            2
+        } else {
+            0
+        }
     }
 
     pub async fn apply_dmm_quote_update(
@@ -75,20 +117,22 @@ impl<E: OrderExecutor> ExecutionManager<E> {
                 let bid_request = self.build_dmm_order_request(&state, OrderSide::Buy);
                 let ask_request = self.build_dmm_order_request(&state, OrderSide::Sell);
 
-                let bid_response = self.submit_order_with_events(
-                    symbol.clone(),
-                    Exchange::Polymarket,
-                    bid_request,
-                    &mut events,
-                )
-                .await?;
-                let ask_response = self.submit_order_with_events(
-                    symbol.clone(),
-                    Exchange::Polymarket,
-                    ask_request,
-                    &mut events,
-                )
-                .await?;
+                let bid_response = self
+                    .submit_order_with_events(
+                        symbol.clone(),
+                        Exchange::Polymarket,
+                        bid_request,
+                        &mut events,
+                    )
+                    .await?;
+                let ask_response = self
+                    .submit_order_with_events(
+                        symbol.clone(),
+                        Exchange::Polymarket,
+                        ask_request,
+                        &mut events,
+                    )
+                    .await?;
 
                 let maybe_bid = if matches!(bid_response.status, OrderStatus::Open) {
                     Some(bid_response.exchange_order_id)
@@ -146,33 +190,35 @@ impl<E: OrderExecutor> ExecutionManager<E> {
         }
 
         let requests = self.requests_from_signal(&signal);
+        let mut all_requests_filled = true;
         for request in requests {
             let exchange = match &request {
                 OrderRequest::Poly(_) => Exchange::Polymarket,
                 OrderRequest::Cex(req) => req.exchange,
             };
             let response = self
-                .submit_order_with_events(
-                    symbol.clone(),
-                    exchange,
-                    request.clone(),
-                    &mut events,
-                )
+                .submit_order_with_events(symbol.clone(), exchange, request.clone(), &mut events)
                 .await?;
             if matches!(response.status, OrderStatus::Filled) {
-                let fill = self.fill_from_request_and_response(
-                    request,
-                    response,
-                    signal.timestamp_ms,
-                );
+                let fill =
+                    self.fill_from_request_and_response(request, response, signal.timestamp_ms);
+                self.apply_fill_to_position(&fill);
                 events.push(ExecutionEvent::OrderFilled(fill));
+            } else {
+                all_requests_filled = false;
             }
         }
 
         let final_state = if matches!(signal.action, ArbSignalAction::ClosePosition { .. }) {
-            HedgeState::Idle
-        } else {
+            if all_requests_filled {
+                HedgeState::Idle
+            } else {
+                HedgeState::Closing
+            }
+        } else if all_requests_filled {
             HedgeState::Hedged
+        } else {
+            current_state
         };
         if current_state != final_state {
             events.push(ExecutionEvent::HedgeStateChanged {
@@ -318,7 +364,7 @@ impl<E: OrderExecutor> ExecutionManager<E> {
                     )
                 })
                 .collect(),
-            ArbSignalAction::ClosePosition { .. } => Vec::new(),
+            ArbSignalAction::ClosePosition { .. } => self.close_orders_for_symbol(&signal.symbol),
         }
     }
 
@@ -350,10 +396,20 @@ impl<E: OrderExecutor> ExecutionManager<E> {
         side: OrderSide,
         base_qty: polyalpha_core::CexBaseQty,
     ) -> OrderRequest {
-        let venue_symbol = Self::to_venue_symbol(&symbol);
+        self.cex_market_order_with_options(symbol, side, base_qty, false)
+    }
+
+    fn cex_market_order_with_options(
+        &mut self,
+        symbol: Symbol,
+        side: OrderSide,
+        base_qty: polyalpha_core::CexBaseQty,
+        reduce_only: bool,
+    ) -> OrderRequest {
+        let (exchange, venue_symbol) = self.resolve_cex_target(&symbol);
         OrderRequest::Cex(CexOrderRequest {
             client_order_id: self.next_client_order_id("arb-cex"),
-            exchange: DEFAULT_CEX_EXCHANGE,
+            exchange,
             symbol,
             venue_symbol,
             side,
@@ -361,12 +417,26 @@ impl<E: OrderExecutor> ExecutionManager<E> {
             price: None,
             base_qty,
             time_in_force: TimeInForce::Ioc,
-            reduce_only: false,
+            reduce_only,
         })
     }
 
-    fn to_venue_symbol(symbol: &Symbol) -> String {
-        symbol.0.to_ascii_uppercase().replace('-', "")
+    fn resolve_cex_target(&self, symbol: &Symbol) -> (Exchange, String) {
+        if let Some(config) = self
+            .symbol_registry
+            .as_ref()
+            .and_then(|registry| registry.get_config(symbol))
+        {
+            return (
+                config.hedge_exchange,
+                cex_venue_symbol(config.hedge_exchange, &config.cex_symbol),
+            );
+        }
+
+        (
+            Exchange::Binance,
+            symbol.0.to_ascii_uppercase().replace('-', ""),
+        )
     }
 
     fn next_client_order_id(&mut self, prefix: &str) -> ClientOrderId {
@@ -379,6 +449,66 @@ impl<E: OrderExecutor> ExecutionManager<E> {
         let seq = self.next_fill_seq;
         self.next_fill_seq += 1;
         format!("dry-fill-{seq}")
+    }
+
+    fn close_orders_for_symbol(&mut self, symbol: &Symbol) -> Vec<OrderRequest> {
+        let Some(position) = self.tracked_positions.get(symbol).cloned() else {
+            return Vec::new();
+        };
+
+        let mut requests = Vec::new();
+        if !position.poly_yes_shares.is_zero() {
+            requests.push(self.poly_market_order(
+                symbol.clone(),
+                TokenSide::Yes,
+                close_side(position.poly_yes_shares),
+                PolyShares(position.poly_yes_shares.abs()),
+                None,
+            ));
+        }
+        if !position.poly_no_shares.is_zero() {
+            requests.push(self.poly_market_order(
+                symbol.clone(),
+                TokenSide::No,
+                close_side(position.poly_no_shares),
+                PolyShares(position.poly_no_shares.abs()),
+                None,
+            ));
+        }
+        if !position.cex_base_qty.is_zero() {
+            requests.push(self.cex_market_order_with_options(
+                symbol.clone(),
+                close_side(position.cex_base_qty),
+                polyalpha_core::CexBaseQty(position.cex_base_qty.abs()),
+                true,
+            ));
+        }
+
+        requests
+    }
+
+    fn apply_fill_to_position(&mut self, fill: &Fill) {
+        let signed_qty = signed_fill_quantity(fill);
+        let should_clear = {
+            let position = self
+                .tracked_positions
+                .entry(fill.symbol.clone())
+                .or_default();
+
+            match fill.instrument {
+                InstrumentKind::PolyYes => position.poly_yes_shares += signed_qty,
+                InstrumentKind::PolyNo => position.poly_no_shares += signed_qty,
+                InstrumentKind::CexPerp => position.cex_base_qty += signed_qty,
+            }
+
+            position.poly_yes_shares.is_zero()
+                && position.poly_no_shares.is_zero()
+                && position.cex_base_qty.is_zero()
+        };
+
+        if should_clear {
+            self.tracked_positions.remove(&fill.symbol);
+        }
     }
 
     fn fill_from_request_and_response(
@@ -440,11 +570,31 @@ impl<E: OrderExecutor> ExecutionManager<E> {
     }
 }
 
+fn close_side(net_qty: Decimal) -> OrderSide {
+    if net_qty > Decimal::ZERO {
+        OrderSide::Sell
+    } else {
+        OrderSide::Buy
+    }
+}
+
+fn signed_fill_quantity(fill: &Fill) -> Decimal {
+    let abs_qty = match fill.quantity {
+        VenueQuantity::PolyShares(shares) => shares.0,
+        VenueQuantity::CexBaseQty(qty) => qty.0,
+    };
+
+    match fill.side {
+        OrderSide::Buy => abs_qty,
+        OrderSide::Sell => -abs_qty,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rust_decimal::Decimal;
 
-    use polyalpha_core::{ArbSignalAction, SignalStrength};
+    use polyalpha_core::{ArbSignalAction, MarketConfig, PolymarketIds, SignalStrength};
 
     use crate::dry_run::DryRunExecutor;
 
@@ -452,6 +602,61 @@ mod tests {
 
     fn sample_symbol() -> Symbol {
         Symbol::new("btc-100k-mar-2026")
+    }
+
+    fn sample_market(exchange: Exchange, cex_symbol: &str) -> MarketConfig {
+        MarketConfig {
+            symbol: sample_symbol(),
+            poly_ids: PolymarketIds {
+                condition_id: "condition-1".to_owned(),
+                yes_token_id: "yes-1".to_owned(),
+                no_token_id: "no-1".to_owned(),
+            },
+            cex_symbol: cex_symbol.to_owned(),
+            hedge_exchange: exchange,
+            strike_price: Some(Price(Decimal::new(100_000, 0))),
+            settlement_timestamp: 1_775_001_600,
+            min_tick_size: Price(Decimal::new(1, 2)),
+            neg_risk: false,
+            cex_price_tick: Decimal::new(1, 1),
+            cex_qty_step: Decimal::new(1, 3),
+            cex_contract_multiplier: Decimal::ONE,
+        }
+    }
+
+    fn sample_basis_signal() -> ArbSignalEvent {
+        ArbSignalEvent {
+            signal_id: "sig-basis-1".to_owned(),
+            symbol: sample_symbol(),
+            action: ArbSignalAction::BasisLong {
+                poly_side: OrderSide::Buy,
+                poly_target_shares: PolyShares(Decimal::new(25, 0)),
+                poly_target_notional: UsdNotional(Decimal::new(12, 1)),
+                cex_side: OrderSide::Sell,
+                cex_hedge_qty: polyalpha_core::CexBaseQty(Decimal::new(3, 1)),
+                delta: 0.012,
+            },
+            strength: SignalStrength::Strong,
+            basis_value: None,
+            z_score: None,
+            expected_pnl: UsdNotional(Decimal::new(3, 0)),
+            timestamp_ms: 1_715_000_000_123,
+        }
+    }
+
+    fn sample_close_signal() -> ArbSignalEvent {
+        ArbSignalEvent {
+            signal_id: "sig-close-1".to_owned(),
+            symbol: sample_symbol(),
+            action: ArbSignalAction::ClosePosition {
+                reason: "basis reverted".to_owned(),
+            },
+            strength: SignalStrength::Normal,
+            basis_value: None,
+            z_score: None,
+            expected_pnl: UsdNotional::ZERO,
+            timestamp_ms: 1_715_000_000_456,
+        }
     }
 
     #[tokio::test]
@@ -500,23 +705,7 @@ mod tests {
     async fn basis_signal_generates_submissions_fills_and_state_transitions() {
         let executor = DryRunExecutor::new();
         let mut manager = ExecutionManager::new(executor);
-        let signal = ArbSignalEvent {
-            signal_id: "sig-basis-1".to_owned(),
-            symbol: sample_symbol(),
-            action: ArbSignalAction::BasisLong {
-                poly_side: OrderSide::Buy,
-                poly_target_shares: PolyShares(Decimal::new(25, 0)),
-                poly_target_notional: UsdNotional(Decimal::new(12, 1)),
-                cex_side: OrderSide::Sell,
-                cex_hedge_qty: polyalpha_core::CexBaseQty(Decimal::new(3, 1)),
-                delta: 0.012,
-            },
-            strength: SignalStrength::Strong,
-            basis_value: None,
-            z_score: None,
-            expected_pnl: UsdNotional(Decimal::new(3, 0)),
-            timestamp_ms: 1_715_000_000_123,
-        };
+        let signal = sample_basis_signal();
 
         let events = manager
             .process_arb_signal(signal)
@@ -544,5 +733,92 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn registry_backed_cex_orders_use_configured_symbol_and_exchange() {
+        let executor = DryRunExecutor::new();
+        let registry = SymbolRegistry::new(vec![sample_market(Exchange::Binance, "BTCUSDT")]);
+        let mut manager = ExecutionManager::with_symbol_registry(executor.clone(), registry);
+
+        manager
+            .process_arb_signal(sample_basis_signal())
+            .await
+            .expect("arb signal should process");
+
+        let orders = executor
+            .order_snapshots()
+            .expect("dry run snapshot should succeed");
+        let hedge_order = orders
+            .iter()
+            .find(|order| order.exchange == Exchange::Binance)
+            .expect("binance hedge order should exist");
+
+        assert_eq!(hedge_order.symbol.0, sample_symbol().0);
+        assert_eq!(hedge_order.venue_symbol.as_deref(), Some("BTCUSDT"));
+    }
+
+    #[tokio::test]
+    async fn registry_backed_okx_orders_use_swap_inst_id() {
+        let executor = DryRunExecutor::new();
+        let registry = SymbolRegistry::new(vec![sample_market(Exchange::Okx, "BTCUSDT")]);
+        let mut manager = ExecutionManager::with_symbol_registry(executor.clone(), registry);
+
+        manager
+            .process_arb_signal(sample_basis_signal())
+            .await
+            .expect("arb signal should process");
+
+        let orders = executor
+            .order_snapshots()
+            .expect("dry run snapshot should succeed");
+        let hedge_order = orders
+            .iter()
+            .find(|order| order.exchange == Exchange::Okx)
+            .expect("okx hedge order should exist");
+
+        assert_eq!(hedge_order.symbol.0, sample_symbol().0);
+        assert_eq!(hedge_order.venue_symbol.as_deref(), Some("BTC-USDT-SWAP"));
+    }
+
+    #[tokio::test]
+    async fn close_position_signal_submits_flattening_orders_and_returns_idle() {
+        let executor = DryRunExecutor::new();
+        let registry = SymbolRegistry::new(vec![sample_market(Exchange::Binance, "BTCUSDT")]);
+        let mut manager = ExecutionManager::with_symbol_registry(executor.clone(), registry);
+
+        manager
+            .process_arb_signal(sample_basis_signal())
+            .await
+            .expect("basis signal should process");
+
+        let close_events = manager
+            .process_arb_signal(sample_close_signal())
+            .await
+            .expect("close signal should process");
+
+        assert_eq!(
+            close_events
+                .iter()
+                .filter(|event| matches!(event, ExecutionEvent::OrderSubmitted { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            close_events
+                .iter()
+                .filter(|event| matches!(event, ExecutionEvent::OrderFilled(_)))
+                .count(),
+            2
+        );
+        assert_eq!(
+            manager.hedge_state(&sample_symbol()),
+            Some(HedgeState::Idle)
+        );
+
+        let orders = executor
+            .order_snapshots()
+            .expect("dry run snapshot should succeed");
+        assert_eq!(orders.len(), 4);
     }
 }

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 
 use polyalpha_core::{
-    CircuitBreakerStatus, CexOrderRequest, Exchange, Fill, InstrumentKind, MarketPhase,
+    CexOrderRequest, CircuitBreakerStatus, Exchange, Fill, InstrumentKind, MarketPhase,
     OrderRequest, OrderSide, PolyOrderRequest, PositionKey, RiskManager, RiskRejection,
     RiskStateSnapshot, Symbol, TokenSide, UsdNotional,
 };
@@ -86,6 +86,10 @@ impl InMemoryRiskManager {
         self.breaker_reason.as_deref()
     }
 
+    pub fn market_phase(&self, symbol: &Symbol) -> Option<&MarketPhase> {
+        self.market_phases.get(symbol)
+    }
+
     pub fn reset_circuit_breaker(&mut self) {
         self.breaker_status = CircuitBreakerStatus::Closed;
         self.breaker_reason = None;
@@ -121,8 +125,7 @@ impl InMemoryRiskManager {
         }
 
         let symbol = request_symbol(request);
-        let projected_symbol =
-            self.position_tracker.symbol_exposure_usd(symbol).0 + estimate.0;
+        let projected_symbol = self.position_tracker.symbol_exposure_usd(symbol).0 + estimate.0;
         if projected_symbol > self.limits.max_single_position_usd.0 {
             return Err(RiskRejection::LimitBreached(format!(
                 "single-position exposure {} > {}",
@@ -155,6 +158,7 @@ impl InMemoryRiskManager {
                     return UsdNotional(shares.0 * price.0);
                 }
 
+                // 风控估值兜底：没有显式价格时回退到持仓均价，拿不到则按 0 处理。
                 let key = poly_position_key(order);
                 let fallback = self
                     .position_tracker
@@ -167,6 +171,7 @@ impl InMemoryRiskManager {
                     return UsdNotional(order.base_qty.0 * price.0);
                 }
 
+                // 风控估值兜底：没有显式价格时回退到持仓均价，拿不到则按 0 处理。
                 let key = cex_position_key(order);
                 let fallback = self
                     .position_tracker
@@ -294,7 +299,9 @@ fn cex_position_key(order: &CexOrderRequest) -> PositionKey {
 
 fn request_signed_qty(request: &OrderRequest) -> Option<Decimal> {
     match request {
-        OrderRequest::Poly(order) => order.shares.map(|shares| signed_by_side(order.side, shares.0)),
+        OrderRequest::Poly(order) => order
+            .shares
+            .map(|shares| signed_by_side(order.side, shares.0)),
         OrderRequest::Cex(order) => Some(signed_by_side(order.side, order.base_qty.0)),
     }
 }
@@ -320,7 +327,7 @@ fn has_opposite_sign(lhs: Decimal, rhs: Decimal) -> bool {
 mod tests {
     use super::*;
     use polyalpha_core::{
-        CexBaseQty, ClientOrderId, CexOrderRequest, Fill, OrderId, OrderType, Price, TimeInForce,
+        CexBaseQty, CexOrderRequest, ClientOrderId, Fill, OrderId, OrderType, Price, TimeInForce,
         VenueQuantity,
     };
 
@@ -410,7 +417,10 @@ mod tests {
             .expect("fill should be applied");
 
         let snapshot = manager.build_snapshot(123);
-        assert_eq!(snapshot.total_exposure_usd, UsdNotional(Decimal::new(200, 0)));
+        assert_eq!(
+            snapshot.total_exposure_usd,
+            UsdNotional(Decimal::new(200, 0))
+        );
         assert_eq!(snapshot.daily_pnl, UsdNotional(Decimal::new(-1, 0)));
         assert_eq!(snapshot.circuit_breaker, CircuitBreakerStatus::Closed);
         assert_eq!(snapshot.positions.len(), 1);
@@ -458,8 +468,14 @@ mod tests {
             max_persistence_lag_secs: 5,
         };
         let limits = RiskLimits::from(config);
-        assert_eq!(limits.max_total_exposure_usd, UsdNotional(Decimal::new(10, 0)));
-        assert_eq!(limits.max_single_position_usd, UsdNotional(Decimal::new(5, 0)));
+        assert_eq!(
+            limits.max_total_exposure_usd,
+            UsdNotional(Decimal::new(10, 0))
+        );
+        assert_eq!(
+            limits.max_single_position_usd,
+            UsdNotional(Decimal::new(5, 0))
+        );
         assert_eq!(limits.max_daily_loss_usd, UsdNotional(Decimal::new(2, 0)));
     }
 }

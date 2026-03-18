@@ -23,9 +23,16 @@ pub enum TokenSide {
 pub enum MarketPhase {
     #[default]
     Trading,
-    PreSettlement { hours_remaining: f64 },
-    ForceReduce { target_ratio: Decimal, hours_remaining: f64 },
-    CloseOnly { hours_remaining: f64 },
+    PreSettlement {
+        hours_remaining: f64,
+    },
+    ForceReduce {
+        target_ratio: Decimal,
+        hours_remaining: f64,
+    },
+    CloseOnly {
+        hours_remaining: f64,
+    },
     SettlementPending,
     Disputed,
     Resolved,
@@ -60,8 +67,7 @@ impl MarketPhase {
         now_timestamp: u64,
         rules: &SettlementRules,
     ) -> Self {
-        let hours_remaining =
-            (settlement_timestamp.saturating_sub(now_timestamp) as f64) / 3600.0;
+        let hours_remaining = (settlement_timestamp.saturating_sub(now_timestamp) as f64) / 3600.0;
 
         if hours_remaining <= 0.0 {
             return Self::SettlementPending;
@@ -135,6 +141,21 @@ pub struct SymbolRegistry {
     cex_symbol_to_symbol: HashMap<(Exchange, String), Symbol>,
 }
 
+pub fn cex_venue_symbol(exchange: Exchange, venue_symbol: &str) -> String {
+    match exchange {
+        Exchange::Okx => {
+            if venue_symbol.contains('-') {
+                venue_symbol.to_owned()
+            } else if let Some(base) = venue_symbol.strip_suffix("USDT") {
+                format!("{base}-USDT-SWAP")
+            } else {
+                venue_symbol.to_owned()
+            }
+        }
+        _ => venue_symbol.to_owned(),
+    }
+}
+
 impl SymbolRegistry {
     pub fn new(markets: Vec<MarketConfig>) -> Self {
         let mut registry = Self::default();
@@ -145,12 +166,14 @@ impl SymbolRegistry {
             let exchange = market.hedge_exchange;
             let cex_symbol = market.cex_symbol.clone();
 
-            registry
-                .poly_token_to_symbol
-                .insert(poly_ids.yes_token_id.clone(), (symbol.clone(), TokenSide::Yes));
-            registry
-                .poly_token_to_symbol
-                .insert(poly_ids.no_token_id.clone(), (symbol.clone(), TokenSide::No));
+            registry.poly_token_to_symbol.insert(
+                poly_ids.yes_token_id.clone(),
+                (symbol.clone(), TokenSide::Yes),
+            );
+            registry.poly_token_to_symbol.insert(
+                poly_ids.no_token_id.clone(),
+                (symbol.clone(), TokenSide::No),
+            );
             registry
                 .poly_condition_to_symbols
                 .entry(poly_ids.condition_id)
@@ -174,7 +197,8 @@ impl SymbolRegistry {
     }
 
     pub fn get_cex_symbol(&self, symbol: &Symbol) -> Option<&str> {
-        self.get_config(symbol).map(|config| config.cex_symbol.as_str())
+        self.get_config(symbol)
+            .map(|config| config.cex_symbol.as_str())
     }
 
     pub fn get_tick_sizes(&self, symbol: &Symbol) -> Option<(Decimal, Decimal)> {
@@ -238,7 +262,10 @@ mod tests {
             registry.lookup_cex_symbol(Exchange::Binance, "BTCUSDT"),
             Some(&symbol)
         );
-        assert_eq!(registry.lookup_poly_condition("condition-1"), Some(&[symbol][..]));
+        assert_eq!(
+            registry.lookup_poly_condition("condition-1"),
+            Some(&[symbol][..])
+        );
     }
 
     #[test]
@@ -266,5 +293,15 @@ mod tests {
             MarketPhase::from_settlement(settlement, settlement, &rules),
             MarketPhase::SettlementPending
         ));
+    }
+
+    #[test]
+    fn cex_venue_symbol_normalizes_okx_swap_symbols() {
+        assert_eq!(cex_venue_symbol(Exchange::Binance, "BTCUSDT"), "BTCUSDT");
+        assert_eq!(cex_venue_symbol(Exchange::Okx, "BTCUSDT"), "BTC-USDT-SWAP");
+        assert_eq!(
+            cex_venue_symbol(Exchange::Okx, "BTC-USDT-SWAP"),
+            "BTC-USDT-SWAP"
+        );
     }
 }

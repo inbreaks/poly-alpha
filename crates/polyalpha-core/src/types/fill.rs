@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use super::{Exchange, InstrumentKind, OrderId, OrderSide, Price, Symbol, UsdNotional, VenueQuantity};
+use super::{
+    Exchange, InstrumentKind, OrderId, OrderSide, Price, Symbol, UsdNotional, VenueQuantity,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Fill {

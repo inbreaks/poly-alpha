@@ -22,7 +22,18 @@ pub struct DryRunExecutor {
 struct StoredOrder {
     exchange: Exchange,
     symbol: Symbol,
+    venue_symbol: Option<String>,
     response: OrderResponse,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DryRunOrderSnapshot {
+    pub exchange_order_id: OrderId,
+    pub exchange: Exchange,
+    pub symbol: Symbol,
+    pub venue_symbol: Option<String>,
+    pub status: OrderStatus,
+    pub timestamp_ms: u64,
 }
 
 impl Default for DryRunExecutor {
@@ -76,10 +87,14 @@ impl DryRunExecutor {
         }
     }
 
-    fn exchange_and_symbol(request: &OrderRequest) -> (Exchange, Symbol) {
+    fn order_identity(request: &OrderRequest) -> (Exchange, Symbol, Option<String>) {
         match request {
-            OrderRequest::Poly(req) => (Exchange::Polymarket, req.symbol.clone()),
-            OrderRequest::Cex(req) => (req.exchange, req.symbol.clone()),
+            OrderRequest::Poly(req) => (Exchange::Polymarket, req.symbol.clone(), None),
+            OrderRequest::Cex(req) => (
+                req.exchange,
+                req.symbol.clone(),
+                Some(req.venue_symbol.clone()),
+            ),
         }
     }
 
@@ -120,13 +135,60 @@ impl DryRunExecutor {
             OrderStatus::Pending | OrderStatus::Open | OrderStatus::PartialFill
         )
     }
+
+    fn to_snapshot(order_id: &OrderId, stored: &StoredOrder) -> DryRunOrderSnapshot {
+        DryRunOrderSnapshot {
+            exchange_order_id: order_id.clone(),
+            exchange: stored.exchange,
+            symbol: stored.symbol.clone(),
+            venue_symbol: stored.venue_symbol.clone(),
+            status: stored.response.status,
+            timestamp_ms: stored.response.timestamp_ms,
+        }
+    }
+
+    pub fn order_snapshots(&self) -> Result<Vec<DryRunOrderSnapshot>> {
+        let orders = self
+            .orders
+            .lock()
+            .map_err(|_| CoreError::Channel("dry-run order store poisoned".to_owned()))?;
+        let mut out: Vec<DryRunOrderSnapshot> = orders
+            .iter()
+            .map(|(order_id, stored)| Self::to_snapshot(order_id, stored))
+            .collect();
+        out.sort_by(|lhs, rhs| lhs.exchange_order_id.0.cmp(&rhs.exchange_order_id.0));
+        Ok(out)
+    }
+
+    pub fn open_order_snapshots(&self) -> Result<Vec<DryRunOrderSnapshot>> {
+        let orders = self
+            .orders
+            .lock()
+            .map_err(|_| CoreError::Channel("dry-run order store poisoned".to_owned()))?;
+        let mut out: Vec<DryRunOrderSnapshot> = orders
+            .iter()
+            .filter_map(|(order_id, stored)| {
+                if Self::is_cancellable(stored.response.status) {
+                    Some(Self::to_snapshot(order_id, stored))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        out.sort_by(|lhs, rhs| lhs.exchange_order_id.0.cmp(&rhs.exchange_order_id.0));
+        Ok(out)
+    }
+
+    pub fn open_order_count(&self) -> Result<usize> {
+        Ok(self.open_order_snapshots()?.len())
+    }
 }
 
 #[async_trait]
 impl OrderExecutor for DryRunExecutor {
     async fn submit_order(&self, request: OrderRequest) -> Result<OrderResponse> {
         let exchange_order_id = self.next_order_id();
-        let (exchange, symbol) = Self::exchange_and_symbol(&request);
+        let (exchange, symbol, venue_symbol) = Self::order_identity(&request);
         let status = Self::initial_status(&request);
         let filled_quantity = if matches!(status, OrderStatus::Filled) {
             Self::requested_quantity(&request)
@@ -154,6 +216,7 @@ impl OrderExecutor for DryRunExecutor {
             StoredOrder {
                 exchange,
                 symbol,
+                venue_symbol,
                 response: response.clone(),
             },
         );
@@ -200,10 +263,9 @@ impl OrderExecutor for DryRunExecutor {
             .orders
             .lock()
             .map_err(|_| CoreError::Channel("dry-run order store poisoned".to_owned()))?;
-        let stored = orders.get(order_id).ok_or_else(|| CoreError::Channel(format!(
-            "order not found: {}",
-            order_id.0
-        )))?;
+        let stored = orders
+            .get(order_id)
+            .ok_or_else(|| CoreError::Channel(format!("order not found: {}", order_id.0)))?;
 
         if stored.exchange != exchange {
             return Err(CoreError::Channel(format!(
@@ -310,6 +372,31 @@ mod tests {
         assert_eq!(
             response.filled_quantity,
             VenueQuantity::PolyShares(PolyShares(Decimal::new(125, 0)))
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_open_order_snapshots_only_include_open_like_status() {
+        let executor = DryRunExecutor::new();
+        let _open = executor
+            .submit_order(sample_poly_limit_order())
+            .await
+            .expect("limit submit should succeed");
+        let _filled = executor
+            .submit_order(sample_cex_market_order())
+            .await
+            .expect("market submit should succeed");
+
+        let open_orders = executor
+            .open_order_snapshots()
+            .expect("open snapshots should succeed");
+        assert_eq!(open_orders.len(), 1);
+        assert_eq!(open_orders[0].status, OrderStatus::Open);
+        assert_eq!(
+            executor
+                .open_order_count()
+                .expect("open count should succeed"),
+            1
         );
     }
 }

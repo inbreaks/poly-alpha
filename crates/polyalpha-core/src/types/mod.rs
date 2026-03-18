@@ -9,16 +9,16 @@ pub mod position;
 pub mod risk;
 pub mod signal;
 
-pub use decimal::{CexBaseQty, Price, Probability, PolyShares, UsdNotional, VenueQuantity};
+pub use decimal::{CexBaseQty, PolyShares, Price, Probability, UsdNotional, VenueQuantity};
 pub use engine::EngineParams;
 pub use fill::Fill;
 pub use hedge::{HedgeState, LegStatus, SessionType};
 pub use market::{
-    Exchange, MarketConfig, MarketPhase, PolymarketIds, SettlementRules, Symbol, SymbolRegistry,
-    TokenSide,
+    cex_venue_symbol, Exchange, MarketConfig, MarketPhase, PolymarketIds, SettlementRules, Symbol,
+    SymbolRegistry, TokenSide,
 };
 pub use order::{
-    ClientOrderId, CexOrderRequest, OrderId, OrderRequest, OrderResponse, OrderSide, OrderStatus,
+    CexOrderRequest, ClientOrderId, OrderId, OrderRequest, OrderResponse, OrderSide, OrderStatus,
     OrderType, PolyOrderRequest, TimeInForce,
 };
 pub use orderbook::{InstrumentKind, OrderBookSnapshot, PriceLevel, Side};

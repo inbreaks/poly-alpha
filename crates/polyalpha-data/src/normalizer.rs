@@ -1,8 +1,9 @@
 use rust_decimal::Decimal;
 
 use polyalpha_core::{
-    Exchange, InstrumentKind, MarketDataEvent, MarketPhase, OrderBookSnapshot, OrderSide, PolyShares,
-    Price, PriceLevel, SettlementRules, Symbol, SymbolRegistry, TokenSide, VenueQuantity, CexBaseQty,
+    CexBaseQty, Exchange, InstrumentKind, MarketDataEvent, MarketPhase, OrderBookSnapshot,
+    OrderSide, PolyShares, Price, PriceLevel, SettlementRules, Symbol, SymbolRegistry, TokenSide,
+    VenueQuantity,
 };
 
 use crate::error::{DataError, Result};
@@ -287,7 +288,10 @@ mod tests {
             } => {
                 assert_eq!(exchange, Exchange::Binance);
                 assert_eq!(symbol, Symbol::new("btc-100k-mar-2026"));
-                assert_eq!(quantity, VenueQuantity::CexBaseQty(CexBaseQty(Decimal::new(25, 3))));
+                assert_eq!(
+                    quantity,
+                    VenueQuantity::CexBaseQty(CexBaseQty(Decimal::new(25, 3)))
+                );
             }
             other => panic!("unexpected event: {other:?}"),
         }

@@ -57,7 +57,12 @@ impl MockMarketDataSource {
     }
 
     pub fn with_defaults(manager: DataManager, ticks: Vec<MockTick>) -> Self {
-        Self::new(manager, Exchange::Polymarket, SettlementRules::default(), ticks)
+        Self::new(
+            manager,
+            Exchange::Polymarket,
+            SettlementRules::default(),
+            ticks,
+        )
     }
 
     pub fn reset(&self) {
@@ -158,7 +163,9 @@ impl MockMarketDataSource {
                 if !self.is_subscribed(&symbol) {
                     return Ok(0);
                 }
-                self.manager.normalize_and_publish_cex_trade(update).map(|_| 1)
+                self.manager
+                    .normalize_and_publish_cex_trade(update)
+                    .map(|_| 1)
             }
             MockTick::CexFunding(update) => {
                 let symbol = self
@@ -186,13 +193,14 @@ impl MockMarketDataSource {
                 if !self.is_subscribed(&symbol) {
                     return Ok(0);
                 }
-                self.manager.publish_market_lifecycle(
-                    &symbol,
-                    now_timestamp_secs,
-                    emitted_at_ms,
-                    &self.settlement_rules,
-                )
-                .map(|_| 1)
+                self.manager
+                    .publish_market_lifecycle(
+                        &symbol,
+                        now_timestamp_secs,
+                        emitted_at_ms,
+                        &self.settlement_rules,
+                    )
+                    .map(|_| 1)
             }
             MockTick::Connection { exchange, status } => self
                 .manager
@@ -241,8 +249,8 @@ mod tests {
     use rust_decimal::Decimal;
 
     use polyalpha_core::{
-        create_channels, Exchange, MarketConfig, MarketDataEvent, MarketDataSource, OrderSide,
-        PolymarketIds, PolyShares, Price, SettlementRules, Symbol, SymbolRegistry, CexBaseQty,
+        create_channels, CexBaseQty, Exchange, MarketConfig, MarketDataEvent, MarketDataSource,
+        OrderSide, PolyShares, PolymarketIds, Price, SettlementRules, Symbol, SymbolRegistry,
     };
 
     use super::*;
@@ -379,7 +387,9 @@ mod tests {
         assert!(matches!(err, DataError::NotConnected { .. }));
 
         source.connect().await.expect("connect should succeed");
-        let sent = source.replay_all().expect("replay should work after connect");
+        let sent = source
+            .replay_all()
+            .expect("replay should work after connect");
         // orderbook skipped due to missing subscription; connection event is still published
         assert_eq!(sent, 1);
         assert!(matches!(

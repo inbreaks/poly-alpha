@@ -218,7 +218,8 @@ impl SimpleAlphaEngine {
 
         if !state.market_phase.allows_new_positions() {
             if state.active_arb.take().is_some() {
-                output.push_arb_signal(self.close_signal(symbol, "market phase blocks new exposure"));
+                output
+                    .push_arb_signal(self.close_signal(symbol, "market phase blocks new exposure"));
             }
             self.states.insert(symbol.clone(), state);
             return output;
@@ -244,7 +245,9 @@ impl SimpleAlphaEngine {
                 }
             } else if abs_basis <= exit {
                 if state.active_arb.take().is_some() {
-                    output.push_arb_signal(self.close_signal(symbol, "basis reverted inside exit band"));
+                    output.push_arb_signal(
+                        self.close_signal(symbol, "basis reverted inside exit band"),
+                    );
                 }
             }
         }
@@ -359,8 +362,7 @@ impl SimpleAlphaEngine {
         };
 
         let expected_pnl = UsdNotional(
-            poly_target_notional.0
-                * Decimal::from_f64(basis.abs()).unwrap_or(Decimal::ZERO),
+            poly_target_notional.0 * Decimal::from_f64(basis.abs()).unwrap_or(Decimal::ZERO),
         );
         let z = if self.config.basis_entry_threshold.abs() <= f64::EPSILON {
             0.0
@@ -442,9 +444,8 @@ impl AlphaEngine for SimpleAlphaEngine {
         }
 
         if let Some(exit) = params.basis_exit_zscore {
-            self.config.basis_exit_threshold = exit
-                .abs()
-                .min(self.config.basis_entry_threshold.max(0.0));
+            self.config.basis_exit_threshold =
+                exit.abs().min(self.config.basis_entry_threshold.max(0.0));
         }
 
         self.max_position_usd = params.max_position_usd;

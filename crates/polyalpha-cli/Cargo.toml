@@ -6,11 +6,15 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1"
+chrono = { version = "0.4", default-features = true, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 polyalpha-core = { path = "../polyalpha-core" }
 polyalpha-data = { path = "../polyalpha-data" }
 polyalpha-engine = { path = "../polyalpha-engine" }
 polyalpha-executor = { path = "../polyalpha-executor" }
 polyalpha-risk = { path = "../polyalpha-risk" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rust_decimal.workspace = true
+serde.workspace = true
+serde_json = "1"
 tokio.workspace = true
