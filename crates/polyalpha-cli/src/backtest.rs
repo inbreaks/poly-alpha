@@ -139,6 +139,8 @@ pub async fn run_backtest_command(command: BacktestCommand) -> Result<()> {
             entry_fill_ratio,
             report_json,
             equity_csv,
+            trades_csv,
+            snapshots_csv,
         } => {
             run_rust_replay_command(RustReplayCommandArgs {
                 db_path,
@@ -160,6 +162,8 @@ pub async fn run_backtest_command(command: BacktestCommand) -> Result<()> {
                 entry_fill_ratio,
                 report_json,
                 equity_csv,
+                trades_csv,
+                snapshots_csv,
             })
             .await
         }

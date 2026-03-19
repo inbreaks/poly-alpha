@@ -325,6 +325,10 @@ pub enum BacktestCommand {
         report_json: Option<String>,
         #[arg(long)]
         equity_csv: Option<String>,
+        #[arg(long)]
+        trades_csv: Option<String>,
+        #[arg(long)]
+        snapshots_csv: Option<String>,
     },
     RustStress {
         #[arg(

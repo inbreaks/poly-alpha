@@ -46,6 +46,8 @@ pub struct RustReplayCommandArgs {
     pub entry_fill_ratio: f64,
     pub report_json: Option<String>,
     pub equity_csv: Option<String>,
+    pub trades_csv: Option<String>,
+    pub snapshots_csv: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -124,6 +126,7 @@ struct ReplayDataset {
 struct ReplayMarketSpec {
     event_id: String,
     market_id: String,
+    market_slug: String,
     symbol: Symbol,
     market_config: MarketConfig,
     settlement_ts_ms: u64,
@@ -157,6 +160,13 @@ struct ReplayPosition {
     last_cex_price: f64,
     reserved_margin: f64,
     round_trip_pnl: f64,
+    entry_ts_ms: u64,
+    entry_poly_price: f64,
+    entry_fees_paid: f64,
+    entry_slippage_paid: f64,
+    entry_z_score: f64,
+    entry_basis_bps: f64,
+    entry_delta: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -282,10 +292,65 @@ struct RustStressReport {
     results: Vec<RustReplaySummary>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct ReplayTradeRow {
+    trade_id: usize,
+    strategy: String,
+    entry_time: u64,
+    event_id: String,
+    market_id: String,
+    market_slug: String,
+    exit_time: u64,
+    direction: String,
+    entry_poly_price: f64,
+    exit_poly_price: f64,
+    entry_cex_price: f64,
+    exit_cex_price: f64,
+    poly_shares: f64,
+    cex_qty: f64,
+    gross_pnl: f64,
+    fees: f64,
+    slippage: f64,
+    gas: f64,
+    funding_cost: f64,
+    net_pnl: f64,
+    holding_bars: u64,
+    z_score_at_entry: f64,
+    basis_bps_at_entry: f64,
+    delta_at_entry: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ReplaySnapshotRow {
+    ts_ms: u64,
+    event_id: String,
+    market_id: String,
+    market_slug: String,
+    yes_price: Option<f64>,
+    no_price: Option<f64>,
+    cex_reference_price: f64,
+    cex_advance_price: f64,
+    signal_count: usize,
+    signal_action: Option<String>,
+    signal_token_side: Option<String>,
+    signal_basis_bps: Option<f64>,
+    signal_z_score: Option<f64>,
+    snapshot_token_side: Option<String>,
+    snapshot_poly_price: Option<f64>,
+    snapshot_fair_value: Option<f64>,
+    snapshot_basis_bps: Option<f64>,
+    snapshot_z_score: Option<f64>,
+    snapshot_delta: Option<f64>,
+    snapshot_sigma: Option<f64>,
+    snapshot_minutes_to_expiry: Option<f64>,
+}
+
 #[derive(Clone, Debug)]
 struct ReplayRunResult {
     summary: RustReplaySummary,
     equity_curve: Vec<EquityPoint>,
+    trade_log: Vec<ReplayTradeRow>,
+    snapshot_log: Vec<ReplaySnapshotRow>,
 }
 
 pub async fn run_rust_replay_command(args: RustReplayCommandArgs) -> Result<()> {
@@ -314,7 +379,7 @@ pub async fn run_rust_replay_command(args: RustReplayCommandArgs) -> Result<()> 
             entry_fill_ratio: args.entry_fill_ratio,
         },
     )?;
-    let run = run_single_replay(&dataset, &config).await?;
+    let run = run_single_replay(&dataset, &config, args.snapshots_csv.is_some()).await?;
     print_replay_summary(&run.summary);
 
     if let Some(path) = args.report_json.as_deref() {
@@ -329,6 +394,12 @@ pub async fn run_rust_replay_command(args: RustReplayCommandArgs) -> Result<()> 
     }
     if let Some(path) = args.equity_csv.as_deref() {
         write_equity_csv(path, &run.equity_curve)?;
+    }
+    if let Some(path) = args.trades_csv.as_deref() {
+        write_trades_csv(path, &run.trade_log)?;
+    }
+    if let Some(path) = args.snapshots_csv.as_deref() {
+        write_snapshots_csv(path, &run.snapshot_log)?;
     }
     Ok(())
 }
@@ -356,7 +427,7 @@ pub async fn run_rust_stress_command(args: RustStressCommandArgs) -> Result<()> 
             args.cex_margin_ratio,
             preset,
         )?;
-        let run = run_single_replay(&dataset, &config).await?;
+        let run = run_single_replay(&dataset, &config, false).await?;
         results.push(run.summary);
     }
 
@@ -624,6 +695,7 @@ fn load_market_specs(
             .ok_or_else(|| anyhow!("market `{market_id}` missing no token id"))?;
         let rule = parse_market_rule(&market_question)?;
         let symbol = Symbol::new(format!("mkt-{market_id}"));
+        let market_slug = format!("mkt-{market_id}");
         let settlement_ts_ms = i64_to_u64(end_ts)?
             .checked_mul(1000)
             .ok_or_else(|| anyhow!("market `{market_id}` settlement timestamp overflow"))?;
@@ -653,6 +725,7 @@ fn load_market_specs(
             ReplayMarketSpec {
                 event_id,
                 market_id: market_id.clone(),
+                market_slug,
                 symbol,
                 market_config,
                 settlement_ts_ms,
@@ -763,6 +836,7 @@ fn build_row_filter_sql(filter: &ReplayFilter) -> String {
 async fn run_single_replay(
     dataset: &ReplayDataset,
     config: &ResolvedReplayConfig,
+    capture_snapshots: bool,
 ) -> Result<ReplayRunResult> {
     let markets = dataset
         .markets
@@ -788,6 +862,8 @@ async fn run_single_replay(
         .collect::<HashMap<_, _>>();
     let mut positions: HashMap<Symbol, ReplayPosition> = HashMap::new();
     let mut equity_curve = Vec::new();
+    let mut trade_log = Vec::new();
+    let mut snapshot_log = Vec::new();
     let mut stats = ReplayStats::default();
     let mut cash = config.initial_capital;
     let mut peak_equity = config.initial_capital;
@@ -908,6 +984,40 @@ async fn run_single_replay(
                 .await;
             stats.grouped_rows_replayed += 1;
 
+            if capture_snapshots {
+                let snapshot = engine.basis_snapshot(&spec.symbol);
+                let first_signal = output.arb_signals.first();
+                snapshot_log.push(ReplaySnapshotRow {
+                    ts_ms,
+                    event_id: spec.event_id.clone(),
+                    market_id: spec.market_id.clone(),
+                    market_slug: spec.market_slug.clone(),
+                    yes_price: row.yes_price,
+                    no_price: row.no_price,
+                    cex_reference_price,
+                    cex_advance_price,
+                    signal_count: output.arb_signals.len(),
+                    signal_action: first_signal.map(signal_action_label),
+                    signal_token_side: first_signal.map(|signal| token_side_label(signal.token_side)),
+                    signal_basis_bps: first_signal
+                        .and_then(|signal| signal.basis_value.as_ref())
+                        .and_then(Decimal::to_f64),
+                    signal_z_score: first_signal
+                        .and_then(|signal| signal.z_score.as_ref())
+                        .and_then(Decimal::to_f64),
+                    snapshot_token_side: snapshot.as_ref().map(|item| token_side_label(item.token_side)),
+                    snapshot_poly_price: snapshot.as_ref().map(|item| item.poly_price),
+                    snapshot_fair_value: snapshot.as_ref().map(|item| item.fair_value),
+                    snapshot_basis_bps: snapshot.as_ref().map(|item| item.signal_basis * 10_000.0),
+                    snapshot_z_score: snapshot.as_ref().and_then(|item| item.z_score),
+                    snapshot_delta: snapshot.as_ref().map(|item| item.delta),
+                    snapshot_sigma: snapshot.as_ref().and_then(|item| item.sigma),
+                    snapshot_minutes_to_expiry: snapshot
+                        .as_ref()
+                        .map(|item| item.minutes_to_expiry),
+                });
+            }
+
             for signal in output.arb_signals {
                 let pending = PendingReplaySignal {
                     signal,
@@ -933,6 +1043,7 @@ async fn run_single_replay(
                 &mut positions,
                 &mut cash,
                 &mut stats,
+                &mut trade_log,
             )?;
             engine.sync_position_state(
                 &pending.spec.symbol,
@@ -966,10 +1077,13 @@ async fn run_single_replay(
                 None,
                 cex_reference_price,
                 true,
+                "settled",
                 config,
                 &mut positions,
                 &mut cash,
                 &mut stats,
+                &mut trade_log,
+                ts_ms,
             )?;
             engine.sync_position_state(
                 &symbol,
@@ -1024,6 +1138,7 @@ async fn run_single_replay(
                 &mut positions,
                 &mut cash,
                 &mut stats,
+                &mut trade_log,
             )?;
             engine.sync_position_state(
                 &pending.spec.symbol,
@@ -1043,6 +1158,7 @@ async fn run_single_replay(
                 &mut positions,
                 &mut cash,
                 &mut stats,
+                &mut trade_log,
             )?;
             engine.sync_position_state(
                 &pending.spec.symbol,
@@ -1089,10 +1205,13 @@ async fn run_single_replay(
                 None,
                 final_cex_price,
                 true,
+                "settled",
                 config,
                 &mut positions,
                 &mut cash,
                 &mut stats,
+                &mut trade_log,
+                last_batch_ts.unwrap_or_default(),
             )?;
             engine.sync_position_state(&symbol, None);
         }
@@ -1174,6 +1293,8 @@ async fn run_single_replay(
     Ok(ReplayRunResult {
         summary,
         equity_curve,
+        trade_log,
+        snapshot_log,
     })
 }
 
@@ -1249,18 +1370,31 @@ fn handle_signal(
     positions: &mut HashMap<Symbol, ReplayPosition>,
     cash: &mut f64,
     stats: &mut ReplayStats,
+    trade_log: &mut Vec<ReplayTradeRow>,
 ) -> Result<()> {
     stats.signals_emitted += 1;
     *stats
         .signals_by_market
         .entry(spec.market_id.clone())
         .or_insert(0) += 1;
+    let entry_z_score = signal
+        .z_score
+        .as_ref()
+        .and_then(Decimal::to_f64)
+        .unwrap_or_default();
+    let entry_basis_bps = signal
+        .basis_value
+        .as_ref()
+        .and_then(Decimal::to_f64)
+        .unwrap_or_default()
+        * 10_000.0;
     match signal.action {
         ArbSignalAction::BasisLong {
             token_side,
             poly_target_shares,
             cex_side,
             cex_hedge_qty,
+            delta,
             ..
         } => {
             if positions.contains_key(&spec.symbol) {
@@ -1334,6 +1468,8 @@ fn handle_signal(
             );
 
             let mut round_trip_pnl = -(poly_costs);
+            let mut entry_fees_paid = poly_fee_paid;
+            let mut entry_slippage_paid = poly_slippage_paid;
             if cex_entry_notional > 0.0 {
                 let (cex_costs, cex_fee_paid, cex_slippage_paid) = trade_cost(
                     cex_entry_notional,
@@ -1343,6 +1479,8 @@ fn handle_signal(
                 *cash -= cex_costs;
                 round_trip_pnl -= cex_costs;
                 record_costs(stats, cex_fee_paid, cex_slippage_paid, false, true, true);
+                entry_fees_paid += cex_fee_paid;
+                entry_slippage_paid += cex_slippage_paid;
             }
 
             positions.insert(
@@ -1358,6 +1496,13 @@ fn handle_signal(
                     last_cex_price: cex_reference_price,
                     reserved_margin: margin_required,
                     round_trip_pnl,
+                    entry_ts_ms: row.ts_ms,
+                    entry_poly_price: poly_entry_price,
+                    entry_fees_paid,
+                    entry_slippage_paid,
+                    entry_z_score,
+                    entry_basis_bps,
+                    entry_delta: delta,
                 },
             );
             stats.entry_count += 1;
@@ -1366,7 +1511,7 @@ fn handle_signal(
                 .entry(spec.market_id.clone())
                 .or_insert(0) += 1;
         }
-        ArbSignalAction::ClosePosition { .. } => {
+        ArbSignalAction::ClosePosition { reason } => {
             if positions.contains_key(&spec.symbol) {
                 close_position(
                     &spec.symbol,
@@ -1374,10 +1519,13 @@ fn handle_signal(
                     row.current_price_for_position(positions.get(&spec.symbol)),
                     cex_reference_price,
                     false,
+                    &reason,
                     config,
                     positions,
                     cash,
                     stats,
+                    trade_log,
+                    row.ts_ms,
                 )?;
             }
         }
@@ -1514,26 +1662,30 @@ fn close_position(
     market_exit_price: Option<f64>,
     exit_cex_price: f64,
     settle_to_payout: bool,
+    close_reason: &str,
     config: &ResolvedReplayConfig,
     positions: &mut HashMap<Symbol, ReplayPosition>,
     cash: &mut f64,
     stats: &mut ReplayStats,
+    trade_log: &mut Vec<ReplayTradeRow>,
+    ts_ms: u64,
 ) -> Result<()> {
     let Some(mut position) = positions.remove(symbol) else {
         return Ok(());
     };
 
-    let sale_value = if settle_to_payout {
-        let payout = settlement_payout(spec, position.token_side, exit_cex_price);
-        position.shares * payout
+    let used_exit_poly_price = if settle_to_payout {
+        settlement_payout(spec, position.token_side, exit_cex_price)
     } else {
-        let exit_price = market_exit_price.unwrap_or(position.last_poly_price);
-        position.shares * exit_price
+        market_exit_price.unwrap_or(position.last_poly_price)
     };
+    let sale_value = position.shares * used_exit_poly_price;
     let poly_gross_pnl = sale_value - position.poly_entry_notional;
     *cash += sale_value;
     stats.poly_realized_gross += poly_gross_pnl;
     position.round_trip_pnl += poly_gross_pnl;
+    let mut exit_fees_paid = 0.0;
+    let mut exit_slippage_paid = 0.0;
 
     if !settle_to_payout && sale_value > 0.0 {
         let (poly_costs, poly_fee_paid, poly_slippage_paid) = trade_cost(
@@ -1544,6 +1696,8 @@ fn close_position(
         *cash -= poly_costs;
         position.round_trip_pnl -= poly_costs;
         record_costs(stats, poly_fee_paid, poly_slippage_paid, true, false, true);
+        exit_fees_paid += poly_fee_paid;
+        exit_slippage_paid += poly_slippage_paid;
     }
 
     let cex_gross_pnl = linear_cex_pnl(
@@ -1565,14 +1719,48 @@ fn close_position(
         *cash -= cex_costs;
         position.round_trip_pnl -= cex_costs;
         record_costs(stats, cex_fee_paid, cex_slippage_paid, false, false, true);
+        exit_fees_paid += cex_fee_paid;
+        exit_slippage_paid += cex_slippage_paid;
     }
+
+    let round_trip_gross_pnl = poly_gross_pnl + cex_gross_pnl;
+    let total_fees_paid = position.entry_fees_paid + exit_fees_paid;
+    let total_slippage_paid = position.entry_slippage_paid + exit_slippage_paid;
+    let round_trip_net_pnl = round_trip_gross_pnl - total_fees_paid - total_slippage_paid;
+
+    trade_log.push(ReplayTradeRow {
+        trade_id: trade_log.len() + 1,
+        strategy: "arb".to_owned(),
+        entry_time: position.entry_ts_ms / 1000,
+        event_id: spec.event_id.clone(),
+        market_id: spec.market_id.clone(),
+        market_slug: spec.market_slug.clone(),
+        exit_time: ts_ms / 1000,
+        direction: format!("{}_{}", token_side_label(position.token_side), close_reason),
+        entry_poly_price: position.entry_poly_price,
+        exit_poly_price: used_exit_poly_price,
+        entry_cex_price: position.cex_entry_price,
+        exit_cex_price,
+        poly_shares: position.shares,
+        cex_qty: position.cex_qty_btc.abs(),
+        gross_pnl: round_trip_gross_pnl,
+        fees: total_fees_paid,
+        slippage: total_slippage_paid,
+        gas: 0.0,
+        funding_cost: 0.0,
+        net_pnl: round_trip_net_pnl,
+        holding_bars: ts_ms.saturating_sub(position.entry_ts_ms) / ONE_MINUTE_MS,
+        z_score_at_entry: position.entry_z_score,
+        basis_bps_at_entry: position.entry_basis_bps,
+        delta_at_entry: position.entry_delta,
+    });
 
     stats.round_trip_count += 1;
     *stats
         .net_pnl_by_market
         .entry(position.market_id.clone())
-        .or_insert(0.0) += position.round_trip_pnl;
-    if position.round_trip_pnl > 0.0 {
+        .or_insert(0.0) += round_trip_net_pnl;
+    if round_trip_net_pnl > 0.0 {
         stats.winning_round_trips += 1;
     }
     if settle_to_payout {
@@ -2005,6 +2193,13 @@ fn print_stress_summary(results: &[RustReplaySummary]) {
     }
 }
 
+fn token_side_label(token_side: TokenSide) -> &'static str {
+    match token_side {
+        TokenSide::Yes => "yes",
+        TokenSide::No => "no",
+    }
+}
+
 fn write_json<T: Serialize>(path: &str, value: &T) -> Result<()> {
     let path_ref = Path::new(path);
     if let Some(parent) = path_ref.parent() {
@@ -2045,6 +2240,58 @@ fn write_equity_csv(path: &str, equity_curve: &[EquityPoint]) -> Result<()> {
         .with_context(|| format!("failed to write equity csv `{}`", path_ref.display()))
 }
 
+fn write_trades_csv(path: &str, trade_log: &[ReplayTradeRow]) -> Result<()> {
+    let path_ref = Path::new(path);
+    if let Some(parent) = path_ref.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create trades directory `{}`", parent.display()))?;
+    }
+
+    let mut out = String::from(
+        "trade_id,strategy,entry_time,event_id,market_id,market_slug,exit_time,direction,entry_poly_price,exit_poly_price,entry_cex_price,exit_cex_price,poly_shares,cex_qty,gross_pnl,fees,slippage,gas,funding_cost,net_pnl,holding_bars,z_score_at_entry,basis_bps_at_entry,delta_at_entry\n",
+    );
+    for trade in trade_log {
+        let _ = writeln!(
+            out,
+            "{},{},{},{},{},{},{},{},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{},{:.8},{:.8},{:.8}",
+            trade.trade_id,
+            csv_escape(&trade.strategy),
+            trade.entry_time,
+            csv_escape(&trade.event_id),
+            csv_escape(&trade.market_id),
+            csv_escape(&trade.market_slug),
+            trade.exit_time,
+            csv_escape(&trade.direction),
+            trade.entry_poly_price,
+            trade.exit_poly_price,
+            trade.entry_cex_price,
+            trade.exit_cex_price,
+            trade.poly_shares,
+            trade.cex_qty,
+            trade.gross_pnl,
+            trade.fees,
+            trade.slippage,
+            trade.gas,
+            trade.funding_cost,
+            trade.net_pnl,
+            trade.holding_bars,
+            trade.z_score_at_entry,
+            trade.basis_bps_at_entry,
+            trade.delta_at_entry,
+        );
+    }
+    fs::write(path_ref, out)
+        .with_context(|| format!("failed to write trades csv `{}`", path_ref.display()))
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
 fn sql_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -2076,6 +2323,10 @@ impl ReplayMinuteRow {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
 
     #[test]
@@ -2144,5 +2395,53 @@ mod tests {
         assert!(is_official_resolution(&[1.0, 0.0], "resolved"));
         assert!(is_official_resolution(&[0.0, 1.0], "finalized"));
         assert!(!is_official_resolution(&[0.6, 0.4], "pending"));
+    }
+
+    #[test]
+    fn writes_trade_csv_with_expected_header_and_fields() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "polyalpha-trades-{}-{nonce}.csv",
+            std::process::id()
+        ));
+        let trades = vec![ReplayTradeRow {
+            trade_id: 1,
+            strategy: "arb".to_owned(),
+            entry_time: 1_750_000_000,
+            event_id: "evt-1".to_owned(),
+            market_id: "mkt-1".to_owned(),
+            market_slug: "btc-above-100k".to_owned(),
+            exit_time: 1_750_000_600,
+            direction: "yes_settled".to_owned(),
+            entry_poly_price: 0.42,
+            exit_poly_price: 1.0,
+            entry_cex_price: 100_000.0,
+            exit_cex_price: 101_000.0,
+            poly_shares: 2_380.95238095,
+            cex_qty: 0.12345678,
+            gross_pnl: 123.45,
+            fees: 4.56,
+            slippage: 7.89,
+            gas: 0.0,
+            funding_cost: 0.0,
+            net_pnl: 111.0,
+            holding_bars: 10,
+            z_score_at_entry: -2.05,
+            basis_bps_at_entry: -123.45,
+            delta_at_entry: 0.12,
+        }];
+
+        write_trades_csv(path.to_str().unwrap_or_default(), &trades).unwrap();
+        let payload = fs::read_to_string(&path).unwrap();
+        assert!(payload.starts_with(
+            "trade_id,strategy,entry_time,event_id,market_id,market_slug,exit_time,direction,"
+        ));
+        assert!(payload.contains("evt-1,mkt-1,btc-above-100k"));
+        assert!(payload.contains("yes_settled"));
+
+        let _ = fs::remove_file(path);
     }
 }
