@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
+use regex::Regex;
 use reqwest::Client;
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -8,7 +9,7 @@ use std::fs;
 use std::path::Path;
 use std::str::FromStr;
 
-use polyalpha_core::{MarketConfig, Price, Settings};
+use polyalpha_core::{MarketConfig, MarketRule, MarketRuleKind, Price, Settings};
 
 use crate::commands::select_market;
 
@@ -32,6 +33,7 @@ struct DiscoveredMarket {
     settlement_iso: String,
     neg_risk: bool,
     strike_price: Option<Price>,
+    market_rule: Option<MarketRule>,
 }
 
 pub async fn run_discover_btc(
@@ -249,6 +251,7 @@ fn extract_markets_from_event(event: &Value, warnings: &mut Vec<String>) -> Vec<
         }
 
         let question = preferred_question(market, &event_title);
+        let strike_price = parse_strike_price(&question, &market_slug);
         out.push(DiscoveredMarket {
             event_id: event_id.clone(),
             event_title: event_title.clone(),
@@ -264,7 +267,9 @@ fn extract_markets_from_event(event: &Value, warnings: &mut Vec<String>) -> Vec<
             neg_risk: bool_field(market, "negRisk")
                 .or_else(|| bool_field(event, "negRisk"))
                 .unwrap_or(false),
-            strike_price: parse_strike_price(&question, &market_slug),
+            market_rule: parse_market_rule(&question)
+                .or_else(|| strike_price.map(MarketRule::fallback_above)),
+            strike_price,
         });
     }
 
@@ -373,6 +378,13 @@ fn render_market_snippet(discovered: &DiscoveredMarket, template: &MarketConfig)
     out.push_str(&format!("condition_id = \"{}\"\n", discovered.condition_id));
     out.push_str(&format!("yes_token_id = \"{}\"\n", discovered.yes_token_id));
     out.push_str(&format!("no_token_id = \"{}\"\n", discovered.no_token_id));
+    out.push_str(&format!(
+        "market_question = {}\n",
+        toml_string_text(&discovered.question)
+    ));
+    if let Some(rule) = &discovered.market_rule {
+        out.push_str(&format!("market_rule = {}\n", render_market_rule(rule)));
+    }
     out.push_str(&format!(
         "settlement_timestamp = {}\n",
         discovered.settlement_timestamp
@@ -566,6 +578,49 @@ fn parse_strike_price(question: &str, slug: &str) -> Option<Price> {
     parse_price_hint(slug).or_else(|| parse_price_hint(question))
 }
 
+fn parse_market_rule(question: &str) -> Option<MarketRule> {
+    let normalized = question
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+
+    let between =
+        Regex::new(r"between\s+\$?([0-9][0-9,]*(?:\.\d+)?)\s+and\s+\$?([0-9][0-9,]*(?:\.\d+)?)")
+            .ok()?;
+    if let Some(captures) = between.captures(&normalized) {
+        return Some(MarketRule {
+            kind: MarketRuleKind::Between,
+            lower_strike: Some(Price(parse_decimal_capture(captures.get(1)?.as_str())?)),
+            upper_strike: Some(Price(parse_decimal_capture(captures.get(2)?.as_str())?)),
+        });
+    }
+
+    let above = Regex::new(r"(above|greater than)\s+\$?([0-9][0-9,]*(?:\.\d+)?)").ok()?;
+    if let Some(captures) = above.captures(&normalized) {
+        return Some(MarketRule {
+            kind: MarketRuleKind::Above,
+            lower_strike: Some(Price(parse_decimal_capture(captures.get(2)?.as_str())?)),
+            upper_strike: None,
+        });
+    }
+
+    let below = Regex::new(r"(below|less than)\s+\$?([0-9][0-9,]*(?:\.\d+)?)").ok()?;
+    if let Some(captures) = below.captures(&normalized) {
+        return Some(MarketRule {
+            kind: MarketRuleKind::Below,
+            lower_strike: None,
+            upper_strike: Some(Price(parse_decimal_capture(captures.get(2)?.as_str())?)),
+        });
+    }
+
+    None
+}
+
+fn parse_decimal_capture(raw: &str) -> Option<Decimal> {
+    Decimal::from_str(&raw.replace(',', "")).ok()
+}
+
 fn parse_price_hint(text: &str) -> Option<Price> {
     let lower = text
         .to_lowercase()
@@ -609,8 +664,28 @@ fn render_optional_price(price: &Option<Price>) -> String {
         .unwrap_or_else(|| "n/a".to_owned())
 }
 
+fn render_market_rule(rule: &MarketRule) -> String {
+    let kind = match rule.kind {
+        MarketRuleKind::Above => "above",
+        MarketRuleKind::Below => "below",
+        MarketRuleKind::Between => "between",
+    };
+    let mut fields = vec![format!("kind = \"{kind}\"")];
+    if let Some(lower) = rule.lower_strike {
+        fields.push(format!("lower_strike = {}", lower.0.normalize()));
+    }
+    if let Some(upper) = rule.upper_strike {
+        fields.push(format!("upper_strike = {}", upper.0.normalize()));
+    }
+    format!("{{ {} }}", fields.join(", "))
+}
+
 fn toml_comment_text(text: &str) -> String {
     text.replace('\n', " ").replace('\r', " ")
+}
+
+fn toml_string_text(text: &str) -> String {
+    serde_json::to_string(&toml_comment_text(text)).unwrap_or_else(|_| "\"\"".to_owned())
 }
 
 fn is_btc_event(event: &Value) -> bool {
@@ -674,5 +749,28 @@ mod tests {
         )
         .expect("price should parse");
         assert_eq!(price.0.normalize().to_string(), "100000");
+    }
+
+    #[test]
+    fn parse_market_rule_supports_between_questions() {
+        let rule = parse_market_rule("Will Bitcoin be between $90,000 and $95,000 on Friday?")
+            .expect("rule should parse");
+        assert_eq!(rule.kind, MarketRuleKind::Between);
+        assert_eq!(
+            rule.lower_strike
+                .expect("lower strike")
+                .0
+                .normalize()
+                .to_string(),
+            "90000"
+        );
+        assert_eq!(
+            rule.upper_strike
+                .expect("upper strike")
+                .0
+                .normalize()
+                .to_string(),
+            "95000"
+        );
     }
 }

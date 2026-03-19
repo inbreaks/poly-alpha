@@ -70,12 +70,19 @@ pub async fn run_demo(env: &str) -> Result<()> {
     source.subscribe_market(&market.symbol).await?;
 
     let mut market_data_rx = channels.market_data_tx.subscribe();
-    let mut engine = SimpleAlphaEngine::new(SimpleEngineConfig {
-        warmup_samples: 1,
-        basis_entry_threshold: 0.05,
-        basis_exit_threshold: 0.02,
-        ..SimpleEngineConfig::default()
-    });
+    let mut engine = SimpleAlphaEngine::with_markets(
+        SimpleEngineConfig {
+            min_signal_samples: 2,
+            rolling_window_minutes: 4,
+            entry_z: 2.0,
+            exit_z: 0.5,
+            position_notional_usd: settings.strategy.basis.max_position_usd,
+            cex_hedge_ratio: 1.0,
+            dmm_half_spread: Decimal::new(1, 2),
+            dmm_quote_size: polyalpha_core::PolyShares::ZERO,
+        },
+        settings.markets.clone(),
+    );
     engine.update_params(EngineParams {
         basis_entry_zscore: None,
         basis_exit_zscore: None,
@@ -375,6 +382,7 @@ fn signal_requests(
 ) -> Result<Vec<OrderRequest>> {
     let requests = match &signal.action {
         ArbSignalAction::BasisLong {
+            token_side,
             poly_side,
             poly_target_shares,
             poly_target_notional,
@@ -383,6 +391,7 @@ fn signal_requests(
             ..
         }
         | ArbSignalAction::BasisShort {
+            token_side,
             poly_side,
             poly_target_shares,
             poly_target_notional,
@@ -397,7 +406,7 @@ fn signal_requests(
                 OrderRequest::Poly(PolyOrderRequest {
                     client_order_id: ClientOrderId("risk-poly".to_owned()),
                     symbol: signal.symbol.clone(),
-                    token_side: TokenSide::Yes,
+                    token_side: *token_side,
                     side: *poly_side,
                     order_type: OrderType::Market,
                     limit_price: None,

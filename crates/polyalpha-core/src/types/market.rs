@@ -19,6 +19,41 @@ pub enum TokenSide {
     No,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MarketRuleKind {
+    Above,
+    Below,
+    Between,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MarketRule {
+    pub kind: MarketRuleKind,
+    #[serde(default)]
+    pub lower_strike: Option<Price>,
+    #[serde(default)]
+    pub upper_strike: Option<Price>,
+}
+
+impl MarketRule {
+    pub fn fallback_above(strike_price: Price) -> Self {
+        Self {
+            kind: MarketRuleKind::Above,
+            lower_strike: Some(strike_price),
+            upper_strike: None,
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        match self.kind {
+            MarketRuleKind::Above => self.lower_strike.is_some(),
+            MarketRuleKind::Below => self.upper_strike.is_some(),
+            MarketRuleKind::Between => self.lower_strike.is_some() && self.upper_strike.is_some(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub enum MarketPhase {
     #[default]
@@ -122,6 +157,10 @@ pub struct MarketConfig {
     pub symbol: Symbol,
     #[serde(flatten)]
     pub poly_ids: PolymarketIds,
+    #[serde(default)]
+    pub market_question: Option<String>,
+    #[serde(default)]
+    pub market_rule: Option<MarketRule>,
     pub cex_symbol: String,
     pub hedge_exchange: Exchange,
     pub strike_price: Option<Price>,
@@ -131,6 +170,15 @@ pub struct MarketConfig {
     pub cex_price_tick: Decimal,
     pub cex_qty_step: Decimal,
     pub cex_contract_multiplier: Decimal,
+}
+
+impl MarketConfig {
+    pub fn resolved_market_rule(&self) -> Option<MarketRule> {
+        self.market_rule
+            .clone()
+            .filter(MarketRule::is_complete)
+            .or_else(|| self.strike_price.map(MarketRule::fallback_above))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -236,6 +284,10 @@ mod tests {
                 yes_token_id: "yes-1".to_owned(),
                 no_token_id: "no-1".to_owned(),
             },
+            market_question: Some(
+                "Will the price of Bitcoin be above $100,000 on March 31, 2026?".to_owned(),
+            ),
+            market_rule: Some(MarketRule::fallback_above(Price(Decimal::new(100_000, 0)))),
             cex_symbol: "BTCUSDT".to_owned(),
             hedge_exchange: Exchange::Binance,
             strike_price: Some(Price(Decimal::new(100_000, 0))),

@@ -323,6 +323,7 @@ impl<E: OrderExecutor> ExecutionManager<E> {
     fn requests_from_signal(&mut self, signal: &ArbSignalEvent) -> Vec<OrderRequest> {
         match &signal.action {
             ArbSignalAction::BasisLong {
+                token_side,
                 poly_side,
                 poly_target_shares,
                 poly_target_notional,
@@ -331,6 +332,7 @@ impl<E: OrderExecutor> ExecutionManager<E> {
                 ..
             }
             | ArbSignalAction::BasisShort {
+                token_side,
                 poly_side,
                 poly_target_shares,
                 poly_target_notional,
@@ -340,7 +342,7 @@ impl<E: OrderExecutor> ExecutionManager<E> {
             } => vec![
                 self.poly_market_order(
                     signal.symbol.clone(),
-                    TokenSide::Yes,
+                    *token_side,
                     *poly_side,
                     *poly_target_shares,
                     Some(*poly_target_notional),
@@ -612,6 +614,12 @@ mod tests {
                 yes_token_id: "yes-1".to_owned(),
                 no_token_id: "no-1".to_owned(),
             },
+            market_question: Some(
+                "Will the price of Bitcoin be above $100,000 on March 31, 2026?".to_owned(),
+            ),
+            market_rule: Some(polyalpha_core::MarketRule::fallback_above(Price(
+                Decimal::new(100_000, 0),
+            ))),
             cex_symbol: cex_symbol.to_owned(),
             hedge_exchange: exchange,
             strike_price: Some(Price(Decimal::new(100_000, 0))),
@@ -629,6 +637,7 @@ mod tests {
             signal_id: "sig-basis-1".to_owned(),
             symbol: sample_symbol(),
             action: ArbSignalAction::BasisLong {
+                token_side: TokenSide::Yes,
                 poly_side: OrderSide::Buy,
                 poly_target_shares: PolyShares(Decimal::new(25, 0)),
                 poly_target_notional: UsdNotional(Decimal::new(12, 1)),

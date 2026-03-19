@@ -4,11 +4,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::args::BacktestCommand;
+use crate::backtest_rust::{
+    run_rust_replay_command, run_rust_stress_command, RustReplayCommandArgs, RustStressCommandArgs,
+};
 
 const BUILD_DB_SCRIPT: &str = "scripts/build_btc_basis_backtest_db.py";
 const REPORT_SCRIPT: &str = "scripts/btc_basis_backtest_report.py";
 
-pub fn run_backtest_command(command: BacktestCommand) -> Result<()> {
+pub async fn run_backtest_command(command: BacktestCommand) -> Result<()> {
     match command {
         BacktestCommand::PrepareDb {
             start_date,
@@ -16,12 +19,14 @@ pub fn run_backtest_command(command: BacktestCommand) -> Result<()> {
             output,
             max_events,
             max_contracts,
+            allow_spot_fallback,
         } => prepare_db(
             start_date.as_deref(),
             end_date.as_deref(),
             &output,
             max_events,
             max_contracts,
+            allow_spot_fallback,
         ),
         BacktestCommand::InspectDb {
             db_path,
@@ -48,6 +53,7 @@ pub fn run_backtest_command(command: BacktestCommand) -> Result<()> {
             equity_csv,
         } => run_report(
             &db_path,
+            "run",
             market_id.as_deref(),
             token_id.as_deref(),
             start.as_deref(),
@@ -66,6 +72,131 @@ pub fn run_backtest_command(command: BacktestCommand) -> Result<()> {
             report_json.as_deref(),
             equity_csv.as_deref(),
         ),
+        BacktestCommand::WalkForward {
+            db_path,
+            market_id,
+            token_id,
+            start,
+            end,
+            initial_capital,
+            rolling_window,
+            entry_z,
+            exit_z,
+            position_units,
+            position_notional_usd,
+            max_capital_usage,
+            cex_hedge_ratio,
+            cex_margin_ratio,
+            fee_bps,
+            slippage_bps,
+            train_days,
+            test_days,
+            step_days,
+            max_slices,
+            report_json,
+            equity_csv,
+        } => run_walk_forward(
+            &db_path,
+            market_id.as_deref(),
+            token_id.as_deref(),
+            start.as_deref(),
+            end.as_deref(),
+            initial_capital,
+            rolling_window,
+            entry_z,
+            exit_z,
+            position_units,
+            position_notional_usd,
+            max_capital_usage,
+            cex_hedge_ratio,
+            cex_margin_ratio,
+            fee_bps,
+            slippage_bps,
+            train_days,
+            test_days,
+            step_days,
+            max_slices,
+            report_json.as_deref(),
+            equity_csv.as_deref(),
+        ),
+        BacktestCommand::RustReplay {
+            db_path,
+            market_id,
+            start,
+            end,
+            initial_capital,
+            rolling_window,
+            entry_z,
+            exit_z,
+            position_notional_usd,
+            max_capital_usage,
+            cex_hedge_ratio,
+            cex_margin_ratio,
+            poly_fee_bps,
+            poly_slippage_bps,
+            cex_fee_bps,
+            cex_slippage_bps,
+            entry_fill_ratio,
+            report_json,
+            equity_csv,
+        } => {
+            run_rust_replay_command(RustReplayCommandArgs {
+                db_path,
+                market_id,
+                start,
+                end,
+                initial_capital,
+                rolling_window,
+                entry_z,
+                exit_z,
+                position_notional_usd,
+                max_capital_usage,
+                cex_hedge_ratio,
+                cex_margin_ratio,
+                poly_fee_bps,
+                poly_slippage_bps,
+                cex_fee_bps,
+                cex_slippage_bps,
+                entry_fill_ratio,
+                report_json,
+                equity_csv,
+            })
+            .await
+        }
+        BacktestCommand::RustStress {
+            db_path,
+            market_id,
+            start,
+            end,
+            initial_capital,
+            rolling_window,
+            entry_z,
+            exit_z,
+            position_notional_usd,
+            max_capital_usage,
+            cex_hedge_ratio,
+            cex_margin_ratio,
+            preset,
+            report_json,
+        } => {
+            run_rust_stress_command(RustStressCommandArgs {
+                db_path,
+                market_id,
+                start,
+                end,
+                initial_capital,
+                rolling_window,
+                entry_z,
+                exit_z,
+                position_notional_usd,
+                max_capital_usage,
+                cex_hedge_ratio,
+                cex_margin_ratio,
+                preset,
+                report_json,
+            })
+            .await
+        }
     }
 }
 
@@ -75,6 +206,7 @@ fn prepare_db(
     output: &str,
     max_events: usize,
     max_contracts: usize,
+    allow_spot_fallback: bool,
 ) -> Result<()> {
     let mut args = vec![
         script_path(BUILD_DB_SCRIPT)?,
@@ -90,6 +222,9 @@ fn prepare_db(
     if max_contracts > 0 {
         args.push("--max-contracts".to_owned());
         args.push(max_contracts.to_string());
+    }
+    if allow_spot_fallback {
+        args.push("--allow-spot-fallback".to_owned());
     }
     run_python_script(&args)
 }
@@ -110,6 +245,7 @@ fn inspect_db(db_path: &str, show_failures: bool) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn run_report(
     db_path: &str,
+    subcommand: &str,
     market_id: Option<&str>,
     token_id: Option<&str>,
     start: Option<&str>,
@@ -132,7 +268,7 @@ fn run_report(
         script_path(REPORT_SCRIPT)?,
         "--db-path".to_owned(),
         db_path.to_owned(),
-        "run".to_owned(),
+        subcommand.to_owned(),
     ];
     push_optional_arg(&mut args, "--market-id", market_id);
     push_optional_arg(&mut args, "--token-id", token_id);
@@ -149,6 +285,61 @@ fn run_report(
     push_optional_value(&mut args, "--cex-margin-ratio", cex_margin_ratio);
     push_optional_value(&mut args, "--fee-bps", fee_bps);
     push_optional_value(&mut args, "--slippage-bps", slippage_bps);
+    push_optional_arg(&mut args, "--report-json", report_json);
+    push_optional_arg(&mut args, "--equity-csv", equity_csv);
+    run_python_script(&args)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_walk_forward(
+    db_path: &str,
+    market_id: Option<&str>,
+    token_id: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
+    initial_capital: Option<f64>,
+    rolling_window: Option<usize>,
+    entry_z: Option<f64>,
+    exit_z: Option<f64>,
+    position_units: Option<f64>,
+    position_notional_usd: Option<f64>,
+    max_capital_usage: Option<f64>,
+    cex_hedge_ratio: Option<f64>,
+    cex_margin_ratio: Option<f64>,
+    fee_bps: Option<f64>,
+    slippage_bps: Option<f64>,
+    train_days: Option<usize>,
+    test_days: Option<usize>,
+    step_days: Option<usize>,
+    max_slices: Option<usize>,
+    report_json: Option<&str>,
+    equity_csv: Option<&str>,
+) -> Result<()> {
+    let mut args = vec![
+        script_path(REPORT_SCRIPT)?,
+        "--db-path".to_owned(),
+        db_path.to_owned(),
+        "walk-forward".to_owned(),
+    ];
+    push_optional_arg(&mut args, "--market-id", market_id);
+    push_optional_arg(&mut args, "--token-id", token_id);
+    push_optional_arg(&mut args, "--start", start);
+    push_optional_arg(&mut args, "--end", end);
+    push_optional_value(&mut args, "--initial-capital", initial_capital);
+    push_optional_value(&mut args, "--rolling-window", rolling_window);
+    push_optional_value(&mut args, "--entry-z", entry_z);
+    push_optional_value(&mut args, "--exit-z", exit_z);
+    push_optional_value(&mut args, "--position-units", position_units);
+    push_optional_value(&mut args, "--position-notional-usd", position_notional_usd);
+    push_optional_value(&mut args, "--max-capital-usage", max_capital_usage);
+    push_optional_value(&mut args, "--cex-hedge-ratio", cex_hedge_ratio);
+    push_optional_value(&mut args, "--cex-margin-ratio", cex_margin_ratio);
+    push_optional_value(&mut args, "--fee-bps", fee_bps);
+    push_optional_value(&mut args, "--slippage-bps", slippage_bps);
+    push_optional_value(&mut args, "--train-days", train_days);
+    push_optional_value(&mut args, "--test-days", test_days);
+    push_optional_value(&mut args, "--step-days", step_days);
+    push_optional_value(&mut args, "--max-slices", max_slices);
     push_optional_arg(&mut args, "--report-json", report_json);
     push_optional_arg(&mut args, "--equity-csv", equity_csv);
     run_python_script(&args)

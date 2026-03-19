@@ -14,8 +14,8 @@ pub use engine::EngineParams;
 pub use fill::Fill;
 pub use hedge::{HedgeState, LegStatus, SessionType};
 pub use market::{
-    cex_venue_symbol, Exchange, MarketConfig, MarketPhase, PolymarketIds, SettlementRules, Symbol,
-    SymbolRegistry, TokenSide,
+    cex_venue_symbol, Exchange, MarketConfig, MarketPhase, MarketRule, MarketRuleKind,
+    PolymarketIds, SettlementRules, Symbol, SymbolRegistry, TokenSide,
 };
 pub use order::{
     CexOrderRequest, ClientOrderId, OrderId, OrderRequest, OrderResponse, OrderSide, OrderStatus,

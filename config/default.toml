@@ -19,8 +19,10 @@ ws_private_url = "wss://ws.okx.com:8443/ws/v5/private"
 [[markets]]
 symbol = "btc-100k-mar-2026"
 condition_id = "0x..."
-yes_token_id = "0x..."
-no_token_id = "0x..."
+yes_token_id = "yes-placeholder..."
+no_token_id = "no-placeholder..."
+market_question = "Will the price of Bitcoin be above $100,000 on March 31, 2026?"
+market_rule = { kind = "above", lower_strike = 100000 }
 settlement_timestamp = 1775001600
 min_tick_size = 0.01
 neg_risk = false

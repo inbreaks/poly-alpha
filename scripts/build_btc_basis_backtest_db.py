@@ -210,6 +210,11 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_POLY_HISTORY_WORKERS,
         help="Concurrent worker count for Polymarket history fetching",
     )
+    parser.add_argument(
+        "--allow-spot-fallback",
+        action="store_true",
+        help="仅在研究调试时允许 Binance futures 拉取失败后回退到 spot mirror；默认关闭以避免混入不同市场结构",
+    )
     return parser.parse_args()
 
 
@@ -247,7 +252,11 @@ def main() -> None:
     if poly_failures:
         print(f"skipped {len(poly_failures)} polymarket contracts without usable price history")
 
-    kline_rows, cex_source = fetch_binance_klines(global_start, global_end)
+    kline_rows, cex_source = fetch_binance_klines(
+        global_start,
+        global_end,
+        allow_spot_fallback=bool(args.allow_spot_fallback),
+    )
     print(f"fetched {len(kline_rows)} binance 1m rows from {cex_source}")
 
     basis_rows = build_basis_rows(poly_rows, kline_rows)
@@ -260,6 +269,7 @@ def main() -> None:
         poly_rows,
         poly_failures,
         cex_source,
+        "allow-spot-fallback" if args.allow_spot_fallback else "strict-futures",
         kline_rows,
         basis_rows,
         args.market_style,
@@ -556,6 +566,9 @@ def extract_contract_tokens(
             token_ids = parse_token_ids(market.get("clobTokenIds"))
             if not token_ids:
                 continue
+            market_question = str(market.get("question", ""))
+            if not supports_causal_market_question(market_question):
+                continue
 
             market_start = first_non_none_dt(
                 parse_dt(market.get("startDate")),
@@ -589,7 +602,7 @@ def extract_contract_tokens(
                         event_title=event_title,
                         event_slug=event_slug,
                         market_id=str(market.get("id", "")),
-                        market_question=str(market.get("question", label)),
+                        market_question=market_question or str(label),
                         condition_id=market.get("conditionId"),
                         token_id=str(token_id),
                         token_side=side_name,
@@ -639,6 +652,32 @@ def parse_string_array(raw: Any) -> list[str]:
             return [str(item) for item in parsed]
         return [str(parsed)]
     return [str(raw)]
+
+
+def supports_causal_market_question(market_question: str) -> bool:
+    question = " ".join(str(market_question).strip().lower().split())
+    if not question:
+        return False
+
+    between_match = re.search(
+        r"between\s+\$([0-9][0-9,]*(?:\.\d+)?(?:[kmb])?)\b\s+and\s+\$([0-9][0-9,]*(?:\.\d+)?(?:[kmb])?)\b",
+        question,
+    )
+    if between_match:
+        return True
+
+    above_match = re.search(
+        r"(above|greater than)\s+\$([0-9][0-9,]*(?:\.\d+)?(?:[kmb])?)\b",
+        question,
+    )
+    if above_match:
+        return True
+
+    below_match = re.search(
+        r"(below|less than)\s+\$([0-9][0-9,]*(?:\.\d+)?(?:[kmb])?)\b",
+        question,
+    )
+    return below_match is not None
 
 
 def first_non_none_dt(*values: datetime | None) -> datetime:
@@ -759,10 +798,17 @@ def fetch_poly_history_for_contract(
 def fetch_binance_klines(
     start_ts: int,
     end_ts: int,
+    *,
+    allow_spot_fallback: bool = False,
 ) -> tuple[list[tuple[int, float, float, float, float, float]], str]:
     try:
         return fetch_binance_futures_klines_via_ccxt(start_ts, end_ts), "binance_usdm_ccxt"
     except ccxt.BaseError as exc:
+        if not allow_spot_fallback:
+            raise SystemExit(
+                "binance futures klines unavailable and spot fallback is disabled; "
+                "rerun with `--allow-spot-fallback` only if you accept mixed research data"
+            ) from exc
         print(
             f"falling back to binance spot mirror after ccxt futures failure: {type(exc).__name__}",
             file=sys.stderr,
@@ -898,11 +944,13 @@ def build_basis_rows(
     poly_rows: Iterable[tuple[str, str, str, str, int, float]],
     kline_rows: Iterable[tuple[int, float, float, float, float, float]],
 ) -> list[tuple[str, str, str, str, int, float, float, float]]:
-    cex_close_by_minute = {row[0]: row[4] for row in kline_rows}
+    # 交易决策只能看到上一根已完成的 1m bar，因此这里显式把 Poly 的分钟点
+    # 对齐到“前一分钟的 CEX close”，避免把同一分钟后半段走势带进当前信号。
+    cex_close_by_trade_minute = {row[0] + 60_000: row[4] for row in kline_rows}
     out: list[tuple[str, str, str, str, int, float, float, float]] = []
 
     for event_id, market_id, token_id, token_side, ts_ms, poly_price in poly_rows:
-        cex_price = cex_close_by_minute.get(ts_ms)
+        cex_price = cex_close_by_trade_minute.get(ts_ms)
         if cex_price is None:
             continue
         out.append(
@@ -932,6 +980,7 @@ def write_duckdb(
     poly_rows: list[tuple[str, str, str, str, int, float]],
     poly_failures: list[tuple[str, str, str, str, str, str]],
     cex_source: str,
+    cex_source_policy: str,
     kline_rows: list[tuple[int, float, float, float, float, float]],
     basis_rows: list[tuple[str, str, str, str, int, float, float, float]],
     market_style: str,
@@ -1005,7 +1054,7 @@ def write_duckdb(
         conn.execute(
             """
             create table if not exists binance_btc_1m (
-                ts_ms bigint primary key,
+                ts_ms bigint,
                 ts_utc timestamptz,
                 open double,
                 high double,
@@ -1118,6 +1167,8 @@ def write_duckdb(
             ),
             label="binance_btc_1m",
         )
+        validate_unique_column(conn, "binance_btc_1m", "ts_ms")
+        conn.execute("create index if not exists idx_binance_btc_1m_ts_ms on binance_btc_1m(ts_ms)")
 
         insert_rows_in_batches(
             conn,
@@ -1131,8 +1182,14 @@ def write_duckdb(
                     else "polymarket_public_search_q_btc",
                 ),
                 ("market_style", market_style),
-                ("raw_basis_formula", "poly_price - cex_price"),
-                ("signal_basis_formula", "poly_price - cex_probability_proxy"),
+                ("raw_basis_formula", "poly_price - prev_completed_cex_close"),
+                ("cex_alignment", "use previous completed cex 1m close for each polymarket minute"),
+                ("cex_source_policy", cex_source_policy),
+                ("signal_basis_formula", "poly_price - causal_terminal_probability"),
+                (
+                    "settlement_payout_source",
+                    "prefer gamma market outcomePrices when officially resolved, otherwise fallback to cex-derived terminal payout",
+                ),
             ],
             label="build_metadata",
         )
@@ -1228,6 +1285,24 @@ def copy_rows_via_temp_csv(
     finally:
         if temp_path and os.path.exists(temp_path):
             os.unlink(temp_path)
+
+
+def validate_unique_column(conn: Any, table_name: str, column_name: str) -> None:
+    duplicate_rows = conn.execute(
+        f"""
+        select count(*)
+        from (
+            select {column_name}
+            from {table_name}
+            group by 1
+            having count(*) > 1
+        ) dup
+        """
+    ).fetchone()[0]
+    if int(duplicate_rows) > 0:
+        raise ValueError(
+            f"{table_name}.{column_name} contains {duplicate_rows} duplicated keys after load"
+        )
 
 
 def to_duck_ts(dt: datetime | None) -> str | None:

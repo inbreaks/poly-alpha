@@ -56,6 +56,7 @@ impl DmmQuoteUpdate {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum ArbSignalAction {
     BasisLong {
+        token_side: TokenSide,
         poly_side: OrderSide,
         poly_target_shares: PolyShares,
         poly_target_notional: UsdNotional,
@@ -64,6 +65,7 @@ pub enum ArbSignalAction {
         delta: f64,
     },
     BasisShort {
+        token_side: TokenSide,
         poly_side: OrderSide,
         poly_target_shares: PolyShares,
         poly_target_notional: UsdNotional,

@@ -1,13 +1,15 @@
 mod args;
 mod backtest;
+mod backtest_rust;
 mod commands;
 mod markets;
+mod paper;
 mod sim;
 
 use anyhow::Result;
 use clap::Parser;
 
-use args::{Cli, Command, MarketCommand, SimCommand};
+use args::{Cli, Command, MarketCommand, PaperCommand, SimCommand};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -88,7 +90,32 @@ async fn main() -> Result<()> {
             }
             SimCommand::Inspect { env, format } => sim::inspect_sim(&env, format)?,
         },
-        Command::Backtest { command } => backtest::run_backtest_command(command)?,
+        Command::Paper { command } => match command {
+            PaperCommand::Run {
+                env,
+                market_index,
+                poll_interval_ms,
+                print_every,
+                max_ticks,
+                depth,
+                include_funding,
+                json,
+            } => {
+                paper::run_paper(
+                    &env,
+                    market_index,
+                    poll_interval_ms,
+                    print_every,
+                    max_ticks,
+                    depth,
+                    include_funding,
+                    json,
+                )
+                .await?
+            }
+            PaperCommand::Inspect { env, format } => paper::inspect_paper(&env, format)?,
+        },
+        Command::Backtest { command } => backtest::run_backtest_command(command).await?,
     }
 
     Ok(())

@@ -1,0 +1,310 @@
+{
+  "cases": [
+    {
+      "name": "yes_entry_then_close",
+      "symbol": "fixture-btc-above-99k-yes",
+      "market_question": "Will the price of Bitcoin be above $99,000 at expiry?",
+      "market_rule": {
+        "kind": "above",
+        "lower_strike": 99000.0,
+        "upper_strike": null
+      },
+      "settlement_ts_ms": 1200000,
+      "config": {
+        "min_signal_samples": 2,
+        "rolling_window_minutes": 4,
+        "entry_z": 2.0,
+        "exit_z": 0.5,
+        "position_notional_usd": 1000.0,
+        "cex_hedge_ratio": 1.0
+      },
+      "cex_closes": [
+        99500.0,
+        100200.0,
+        100400.0,
+        100600.0,
+        100500.0,
+        100450.0,
+        100430.0
+      ],
+      "poly_observations": [
+        {
+          "ts_ms": 60000,
+          "yes_price": 0.6,
+          "no_price": 0.4
+        },
+        {
+          "ts_ms": 120000,
+          "yes_price": 0.61,
+          "no_price": 0.39
+        },
+        {
+          "ts_ms": 180000,
+          "yes_price": 0.32,
+          "no_price": 0.68
+        },
+        {
+          "ts_ms": 240000,
+          "yes_price": 0.58,
+          "no_price": 0.42
+        },
+        {
+          "ts_ms": 300000,
+          "yes_price": 0.59,
+          "no_price": 0.41
+        },
+        {
+          "ts_ms": 360000,
+          "yes_price": 0.83,
+          "no_price": 0.17
+        }
+      ],
+      "expected_steps": [
+        {
+          "ts_ms": 60000,
+          "preferred_snapshot": {
+            "token_side": "yes",
+            "poly_price": 0.6,
+            "fair_value": 1.0,
+            "signal_basis": -0.4,
+            "z_score": null,
+            "delta": 0.0,
+            "cex_reference_price": 99500.0,
+            "sigma": null,
+            "minutes_to_expiry": 19.0
+          },
+          "signal": null
+        },
+        {
+          "ts_ms": 120000,
+          "preferred_snapshot": {
+            "token_side": "yes",
+            "poly_price": 0.61,
+            "fair_value": 1.0,
+            "signal_basis": -0.39,
+            "z_score": null,
+            "delta": 0.0,
+            "cex_reference_price": 100200.0,
+            "sigma": null,
+            "minutes_to_expiry": 18.0
+          },
+          "signal": null
+        },
+        {
+          "ts_ms": 180000,
+          "preferred_snapshot": {
+            "token_side": "yes",
+            "poly_price": 0.32,
+            "fair_value": 0.82965723,
+            "signal_basis": -0.50965723,
+            "z_score": -22.93144597,
+            "delta": 0.00017255,
+            "cex_reference_price": 100400.0,
+            "sigma": 0.00354722,
+            "minutes_to_expiry": 17.0
+          },
+          "signal": {
+            "kind": "open",
+            "token_side": "yes",
+            "poly_side": "buy",
+            "cex_side": "sell",
+            "signal_basis": -0.50965723,
+            "z_score": -22.93144597,
+            "delta": 0.00017255
+          }
+        },
+        {
+          "ts_ms": 240000,
+          "preferred_snapshot": {
+            "token_side": "yes",
+            "poly_price": 0.58,
+            "fair_value": 0.91582592,
+            "signal_basis": -0.33582592,
+            "z_score": 1.79679249,
+            "delta": 0.00013249,
+            "cex_reference_price": 100600.0,
+            "sigma": 0.00289744,
+            "minutes_to_expiry": 16.0
+          },
+          "signal": null
+        },
+        {
+          "ts_ms": 300000,
+          "preferred_snapshot": {
+            "token_side": "yes",
+            "poly_price": 0.59,
+            "fair_value": 0.87758078,
+            "signal_basis": -0.28758078,
+            "z_score": 1.92207752,
+            "delta": 0.00015697,
+            "cex_reference_price": 100500.0,
+            "sigma": 0.00332028,
+            "minutes_to_expiry": 15.0
+          },
+          "signal": null
+        },
+        {
+          "ts_ms": 360000,
+          "preferred_snapshot": {
+            "token_side": "yes",
+            "poly_price": 0.83,
+            "fair_value": 0.9925586,
+            "signal_basis": -0.1625586,
+            "z_score": 2.63641484,
+            "delta": 3.434e-05,
+            "cex_reference_price": 100450.0,
+            "sigma": 0.00159382,
+            "minutes_to_expiry": 14.0
+          },
+          "signal": {
+            "kind": "close",
+            "reason": "signal basis reverted inside exit band"
+          }
+        }
+      ]
+    },
+    {
+      "name": "no_entry_then_close",
+      "symbol": "fixture-btc-above-100k-no",
+      "market_question": "Will the price of Bitcoin be above $100,000 at expiry?",
+      "market_rule": {
+        "kind": "above",
+        "lower_strike": 100000.0,
+        "upper_strike": null
+      },
+      "settlement_ts_ms": 1200000,
+      "config": {
+        "min_signal_samples": 2,
+        "rolling_window_minutes": 4,
+        "entry_z": 2.0,
+        "exit_z": 0.5,
+        "position_notional_usd": 1000.0,
+        "cex_hedge_ratio": 1.0
+      },
+      "cex_closes": [
+        100000.0,
+        99500.0,
+        99200.0,
+        99000.0,
+        99100.0,
+        99200.0,
+        99350.0
+      ],
+      "poly_observations": [
+        {
+          "ts_ms": 60000,
+          "yes_price": 0.53,
+          "no_price": 0.47
+        },
+        {
+          "ts_ms": 120000,
+          "yes_price": 0.54,
+          "no_price": 0.46
+        },
+        {
+          "ts_ms": 180000,
+          "yes_price": 0.72,
+          "no_price": 0.28
+        },
+        {
+          "ts_ms": 240000,
+          "yes_price": 0.58,
+          "no_price": 0.42
+        },
+        {
+          "ts_ms": 300000,
+          "yes_price": 0.55,
+          "no_price": 0.45
+        }
+      ],
+      "expected_steps": [
+        {
+          "ts_ms": 60000,
+          "preferred_snapshot": {
+            "token_side": "no",
+            "poly_price": 0.47,
+            "fair_value": 1.0,
+            "signal_basis": -0.53,
+            "z_score": null,
+            "delta": -0.05,
+            "cex_reference_price": 100000.0,
+            "sigma": null,
+            "minutes_to_expiry": 19.0
+          },
+          "signal": null
+        },
+        {
+          "ts_ms": 120000,
+          "preferred_snapshot": {
+            "token_side": "no",
+            "poly_price": 0.46,
+            "fair_value": 1.0,
+            "signal_basis": -0.54,
+            "z_score": null,
+            "delta": 0.0,
+            "cex_reference_price": 99500.0,
+            "sigma": null,
+            "minutes_to_expiry": 18.0
+          },
+          "signal": null
+        },
+        {
+          "ts_ms": 180000,
+          "preferred_snapshot": {
+            "token_side": "no",
+            "poly_price": 0.28,
+            "fair_value": 0.91702123,
+            "signal_basis": -0.63702123,
+            "z_score": -20.40424569,
+            "delta": -0.00026515,
+            "cex_reference_price": 99200.0,
+            "sigma": 0.0014092,
+            "minutes_to_expiry": 17.0
+          },
+          "signal": {
+            "kind": "open",
+            "token_side": "no",
+            "poly_side": "buy",
+            "cex_side": "buy",
+            "signal_basis": -0.63702123,
+            "z_score": -20.40424569,
+            "delta": -0.00026515
+          }
+        },
+        {
+          "ts_ms": 240000,
+          "preferred_snapshot": {
+            "token_side": "no",
+            "poly_price": 0.42,
+            "fair_value": 0.95067175,
+            "signal_basis": -0.53067175,
+            "z_score": 0.79424736,
+            "delta": -0.00016904,
+            "cex_reference_price": 99000.0,
+            "sigma": 0.0015243,
+            "minutes_to_expiry": 16.0
+          },
+          "signal": null
+        },
+        {
+          "ts_ms": 300000,
+          "preferred_snapshot": {
+            "token_side": "no",
+            "poly_price": 0.45,
+            "fair_value": 0.82505877,
+            "signal_basis": -0.37505877,
+            "z_score": 4.09924462,
+            "delta": -0.00026751,
+            "cex_reference_price": 99100.0,
+            "sigma": 0.00251013,
+            "minutes_to_expiry": 15.0
+          },
+          "signal": {
+            "kind": "close",
+            "reason": "signal basis reverted inside exit band"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -5,31 +5,32 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::{sleep, Duration};
 
 use polyalpha_core::{
-    create_channels, AlphaEngine, ArbSignalAction, ArbSignalEvent, CexBaseQty, ConnectionStatus,
-    EngineParams, Exchange, ExecutionEvent, InstrumentKind, MarketConfig, MarketDataEvent,
-    MarketDataSource, MarketPhase, Position, Price, RiskManager, Settings, SymbolRegistry,
+    create_channels, AlphaEngine, ArbSignalAction, ArbSignalEvent, ConnectionStatus, EngineParams,
+    Exchange, ExecutionEvent, InstrumentKind, MarketConfig, MarketDataEvent, MarketDataSource,
+    MarketPhase, PolyShares, Position, RiskManager, Settings, Symbol, SymbolRegistry, TokenSide,
     VenueQuantity,
 };
 use polyalpha_data::{
-    CexBookLevel, CexBookUpdate, DataManager, MarketDataNormalizer, MockMarketDataSource, MockTick,
-    PolyBookLevel, PolyBookUpdate,
+    BinanceFuturesDataSource, DataManager, MarketDataNormalizer, OkxMarketDataSource,
+    PolymarketLiveDataSource,
 };
 use polyalpha_engine::{SimpleAlphaEngine, SimpleEngineConfig};
 use polyalpha_executor::{dry_run::DryRunOrderSnapshot, DryRunExecutor, ExecutionManager};
 use polyalpha_risk::{InMemoryRiskManager, RiskLimits};
 
-use crate::args::{SimInspectFormat, SimScenario};
+use crate::args::PaperInspectFormat;
 use crate::commands::{select_market, signal_allowed};
 
-const MAX_EVENT_LOGS: usize = 32;
+const MAX_EVENT_LOGS: usize = 48;
 const REPORT_WIDTH: usize = 78;
 
 #[derive(Default)]
-struct SimStats {
+struct PaperStats {
     ticks_processed: usize,
     market_events: usize,
     signals_seen: usize,
@@ -38,6 +39,7 @@ struct SimStats {
     order_cancelled: usize,
     fills: usize,
     state_changes: usize,
+    poll_errors: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -50,13 +52,13 @@ struct ObservedState {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct SimEventLog {
+struct PaperEventLog {
     kind: String,
     summary: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct SimPositionView {
+struct PaperPositionView {
     exchange: String,
     instrument: String,
     side: String,
@@ -68,7 +70,7 @@ struct SimPositionView {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct SimOrderView {
+struct PaperOrderView {
     exchange_order_id: String,
     exchange: String,
     symbol: String,
@@ -77,11 +79,11 @@ struct SimOrderView {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct SimSnapshot {
+struct PaperSnapshot {
     tick_index: usize,
     market: String,
+    hedge_exchange: String,
     hedge_symbol: String,
-    scenario: String,
     market_phase: String,
     #[serde(default)]
     connections: Vec<String>,
@@ -104,33 +106,99 @@ struct SimSnapshot {
     order_cancelled: usize,
     fills: usize,
     state_changes: usize,
+    poll_errors: usize,
     total_exposure_usd: String,
     daily_pnl_usd: String,
     breaker: String,
-    positions: Vec<SimPositionView>,
+    positions: Vec<PaperPositionView>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct SimArtifact {
+struct PaperArtifact {
     env: String,
     market_index: usize,
     market: String,
-    scenario: String,
-    tick_interval_ms: u64,
+    hedge_exchange: String,
+    poll_interval_ms: u64,
+    depth: u16,
+    include_funding: bool,
     ticks_processed: usize,
-    final_snapshot: SimSnapshot,
-    open_orders: Vec<SimOrderView>,
-    recent_events: Vec<SimEventLog>,
-    snapshots: Vec<SimSnapshot>,
+    final_snapshot: PaperSnapshot,
+    open_orders: Vec<PaperOrderView>,
+    recent_events: Vec<PaperEventLog>,
+    snapshots: Vec<PaperSnapshot>,
 }
 
-pub async fn run_sim(
+enum CexLiveSource {
+    Binance(BinanceFuturesDataSource),
+    Okx(OkxMarketDataSource),
+}
+
+impl CexLiveSource {
+    async fn connect(&mut self) -> Result<()> {
+        match self {
+            Self::Binance(source) => source.connect().await?,
+            Self::Okx(source) => source.connect().await?,
+        }
+        Ok(())
+    }
+
+    async fn subscribe_market(&self, symbol: &Symbol) -> Result<()> {
+        match self {
+            Self::Binance(source) => source.subscribe_market(symbol).await?,
+            Self::Okx(source) => source.subscribe_market(symbol).await?,
+        }
+        Ok(())
+    }
+
+    fn connection_status(&self) -> ConnectionStatus {
+        match self {
+            Self::Binance(source) => source.connection_status(),
+            Self::Okx(source) => source.connection_status(),
+        }
+    }
+
+    async fn poll_symbol(
+        &self,
+        symbol: &Symbol,
+        depth: u16,
+        include_funding: bool,
+    ) -> Result<usize> {
+        let mut published = 0usize;
+        match self {
+            Self::Binance(source) => {
+                published += source
+                    .fetch_and_publish_orderbook_by_symbol(symbol, depth)
+                    .await?;
+                if include_funding {
+                    published += source
+                        .fetch_and_publish_funding_and_mark_by_symbol(symbol)
+                        .await?;
+                }
+            }
+            Self::Okx(source) => {
+                published += source
+                    .fetch_and_publish_orderbook_by_symbol(symbol, depth)
+                    .await?;
+                if include_funding {
+                    published += source
+                        .fetch_and_publish_funding_and_mark_by_symbol(symbol)
+                        .await?;
+                }
+            }
+        }
+        Ok(published)
+    }
+}
+
+pub async fn run_paper(
     env: &str,
     market_index: usize,
-    scenario: SimScenario,
-    tick_interval_ms: u64,
+    poll_interval_ms: u64,
     print_every: usize,
     max_ticks: usize,
+    depth: u16,
+    include_funding: bool,
     json: bool,
 ) -> Result<()> {
     let settings =
@@ -143,27 +211,19 @@ pub async fn run_sim(
         channels.market_data_tx.clone(),
     );
 
-    let ticks = scenario_ticks(&market, scenario);
-    let mut source = MockMarketDataSource::new(
-        manager,
-        Exchange::Polymarket,
+    let mut poly_source = PolymarketLiveDataSource::new(
+        manager.clone(),
+        settings.polymarket.clob_api_url.clone(),
         settings.strategy.settlement.clone(),
-        ticks,
     );
-    source.connect().await?;
-    source.subscribe_market(&market.symbol).await?;
+    let mut cex_source = build_cex_source(manager.clone(), &market, &settings);
+    poly_source.connect().await?;
+    cex_source.connect().await?;
+    poly_source.subscribe_market(&market.symbol).await?;
+    cex_source.subscribe_market(&market.symbol).await?;
 
     let mut market_data_rx = channels.market_data_tx.subscribe();
-    let engine_config = SimpleEngineConfig {
-        min_signal_samples: 2,
-        rolling_window_minutes: 4,
-        entry_z: 2.0,
-        exit_z: 0.5,
-        position_notional_usd: settings.strategy.basis.max_position_usd,
-        cex_hedge_ratio: 1.0,
-        dmm_half_spread: Decimal::new(1, 2),
-        dmm_quote_size: polyalpha_core::PolyShares::ZERO,
-    };
+    let engine_config = build_paper_engine_config(&settings);
     let mut engine =
         SimpleAlphaEngine::with_markets(engine_config.clone(), settings.markets.clone());
     engine.update_params(EngineParams {
@@ -176,12 +236,80 @@ pub async fn run_sim(
     let mut execution = ExecutionManager::with_symbol_registry(executor.clone(), registry.clone());
     let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
     let mut observed = ObservedState::default();
-    let mut stats = SimStats::default();
+    let mut stats = PaperStats::default();
     let mut recent_events = VecDeque::with_capacity(MAX_EVENT_LOGS);
     let mut snapshots = Vec::new();
+    let mut printed_placeholder_warning = false;
 
-    while source.emit_next()?.is_some() {
+    loop {
         stats.ticks_processed += 1;
+        let tick_index = stats.ticks_processed;
+        let now_ms = now_millis();
+        let now_secs = now_ms / 1000;
+
+        if let Err(err) = manager.publish_market_lifecycle(
+            &market.symbol,
+            now_secs,
+            now_ms,
+            &settings.strategy.settlement,
+        ) {
+            stats.poll_errors += 1;
+            push_event(
+                &mut recent_events,
+                "poll_error",
+                format!("publish lifecycle failed: {err}"),
+            );
+        }
+
+        if looks_like_placeholder_id(&market.poly_ids.yes_token_id)
+            || looks_like_placeholder_id(&market.poly_ids.no_token_id)
+        {
+            if !printed_placeholder_warning {
+                printed_placeholder_warning = true;
+                push_event(
+                    &mut recent_events,
+                    "warning",
+                    "Polymarket token_id 还是占位值，已跳过双边拉取；先执行 markets discover-btc 生成 live overlay".to_owned(),
+                );
+            }
+        } else {
+            for token_side in [TokenSide::Yes, TokenSide::No] {
+                if let Err(err) = poly_source
+                    .fetch_and_publish_orderbook_by_symbol(&market.symbol, token_side)
+                    .await
+                {
+                    stats.poll_errors += 1;
+                    push_event(
+                        &mut recent_events,
+                        "poll_error",
+                        format!("polymarket {:?} poll failed: {err}", token_side),
+                    );
+                }
+            }
+        }
+
+        if let Err(err) = cex_source
+            .poll_symbol(&market.symbol, depth, include_funding)
+            .await
+        {
+            stats.poll_errors += 1;
+            push_event(
+                &mut recent_events,
+                "poll_error",
+                format!("cex poll failed: {err}"),
+            );
+        }
+
+        update_connection_state(
+            &mut observed,
+            Exchange::Polymarket,
+            poly_source.connection_status(),
+        );
+        update_connection_state(
+            &mut observed,
+            market.hedge_exchange,
+            cex_source.connection_status(),
+        );
 
         loop {
             match market_data_rx.try_recv() {
@@ -231,17 +359,9 @@ pub async fn run_sim(
         }
 
         let snapshot = build_snapshot(
-            &market,
-            scenario,
-            stats.ticks_processed,
-            &engine,
-            &observed,
-            &stats,
-            &risk,
-            &execution,
-            &executor,
+            &market, tick_index, &engine, &observed, &stats, &risk, &execution, &executor,
         )?;
-        if stats.ticks_processed % print_every.max(1) == 0 {
+        if tick_index % print_every.max(1) == 0 {
             print_snapshot(&snapshot, json);
             if !json {
                 if let Some(last_event) = recent_events.back() {
@@ -251,29 +371,31 @@ pub async fn run_sim(
         }
         snapshots.push(snapshot);
 
-        if max_ticks > 0 && stats.ticks_processed >= max_ticks {
+        if max_ticks > 0 && tick_index >= max_ticks {
             break;
         }
-        if tick_interval_ms > 0 {
-            sleep(Duration::from_millis(tick_interval_ms)).await;
+        if poll_interval_ms > 0 {
+            sleep(Duration::from_millis(poll_interval_ms)).await;
         }
     }
 
     let final_snapshot = snapshots
         .last()
         .cloned()
-        .ok_or_else(|| anyhow!("sim session did not produce snapshots"))?;
+        .ok_or_else(|| anyhow!("paper session did not produce snapshots"))?;
     let open_orders = executor
         .open_order_snapshots()?
         .into_iter()
         .map(order_view_from_snapshot)
         .collect();
-    let artifact = SimArtifact {
+    let artifact = PaperArtifact {
         env: env.to_owned(),
         market_index,
         market: market.symbol.0.clone(),
-        scenario: format!("{scenario:?}"),
-        tick_interval_ms,
+        hedge_exchange: format!("{:?}", market.hedge_exchange),
+        poll_interval_ms,
+        depth,
+        include_funding,
         ticks_processed: stats.ticks_processed,
         final_snapshot,
         open_orders,
@@ -282,23 +404,31 @@ pub async fn run_sim(
     };
     let artifact_path = artifact_path(&settings, env)?;
     persist_artifact(&artifact_path, &artifact)?;
-    println!("sim artifact written: {}", artifact_path.display());
+    println!("paper artifact written: {}", artifact_path.display());
 
     Ok(())
 }
 
-pub fn inspect_sim(env: &str, format: SimInspectFormat) -> Result<()> {
+pub fn inspect_paper(env: &str, format: PaperInspectFormat) -> Result<()> {
     let settings =
         Settings::load(env).with_context(|| format!("failed to load config env `{env}`"))?;
     let artifact_path = resolve_artifact_for_read(&settings, env)?;
-    let raw = fs::read_to_string(&artifact_path)
-        .with_context(|| format!("failed to read sim artifact `{}`", artifact_path.display()))?;
-    let artifact: SimArtifact = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse sim artifact `{}`", artifact_path.display()))?;
+    let raw = fs::read_to_string(&artifact_path).with_context(|| {
+        format!(
+            "failed to read paper artifact `{}`",
+            artifact_path.display()
+        )
+    })?;
+    let artifact: PaperArtifact = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "failed to parse paper artifact `{}`",
+            artifact_path.display()
+        )
+    })?;
 
     match format {
-        SimInspectFormat::Table => print_artifact_table(&artifact, &artifact_path),
-        SimInspectFormat::Json => {
+        PaperInspectFormat::Table => print_artifact_table(&artifact, &artifact_path),
+        PaperInspectFormat::Json => {
             println!("{}", serde_json::to_string_pretty(&artifact)?);
         }
     }
@@ -306,169 +436,65 @@ pub fn inspect_sim(env: &str, format: SimInspectFormat) -> Result<()> {
     Ok(())
 }
 
-fn scenario_ticks(market: &MarketConfig, scenario: SimScenario) -> Vec<MockTick> {
-    match scenario {
-        SimScenario::Basic => basic_ticks(market),
-        SimScenario::BasisEntry => basis_entry_ticks(market),
-        SimScenario::PhaseCloseOnly => phase_close_only_ticks(market),
+fn build_paper_engine_config(settings: &Settings) -> SimpleEngineConfig {
+    let mut config = SimpleEngineConfig::default();
+    let configured_entry = settings
+        .strategy
+        .basis
+        .entry_z_score_threshold
+        .to_f64()
+        .unwrap_or(2.0);
+    let configured_exit = settings
+        .strategy
+        .basis
+        .exit_z_score_threshold
+        .to_f64()
+        .unwrap_or(0.5);
+
+    config.min_signal_samples = settings.strategy.basis.min_warmup_samples.max(2);
+    config.rolling_window_minutes =
+        ((settings.strategy.basis.rolling_window_secs / 60) as usize).max(2);
+    config.entry_z = configured_entry.abs().max(0.1);
+    config.exit_z = configured_exit.abs().min(config.entry_z).max(0.05);
+    config.position_notional_usd = settings.strategy.basis.max_position_usd;
+    config.cex_hedge_ratio = 1.0;
+    config.dmm_quote_size = PolyShares::ZERO;
+    config
+}
+
+fn build_cex_source(
+    manager: DataManager,
+    market: &MarketConfig,
+    settings: &Settings,
+) -> CexLiveSource {
+    match market.hedge_exchange {
+        Exchange::Binance => CexLiveSource::Binance(BinanceFuturesDataSource::new(
+            manager,
+            settings.binance.rest_url.clone(),
+        )),
+        Exchange::Okx => CexLiveSource::Okx(OkxMarketDataSource::new(
+            manager,
+            settings.okx.rest_url.clone(),
+        )),
+        _ => CexLiveSource::Binance(BinanceFuturesDataSource::new(
+            manager,
+            settings.binance.rest_url.clone(),
+        )),
     }
 }
 
-fn basic_ticks(market: &MarketConfig) -> Vec<MockTick> {
-    let mut ticks = Vec::new();
-    let symbol = market.symbol.clone();
-    let trading_now = market.settlement_timestamp.saturating_sub(48 * 3600);
-    push_connections(&mut ticks, market);
-    ticks.push(MockTick::Lifecycle {
-        symbol: symbol.clone(),
-        now_timestamp_secs: trading_now,
-        emitted_at_ms: 1,
-    });
-    push_cex_book(&mut ticks, market, 0, 100_000, 100_000);
-    push_poly_yes_book(&mut ticks, market, 60_100, 50, 52);
-    push_cex_book(&mut ticks, market, 60_200, 103_800, 103_800);
-    push_poly_yes_book(&mut ticks, market, 120_100, 38, 40);
-    push_cex_book(&mut ticks, market, 120_200, 101_200, 101_200);
-    push_poly_yes_book(&mut ticks, market, 180_100, 57, 59);
-    push_cex_book(&mut ticks, market, 180_200, 101_400, 101_400);
-    ticks.push(MockTick::Lifecycle {
-        symbol,
-        now_timestamp_secs: market.settlement_timestamp.saturating_sub(1800),
-        emitted_at_ms: 240_000,
-    });
-    ticks
+fn looks_like_placeholder_id(value: &str) -> bool {
+    value.trim().is_empty() || value.contains("...")
 }
 
-fn basis_entry_ticks(market: &MarketConfig) -> Vec<MockTick> {
-    let mut ticks = Vec::new();
-    let symbol = market.symbol.clone();
-    let trading_now = market.settlement_timestamp.saturating_sub(72 * 3600);
-    push_connections(&mut ticks, market);
-    ticks.push(MockTick::Lifecycle {
-        symbol,
-        now_timestamp_secs: trading_now,
-        emitted_at_ms: 1,
-    });
-    push_cex_book(&mut ticks, market, 0, 100_000, 100_000);
-    push_poly_yes_book(&mut ticks, market, 60_100, 53, 53);
-    push_poly_no_book(&mut ticks, market, 60_120, 47, 47);
-    push_cex_book(&mut ticks, market, 60_200, 99_500, 99_500);
-    push_poly_yes_book(&mut ticks, market, 120_100, 54, 54);
-    push_poly_no_book(&mut ticks, market, 120_120, 46, 46);
-    push_cex_book(&mut ticks, market, 120_200, 99_200, 99_200);
-    push_poly_yes_book(&mut ticks, market, 180_100, 72, 72);
-    push_poly_no_book(&mut ticks, market, 180_120, 28, 28);
-    push_cex_book(&mut ticks, market, 180_200, 99_000, 99_000);
-    push_poly_yes_book(&mut ticks, market, 240_100, 58, 58);
-    push_poly_no_book(&mut ticks, market, 240_120, 42, 42);
-    push_cex_book(&mut ticks, market, 240_200, 99_100, 99_100);
-    push_poly_yes_book(&mut ticks, market, 300_100, 55, 55);
-    push_poly_no_book(&mut ticks, market, 300_120, 45, 45);
-    push_cex_book(&mut ticks, market, 300_200, 99_200, 99_200);
-    ticks
-}
-
-fn phase_close_only_ticks(market: &MarketConfig) -> Vec<MockTick> {
-    let mut ticks = Vec::new();
-    let symbol = market.symbol.clone();
-    push_connections(&mut ticks, market);
-    push_cex_book(&mut ticks, market, 0, 100_000, 100_000);
-    push_poly_yes_book(&mut ticks, market, 60_100, 53, 53);
-    push_poly_no_book(&mut ticks, market, 60_120, 47, 47);
-    push_cex_book(&mut ticks, market, 60_200, 99_500, 99_500);
-    push_poly_yes_book(&mut ticks, market, 120_100, 54, 54);
-    push_poly_no_book(&mut ticks, market, 120_120, 46, 46);
-    push_cex_book(&mut ticks, market, 120_200, 99_200, 99_200);
-    push_poly_yes_book(&mut ticks, market, 180_100, 72, 72);
-    push_poly_no_book(&mut ticks, market, 180_120, 28, 28);
-    push_cex_book(&mut ticks, market, 180_200, 99_000, 99_000);
-    ticks.push(MockTick::Lifecycle {
-        symbol,
-        now_timestamp_secs: market.settlement_timestamp.saturating_sub(1800),
-        emitted_at_ms: 180_300,
-    });
-    ticks
-}
-
-fn push_connections(ticks: &mut Vec<MockTick>, market: &MarketConfig) {
-    ticks.push(MockTick::Connection {
-        exchange: Exchange::Polymarket,
-        status: ConnectionStatus::Connected,
-    });
-    ticks.push(MockTick::Connection {
-        exchange: market.hedge_exchange,
-        status: ConnectionStatus::Connected,
-    });
-}
-
-fn push_cex_book(
-    ticks: &mut Vec<MockTick>,
-    market: &MarketConfig,
-    ts_ms: u64,
-    best_bid: i64,
-    best_ask: i64,
+fn update_connection_state(
+    observed: &mut ObservedState,
+    exchange: Exchange,
+    status: ConnectionStatus,
 ) {
-    ticks.push(MockTick::CexOrderBook(CexBookUpdate {
-        exchange: market.hedge_exchange,
-        venue_symbol: market.cex_symbol.clone(),
-        bids: vec![CexBookLevel {
-            price: Price(Decimal::new(best_bid, 0)),
-            base_qty: CexBaseQty(Decimal::new(5, 1)),
-        }],
-        asks: vec![CexBookLevel {
-            price: Price(Decimal::new(best_ask, 0)),
-            base_qty: CexBaseQty(Decimal::new(5, 1)),
-        }],
-        exchange_timestamp_ms: ts_ms,
-        received_at_ms: ts_ms,
-        sequence: ts_ms,
-    }));
-}
-
-fn push_poly_yes_book(
-    ticks: &mut Vec<MockTick>,
-    market: &MarketConfig,
-    ts_ms: u64,
-    best_bid_cents: i64,
-    best_ask_cents: i64,
-) {
-    ticks.push(MockTick::PolyOrderBook(PolyBookUpdate {
-        asset_id: market.poly_ids.yes_token_id.clone(),
-        bids: vec![PolyBookLevel {
-            price: Price(Decimal::new(best_bid_cents, 2)),
-            shares: polyalpha_core::PolyShares(Decimal::new(25, 0)),
-        }],
-        asks: vec![PolyBookLevel {
-            price: Price(Decimal::new(best_ask_cents, 2)),
-            shares: polyalpha_core::PolyShares(Decimal::new(25, 0)),
-        }],
-        exchange_timestamp_ms: ts_ms,
-        received_at_ms: ts_ms,
-        sequence: ts_ms,
-    }));
-}
-
-fn push_poly_no_book(
-    ticks: &mut Vec<MockTick>,
-    market: &MarketConfig,
-    ts_ms: u64,
-    best_bid_cents: i64,
-    best_ask_cents: i64,
-) {
-    ticks.push(MockTick::PolyOrderBook(PolyBookUpdate {
-        asset_id: market.poly_ids.no_token_id.clone(),
-        bids: vec![PolyBookLevel {
-            price: Price(Decimal::new(best_bid_cents, 2)),
-            shares: polyalpha_core::PolyShares(Decimal::new(25, 0)),
-        }],
-        asks: vec![PolyBookLevel {
-            price: Price(Decimal::new(best_ask_cents, 2)),
-            shares: polyalpha_core::PolyShares(Decimal::new(25, 0)),
-        }],
-        exchange_timestamp_ms: ts_ms,
-        received_at_ms: ts_ms,
-        sequence: ts_ms,
-    }));
+    observed
+        .connections
+        .insert(format!("{exchange:?}"), format!("{status:?}"));
 }
 
 fn observe_market_event(observed: &mut ObservedState, event: &MarketDataEvent) {
@@ -509,27 +535,26 @@ fn mid_from_book(snapshot: &polyalpha_core::OrderBookSnapshot) -> Option<Decimal
 
 fn build_snapshot(
     market: &MarketConfig,
-    scenario: SimScenario,
     tick_index: usize,
     engine: &SimpleAlphaEngine,
     observed: &ObservedState,
-    stats: &SimStats,
+    stats: &PaperStats,
     risk: &InMemoryRiskManager,
     execution: &ExecutionManager<DryRunExecutor>,
     executor: &DryRunExecutor,
-) -> Result<SimSnapshot> {
-    let snapshot = risk.build_snapshot(tick_index as u64);
-    let positions = snapshot
+) -> Result<PaperSnapshot> {
+    let risk_snapshot = risk.build_snapshot(now_millis());
+    let positions = risk_snapshot
         .positions
         .values()
         .map(position_view_from_position)
         .collect::<Vec<_>>();
     let signal_snapshot = engine.basis_snapshot(&market.symbol);
-    Ok(SimSnapshot {
+    Ok(PaperSnapshot {
         tick_index,
         market: market.symbol.0.clone(),
+        hedge_exchange: format!("{:?}", market.hedge_exchange),
         hedge_symbol: market.cex_symbol.clone(),
-        scenario: format!("{scenario:?}"),
         market_phase: observed
             .market_phase
             .clone()
@@ -539,16 +564,20 @@ fn build_snapshot(
         poly_yes_mid: observed.poly_yes_mid.and_then(|value| value.to_f64()),
         poly_no_mid: observed.poly_no_mid.and_then(|value| value.to_f64()),
         cex_mid: observed.cex_mid.and_then(|value| value.to_f64()),
-        current_basis: signal_snapshot.as_ref().map(|item| item.signal_basis),
+        current_basis: signal_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.signal_basis),
         signal_token_side: signal_snapshot
             .as_ref()
-            .map(|item| format!("{:?}", item.token_side)),
-        current_zscore: signal_snapshot.as_ref().and_then(|item| item.z_score),
-        current_fair_value: signal_snapshot.as_ref().map(|item| item.fair_value),
-        current_delta: signal_snapshot.as_ref().map(|item| item.delta),
+            .map(|snapshot| format!("{:?}", snapshot.token_side)),
+        current_zscore: signal_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.z_score),
+        current_fair_value: signal_snapshot.as_ref().map(|snapshot| snapshot.fair_value),
+        current_delta: signal_snapshot.as_ref().map(|snapshot| snapshot.delta),
         cex_reference_price: signal_snapshot
             .as_ref()
-            .map(|item| item.cex_reference_price),
+            .map(|snapshot| snapshot.cex_reference_price),
         hedge_state: execution
             .hedge_state(&market.symbol)
             .map(|state| format!("{state:?}"))
@@ -564,17 +593,18 @@ fn build_snapshot(
         order_cancelled: stats.order_cancelled,
         fills: stats.fills,
         state_changes: stats.state_changes,
-        total_exposure_usd: snapshot.total_exposure_usd.0.normalize().to_string(),
-        daily_pnl_usd: snapshot.daily_pnl.0.normalize().to_string(),
-        breaker: format!("{:?}", snapshot.circuit_breaker),
+        poll_errors: stats.poll_errors,
+        total_exposure_usd: risk_snapshot.total_exposure_usd.0.normalize().to_string(),
+        daily_pnl_usd: risk_snapshot.daily_pnl.0.normalize().to_string(),
+        breaker: format!("{:?}", risk_snapshot.circuit_breaker),
         positions,
     })
 }
 
 async fn apply_execution_events(
     risk: &mut InMemoryRiskManager,
-    stats: &mut SimStats,
-    recent_events: &mut VecDeque<SimEventLog>,
+    stats: &mut PaperStats,
+    recent_events: &mut VecDeque<PaperEventLog>,
     events: Vec<ExecutionEvent>,
 ) -> Result<()> {
     for event in events {
@@ -677,17 +707,17 @@ fn summarize_signal(signal: &ArbSignalEvent) -> String {
     format!("{action} {}", signal.signal_id)
 }
 
-fn push_event(events: &mut VecDeque<SimEventLog>, kind: &str, summary: String) {
+fn push_event(events: &mut VecDeque<PaperEventLog>, kind: &str, summary: String) {
     if events.len() == MAX_EVENT_LOGS {
         events.pop_front();
     }
-    events.push_back(SimEventLog {
+    events.push_back(PaperEventLog {
         kind: kind.to_owned(),
         summary,
     });
 }
 
-fn print_snapshot(snapshot: &SimSnapshot, json: bool) {
+fn print_snapshot(snapshot: &PaperSnapshot, json: bool) {
     if json {
         match serde_json::to_string(snapshot) {
             Ok(line) => println!("{line}"),
@@ -697,7 +727,7 @@ fn print_snapshot(snapshot: &SimSnapshot, json: bool) {
     }
 
     println!(
-        "tick={} market={} phase={} connections={} poly_yes={:?} poly_no={:?} cex_mid={:?} token_side={:?} signal_basis={:?} z={:?} fair={:?} delta={:?} cex_ref={:?} hedge={} last_signal={:?} open_orders={} active_dmm_orders={} signals={}/{} submitted={} cancelled={} fills={} positions={} exposure={} pnl={} breaker={}",
+        "tick={} market={} phase={} connections={} poly_yes={:?} poly_no={:?} cex_mid={:?} token_side={:?} signal_basis={:?} z={:?} fair={:?} delta={:?} cex_ref={:?} hedge={} last_signal={:?} open_orders={} active_dmm_orders={} signals={}/{} submitted={} cancelled={} fills={} poll_errors={} positions={} exposure={} pnl={} breaker={}",
         snapshot.tick_index,
         snapshot.market,
         snapshot.market_phase,
@@ -720,6 +750,7 @@ fn print_snapshot(snapshot: &SimSnapshot, json: bool) {
         snapshot.order_submitted,
         snapshot.order_cancelled,
         snapshot.fills,
+        snapshot.poll_errors,
         snapshot.positions.len(),
         snapshot.total_exposure_usd,
         snapshot.daily_pnl_usd,
@@ -727,17 +758,25 @@ fn print_snapshot(snapshot: &SimSnapshot, json: bool) {
     );
 }
 
-fn print_artifact_table(artifact: &SimArtifact, artifact_path: &PathBuf) {
-    print_report_title("模拟盘会话回看");
+fn print_artifact_table(artifact: &PaperArtifact, artifact_path: &PathBuf) {
+    print_report_title("纸面盘会话回看");
 
     print_report_section("会话概览");
     print_report_kv("结果文件", artifact_path.display().to_string());
     print_report_kv("环境", artifact.env.as_str());
     print_report_kv("市场", artifact.market.as_str());
-    print_report_kv("对冲标的", artifact.final_snapshot.hedge_symbol.as_str());
-    print_report_kv("场景", artifact.scenario.as_str());
+    print_report_kv("对冲交易所", artifact.hedge_exchange.as_str());
+    print_report_kv("轮询间隔", format!("{} ms", artifact.poll_interval_ms));
+    print_report_kv("订单簿深度", artifact.depth.to_string());
+    print_report_kv(
+        "轮询 funding/mark",
+        if artifact.include_funding {
+            "是"
+        } else {
+            "否"
+        },
+    );
     print_report_kv("已处理 ticks", artifact.ticks_processed.to_string());
-    print_report_kv("tick 间隔", format!("{} ms", artifact.tick_interval_ms));
     print_report_kv("快照数量", artifact.snapshots.len().to_string());
 
     print_report_section("最终状态");
@@ -819,6 +858,10 @@ fn print_artifact_table(artifact: &SimArtifact, artifact_path: &PathBuf) {
     print_report_kv(
         "状态变更数",
         artifact.final_snapshot.state_changes.to_string(),
+    );
+    print_report_kv(
+        "轮询错误数",
+        artifact.final_snapshot.poll_errors.to_string(),
     );
     print_report_kv(
         "当前挂单数",
@@ -919,9 +962,9 @@ fn sorted_connections(connections: &HashMap<String, String>) -> Vec<String> {
 
 fn artifact_path(settings: &Settings, env: &str) -> Result<PathBuf> {
     let mut path = PathBuf::from(&settings.general.data_dir);
-    path.push("sim");
+    path.push("paper");
     fs::create_dir_all(&path)
-        .with_context(|| format!("failed to create sim artifact dir `{}`", path.display()))?;
+        .with_context(|| format!("failed to create paper artifact dir `{}`", path.display()))?;
     path.push(format!("{env}-last-run.json"));
     Ok(path)
 }
@@ -933,7 +976,7 @@ fn resolve_artifact_for_read(settings: &Settings, env: &str) -> Result<PathBuf> 
     }
 
     let mut legacy = PathBuf::from(&settings.general.data_dir);
-    legacy.push("sim");
+    legacy.push("paper");
     legacy.push(format!("{env}-last-session.json"));
     if legacy.exists() {
         return Ok(legacy);
@@ -942,10 +985,10 @@ fn resolve_artifact_for_read(settings: &Settings, env: &str) -> Result<PathBuf> 
     Ok(current)
 }
 
-fn persist_artifact(path: &PathBuf, artifact: &SimArtifact) -> Result<()> {
+fn persist_artifact(path: &PathBuf, artifact: &PaperArtifact) -> Result<()> {
     let payload = serde_json::to_string_pretty(artifact)?;
     fs::write(path, payload)
-        .with_context(|| format!("failed to write sim artifact `{}`", path.display()))
+        .with_context(|| format!("failed to write paper artifact `{}`", path.display()))
 }
 
 fn format_connections(connections: &[String]) -> String {
@@ -956,8 +999,8 @@ fn format_connections(connections: &[String]) -> String {
     }
 }
 
-fn position_view_from_position(position: &Position) -> SimPositionView {
-    SimPositionView {
+fn position_view_from_position(position: &Position) -> PaperPositionView {
+    PaperPositionView {
         exchange: format!("{:?}", position.key.exchange),
         instrument: format!("{:?}", position.key.instrument),
         side: format!("{:?}", position.side),
@@ -969,8 +1012,8 @@ fn position_view_from_position(position: &Position) -> SimPositionView {
     }
 }
 
-fn order_view_from_snapshot(order: DryRunOrderSnapshot) -> SimOrderView {
-    SimOrderView {
+fn order_view_from_snapshot(order: DryRunOrderSnapshot) -> PaperOrderView {
+    PaperOrderView {
         exchange_order_id: order.exchange_order_id.0,
         exchange: format!("{:?}", order.exchange),
         symbol: order.symbol.0,
@@ -984,4 +1027,11 @@ fn quantity_to_string(quantity: VenueQuantity) -> String {
         VenueQuantity::PolyShares(shares) => shares.0.normalize().to_string(),
         VenueQuantity::CexBaseQty(qty) => qty.0.normalize().to_string(),
     }
+}
+
+fn now_millis() -> u64 {
+    let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return 0;
+    };
+    duration.as_millis() as u64
 }

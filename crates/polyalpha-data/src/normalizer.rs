@@ -222,6 +222,8 @@ mod tests {
                 yes_token_id: "yes-1".to_owned(),
                 no_token_id: "no-1".to_owned(),
             },
+            market_question: None,
+            market_rule: None,
             cex_symbol: "BTCUSDT".to_owned(),
             hedge_exchange: Exchange::Binance,
             strike_price: Some(Price(Decimal::new(100_000, 0))),
