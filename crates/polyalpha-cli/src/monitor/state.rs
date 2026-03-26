@@ -949,8 +949,8 @@ fn sorted_markets(markets: &[MarketView]) -> Vec<&MarketView> {
 
 fn market_rank(market: &MarketView) -> f64 {
     market
-        .z_score
-        .map(|value| value.abs())
+        .fair_value
+        .or_else(|| market.z_score.map(|value| value.abs()))
         .or_else(|| market.basis_pct.map(|value| value.abs()))
         .unwrap_or(-1.0)
 }
