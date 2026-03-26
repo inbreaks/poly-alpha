@@ -5,21 +5,25 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::{sleep, Duration};
 
 use polyalpha_core::{
-    create_channels, AlphaEngine, ArbSignalAction, ArbSignalEvent, CexBaseQty, ConnectionStatus,
-    EngineParams, Exchange, ExecutionEvent, InstrumentKind, MarketConfig, MarketDataEvent,
-    MarketDataSource, MarketPhase, Position, Price, RiskManager, Settings, SymbolRegistry,
-    VenueQuantity,
+    cex_venue_symbol, create_channels, AlphaEngine, ArbSignalAction, ArbSignalEvent, CexBaseQty,
+    ConnectionStatus, EngineParams, EngineWarning, Exchange, ExecutionEvent, HedgeState,
+    InstrumentKind, MarketConfig, MarketDataEvent, MarketDataSource, MarketPhase, OrderStatus,
+    Position, Price, RiskManager, Settings, SymbolRegistry, VenueQuantity,
 };
 use polyalpha_data::{
     CexBookLevel, CexBookUpdate, DataManager, MarketDataNormalizer, MockMarketDataSource, MockTick,
     PolyBookLevel, PolyBookUpdate,
 };
 use polyalpha_engine::{SimpleAlphaEngine, SimpleEngineConfig};
-use polyalpha_executor::{dry_run::DryRunOrderSnapshot, DryRunExecutor, ExecutionManager};
+use polyalpha_executor::{
+    dry_run::{DryRunOrderSnapshot, SlippageConfig},
+    DryRunExecutor, ExecutionManager, InMemoryOrderbookProvider,
+};
 use polyalpha_risk::{InMemoryRiskManager, RiskLimits};
 
 use crate::args::{SimInspectFormat, SimScenario};
@@ -27,6 +31,191 @@ use crate::commands::{select_market, signal_allowed};
 
 const MAX_EVENT_LOGS: usize = 32;
 const REPORT_WIDTH: usize = 78;
+
+fn format_exchange_label(exchange: Exchange) -> &'static str {
+    match exchange {
+        Exchange::Polymarket => "Polymarket",
+        Exchange::Binance => "Binance",
+        Exchange::Okx => "OKX",
+    }
+}
+
+fn format_order_side_label(side: polyalpha_core::OrderSide) -> &'static str {
+    match side {
+        polyalpha_core::OrderSide::Buy => "买入",
+        polyalpha_core::OrderSide::Sell => "卖出",
+    }
+}
+
+fn format_instrument_label(instrument: InstrumentKind) -> &'static str {
+    match instrument {
+        InstrumentKind::PolyYes => "YES",
+        InstrumentKind::PolyNo => "NO",
+        InstrumentKind::CexPerp => "交易所永续",
+    }
+}
+
+fn format_market_phase_label(phase: &MarketPhase) -> &'static str {
+    match phase {
+        MarketPhase::Trading => "交易中",
+        MarketPhase::PreSettlement { .. } => "预结算",
+        MarketPhase::ForceReduce { .. } => "强制降仓",
+        MarketPhase::CloseOnly { .. } => "只平仓",
+        MarketPhase::SettlementPending => "待结算",
+        MarketPhase::Disputed => "争议中",
+        MarketPhase::Resolved => "已结算",
+    }
+}
+
+fn format_connection_status_label(status: ConnectionStatus) -> &'static str {
+    match status {
+        ConnectionStatus::Connecting => "连接中",
+        ConnectionStatus::Connected => "已连接",
+        ConnectionStatus::Disconnected => "已断开",
+        ConnectionStatus::Reconnecting => "重连中",
+    }
+}
+
+fn format_hedge_state_label(state: HedgeState) -> &'static str {
+    match state {
+        HedgeState::Idle => "空闲",
+        HedgeState::SubmittingLegs => "提交腿单中",
+        HedgeState::Hedging => "对冲中",
+        HedgeState::Hedged => "已对冲",
+        HedgeState::Rebalancing => "再平衡中",
+        HedgeState::Closing => "平仓中",
+    }
+}
+
+fn display_exchange_text(value: &str) -> &str {
+    match value {
+        "Polymarket" => "Polymarket",
+        "Binance" => "Binance",
+        "Okx" | "OKX" => "OKX",
+        _ => value,
+    }
+}
+
+fn display_market_phase_text(value: &str) -> &str {
+    if value.starts_with("Trading") {
+        "交易中"
+    } else if value.starts_with("PreSettlement") {
+        "预结算"
+    } else if value.starts_with("ForceReduce") {
+        "强制降仓"
+    } else if value.starts_with("CloseOnly") {
+        "只平仓"
+    } else if value.starts_with("SettlementPending") {
+        "待结算"
+    } else if value.starts_with("Disputed") {
+        "争议中"
+    } else if value.starts_with("Resolved") {
+        "已结算"
+    } else if value.eq_ignore_ascii_case("unknown") {
+        "未知"
+    } else {
+        value
+    }
+}
+
+fn display_hedge_state_text(value: &str) -> &str {
+    match value {
+        "Idle" => "空闲",
+        "SubmittingLegs" => "提交腿单中",
+        "Hedging" => "对冲中",
+        "Hedged" => "已对冲",
+        "Rebalancing" => "再平衡中",
+        "Closing" => "平仓中",
+        _ => value,
+    }
+}
+
+fn display_connection_status_text(value: &str) -> &str {
+    match value {
+        "Connecting" => "连接中",
+        "Connected" => "已连接",
+        "Disconnected" => "已断开",
+        "Reconnecting" => "重连中",
+        _ => value,
+    }
+}
+
+fn display_circuit_breaker_text(value: &str) -> &str {
+    match value {
+        "Closed" => "关闭",
+        "HalfOpen" => "半开",
+        "Open" => "打开",
+        _ => value,
+    }
+}
+
+fn display_order_status_text(value: &str) -> &str {
+    match value {
+        "Pending" => "待处理",
+        "Open" => "已挂单",
+        "PartialFill" => "部分成交",
+        "Filled" => "已成交",
+        "Cancelled" => "已撤销",
+        "Rejected" => "已拒绝",
+        _ => value,
+    }
+}
+
+fn display_position_side_text(value: &str) -> &str {
+    match value {
+        "Long" | "LONG" => "多",
+        "Short" | "SHORT" => "空",
+        "Flat" | "FLAT" => "平",
+        "Buy" | "BUY" => "买",
+        "Sell" | "SELL" => "卖",
+        _ => value,
+    }
+}
+
+fn display_instrument_text(value: &str) -> &str {
+    match value {
+        "PolyYes" => "Polymarket YES",
+        "PolyNo" => "Polymarket NO",
+        "CexPerp" => "交易所永续",
+        _ => value,
+    }
+}
+
+fn display_connection_entry(value: &str) -> String {
+    match value.split_once('=') {
+        Some((exchange, status)) => format!(
+            "{}={}",
+            display_exchange_text(exchange),
+            display_connection_status_text(status)
+        ),
+        None => value.to_owned(),
+    }
+}
+
+fn display_event_kind_text(value: &str) -> &str {
+    match value {
+        "market_data" => "行情",
+        "signal" => "信号",
+        "fill" | "execution" => "成交",
+        "trade_closed" => "平仓",
+        "state" => "状态",
+        "warning" => "警告",
+        "skip" => "跳过",
+        "risk" => "风控",
+        "reconcile" => "对账",
+        "error" | "poll_error" => "错误",
+        _ => value,
+    }
+}
+
+fn display_sim_scenario_text(value: &str) -> &str {
+    match value {
+        "Basic" => "基础场景",
+        "BasisEntry" => "基差入场场景",
+        "PhaseCloseOnly" => "只平仓阶段场景",
+        _ => value,
+    }
+}
 
 #[derive(Default)]
 struct SimStats {
@@ -38,6 +227,8 @@ struct SimStats {
     order_cancelled: usize,
     fills: usize,
     state_changes: usize,
+    trades_closed: usize,
+    total_pnl_usd: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -124,18 +315,96 @@ struct SimArtifact {
     snapshots: Vec<SimSnapshot>,
 }
 
-pub async fn run_sim(
+fn build_sim_engine_config(settings: &Settings) -> SimpleEngineConfig {
+    let configured_entry = settings
+        .strategy
+        .basis
+        .entry_z_score_threshold
+        .to_f64()
+        .unwrap_or(2.0);
+    let configured_exit = settings
+        .strategy
+        .basis
+        .exit_z_score_threshold
+        .to_f64()
+        .unwrap_or(0.5);
+
+    SimpleEngineConfig {
+        min_signal_samples: settings.strategy.basis.min_warmup_samples.max(2),
+        rolling_window_minutes: ((settings.strategy.basis.rolling_window_secs / 60) as usize)
+            .max(2),
+        entry_z: configured_entry.abs().max(0.1),
+        exit_z: configured_exit
+            .abs()
+            .min(configured_entry.abs().max(0.1))
+            .max(0.05),
+        position_notional_usd: settings.strategy.basis.max_position_usd,
+        cex_hedge_ratio: 1.0,
+        dmm_half_spread: Decimal::new(1, 2),
+        dmm_quote_size: polyalpha_core::PolyShares::ZERO,
+        enable_freshness_check: settings.strategy.basis.enable_freshness_check,
+        reject_on_disconnect: settings.strategy.basis.reject_on_disconnect,
+        max_poly_data_age_ms: settings
+            .strategy
+            .basis
+            .max_data_age_minutes
+            .saturating_mul(60_000),
+        max_cex_data_age_ms: settings
+            .strategy
+            .basis
+            .max_data_age_minutes
+            .saturating_mul(60_000),
+        max_time_diff_ms: settings
+            .strategy
+            .basis
+            .max_time_diff_minutes
+            .saturating_mul(60_000),
+    }
+}
+
+fn build_sim_slippage_config(settings: &Settings) -> SlippageConfig {
+    SlippageConfig {
+        poly_slippage_bps: settings.paper_slippage.poly_slippage_bps,
+        cex_slippage_bps: settings.paper_slippage.cex_slippage_bps,
+        min_liquidity: settings.paper_slippage.min_liquidity,
+        allow_partial_fill: settings.paper_slippage.allow_partial_fill,
+    }
+}
+
+fn update_sim_orderbook(
+    provider: &InMemoryOrderbookProvider,
+    registry: &SymbolRegistry,
+    snapshot: &polyalpha_core::OrderBookSnapshot,
+) {
+    match snapshot.instrument {
+        InstrumentKind::CexPerp => {
+            let venue_symbol = registry
+                .get_config(&snapshot.symbol)
+                .map(|config| cex_venue_symbol(config.hedge_exchange, &config.cex_symbol))
+                .unwrap_or_else(|| {
+                    cex_venue_symbol(
+                        snapshot.exchange,
+                        &snapshot.symbol.0.to_ascii_uppercase().replace('-', ""),
+                    )
+                });
+            provider.update_cex(snapshot.clone(), venue_symbol);
+        }
+        InstrumentKind::PolyYes | InstrumentKind::PolyNo => provider.update(snapshot.clone()),
+    }
+}
+
+async fn run_sim_with_mock_ticks(
     env: &str,
+    settings: &Settings,
     market_index: usize,
-    scenario: SimScenario,
+    scenario_label: &str,
+    ticks: Vec<MockTick>,
     tick_interval_ms: u64,
     print_every: usize,
     max_ticks: usize,
     json: bool,
-) -> Result<()> {
-    let settings =
-        Settings::load(env).with_context(|| format!("failed to load config env `{env}`"))?;
-    let market = select_market(&settings, market_index)?;
+) -> Result<SimArtifact> {
+    let market = select_market(settings, market_index)?;
     let registry = SymbolRegistry::new(settings.markets.clone());
     let channels = create_channels(std::slice::from_ref(&market.symbol));
     let manager = DataManager::new(
@@ -143,7 +412,6 @@ pub async fn run_sim(
         channels.market_data_tx.clone(),
     );
 
-    let ticks = scenario_ticks(&market, scenario);
     let mut source = MockMarketDataSource::new(
         manager,
         Exchange::Polymarket,
@@ -154,25 +422,21 @@ pub async fn run_sim(
     source.subscribe_market(&market.symbol).await?;
 
     let mut market_data_rx = channels.market_data_tx.subscribe();
-    let engine_config = SimpleEngineConfig {
-        min_signal_samples: 2,
-        rolling_window_minutes: 4,
-        entry_z: 2.0,
-        exit_z: 0.5,
-        position_notional_usd: settings.strategy.basis.max_position_usd,
-        cex_hedge_ratio: 1.0,
-        dmm_half_spread: Decimal::new(1, 2),
-        dmm_quote_size: polyalpha_core::PolyShares::ZERO,
-    };
+    let engine_config = build_sim_engine_config(settings);
     let mut engine =
         SimpleAlphaEngine::with_markets(engine_config.clone(), settings.markets.clone());
     engine.update_params(EngineParams {
         basis_entry_zscore: None,
         basis_exit_zscore: None,
+        rolling_window_secs: None,
         max_position_usd: Some(settings.strategy.basis.max_position_usd),
     });
 
-    let executor = DryRunExecutor::new();
+    let orderbook_provider = Arc::new(InMemoryOrderbookProvider::new());
+    let executor = DryRunExecutor::with_orderbook(
+        orderbook_provider.clone(),
+        build_sim_slippage_config(settings),
+    );
     let mut execution = ExecutionManager::with_symbol_registry(executor.clone(), registry.clone());
     let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
     let mut observed = ObservedState::default();
@@ -187,6 +451,9 @@ pub async fn run_sim(
             match market_data_rx.try_recv() {
                 Ok(event) => {
                     stats.market_events += 1;
+                    if let MarketDataEvent::OrderBookUpdate { snapshot } = &event {
+                        update_sim_orderbook(&orderbook_provider, &registry, snapshot);
+                    }
                     observe_market_event(&mut observed, &event);
                     push_event(
                         &mut recent_events,
@@ -199,6 +466,13 @@ pub async fn run_sim(
                     }
 
                     let output = engine.on_market_data(&event).await;
+                    for warning in &output.warnings {
+                        push_event(
+                            &mut recent_events,
+                            "warning",
+                            summarize_engine_warning(warning),
+                        );
+                    }
                     for update in output.dmm_updates {
                         let events = execution.apply_dmm_quote_update(update).await?;
                         apply_execution_events(&mut risk, &mut stats, &mut recent_events, events)
@@ -214,7 +488,7 @@ pub async fn run_sim(
                             push_event(
                                 &mut recent_events,
                                 "risk",
-                                format!("signal rejected: {}", signal.signal_id),
+                                format!("信号被拒绝：未通过风控检查 {}", signal.signal_id),
                             );
                             continue;
                         }
@@ -232,7 +506,7 @@ pub async fn run_sim(
 
         let snapshot = build_snapshot(
             &market,
-            scenario,
+            scenario_label,
             stats.ticks_processed,
             &engine,
             &observed,
@@ -245,7 +519,11 @@ pub async fn run_sim(
             print_snapshot(&snapshot, json);
             if !json {
                 if let Some(last_event) = recent_events.back() {
-                    println!("last_event=[{}] {}", last_event.kind, last_event.summary);
+                    println!(
+                        "最近事件=[{}] {}",
+                        display_event_kind_text(&last_event.kind),
+                        last_event.summary
+                    );
                 }
             }
         }
@@ -262,39 +540,65 @@ pub async fn run_sim(
     let final_snapshot = snapshots
         .last()
         .cloned()
-        .ok_or_else(|| anyhow!("sim session did not produce snapshots"))?;
+        .ok_or_else(|| anyhow!("模拟盘会话未生成任何快照"))?;
     let open_orders = executor
         .open_order_snapshots()?
         .into_iter()
         .map(order_view_from_snapshot)
         .collect();
-    let artifact = SimArtifact {
+
+    Ok(SimArtifact {
         env: env.to_owned(),
         market_index,
         market: market.symbol.0.clone(),
-        scenario: format!("{scenario:?}"),
+        scenario: scenario_label.to_owned(),
         tick_interval_ms,
         ticks_processed: stats.ticks_processed,
         final_snapshot,
         open_orders,
         recent_events: recent_events.into_iter().collect(),
         snapshots,
-    };
+    })
+}
+
+pub async fn run_sim(
+    env: &str,
+    market_index: usize,
+    scenario: SimScenario,
+    tick_interval_ms: u64,
+    print_every: usize,
+    max_ticks: usize,
+    json: bool,
+) -> Result<()> {
+    let settings = Settings::load(env).with_context(|| format!("加载配置环境 `{env}` 失败"))?;
+    let market = select_market(&settings, market_index)?;
+    let ticks = scenario_ticks(&market, scenario);
+    let artifact = run_sim_with_mock_ticks(
+        env,
+        &settings,
+        market_index,
+        &format!("{scenario:?}"),
+        ticks,
+        tick_interval_ms,
+        print_every,
+        max_ticks,
+        json,
+    )
+    .await?;
     let artifact_path = artifact_path(&settings, env)?;
     persist_artifact(&artifact_path, &artifact)?;
-    println!("sim artifact written: {}", artifact_path.display());
+    println!("模拟结果已写入：{}", artifact_path.display());
 
     Ok(())
 }
 
 pub fn inspect_sim(env: &str, format: SimInspectFormat) -> Result<()> {
-    let settings =
-        Settings::load(env).with_context(|| format!("failed to load config env `{env}`"))?;
+    let settings = Settings::load(env).with_context(|| format!("加载配置环境 `{env}` 失败"))?;
     let artifact_path = resolve_artifact_for_read(&settings, env)?;
     let raw = fs::read_to_string(&artifact_path)
-        .with_context(|| format!("failed to read sim artifact `{}`", artifact_path.display()))?;
+        .with_context(|| format!("读取模拟结果 `{}` 失败", artifact_path.display()))?;
     let artifact: SimArtifact = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse sim artifact `{}`", artifact_path.display()))?;
+        .with_context(|| format!("解析模拟结果 `{}` 失败", artifact_path.display()))?;
 
     match format {
         SimInspectFormat::Table => print_artifact_table(&artifact, &artifact_path),
@@ -445,6 +749,7 @@ fn push_poly_yes_book(
         exchange_timestamp_ms: ts_ms,
         received_at_ms: ts_ms,
         sequence: ts_ms,
+        last_trade_price: None,
     }));
 }
 
@@ -468,6 +773,7 @@ fn push_poly_no_book(
         exchange_timestamp_ms: ts_ms,
         received_at_ms: ts_ms,
         sequence: ts_ms,
+        last_trade_price: None,
     }));
 }
 
@@ -509,7 +815,7 @@ fn mid_from_book(snapshot: &polyalpha_core::OrderBookSnapshot) -> Option<Decimal
 
 fn build_snapshot(
     market: &MarketConfig,
-    scenario: SimScenario,
+    scenario: &str,
     tick_index: usize,
     engine: &SimpleAlphaEngine,
     observed: &ObservedState,
@@ -529,7 +835,7 @@ fn build_snapshot(
         tick_index,
         market: market.symbol.0.clone(),
         hedge_symbol: market.cex_symbol.clone(),
-        scenario: format!("{scenario:?}"),
+        scenario: scenario.to_owned(),
         market_phase: observed
             .market_phase
             .clone()
@@ -579,17 +885,12 @@ async fn apply_execution_events(
 ) -> Result<()> {
     for event in events {
         match &event {
-            ExecutionEvent::OrderSubmitted {
-                exchange, response, ..
-            } => {
+            ExecutionEvent::OrderSubmitted { .. } => {
                 stats.order_submitted += 1;
                 push_event(
                     recent_events,
                     "execution",
-                    format!(
-                        "submitted {:?} {:?}",
-                        exchange, response.exchange_order_id.0
-                    ),
+                    summarize_execution_event(&event),
                 );
             }
             ExecutionEvent::OrderFilled(fill) => {
@@ -598,81 +899,203 @@ async fn apply_execution_events(
                 push_event(
                     recent_events,
                     "execution",
-                    format!(
-                        "filled {:?} {:?} {} @ {}",
-                        fill.exchange,
-                        fill.side,
-                        quantity_to_string(fill.quantity),
-                        fill.price.0.normalize()
-                    ),
+                    summarize_execution_event(&event),
                 );
             }
-            ExecutionEvent::OrderCancelled {
-                exchange, order_id, ..
-            } => {
+            ExecutionEvent::OrderCancelled { .. } => {
                 stats.order_cancelled += 1;
                 push_event(
                     recent_events,
                     "execution",
-                    format!("cancelled {:?} {}", exchange, order_id.0),
+                    summarize_execution_event(&event),
                 );
             }
-            ExecutionEvent::HedgeStateChanged {
-                old_state,
-                new_state,
-                ..
-            } => {
+            ExecutionEvent::HedgeStateChanged { .. } => {
                 stats.state_changes += 1;
+                push_event(recent_events, "state", summarize_execution_event(&event));
+            }
+            ExecutionEvent::ReconcileRequired { .. } => {
                 push_event(
                     recent_events,
-                    "state",
-                    format!("hedge {:?} -> {:?}", old_state, new_state),
+                    "reconcile",
+                    summarize_execution_event(&event),
                 );
             }
-            ExecutionEvent::ReconcileRequired { reason, .. } => {
-                push_event(recent_events, "reconcile", reason.clone());
+            ExecutionEvent::TradeClosed { realized_pnl, .. } => {
+                stats.trades_closed += 1;
+                stats.total_pnl_usd += realized_pnl.0.to_f64().unwrap_or(0.0);
+                push_event(
+                    recent_events,
+                    "trade_closed",
+                    summarize_execution_event(&event),
+                );
             }
         }
     }
     Ok(())
 }
 
+fn summarize_execution_event(event: &ExecutionEvent) -> String {
+    match event {
+        ExecutionEvent::OrderSubmitted {
+            exchange, response, ..
+        } => {
+            if matches!(response.status, OrderStatus::Rejected) {
+                let reason = response
+                    .rejection_reason
+                    .as_deref()
+                    .unwrap_or("order_rejected");
+                format!(
+                    "订单已拒绝 {} {}（原因：{}）",
+                    format_exchange_label(*exchange),
+                    response.exchange_order_id.0,
+                    reason
+                )
+            } else {
+                format!(
+                    "订单已提交 {} {}",
+                    format_exchange_label(*exchange),
+                    response.exchange_order_id.0
+                )
+            }
+        }
+        ExecutionEvent::OrderFilled(fill) => format!(
+            "订单已成交 {} {} {} @ {}",
+            format_exchange_label(fill.exchange),
+            format_order_side_label(fill.side),
+            quantity_to_string(fill.quantity),
+            fill.price.0.normalize()
+        ),
+        ExecutionEvent::OrderCancelled {
+            exchange, order_id, ..
+        } => format!(
+            "订单已撤销 {} {}",
+            format_exchange_label(*exchange),
+            order_id.0
+        ),
+        ExecutionEvent::HedgeStateChanged {
+            old_state,
+            new_state,
+            ..
+        } => format!(
+            "对冲状态变更 {} -> {}",
+            format_hedge_state_label(*old_state),
+            format_hedge_state_label(*new_state)
+        ),
+        ExecutionEvent::ReconcileRequired { symbol, reason } => match symbol {
+            Some(symbol) => format!("{} 需要对账：{}", symbol.0, reason),
+            None => format!("需要对账：{}", reason),
+        },
+        ExecutionEvent::TradeClosed {
+            symbol,
+            realized_pnl,
+            ..
+        } => format!(
+            "{} 已平仓，已实现盈亏={}",
+            symbol.0,
+            realized_pnl.0.normalize()
+        ),
+    }
+}
+
 fn summarize_market_event(event: &MarketDataEvent) -> String {
     match event {
-        MarketDataEvent::OrderBookUpdate { snapshot } => {
-            format!(
-                "orderbook {:?} {:?}",
-                snapshot.exchange, snapshot.instrument
-            )
-        }
+        MarketDataEvent::OrderBookUpdate { snapshot } => format!(
+            "订单簿更新 {} {}（{}）",
+            format_exchange_label(snapshot.exchange),
+            snapshot.symbol.0,
+            format_instrument_label(snapshot.instrument)
+        ),
         MarketDataEvent::TradeUpdate {
             exchange,
+            symbol,
             instrument,
             price,
             ..
         } => format!(
-            "trade {:?} {:?} @ {}",
-            exchange,
-            instrument,
+            "成交更新 {} {}（{}）@ {}",
+            format_exchange_label(*exchange),
+            symbol.0,
+            format_instrument_label(*instrument),
             price.0.normalize()
         ),
-        MarketDataEvent::FundingRate { exchange, rate, .. } => {
-            format!("funding {:?} {}", exchange, rate.normalize())
-        }
-        MarketDataEvent::MarketLifecycle { phase, .. } => format!("phase {:?}", phase),
+        MarketDataEvent::FundingRate {
+            exchange,
+            symbol,
+            rate,
+            ..
+        } => format!(
+            "资金费更新 {} {} {}",
+            format_exchange_label(*exchange),
+            symbol.0,
+            rate.normalize()
+        ),
+        MarketDataEvent::MarketLifecycle { symbol, phase, .. } => format!(
+            "市场阶段更新 {} {}",
+            symbol.0,
+            format_market_phase_label(phase)
+        ),
         MarketDataEvent::ConnectionEvent { exchange, status } => {
-            format!("connection {:?} {:?}", exchange, status)
+            format!(
+                "连接状态更新 {} {}",
+                format_exchange_label(*exchange),
+                format_connection_status_label(*status)
+            )
         }
+    }
+}
+
+fn summarize_engine_warning(warning: &EngineWarning) -> String {
+    match warning {
+        EngineWarning::ConnectionLost {
+            symbol,
+            poly_connected,
+            cex_connected,
+        } => format!(
+            "{} 本轮跳过：行情连接异常（Polymarket={}, 交易所={}）",
+            symbol.0, poly_connected, cex_connected
+        ),
+        EngineWarning::NoCexData { symbol } => {
+            format!("{} 本轮跳过：缺少可用的交易所参考价", symbol.0)
+        }
+        EngineWarning::NoPolyData { symbol } => {
+            format!("{} 本轮跳过：暂无新的 Polymarket 行情样本", symbol.0)
+        }
+        EngineWarning::CexPriceStale {
+            symbol,
+            cex_age_ms,
+            max_age_ms,
+        } => format!(
+            "{} 本轮跳过：交易所行情已超时（当前 {}ms，阈值 {}ms）",
+            symbol.0, cex_age_ms, max_age_ms
+        ),
+        EngineWarning::PolyPriceStale {
+            symbol,
+            poly_age_ms,
+            max_age_ms,
+        } => format!(
+            "{} 本轮跳过：Polymarket 行情已超时（当前 {}ms，阈值 {}ms）",
+            symbol.0, poly_age_ms, max_age_ms
+        ),
+        EngineWarning::DataMisaligned {
+            symbol,
+            poly_time_ms,
+            cex_time_ms,
+            diff_ms,
+        } => format!(
+            "{} 本轮跳过：Polymarket 与交易所时间未对齐（Poly={}，交易所={}，差值 {}ms）",
+            symbol.0, poly_time_ms, cex_time_ms, diff_ms
+        ),
     }
 }
 
 fn summarize_signal(signal: &ArbSignalEvent) -> String {
     let action = match &signal.action {
-        ArbSignalAction::BasisLong { .. } => "basis_long",
-        ArbSignalAction::BasisShort { .. } => "basis_short",
-        ArbSignalAction::DeltaRebalance { .. } => "delta_rebalance",
-        ArbSignalAction::NegRiskArb { .. } => "neg_risk_arb",
-        ArbSignalAction::ClosePosition { .. } => "close_position",
+        ArbSignalAction::BasisLong { .. } => "基差做多信号",
+        ArbSignalAction::BasisShort { .. } => "基差做空信号",
+        ArbSignalAction::DeltaRebalance { .. } => "Delta 再平衡信号",
+        ArbSignalAction::NegRiskArb { .. } => "负风险套利信号",
+        ArbSignalAction::ClosePosition { .. } => "平仓信号",
     };
     format!("{action} {}", signal.signal_id)
 }
@@ -697,10 +1120,10 @@ fn print_snapshot(snapshot: &SimSnapshot, json: bool) {
     }
 
     println!(
-        "tick={} market={} phase={} connections={} poly_yes={:?} poly_no={:?} cex_mid={:?} token_side={:?} signal_basis={:?} z={:?} fair={:?} delta={:?} cex_ref={:?} hedge={} last_signal={:?} open_orders={} active_dmm_orders={} signals={}/{} submitted={} cancelled={} fills={} positions={} exposure={} pnl={} breaker={}",
+        "轮次={} 市场={} 阶段={} 连接={} Polymarket-YES={:?} Polymarket-NO={:?} 交易所中价={:?} 信号腿={:?} 基差={:?} Z值={:?} 公允值={:?} Delta={:?} 交易所参考价={:?} 对冲={} 最近信号={:?} 挂单={} DMM挂单={} 信号={}/{} 提交={} 撤单={} 成交={} 持仓={} 敞口={} 盈亏={} 熔断={}",
         snapshot.tick_index,
         snapshot.market,
-        snapshot.market_phase,
+        display_market_phase_text(&snapshot.market_phase),
         format_connections(&snapshot.connections),
         snapshot.poly_yes_mid,
         snapshot.poly_no_mid,
@@ -711,7 +1134,7 @@ fn print_snapshot(snapshot: &SimSnapshot, json: bool) {
         snapshot.current_fair_value,
         snapshot.current_delta,
         snapshot.cex_reference_price,
-        snapshot.hedge_state,
+        display_hedge_state_text(&snapshot.hedge_state),
         snapshot.last_signal_id,
         snapshot.open_orders,
         snapshot.active_dmm_orders,
@@ -723,7 +1146,7 @@ fn print_snapshot(snapshot: &SimSnapshot, json: bool) {
         snapshot.positions.len(),
         snapshot.total_exposure_usd,
         snapshot.daily_pnl_usd,
-        snapshot.breaker,
+        display_circuit_breaker_text(&snapshot.breaker),
     );
 }
 
@@ -735,39 +1158,51 @@ fn print_artifact_table(artifact: &SimArtifact, artifact_path: &PathBuf) {
     print_report_kv("环境", artifact.env.as_str());
     print_report_kv("市场", artifact.market.as_str());
     print_report_kv("对冲标的", artifact.final_snapshot.hedge_symbol.as_str());
-    print_report_kv("场景", artifact.scenario.as_str());
-    print_report_kv("已处理 ticks", artifact.ticks_processed.to_string());
-    print_report_kv("tick 间隔", format!("{} ms", artifact.tick_interval_ms));
+    print_report_kv(
+        "场景",
+        display_sim_scenario_text(artifact.scenario.as_str()),
+    );
+    print_report_kv("已处理轮次", artifact.ticks_processed.to_string());
+    print_report_kv("轮次间隔", format!("{} ms", artifact.tick_interval_ms));
     print_report_kv("快照数量", artifact.snapshots.len().to_string());
 
     print_report_section("最终状态");
-    print_report_kv("市场阶段", artifact.final_snapshot.market_phase.as_str());
+    print_report_kv(
+        "市场阶段",
+        display_market_phase_text(artifact.final_snapshot.market_phase.as_str()),
+    );
     print_report_kv(
         "连接状态",
         format_connections(&artifact.final_snapshot.connections),
     );
-    print_report_kv("对冲状态", artifact.final_snapshot.hedge_state.as_str());
+    print_report_kv(
+        "对冲状态",
+        display_hedge_state_text(artifact.final_snapshot.hedge_state.as_str()),
+    );
     print_report_kv(
         "最后信号",
         artifact
             .final_snapshot
             .last_signal_id
             .as_deref()
-            .unwrap_or("-"),
+            .unwrap_or("无"),
     );
-    print_report_kv("熔断状态", artifact.final_snapshot.breaker.as_str());
+    print_report_kv(
+        "熔断状态",
+        display_circuit_breaker_text(artifact.final_snapshot.breaker.as_str()),
+    );
 
     print_report_section("行情观察");
     print_report_kv(
-        "Poly Yes 中间价",
+        "Polymarket YES 中间价",
         format_option_f64(artifact.final_snapshot.poly_yes_mid),
     );
     print_report_kv(
-        "Poly No 中间价",
+        "Polymarket NO 中间价",
         format_option_f64(artifact.final_snapshot.poly_no_mid),
     );
     print_report_kv(
-        "CEX 中间价",
+        "交易所中间价",
         format_option_f64(artifact.final_snapshot.cex_mid),
     );
     print_report_kv(
@@ -776,26 +1211,26 @@ fn print_artifact_table(artifact: &SimArtifact, artifact_path: &PathBuf) {
             .final_snapshot
             .signal_token_side
             .as_deref()
-            .unwrap_or("-"),
+            .unwrap_or("无"),
     );
     print_report_kv(
         "信号基差",
         format_option_f64(artifact.final_snapshot.current_basis),
     );
     print_report_kv(
-        "当前 z-score",
+        "当前 Z 值",
         format_option_f64(artifact.final_snapshot.current_zscore),
     );
     print_report_kv(
-        "当前 fair value",
+        "当前公允值",
         format_option_f64(artifact.final_snapshot.current_fair_value),
     );
     print_report_kv(
-        "当前 delta",
+        "当前 Delta",
         format_option_f64(artifact.final_snapshot.current_delta),
     );
     print_report_kv(
-        "上一根已完成 CEX close",
+        "交易所参考收盘价",
         format_option_f64(artifact.final_snapshot.cex_reference_price),
     );
 
@@ -842,15 +1277,15 @@ fn print_artifact_table(artifact: &SimArtifact, artifact_path: &PathBuf) {
 
     print_report_section("持仓明细");
     if artifact.final_snapshot.positions.is_empty() {
-        println!("  (none)");
+        println!("  （无）");
     } else {
         for (idx, position) in artifact.final_snapshot.positions.iter().enumerate() {
             println!(
-                "  {}. {} / {} / {} | qty={} | entry={} | realized={} | unrealized={}",
+                "  {}. {} / {} / {} | 数量={} | 入场={} | 已实现={} | 未实现={}",
                 idx + 1,
-                position.exchange,
-                position.instrument,
-                position.side,
+                display_exchange_text(&position.exchange),
+                display_instrument_text(&position.instrument),
+                display_position_side_text(&position.side),
                 position.quantity,
                 position.entry_price,
                 position.realized_pnl,
@@ -861,16 +1296,16 @@ fn print_artifact_table(artifact: &SimArtifact, artifact_path: &PathBuf) {
 
     print_report_section("挂单明细");
     if artifact.open_orders.is_empty() {
-        println!("  (none)");
+        println!("  （无）");
     } else {
         for (idx, order) in artifact.open_orders.iter().enumerate() {
             println!(
-                "  {}. {} | {} | {} | {} | ts_ms={}",
+                "  {}. {} | {} | {} | {} | 时间戳={}",
                 idx + 1,
                 order.exchange_order_id,
-                order.exchange,
+                display_exchange_text(&order.exchange),
                 order.symbol,
-                order.status,
+                display_order_status_text(&order.status),
                 order.timestamp_ms,
             );
         }
@@ -878,10 +1313,15 @@ fn print_artifact_table(artifact: &SimArtifact, artifact_path: &PathBuf) {
 
     print_report_section("最近事件");
     if artifact.recent_events.is_empty() {
-        println!("  (none)");
+        println!("  （无）");
     } else {
         for (idx, event) in artifact.recent_events.iter().enumerate() {
-            println!("  {}. [{}] {}", idx + 1, event.kind, event.summary);
+            println!(
+                "  {}. [{}] {}",
+                idx + 1,
+                display_event_kind_text(&event.kind),
+                event.summary
+            );
         }
     }
 }
@@ -904,7 +1344,7 @@ fn print_report_kv(label: &str, value: impl AsRef<str>) {
 fn format_option_f64(value: Option<f64>) -> String {
     match value {
         Some(value) => format!("{value:.6}"),
-        None => "-".to_owned(),
+        None => "无".to_owned(),
     }
 }
 
@@ -921,7 +1361,7 @@ fn artifact_path(settings: &Settings, env: &str) -> Result<PathBuf> {
     let mut path = PathBuf::from(&settings.general.data_dir);
     path.push("sim");
     fs::create_dir_all(&path)
-        .with_context(|| format!("failed to create sim artifact dir `{}`", path.display()))?;
+        .with_context(|| format!("创建模拟结果目录 `{}` 失败", path.display()))?;
     path.push(format!("{env}-last-run.json"));
     Ok(path)
 }
@@ -944,15 +1384,18 @@ fn resolve_artifact_for_read(settings: &Settings, env: &str) -> Result<PathBuf> 
 
 fn persist_artifact(path: &PathBuf, artifact: &SimArtifact) -> Result<()> {
     let payload = serde_json::to_string_pretty(artifact)?;
-    fs::write(path, payload)
-        .with_context(|| format!("failed to write sim artifact `{}`", path.display()))
+    fs::write(path, payload).with_context(|| format!("写入模拟结果 `{}` 失败", path.display()))
 }
 
 fn format_connections(connections: &[String]) -> String {
     if connections.is_empty() {
-        "n/a".to_owned()
+        "无".to_owned()
     } else {
-        connections.join(",")
+        connections
+            .iter()
+            .map(|item| display_connection_entry(item))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 
@@ -983,5 +1426,319 @@ fn quantity_to_string(quantity: VenueQuantity) -> String {
     match quantity {
         VenueQuantity::PolyShares(shares) => shares.0.normalize().to_string(),
         VenueQuantity::CexBaseQty(qty) => qty.0.normalize().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use polyalpha_core::{
+        AuditConfig, BasisStrategyConfig, BinanceConfig, DmmStrategyConfig, GeneralConfig,
+        MarketDataConfig, MarketRule, NegRiskStrategyConfig, OkxConfig, PaperSlippageConfig,
+        PaperTradingConfig, PolymarketConfig, PolymarketIds, RiskConfig, SettlementRules,
+        StrategyConfig, Symbol, UsdNotional,
+    };
+
+    fn test_market(cex_qty_step: Decimal) -> MarketConfig {
+        MarketConfig {
+            symbol: Symbol::new("e2e-btc-reach-99500"),
+            poly_ids: PolymarketIds {
+                condition_id: "e2e-cond".to_owned(),
+                yes_token_id: "e2e-yes".to_owned(),
+                no_token_id: "e2e-no".to_owned(),
+            },
+            market_question: Some("E2E: Will Bitcoin reach $100,000?".to_owned()),
+            market_rule: Some(MarketRule::fallback_above(Price(Decimal::new(100_000, 0)))),
+            cex_symbol: "BTCUSDT".to_owned(),
+            hedge_exchange: Exchange::Binance,
+            strike_price: Some(Price(Decimal::new(100_000, 0))),
+            settlement_timestamp: 1_775_016_000,
+            min_tick_size: Price(Decimal::new(1, 2)),
+            neg_risk: false,
+            cex_price_tick: Decimal::new(1, 1),
+            cex_qty_step,
+            cex_contract_multiplier: Decimal::ONE,
+        }
+    }
+
+    fn test_settings(market: MarketConfig, max_position_usd: Decimal) -> Settings {
+        Settings {
+            general: GeneralConfig {
+                log_level: "info".to_owned(),
+                data_dir: "./data".to_owned(),
+                monitor_socket_path: "/tmp/polyalpha.sock".to_owned(),
+            },
+            polymarket: PolymarketConfig {
+                clob_api_url: "https://example.com".to_owned(),
+                ws_url: "wss://example.com/ws".to_owned(),
+                chain_id: 137,
+            },
+            binance: BinanceConfig {
+                rest_url: "https://example.com".to_owned(),
+                ws_url: "wss://example.com/ws".to_owned(),
+            },
+            okx: OkxConfig {
+                rest_url: "https://example.com".to_owned(),
+                ws_public_url: "wss://example.com/public".to_owned(),
+                ws_private_url: "wss://example.com/private".to_owned(),
+            },
+            markets: vec![market],
+            strategy: StrategyConfig {
+                basis: BasisStrategyConfig {
+                    entry_z_score_threshold: Decimal::new(5, 1),
+                    exit_z_score_threshold: Decimal::new(2, 1),
+                    rolling_window_secs: 240,
+                    min_warmup_samples: 2,
+                    min_basis_bps: Decimal::ZERO,
+                    max_position_usd: UsdNotional(max_position_usd),
+                    delta_rebalance_threshold: Decimal::new(5, 2),
+                    delta_rebalance_interval_secs: 60,
+                    min_poly_price: Some(Decimal::ZERO),
+                    max_poly_price: Some(Decimal::ONE),
+                    max_data_age_minutes: 1,
+                    max_time_diff_minutes: 1,
+                    enable_freshness_check: true,
+                    reject_on_disconnect: true,
+                    overrides: HashMap::new(),
+                },
+                dmm: DmmStrategyConfig {
+                    gamma: Decimal::new(1, 1),
+                    sigma_window_secs: 300,
+                    max_inventory: UsdNotional(Decimal::new(50, 0)),
+                    order_refresh_secs: 10,
+                    num_levels: 3,
+                    level_spacing_bps: Decimal::new(10, 0),
+                    min_spread_bps: Decimal::new(20, 0),
+                },
+                negrisk: NegRiskStrategyConfig {
+                    min_arb_bps: Decimal::new(30, 0),
+                    max_legs: 8,
+                    enable_inventory_backed_short: false,
+                },
+                settlement: SettlementRules::default(),
+                market_data: MarketDataConfig::default(),
+            },
+            risk: RiskConfig {
+                max_total_exposure_usd: UsdNotional(Decimal::new(100_000, 0)),
+                max_single_position_usd: UsdNotional(Decimal::new(100_000, 0)),
+                max_daily_loss_usd: UsdNotional(Decimal::new(50_000, 0)),
+                max_drawdown_pct: Decimal::new(50, 0),
+                max_open_orders: 100,
+                circuit_breaker_cooldown_secs: 60,
+                rate_limit_orders_per_sec: 20,
+                max_persistence_lag_secs: 10,
+            },
+            paper: PaperTradingConfig::default(),
+            paper_slippage: PaperSlippageConfig {
+                poly_slippage_bps: 0,
+                cex_slippage_bps: 0,
+                min_liquidity: Decimal::new(1, 0),
+                allow_partial_fill: false,
+            },
+            audit: AuditConfig::default(),
+        }
+    }
+
+    fn push_cex_book_with_qty(
+        ticks: &mut Vec<MockTick>,
+        market: &MarketConfig,
+        ts_ms: u64,
+        best_bid: i64,
+        best_ask: i64,
+        base_qty: Decimal,
+    ) {
+        ticks.push(MockTick::CexOrderBook(CexBookUpdate {
+            exchange: market.hedge_exchange,
+            venue_symbol: market.cex_symbol.clone(),
+            bids: vec![CexBookLevel {
+                price: Price(Decimal::new(best_bid, 0)),
+                base_qty: CexBaseQty(base_qty),
+            }],
+            asks: vec![CexBookLevel {
+                price: Price(Decimal::new(best_ask, 0)),
+                base_qty: CexBaseQty(base_qty),
+            }],
+            exchange_timestamp_ms: ts_ms,
+            received_at_ms: ts_ms,
+            sequence: ts_ms,
+        }));
+    }
+
+    fn push_poly_yes_book_with_shares(
+        ticks: &mut Vec<MockTick>,
+        market: &MarketConfig,
+        ts_ms: u64,
+        best_bid_cents: i64,
+        best_ask_cents: i64,
+        shares: Decimal,
+    ) {
+        ticks.push(MockTick::PolyOrderBook(PolyBookUpdate {
+            asset_id: market.poly_ids.yes_token_id.clone(),
+            bids: vec![PolyBookLevel {
+                price: Price(Decimal::new(best_bid_cents, 2)),
+                shares: polyalpha_core::PolyShares(shares),
+            }],
+            asks: vec![PolyBookLevel {
+                price: Price(Decimal::new(best_ask_cents, 2)),
+                shares: polyalpha_core::PolyShares(shares),
+            }],
+            exchange_timestamp_ms: ts_ms,
+            received_at_ms: ts_ms,
+            sequence: ts_ms,
+            last_trade_price: None,
+        }));
+    }
+
+    fn push_poly_no_book_with_shares(
+        ticks: &mut Vec<MockTick>,
+        market: &MarketConfig,
+        ts_ms: u64,
+        best_bid_cents: i64,
+        best_ask_cents: i64,
+        shares: Decimal,
+    ) {
+        ticks.push(MockTick::PolyOrderBook(PolyBookUpdate {
+            asset_id: market.poly_ids.no_token_id.clone(),
+            bids: vec![PolyBookLevel {
+                price: Price(Decimal::new(best_bid_cents, 2)),
+                shares: polyalpha_core::PolyShares(shares),
+            }],
+            asks: vec![PolyBookLevel {
+                price: Price(Decimal::new(best_ask_cents, 2)),
+                shares: polyalpha_core::PolyShares(shares),
+            }],
+            exchange_timestamp_ms: ts_ms,
+            received_at_ms: ts_ms,
+            sequence: ts_ms,
+            last_trade_price: None,
+        }));
+    }
+
+    fn acceptance_round_trip_ticks(market: &MarketConfig) -> Vec<MockTick> {
+        let mut ticks = Vec::new();
+        let trading_now = market.settlement_timestamp.saturating_sub(72 * 3600);
+        push_connections(&mut ticks, market);
+        ticks.push(MockTick::Lifecycle {
+            symbol: market.symbol.clone(),
+            now_timestamp_secs: trading_now,
+            emitted_at_ms: 1,
+        });
+
+        let deep_cex_qty = Decimal::new(10_000, 0);
+        let deep_poly_shares = Decimal::new(10_000, 0);
+        push_cex_book_with_qty(&mut ticks, market, 0, 100_000, 100_000, deep_cex_qty);
+
+        push_poly_yes_book_with_shares(&mut ticks, market, 60_100, 30, 30, deep_poly_shares);
+        push_poly_no_book_with_shares(&mut ticks, market, 60_120, 70, 70, deep_poly_shares);
+        push_cex_book_with_qty(&mut ticks, market, 60_200, 100_000, 100_000, deep_cex_qty);
+
+        push_poly_yes_book_with_shares(&mut ticks, market, 120_100, 35, 35, deep_poly_shares);
+        push_poly_no_book_with_shares(&mut ticks, market, 120_120, 65, 65, deep_poly_shares);
+        push_cex_book_with_qty(&mut ticks, market, 120_200, 100_000, 100_000, deep_cex_qty);
+
+        push_poly_yes_book_with_shares(&mut ticks, market, 180_100, 54, 54, deep_poly_shares);
+        push_poly_no_book_with_shares(&mut ticks, market, 180_120, 46, 46, deep_poly_shares);
+        push_cex_book_with_qty(&mut ticks, market, 180_200, 99_500, 99_500, deep_cex_qty);
+
+        ticks.push(MockTick::Lifecycle {
+            symbol: market.symbol.clone(),
+            now_timestamp_secs: market.settlement_timestamp.saturating_sub(1_800),
+            emitted_at_ms: 180_300,
+        });
+        ticks
+    }
+
+    fn snapshot_positions_are_flat(snapshot: &SimSnapshot) -> bool {
+        snapshot.positions.iter().all(|position| {
+            position.side == "Flat"
+                || position.side == "FLAT"
+                || position.quantity == "0"
+                || position.quantity == "0.0"
+        })
+    }
+
+    #[tokio::test]
+    async fn sim_round_trip_opens_and_closes_all_legs() {
+        let market = test_market(Decimal::new(1, 3));
+        let settings = test_settings(market.clone(), Decimal::new(1_000, 0));
+        let artifact = run_sim_with_mock_ticks(
+            "sim-e2e-round-trip",
+            &settings,
+            0,
+            "AcceptanceRoundTrip",
+            acceptance_round_trip_ticks(&market),
+            0,
+            usize::MAX,
+            0,
+            false,
+        )
+        .await
+        .expect("sim round-trip should succeed");
+
+        assert_eq!(
+            artifact.final_snapshot.signals_seen, 2,
+            "unexpected snapshots: {:#?}",
+            artifact.snapshots
+        );
+        assert_eq!(artifact.final_snapshot.signals_rejected, 0);
+        assert_eq!(artifact.final_snapshot.order_submitted, 4);
+        assert_eq!(artifact.final_snapshot.fills, 4);
+        assert!(
+            snapshot_positions_are_flat(&artifact.final_snapshot),
+            "unexpected final snapshot: {:#?}\nrecent events: {:#?}",
+            artifact.final_snapshot,
+            artifact.recent_events
+        );
+        assert_eq!(artifact.final_snapshot.hedge_state, "Idle");
+        assert!(
+            artifact
+                .recent_events
+                .iter()
+                .any(|event| event.kind == "trade_closed"),
+            "sim acceptance should emit TradeClosed"
+        );
+    }
+
+    #[tokio::test]
+    async fn sim_blocks_entry_when_cex_hedge_qty_floors_to_zero() {
+        let market = test_market(Decimal::ONE);
+        let settings = test_settings(market.clone(), Decimal::ONE);
+        let artifact = run_sim_with_mock_ticks(
+            "sim-e2e-zero-hedge",
+            &settings,
+            0,
+            "AcceptanceZeroHedge",
+            acceptance_round_trip_ticks(&market),
+            0,
+            usize::MAX,
+            0,
+            false,
+        )
+        .await
+        .expect("sim zero-hedge scenario should succeed");
+
+        assert!(
+            artifact.snapshots.iter().any(|snapshot| {
+                snapshot
+                    .current_zscore
+                    .is_some_and(|z_score| z_score <= -0.5)
+                    && snapshot
+                        .current_delta
+                        .is_some_and(|delta| delta.abs() >= 0.05)
+            }),
+            "scenario should produce an entry-quality basis snapshot before hedge floor is applied"
+        );
+        assert_eq!(artifact.final_snapshot.signals_seen, 0);
+        assert_eq!(artifact.final_snapshot.order_submitted, 0);
+        assert_eq!(artifact.final_snapshot.fills, 0);
+        assert!(snapshot_positions_are_flat(&artifact.final_snapshot));
+        assert!(
+            artifact
+                .recent_events
+                .iter()
+                .all(|event| event.kind != "trade_closed"),
+            "no position should mean no TradeClosed event"
+        );
     }
 }
