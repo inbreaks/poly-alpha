@@ -280,6 +280,11 @@ impl OkxExecutor {
 impl OrderExecutor for OkxExecutor {
     async fn submit_order(&self, request: OrderRequest) -> Result<OrderResponse> {
         let req = Self::ensure_okx(&request)?;
+        if req.base_qty.0 <= Decimal::ZERO {
+            return Err(CoreError::Channel(
+                "okx reject zero quantity order".to_owned(),
+            ));
+        }
         let body = Self::build_submit_body(req);
         let envelope: OkxEnvelope<OkxSubmitData> =
             self.signed_post_json("/api/v5/trade/order", &body).await?;
@@ -306,6 +311,7 @@ impl OrderExecutor for OkxExecutor {
             status: OrderStatus::Pending,
             filled_quantity: VenueQuantity::CexBaseQty(CexBaseQty::default()),
             average_price: None,
+            rejection_reason: None,
             timestamp_ms: Self::now_timestamp_ms()?,
         })
     }
@@ -387,6 +393,7 @@ impl OrderExecutor for OkxExecutor {
                     None
                 }
             }),
+            rejection_reason: None,
             timestamp_ms: row
                 .u_time
                 .as_deref()

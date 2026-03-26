@@ -2,10 +2,18 @@ use std::collections::HashMap;
 
 use rust_decimal::Decimal;
 
-use polyalpha_core::{
+use crate::{
     CexBaseQty, Fill, InstrumentKind, OrderSide, PolyShares, Position, PositionKey, PositionSide,
-    Price, UsdNotional, VenueQuantity,
+    Price, Symbol, UsdNotional, VenueQuantity,
 };
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FillEffect {
+    pub position_key: PositionKey,
+    pub realized_pnl_delta: UsdNotional,
+    pub net_qty_after: Decimal,
+    pub position_became_flat: bool,
+}
 
 #[derive(Clone, Debug, Default)]
 struct TrackedPosition {
@@ -17,11 +25,10 @@ struct TrackedPosition {
 #[derive(Clone, Debug, Default)]
 pub struct PositionTracker {
     positions: HashMap<PositionKey, TrackedPosition>,
-    daily_realized_pnl: UsdNotional,
 }
 
 impl PositionTracker {
-    pub fn apply_fill(&mut self, fill: &Fill) {
+    pub fn apply_fill(&mut self, fill: &Fill) -> FillEffect {
         let key = PositionKey {
             exchange: fill.exchange,
             symbol: fill.symbol.clone(),
@@ -29,7 +36,12 @@ impl PositionTracker {
         };
         let fill_qty = quantity_to_decimal(fill.quantity);
         if fill_qty.is_zero() {
-            return;
+            return FillEffect {
+                position_key: key,
+                realized_pnl_delta: UsdNotional::ZERO,
+                net_qty_after: Decimal::ZERO,
+                position_became_flat: false,
+            };
         }
 
         let signed_delta = signed_qty(fill.side, fill_qty);
@@ -63,8 +75,16 @@ impl PositionTracker {
         }
 
         tracked.realized_pnl.0 += realized_delta;
-        self.daily_realized_pnl.0 += realized_delta;
-        self.positions.insert(key, tracked);
+        let net_qty_after = tracked.net_qty;
+        let position_became_flat = !old_net.is_zero() && net_qty_after.is_zero();
+        self.positions.insert(key.clone(), tracked);
+
+        FillEffect {
+            position_key: key,
+            realized_pnl_delta: UsdNotional(realized_delta),
+            net_qty_after,
+            position_became_flat,
+        }
     }
 
     pub fn positions_snapshot(&self) -> HashMap<PositionKey, Position> {
@@ -102,11 +122,36 @@ impl PositionTracker {
             .unwrap_or(Decimal::ZERO)
     }
 
+    pub fn realized_pnl_for(&self, key: &PositionKey) -> UsdNotional {
+        self.positions
+            .get(key)
+            .map(|tracked| tracked.realized_pnl)
+            .unwrap_or(UsdNotional::ZERO)
+    }
+
+    pub fn net_symbol_qty(&self, symbol: &Symbol, instrument: InstrumentKind) -> Decimal {
+        self.positions
+            .iter()
+            .filter(|(key, _)| &key.symbol == symbol && key.instrument == instrument)
+            .fold(Decimal::ZERO, |acc, (_, tracked)| acc + tracked.net_qty)
+    }
+
+    pub fn symbol_is_flat(&self, symbol: &Symbol) -> bool {
+        self.positions
+            .iter()
+            .filter(|(key, _)| &key.symbol == symbol)
+            .all(|(_, tracked)| tracked.net_qty.is_zero())
+    }
+
+    pub fn symbol_has_open_position(&self, symbol: &Symbol) -> bool {
+        !self.symbol_is_flat(symbol)
+    }
+
     pub fn entry_price_for(&self, key: &PositionKey) -> Option<Price> {
         self.positions.get(key).map(|tracked| tracked.entry_price)
     }
 
-    pub fn symbol_exposure_usd(&self, symbol: &polyalpha_core::Symbol) -> UsdNotional {
+    pub fn symbol_exposure_usd(&self, symbol: &Symbol) -> UsdNotional {
         let exposure = self
             .positions
             .iter()
@@ -122,10 +167,6 @@ impl PositionTracker {
             acc + (tracked.net_qty.abs() * tracked.entry_price.0)
         });
         UsdNotional(total)
-    }
-
-    pub fn daily_realized_pnl(&self) -> UsdNotional {
-        self.daily_realized_pnl
     }
 }
 
@@ -160,7 +201,7 @@ fn has_same_sign(lhs: Decimal, rhs: Decimal) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use polyalpha_core::{Exchange, OrderId, Symbol};
+    use crate::{Exchange, OrderId};
 
     fn fill(
         side: OrderSide,
@@ -171,6 +212,7 @@ mod tests {
     ) -> Fill {
         Fill {
             fill_id: format!("fill-{timestamp_ms}"),
+            correlation_id: format!("corr-{timestamp_ms}"),
             exchange: Exchange::Binance,
             symbol: Symbol::new("btc-100k-mar-2026"),
             instrument: InstrumentKind::CexPerp,
@@ -195,7 +237,7 @@ mod tests {
             Decimal::new(10, 1),
             1,
         ));
-        tracker.apply_fill(&fill(
+        let effect = tracker.apply_fill(&fill(
             OrderSide::Sell,
             Decimal::new(10, 1),
             Decimal::new(900, 1),
@@ -216,9 +258,12 @@ mod tests {
             position.quantity,
             VenueQuantity::CexBaseQty(CexBaseQty(Decimal::ZERO))
         );
+        assert_eq!(effect.realized_pnl_delta, UsdNotional(Decimal::new(-11, 0)));
+        assert!(effect.position_became_flat);
+        assert!(tracker.symbol_is_flat(&Symbol::new("btc-100k-mar-2026")));
         assert_eq!(
-            tracker.daily_realized_pnl(),
-            UsdNotional(Decimal::new(-12, 0))
+            tracker.realized_pnl_for(&key),
+            UsdNotional(Decimal::new(-1200, 2))
         );
     }
 }

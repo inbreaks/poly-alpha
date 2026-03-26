@@ -6,6 +6,7 @@ pub mod market;
 pub mod order;
 pub mod orderbook;
 pub mod position;
+pub mod position_tracker;
 pub mod risk;
 pub mod signal;
 
@@ -23,8 +24,9 @@ pub use order::{
 };
 pub use orderbook::{InstrumentKind, OrderBookSnapshot, PriceLevel, Side};
 pub use position::{Position, PositionKey, PositionSide};
+pub use position_tracker::{FillEffect, PositionTracker};
 pub use risk::{CircuitBreakerStatus, PersistenceLag, RiskRejection};
 pub use signal::{
     AlphaEngineOutput, ArbLeg, ArbSignalAction, ArbSignalEvent, DmmQuoteSlot, DmmQuoteState,
-    DmmQuoteUpdate, SignalStrength,
+    DmmQuoteUpdate, EngineWarning, SignalStrength,
 };

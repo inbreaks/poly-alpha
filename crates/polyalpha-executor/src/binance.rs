@@ -246,6 +246,11 @@ impl BinanceFuturesExecutor {
 impl OrderExecutor for BinanceFuturesExecutor {
     async fn submit_order(&self, request: OrderRequest) -> Result<OrderResponse> {
         let req = Self::ensure_binance(&request)?;
+        if req.base_qty.0 <= Decimal::ZERO {
+            return Err(CoreError::Channel(
+                "binance reject zero quantity order".to_owned(),
+            ));
+        }
         let params = Self::build_submit_params(req);
         let payload: BinanceOrderPayload = self
             .signed_json(Method::POST, "/fapi/v1/order", params)
@@ -268,6 +273,7 @@ impl OrderExecutor for BinanceFuturesExecutor {
                     None
                 }
             }),
+            rejection_reason: None,
             timestamp_ms: payload.update_time,
         })
     }
@@ -354,6 +360,7 @@ impl OrderExecutor for BinanceFuturesExecutor {
                     None
                 }
             }),
+            rejection_reason: None,
             timestamp_ms: payload.update_time,
         })
     }

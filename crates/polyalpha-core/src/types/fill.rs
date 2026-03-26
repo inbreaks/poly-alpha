@@ -7,6 +7,7 @@ use super::{
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Fill {
     pub fill_id: String,
+    pub correlation_id: String,
     pub exchange: Exchange,
     pub symbol: Symbol,
     pub instrument: InstrumentKind,

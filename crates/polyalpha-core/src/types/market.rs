@@ -186,7 +186,7 @@ pub struct SymbolRegistry {
     configs: HashMap<Symbol, MarketConfig>,
     poly_token_to_symbol: HashMap<String, (Symbol, TokenSide)>,
     poly_condition_to_symbols: HashMap<String, Vec<Symbol>>,
-    cex_symbol_to_symbol: HashMap<(Exchange, String), Symbol>,
+    cex_symbol_to_symbols: HashMap<(Exchange, String), Vec<Symbol>>,
 }
 
 pub fn cex_venue_symbol(exchange: Exchange, venue_symbol: &str) -> String {
@@ -228,8 +228,10 @@ impl SymbolRegistry {
                 .or_default()
                 .push(symbol.clone());
             registry
-                .cex_symbol_to_symbol
-                .insert((exchange, cex_symbol), symbol.clone());
+                .cex_symbol_to_symbols
+                .entry((exchange, cex_symbol))
+                .or_default()
+                .push(symbol.clone());
             registry.configs.insert(symbol, market);
         }
 
@@ -264,9 +266,10 @@ impl SymbolRegistry {
             .map(Vec::as_slice)
     }
 
-    pub fn lookup_cex_symbol(&self, exchange: Exchange, venue_symbol: &str) -> Option<&Symbol> {
-        self.cex_symbol_to_symbol
+    pub fn lookup_cex_symbols(&self, exchange: Exchange, venue_symbol: &str) -> Option<&[Symbol]> {
+        self.cex_symbol_to_symbols
             .get(&(exchange, venue_symbol.to_owned()))
+            .map(Vec::as_slice)
     }
 }
 
@@ -311,8 +314,8 @@ mod tests {
             Some((symbol.clone(), TokenSide::Yes))
         );
         assert_eq!(
-            registry.lookup_cex_symbol(Exchange::Binance, "BTCUSDT"),
-            Some(&symbol)
+            registry.lookup_cex_symbols(Exchange::Binance, "BTCUSDT"),
+            Some(&[symbol.clone()][..])
         );
         assert_eq!(
             registry.lookup_poly_condition("condition-1"),

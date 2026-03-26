@@ -5,7 +5,10 @@ pub mod mock_source;
 pub mod normalizer;
 
 pub use error::{DataError, Result};
-pub use live::{BinanceFuturesDataSource, OkxMarketDataSource, PolymarketLiveDataSource};
+pub use live::{
+    BinanceFuturesDataSource, BinanceKline, OkxMarketDataSource, PolyPricePoint,
+    PolymarketLiveDataSource,
+};
 pub use manager::DataManager;
 pub use mock_source::{MockMarketDataSource, MockTick};
 pub use normalizer::{

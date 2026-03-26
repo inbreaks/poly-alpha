@@ -44,6 +44,9 @@ pub struct RustReplayCommandArgs {
     pub cex_fee_bps: f64,
     pub cex_slippage_bps: f64,
     pub entry_fill_ratio: f64,
+    pub min_poly_price: Option<f64>,
+    pub max_poly_price: Option<f64>,
+    pub max_holding_bars: Option<usize>,
     pub report_json: Option<String>,
     pub equity_csv: Option<String>,
     pub trades_csv: Option<String>,
@@ -96,6 +99,9 @@ struct ResolvedReplayConfig {
     max_capital_usage: f64,
     cex_hedge_ratio: f64,
     cex_margin_ratio: f64,
+    min_poly_price: Option<f64>,
+    max_poly_price: Option<f64>,
+    max_holding_bars: Option<usize>,
     stress: ExecutionStressConfig,
 }
 
@@ -370,6 +376,9 @@ pub async fn run_rust_replay_command(args: RustReplayCommandArgs) -> Result<()> 
         args.max_capital_usage,
         args.cex_hedge_ratio,
         args.cex_margin_ratio,
+        args.min_poly_price,
+        args.max_poly_price,
+        args.max_holding_bars,
         ExecutionStressConfig {
             label: "custom".to_owned(),
             poly_fee_bps: args.poly_fee_bps,
@@ -425,6 +434,9 @@ pub async fn run_rust_stress_command(args: RustStressCommandArgs) -> Result<()> 
             args.max_capital_usage,
             args.cex_hedge_ratio,
             args.cex_margin_ratio,
+            None, // min_poly_price - not available in stress test
+            None, // max_poly_price - not available in stress test
+            None, // max_holding_bars - not available in stress test
             preset,
         )?;
         let run = run_single_replay(&dataset, &config, false).await?;
@@ -467,6 +479,9 @@ fn resolve_replay_config(
     max_capital_usage: f64,
     cex_hedge_ratio: f64,
     cex_margin_ratio: f64,
+    min_poly_price: Option<f64>,
+    max_poly_price: Option<f64>,
+    max_holding_bars: Option<usize>,
     stress: ExecutionStressConfig,
 ) -> Result<ResolvedReplayConfig> {
     let initial_capital = initial_capital.max(0.0);
@@ -489,6 +504,9 @@ fn resolve_replay_config(
         max_capital_usage: max_capital_usage.max(0.0),
         cex_hedge_ratio: cex_hedge_ratio.max(0.0),
         cex_margin_ratio: cex_margin_ratio.max(0.0),
+        min_poly_price,
+        max_poly_price,
+        max_holding_bars,
         stress: ExecutionStressConfig {
             label: stress.label,
             poly_fee_bps: stress.poly_fee_bps.max(0.0),
@@ -545,9 +563,9 @@ fn load_dataset(db_path: &str, filter: &ReplayFilter) -> Result<ReplayDataset> {
 
     let metadata = load_build_metadata(&conn)?;
     let market_resolutions = load_market_resolutions(&conn)?;
-    let markets = load_market_specs(&conn, filter, &market_resolutions)?;
+    let markets = load_market_specs(&conn, filter, &market_resolutions, &metadata)?;
     let rows = load_price_rows(&conn, filter)?;
-    let cex_close_by_ts = load_cex_closes(&conn)?;
+    let cex_close_by_ts = load_cex_closes(&conn, &metadata)?;
 
     if markets.is_empty() {
         bail!("no replay markets matched filter");
@@ -556,7 +574,11 @@ fn load_dataset(db_path: &str, filter: &ReplayFilter) -> Result<ReplayDataset> {
         bail!("no grouped polymarket rows matched filter");
     }
     if cex_close_by_ts.is_empty() {
-        bail!("no Binance BTC 1m rows found");
+        let cex_table = metadata
+            .get("cex_table")
+            .map(|s| s.as_str())
+            .unwrap_or("binance_btc_1m");
+        bail!("no {} 1m rows found", cex_table);
     }
 
     let mut minute_set = HashSet::new();
@@ -642,6 +664,7 @@ fn load_market_specs(
     conn: &Connection,
     filter: &ReplayFilter,
     market_resolutions: &HashMap<(String, String), f64>,
+    metadata: &HashMap<String, String>,
 ) -> Result<HashMap<String, ReplayMarketSpec>> {
     let sql = format!(
         "
@@ -700,6 +723,10 @@ fn load_market_specs(
             .checked_mul(1000)
             .ok_or_else(|| anyhow!("market `{market_id}` settlement timestamp overflow"))?;
         let strike_price = rule.lower_strike.or(rule.upper_strike);
+        let cex_symbol = metadata
+            .get("cex_symbol")
+            .cloned()
+            .unwrap_or_else(|| "BTCUSDT".to_owned());
         let market_config = MarketConfig {
             symbol: symbol.clone(),
             poly_ids: PolymarketIds {
@@ -709,7 +736,7 @@ fn load_market_specs(
             },
             market_question: Some(market_question.clone()),
             market_rule: Some(rule.clone()),
-            cex_symbol: "BTCUSDT".to_owned(),
+            cex_symbol,
             hedge_exchange: Exchange::Binance,
             strike_price,
             settlement_timestamp: settlement_ts_ms / 1000,
@@ -784,8 +811,16 @@ fn load_price_rows(conn: &Connection, filter: &ReplayFilter) -> Result<Vec<Repla
     Ok(out)
 }
 
-fn load_cex_closes(conn: &Connection) -> Result<HashMap<u64, f64>> {
-    let mut stmt = conn.prepare("select ts_ms, close from binance_btc_1m order by ts_ms asc")?;
+fn load_cex_closes(
+    conn: &Connection,
+    metadata: &HashMap<String, String>,
+) -> Result<HashMap<u64, f64>> {
+    let cex_table = metadata
+        .get("cex_table")
+        .map(|s| s.as_str())
+        .unwrap_or("binance_btc_1m");
+    let sql = format!("select ts_ms, close from {} order by ts_ms asc", cex_table);
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)))?;
 
     let mut out = HashMap::new();
@@ -852,6 +887,7 @@ async fn run_single_replay(
         cex_hedge_ratio: config.cex_hedge_ratio,
         dmm_half_spread: Decimal::new(1, 2),
         dmm_quote_size: polyalpha_core::PolyShares::ZERO,
+        ..SimpleEngineConfig::default()
     };
     let mut engine = SimpleAlphaEngine::with_markets(engine_config, markets);
 
@@ -997,15 +1033,20 @@ async fn run_single_replay(
                     cex_reference_price,
                     cex_advance_price,
                     signal_count: output.arb_signals.len(),
-                    signal_action: first_signal.map(signal_action_label),
-                    signal_token_side: first_signal.map(|signal| token_side_label(signal.token_side)),
+                    signal_action: first_signal.map(|s| signal_action_label(&s.action)),
+                    signal_token_side: first_signal
+                        .and_then(|s| signal_token_side(&s.action))
+                        .map(token_side_label)
+                        .map(|s| s.to_string()),
                     signal_basis_bps: first_signal
                         .and_then(|signal| signal.basis_value.as_ref())
                         .and_then(Decimal::to_f64),
                     signal_z_score: first_signal
                         .and_then(|signal| signal.z_score.as_ref())
                         .and_then(Decimal::to_f64),
-                    snapshot_token_side: snapshot.as_ref().map(|item| token_side_label(item.token_side)),
+                    snapshot_token_side: snapshot
+                        .as_ref()
+                        .map(|item| token_side_label(item.token_side).to_string()),
                     snapshot_poly_price: snapshot.as_ref().map(|item| item.poly_price),
                     snapshot_fair_value: snapshot.as_ref().map(|item| item.fair_value),
                     snapshot_basis_bps: snapshot.as_ref().map(|item| item.signal_basis * 10_000.0),
@@ -1089,6 +1130,55 @@ async fn run_single_replay(
                 &symbol,
                 positions.get(&symbol).map(|position| position.token_side),
             );
+        }
+
+        // Max holding time check
+        if let Some(max_bars) = config.max_holding_bars {
+            let symbols_to_force_close: Vec<(Symbol, String)> = positions
+                .iter()
+                .filter_map(|(symbol, position)| {
+                    let holding_bars =
+                        (ts_ms.saturating_sub(position.entry_ts_ms) / ONE_MINUTE_MS) as usize;
+                    if holding_bars >= max_bars {
+                        Some((symbol.clone(), format!("max_holding_{}min", max_bars)))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            for (symbol, reason) in symbols_to_force_close {
+                let market_id = positions
+                    .get(&symbol)
+                    .map(|position| position.market_id.clone())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "position disappeared before max holding close for `{}`",
+                            symbol.0
+                        )
+                    })?;
+                let spec = dataset.markets.get(&market_id).ok_or_else(|| {
+                    anyhow!("market spec missing for max holding close `{market_id}`")
+                })?;
+                close_position(
+                    &symbol,
+                    spec,
+                    None,
+                    cex_reference_price,
+                    false,
+                    &reason,
+                    config,
+                    &mut positions,
+                    &mut cash,
+                    &mut stats,
+                    &mut trade_log,
+                    ts_ms,
+                )?;
+                engine.sync_position_state(
+                    &symbol,
+                    positions.get(&symbol).map(|position| position.token_side),
+                );
+            }
         }
 
         pending_entry_signals.sort_by(|left, right| {
@@ -1412,6 +1502,20 @@ fn handle_signal(
             if shares <= 0.0 || poly_entry_price <= 0.0 || cex_reference_price <= 0.0 {
                 stats.signals_rejected_missing_price += 1;
                 return Ok(());
+            }
+
+            // Price range filter: reject signals outside the configured price range
+            if let Some(min_price) = config.min_poly_price {
+                if poly_entry_price < min_price {
+                    stats.signals_rejected_missing_price += 1;
+                    return Ok(());
+                }
+            }
+            if let Some(max_price) = config.max_poly_price {
+                if poly_entry_price >= max_price {
+                    stats.signals_rejected_missing_price += 1;
+                    return Ok(());
+                }
             }
 
             let poly_entry_notional = shares * poly_entry_price;
@@ -2200,6 +2304,24 @@ fn token_side_label(token_side: TokenSide) -> &'static str {
     }
 }
 
+fn signal_action_label(action: &ArbSignalAction) -> String {
+    match action {
+        ArbSignalAction::BasisLong { .. } => "basis_long".to_string(),
+        ArbSignalAction::BasisShort { .. } => "basis_short".to_string(),
+        ArbSignalAction::DeltaRebalance { .. } => "delta_rebalance".to_string(),
+        ArbSignalAction::NegRiskArb { .. } => "neg_risk_arb".to_string(),
+        ArbSignalAction::ClosePosition { reason } => format!("close_position:{}", reason),
+    }
+}
+
+fn signal_token_side(action: &ArbSignalAction) -> Option<TokenSide> {
+    match action {
+        ArbSignalAction::BasisLong { token_side, .. } => Some(*token_side),
+        ArbSignalAction::BasisShort { token_side, .. } => Some(*token_side),
+        _ => None,
+    }
+}
+
 fn write_json<T: Serialize>(path: &str, value: &T) -> Result<()> {
     let path_ref = Path::new(path);
     if let Some(parent) = path_ref.parent() {
@@ -2282,6 +2404,51 @@ fn write_trades_csv(path: &str, trade_log: &[ReplayTradeRow]) -> Result<()> {
     }
     fs::write(path_ref, out)
         .with_context(|| format!("failed to write trades csv `{}`", path_ref.display()))
+}
+
+fn write_snapshots_csv(path: &str, snapshot_log: &[ReplaySnapshotRow]) -> Result<()> {
+    let path_ref = Path::new(path);
+    if let Some(parent) = path_ref.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create snapshots directory `{}`",
+                parent.display()
+            )
+        })?;
+    }
+
+    let mut out = String::from(
+        "ts_ms,event_id,market_id,market_slug,yes_price,no_price,cex_reference_price,cex_advance_price,signal_count,signal_action,signal_token_side,signal_basis_bps,signal_z_score,snapshot_token_side,snapshot_poly_price,snapshot_fair_value,snapshot_basis_bps,snapshot_z_score,snapshot_delta,snapshot_sigma,snapshot_minutes_to_expiry\n",
+    );
+    for snap in snapshot_log {
+        let _ = writeln!(
+            out,
+            "{},{},{},{},{},{},{:.8},{:.8},{},{},{},{},{},{},{:.8},{:.8},{:.4},{:.4},{:.6},{:.6},{:.2}",
+            snap.ts_ms,
+            csv_escape(&snap.event_id),
+            csv_escape(&snap.market_id),
+            csv_escape(&snap.market_slug),
+            snap.yes_price.map_or(String::new(), |v| format!("{:.8}", v)),
+            snap.no_price.map_or(String::new(), |v| format!("{:.8}", v)),
+            snap.cex_reference_price,
+            snap.cex_advance_price,
+            snap.signal_count,
+            snap.signal_action.as_deref().unwrap_or(""),
+            snap.signal_token_side.as_deref().unwrap_or(""),
+            snap.signal_basis_bps.map_or(String::new(), |v| format!("{:.4}", v)),
+            snap.signal_z_score.map_or(String::new(), |v| format!("{:.4}", v)),
+            snap.snapshot_token_side.as_deref().unwrap_or(""),
+            snap.snapshot_poly_price.map_or(String::new(), |v| format!("{:.8}", v)),
+            snap.snapshot_fair_value.map_or(String::new(), |v| format!("{:.8}", v)),
+            snap.snapshot_basis_bps.unwrap_or(0.0),
+            snap.snapshot_z_score.unwrap_or(0.0),
+            snap.snapshot_delta.unwrap_or(0.0),
+            snap.snapshot_sigma.unwrap_or(0.0),
+            snap.snapshot_minutes_to_expiry.unwrap_or(0.0),
+        );
+    }
+    fs::write(path_ref, out)
+        .with_context(|| format!("failed to write snapshots csv `{}`", path_ref.display()))
 }
 
 fn csv_escape(value: &str) -> String {

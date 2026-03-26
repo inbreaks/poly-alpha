@@ -35,18 +35,30 @@ impl DataManager {
     }
 
     pub fn normalize_and_publish_cex_orderbook(&self, update: CexBookUpdate) -> Result<usize> {
-        let event = self.normalizer.normalize_cex_orderbook(update)?;
-        self.publish(event)
+        let events = self.normalizer.normalize_cex_orderbook(update)?;
+        let mut total = 0;
+        for event in events {
+            total += self.publish(event)?;
+        }
+        Ok(total)
     }
 
     pub fn normalize_and_publish_cex_trade(&self, update: CexTradeUpdate) -> Result<usize> {
-        let event = self.normalizer.normalize_cex_trade(update)?;
-        self.publish(event)
+        let events = self.normalizer.normalize_cex_trade(update)?;
+        let mut total = 0;
+        for event in events {
+            total += self.publish(event)?;
+        }
+        Ok(total)
     }
 
     pub fn normalize_and_publish_cex_funding(&self, update: CexFundingUpdate) -> Result<usize> {
-        let event = self.normalizer.normalize_cex_funding(update)?;
-        self.publish(event)
+        let events = self.normalizer.normalize_cex_funding(update)?;
+        let mut total = 0;
+        for event in events {
+            total += self.publish(event)?;
+        }
+        Ok(total)
     }
 
     pub fn publish_market_lifecycle(
@@ -117,6 +129,7 @@ mod tests {
                 exchange_timestamp_ms: 10,
                 received_at_ms: 11,
                 sequence: 1,
+                last_trade_price: None,
             })
             .expect("publish should succeed");
 

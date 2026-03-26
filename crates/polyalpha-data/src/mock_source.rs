@@ -132,17 +132,17 @@ impl MockMarketDataSource {
                     .map(|_| 1)
             }
             MockTick::CexOrderBook(update) => {
-                let symbol = self
+                let symbols = self
                     .manager
                     .normalizer()
                     .registry()
-                    .lookup_cex_symbol(update.exchange, &update.venue_symbol)
-                    .cloned()
+                    .lookup_cex_symbols(update.exchange, &update.venue_symbol)
+                    .map(|s| s.to_vec())
                     .ok_or_else(|| DataError::UnknownCexSymbol {
                         exchange: update.exchange,
                         venue_symbol: update.venue_symbol.clone(),
                     })?;
-                if !self.is_subscribed(&symbol) {
+                if !symbols.iter().any(|s| self.is_subscribed(s)) {
                     return Ok(0);
                 }
                 self.manager
@@ -150,17 +150,17 @@ impl MockMarketDataSource {
                     .map(|_| 1)
             }
             MockTick::CexTrade(update) => {
-                let symbol = self
+                let symbols = self
                     .manager
                     .normalizer()
                     .registry()
-                    .lookup_cex_symbol(update.exchange, &update.venue_symbol)
-                    .cloned()
+                    .lookup_cex_symbols(update.exchange, &update.venue_symbol)
+                    .map(|s| s.to_vec())
                     .ok_or_else(|| DataError::UnknownCexSymbol {
                         exchange: update.exchange,
                         venue_symbol: update.venue_symbol.clone(),
                     })?;
-                if !self.is_subscribed(&symbol) {
+                if !symbols.iter().any(|s| self.is_subscribed(s)) {
                     return Ok(0);
                 }
                 self.manager
@@ -168,17 +168,17 @@ impl MockMarketDataSource {
                     .map(|_| 1)
             }
             MockTick::CexFunding(update) => {
-                let symbol = self
+                let symbols = self
                     .manager
                     .normalizer()
                     .registry()
-                    .lookup_cex_symbol(update.exchange, &update.venue_symbol)
-                    .cloned()
+                    .lookup_cex_symbols(update.exchange, &update.venue_symbol)
+                    .map(|s| s.to_vec())
                     .ok_or_else(|| DataError::UnknownCexSymbol {
                         exchange: update.exchange,
                         venue_symbol: update.venue_symbol.clone(),
                     })?;
-                if !self.is_subscribed(&symbol) {
+                if !symbols.iter().any(|s| self.is_subscribed(s)) {
                     return Ok(0);
                 }
                 self.manager
@@ -304,6 +304,7 @@ mod tests {
                     exchange_timestamp_ms: 10,
                     received_at_ms: 11,
                     sequence: 1,
+                    last_trade_price: None,
                 }),
                 MockTick::CexTrade(CexTradeUpdate {
                     exchange: Exchange::Binance,
@@ -374,6 +375,7 @@ mod tests {
                     exchange_timestamp_ms: 1,
                     received_at_ms: 2,
                     sequence: 1,
+                    last_trade_price: None,
                 }),
                 MockTick::Connection {
                     exchange: Exchange::Binance,

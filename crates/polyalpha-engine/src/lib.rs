@@ -6,10 +6,10 @@ use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 
 use polyalpha_core::{
-    AlphaEngine, AlphaEngineOutput, ArbSignalAction, ArbSignalEvent, DmmQuoteState, EngineParams,
-    InstrumentKind, MarketConfig, MarketDataEvent, MarketPhase, MarketRule, MarketRuleKind,
-    OrderBookSnapshot, OrderSide, PolyShares, Price, SignalStrength, Symbol, TokenSide,
-    UsdNotional,
+    AlphaEngine, AlphaEngineOutput, ArbSignalAction, ArbSignalEvent, ConnectionStatus,
+    DmmQuoteState, EngineParams, EngineWarning, Exchange, InstrumentKind, MarketConfig,
+    MarketDataEvent, MarketPhase, MarketRule, MarketRuleKind, OrderBookSnapshot, OrderSide,
+    PolyShares, Price, SignalStrength, Symbol, TokenSide, UsdNotional,
 };
 
 const ONE_MINUTE_MS: u64 = 60_000;
@@ -97,6 +97,7 @@ struct CexMinuteState {
     current_minute_ms: Option<u64>,
     current_minute_last_close: Option<f64>,
     previous_completed_close: Option<f64>,
+    previous_completed_minute_ms: Option<u64>,
     returns_window: VecDeque<f64>,
 }
 
@@ -106,26 +107,32 @@ impl CexMinuteState {
             current_minute_ms: None,
             current_minute_last_close: None,
             previous_completed_close: None,
+            previous_completed_minute_ms: None,
             returns_window: VecDeque::new(),
         }
     }
 
-    fn ingest_price(&mut self, ts_ms: u64, price: f64, max_returns: usize) {
+    fn ingest_price(&mut self, ts_ms: u64, price: f64, max_returns: usize) -> Result<(), String> {
         if !price.is_finite() || price <= 0.0 {
-            return;
+            return Err(format!("Invalid price: {}", price));
         }
 
         let minute_ms = minute_bucket(ts_ms);
         match self.current_minute_ms {
             None => {
+                // First data point only seeds the in-progress minute.
+                // The first completed close becomes available on the next minute rollover,
+                // which keeps reference closes and sigma causal.
                 self.current_minute_ms = Some(minute_ms);
                 self.current_minute_last_close = Some(price);
+                Ok(())
             }
-            Some(current_minute_ms) if minute_ms < current_minute_ms => {}
+            Some(current_minute_ms) if minute_ms < current_minute_ms => Ok(()),
             Some(current_minute_ms) if minute_ms == current_minute_ms => {
                 self.current_minute_last_close = Some(price);
+                Ok(())
             }
-            Some(_) => {
+            Some(current_minute_ms) => {
                 let finalized_close = self.current_minute_last_close.unwrap_or(price);
                 if let Some(previous_completed_close) = self.previous_completed_close {
                     if previous_completed_close > 0.0 && finalized_close > 0.0 {
@@ -137,14 +144,29 @@ impl CexMinuteState {
                     }
                 }
                 self.previous_completed_close = Some(finalized_close);
+                // If the feed resumes after skipping multiple whole minutes, carry the finalized
+                // close forward to the latest completed minute. This avoids reporting an
+                // artificially large minute skew immediately after reconnect while still keeping
+                // the reference close causal.
+                self.previous_completed_minute_ms = Some(
+                    if minute_ms > current_minute_ms.saturating_add(ONE_MINUTE_MS) {
+                        minute_ms.saturating_sub(ONE_MINUTE_MS)
+                    } else {
+                        current_minute_ms
+                    },
+                );
                 self.current_minute_ms = Some(minute_ms);
                 self.current_minute_last_close = Some(price);
+                Ok(())
             }
         }
     }
 
-    fn reference_close(&self) -> Option<f64> {
-        self.previous_completed_close
+    fn reference_close_with_time(&self) -> Option<(f64, u64)> {
+        Some((
+            self.previous_completed_close?,
+            self.previous_completed_minute_ms?,
+        ))
     }
 
     fn sigma(&self) -> Option<f64> {
@@ -177,11 +199,15 @@ struct SymbolState {
     active_token_side: Option<TokenSide>,
     has_live_dmm_quote: bool,
     last_update_ms: u64,
+    poly_connected: bool,
+    cex_connected: bool,
+    last_poly_update_ms: u64,
+    last_cex_update_ms: u64,
     last_basis_snapshot: Option<BasisStrategySnapshot>,
 }
 
 impl SymbolState {
-    fn new(history_capacity: usize) -> Self {
+    fn new(history_capacity: usize, poly_connected: bool, cex_connected: bool) -> Self {
         Self {
             yes: TokenMarketState::new(history_capacity),
             no: TokenMarketState::new(history_capacity),
@@ -191,12 +217,39 @@ impl SymbolState {
             active_token_side: None,
             has_live_dmm_quote: false,
             last_update_ms: 0,
+            poly_connected,
+            cex_connected,
+            last_poly_update_ms: 0,
+            last_cex_update_ms: 0,
             last_basis_snapshot: None,
         }
     }
 
     fn set_basis_snapshot(&mut self, snapshot: Option<BasisStrategySnapshot>) {
         self.last_basis_snapshot = snapshot;
+    }
+
+    fn mark_poly_update(&mut self, ts_ms: u64) {
+        self.poly_connected = true;
+        self.last_poly_update_ms = ts_ms;
+    }
+
+    fn mark_cex_update(&mut self, ts_ms: u64) {
+        self.cex_connected = true;
+        self.last_cex_update_ms = ts_ms;
+    }
+
+    fn has_pending_observations(&self) -> bool {
+        self.yes.pending_observation.is_some() || self.no.pending_observation.is_some()
+    }
+
+    fn discard_pending_observations(&mut self) {
+        if let Some(pending) = self.yes.pending_observation.take() {
+            self.yes.mark_processed(pending.minute_bucket_ms);
+        }
+        if let Some(pending) = self.no.pending_observation.take() {
+            self.no.mark_processed(pending.minute_bucket_ms);
+        }
     }
 }
 
@@ -210,6 +263,11 @@ pub struct SimpleEngineConfig {
     pub cex_hedge_ratio: f64,
     pub dmm_half_spread: Decimal,
     pub dmm_quote_size: PolyShares,
+    pub enable_freshness_check: bool,
+    pub reject_on_disconnect: bool,
+    pub max_poly_data_age_ms: u64,
+    pub max_cex_data_age_ms: u64,
+    pub max_time_diff_ms: u64,
 }
 
 impl Default for SimpleEngineConfig {
@@ -223,15 +281,34 @@ impl Default for SimpleEngineConfig {
             cex_hedge_ratio: 1.0,
             dmm_half_spread: Decimal::new(1, 2),
             dmm_quote_size: PolyShares::ZERO,
+            enable_freshness_check: true,
+            reject_on_disconnect: true,
+            max_poly_data_age_ms: ONE_MINUTE_MS,
+            max_cex_data_age_ms: ONE_MINUTE_MS,
+            max_time_diff_ms: ONE_MINUTE_MS,
         }
     }
+}
+
+/// Per-market parameter overrides for strategy configuration.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MarketOverrideConfig {
+    pub entry_z: Option<f64>,
+    pub exit_z: Option<f64>,
+    pub rolling_window_minutes: Option<usize>,
+    pub min_warmup_samples: Option<usize>,
+    pub min_basis_bps: Option<f64>,
+    pub position_notional_usd: Option<UsdNotional>,
 }
 
 #[derive(Clone, Debug)]
 pub struct SimpleAlphaEngine {
     config: SimpleEngineConfig,
     markets: HashMap<Symbol, MarketConfig>,
+    market_overrides: HashMap<Symbol, MarketOverrideConfig>,
     states: HashMap<Symbol, SymbolState>,
+    poly_connected: bool,
+    cex_connections: HashMap<Exchange, bool>,
     max_position_usd: Option<UsdNotional>,
     next_signal_seq: u64,
 }
@@ -254,7 +331,10 @@ impl SimpleAlphaEngine {
                 .into_iter()
                 .map(|market| (market.symbol.clone(), market))
                 .collect(),
+            market_overrides: HashMap::new(),
             states: HashMap::new(),
+            poly_connected: true,
+            cex_connections: HashMap::new(),
             max_position_usd: None,
             next_signal_seq: 0,
         }
@@ -262,6 +342,51 @@ impl SimpleAlphaEngine {
 
     pub fn config(&self) -> &SimpleEngineConfig {
         &self.config
+    }
+
+    /// Set per-market parameter overrides
+    pub fn set_market_overrides(&mut self, overrides: HashMap<Symbol, MarketOverrideConfig>) {
+        self.market_overrides = overrides;
+    }
+
+    /// Get entry Z-score threshold for a specific market (with override support)
+    fn get_entry_z(&self, symbol: &Symbol) -> f64 {
+        self.market_overrides
+            .get(symbol)
+            .and_then(|o| o.entry_z)
+            .unwrap_or(self.config.entry_z)
+    }
+
+    /// Get exit Z-score threshold for a specific market (with override support)
+    fn get_exit_z(&self, symbol: &Symbol) -> f64 {
+        self.market_overrides
+            .get(symbol)
+            .and_then(|o| o.exit_z)
+            .unwrap_or(self.config.exit_z)
+    }
+
+    /// Get rolling window minutes for a specific market (with override support)
+    pub fn get_rolling_window_minutes(&self, symbol: &Symbol) -> usize {
+        self.market_overrides
+            .get(symbol)
+            .and_then(|o| o.rolling_window_minutes)
+            .unwrap_or(self.config.rolling_window_minutes)
+    }
+
+    /// Get minimum warmup samples for a specific market (with override support)
+    pub fn get_min_warmup_samples(&self, symbol: &Symbol) -> usize {
+        self.market_overrides
+            .get(symbol)
+            .and_then(|o| o.min_warmup_samples)
+            .unwrap_or(self.config.min_signal_samples)
+    }
+
+    /// Get position notional USD for a specific market (with override support)
+    pub fn get_position_notional_usd(&self, symbol: &Symbol) -> UsdNotional {
+        self.market_overrides
+            .get(symbol)
+            .and_then(|o| o.position_notional_usd)
+            .unwrap_or(self.config.position_notional_usd)
     }
 
     pub fn replace_markets(&mut self, markets: Vec<MarketConfig>) {
@@ -277,10 +402,232 @@ impl SimpleAlphaEngine {
             .and_then(|state| state.last_basis_snapshot.clone())
     }
 
+    /// Manually flush pending observations for a specific symbol.
+    /// This is useful when you want to process pending data even without a CEX event.
+    pub fn flush_symbol(&mut self, symbol: &Symbol) -> AlphaEngineOutput {
+        self.generate_output(symbol, true, false)
+    }
+
+    pub fn set_poly_connected(&mut self, _symbol: &Symbol, connected: bool) {
+        self.poly_connected = connected;
+        for state in self.states.values_mut() {
+            state.poly_connected = connected;
+        }
+    }
+
+    pub fn set_cex_connected(&mut self, symbol: &Symbol, connected: bool) {
+        let exchange = self.markets.get(symbol).map(|market| market.hedge_exchange);
+        if let Some(exchange) = exchange {
+            self.cex_connections.insert(exchange, connected);
+            for (candidate_symbol, state) in self.states.iter_mut() {
+                let matches_exchange = self
+                    .markets
+                    .get(candidate_symbol)
+                    .map(|market| market.hedge_exchange == exchange)
+                    .unwrap_or(false);
+                if matches_exchange {
+                    state.cex_connected = connected;
+                }
+            }
+        } else if let Some(state) = self.states.get_mut(symbol) {
+            state.cex_connected = connected;
+        }
+    }
+
     pub fn sync_position_state(&mut self, symbol: &Symbol, token_side: Option<TokenSide>) {
-        let default_state = self.state_for_symbol();
+        let default_state = self.state_for_symbol(symbol);
         let state = self.states.entry(symbol.clone()).or_insert(default_state);
         state.active_token_side = token_side;
+    }
+
+    /// Warmup engine with historical CEX kline data
+    /// This pre-populates the returns_window to reduce warmup time
+    pub fn warmup_cex_prices(&mut self, symbol: &Symbol, klines: &[(u64, f64)]) {
+        let capacity = self.history_capacity();
+        let default_state = self.state_for_symbol(symbol);
+        let state = self.states.entry(symbol.clone()).or_insert(default_state);
+
+        // Ingest klines in chronological order
+        for (ts_ms, close) in klines {
+            let _ = state.cex_minutes.ingest_price(*ts_ms, *close, capacity);
+        }
+
+        // After ingesting, the last close is in current_minute_last_close.
+        // We need to finalize it to previous_completed_close for reference_close() to work.
+        if let Some(last_close) = state.cex_minutes.current_minute_last_close {
+            state.cex_minutes.previous_completed_close = Some(last_close);
+            state.cex_minutes.previous_completed_minute_ms = state.cex_minutes.current_minute_ms;
+        }
+
+        // Set last known price as current mid
+        if let Some((ts_ms, last_close)) = klines.last() {
+            state.cex_mid = Some(Decimal::from_f64(*last_close).unwrap_or(Decimal::ZERO));
+            state.mark_cex_update(*ts_ms);
+        }
+    }
+
+    /// Warmup engine with historical Polymarket prices and corresponding CEX prices
+    /// This pre-populates the basis history to reduce warmup time
+    /// cex_prices: map from timestamp_ms -> close price (from klines)
+    /// poly_prices: list of (timestamp_ms, price) from price history
+    pub fn warmup_poly_prices(
+        &mut self,
+        symbol: &Symbol,
+        token_side: TokenSide,
+        market: &MarketConfig,
+        cex_prices: &std::collections::HashMap<u64, f64>,
+        poly_prices: &[(u64, f64)],
+    ) {
+        let capacity = self.history_capacity();
+        let default_state = self.state_for_symbol(symbol);
+        let state = self.states.entry(symbol.clone()).or_insert(default_state);
+
+        // Get the market rule
+        let Some(rule) = market.resolved_market_rule() else {
+            return;
+        };
+
+        // Calculate sigma from CEX returns if available
+        let sigma = if state.cex_minutes.returns_window.len() >= 30 {
+            let returns: Vec<f64> = state.cex_minutes.returns_window.iter().copied().collect();
+            calculate_sigma(&returns)
+        } else {
+            // Default annualized volatility ~50%
+            Some(0.5 / (252.0_f64).sqrt() / (1440.0_f64).sqrt())
+        };
+
+        let settlement_ts_ms = market.settlement_timestamp.saturating_mul(1000);
+        // Get sorted CEX timestamps for finding closest match
+        let mut cex_ts_list: Vec<u64> = cex_prices.keys().copied().collect();
+        cex_ts_list.sort();
+
+        // Process poly prices in chronological order
+        for (ts_ms, poly_price) in poly_prices {
+            // Find the closest CEX price within 5 minutes
+            let cex_price = Self::find_closest_cex_price(*ts_ms, &cex_ts_list, cex_prices);
+
+            if let Some(cex_price) = cex_price {
+                let minutes_to_expiry =
+                    (settlement_ts_ms.saturating_sub(*ts_ms) as f64) / ONE_MINUTE_MS as f64;
+
+                let fair_value =
+                    token_fair_value(&rule, token_side, cex_price, sigma, minutes_to_expiry);
+                let signal_basis = poly_price - fair_value;
+
+                // Add to appropriate token history
+                match token_side {
+                    TokenSide::Yes => {
+                        state.yes.history.push_back(signal_basis);
+                        while state.yes.history.len() > capacity {
+                            state.yes.history.pop_front();
+                        }
+                        state.yes.current_mid =
+                            Some(Decimal::from_f64(*poly_price).unwrap_or(Decimal::ZERO));
+                    }
+                    TokenSide::No => {
+                        state.no.history.push_back(signal_basis);
+                        while state.no.history.len() > capacity {
+                            state.no.history.pop_front();
+                        }
+                        state.no.current_mid =
+                            Some(Decimal::from_f64(*poly_price).unwrap_or(Decimal::ZERO));
+                    }
+                }
+            }
+        }
+
+        // Update last_processed_minute_ms to prevent reprocessing
+        if let Some((last_ts, _)) = poly_prices.last() {
+            let last_minute = (*last_ts / ONE_MINUTE_MS) * ONE_MINUTE_MS;
+            match token_side {
+                TokenSide::Yes => state.yes.last_processed_minute_ms = Some(last_minute),
+                TokenSide::No => state.no.last_processed_minute_ms = Some(last_minute),
+            }
+
+            // Generate a basis snapshot for the last data point if we have history
+            let history = match token_side {
+                TokenSide::Yes => &state.yes.history,
+                TokenSide::No => &state.no.history,
+            };
+
+            if history.len() >= self.config.min_signal_samples {
+                // Get the last matched poly price and its CEX reference
+                // We need to iterate backwards to find the last matched point
+                for (ts_ms, poly_price) in poly_prices.iter().rev() {
+                    if let Some(cex_price) =
+                        Self::find_closest_cex_price(*ts_ms, &cex_ts_list, cex_prices)
+                    {
+                        let minutes_to_expiry =
+                            (settlement_ts_ms.saturating_sub(*ts_ms) as f64) / ONE_MINUTE_MS as f64;
+                        let fair_value = token_fair_value(
+                            &rule,
+                            token_side,
+                            cex_price,
+                            sigma,
+                            minutes_to_expiry,
+                        );
+                        let signal_basis = poly_price - fair_value;
+                        let z_score =
+                            rolling_zscore(history, signal_basis, self.config.min_signal_samples);
+                        let delta =
+                            token_delta(&rule, token_side, cex_price, sigma, minutes_to_expiry);
+
+                        let snapshot = BasisStrategySnapshot {
+                            token_side,
+                            poly_price: *poly_price,
+                            fair_value,
+                            signal_basis,
+                            z_score,
+                            delta,
+                            cex_reference_price: cex_price,
+                            sigma,
+                            minutes_to_expiry,
+                        };
+
+                        match token_side {
+                            TokenSide::Yes => state.yes.last_snapshot = Some(snapshot.clone()),
+                            TokenSide::No => state.no.last_snapshot = Some(snapshot.clone()),
+                        }
+
+                        // Set the overall basis snapshot (prefer Yes, or whichever has data)
+                        state.set_basis_snapshot(Some(snapshot));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Find the closest CEX price within 5 minutes of the target timestamp
+    fn find_closest_cex_price(
+        target_ts_ms: u64,
+        sorted_ts: &[u64],
+        cex_prices: &std::collections::HashMap<u64, f64>,
+    ) -> Option<f64> {
+        const MAX_DIFF_MS: u64 = 5 * ONE_MINUTE_MS; // 5 minutes
+
+        // Binary search for closest timestamp
+        let pos = sorted_ts.binary_search(&target_ts_ms).unwrap_or_else(|x| x);
+
+        // Check nearby timestamps
+        let mut best_match: Option<(u64, f64)> = None;
+        let mut best_diff = u64::MAX;
+
+        for &ts in sorted_ts.iter().take(pos + 1).skip(pos.saturating_sub(5)) {
+            let diff = if ts > target_ts_ms {
+                ts - target_ts_ms
+            } else {
+                target_ts_ms - ts
+            };
+            if diff < best_diff && diff <= MAX_DIFF_MS {
+                if let Some(&price) = cex_prices.get(&ts) {
+                    best_diff = diff;
+                    best_match = Some((ts, price));
+                }
+            }
+        }
+
+        best_match.map(|(_, price)| price)
     }
 
     fn history_capacity(&self) -> usize {
@@ -290,8 +637,41 @@ impl SimpleAlphaEngine {
             .max(2)
     }
 
-    fn state_for_symbol(&self) -> SymbolState {
-        SymbolState::new(self.history_capacity())
+    fn state_for_symbol(&self, symbol: &Symbol) -> SymbolState {
+        SymbolState::new(
+            self.history_capacity(),
+            self.poly_connected,
+            self.cex_connected_for_symbol(symbol),
+        )
+    }
+
+    fn cex_connected_for_symbol(&self, symbol: &Symbol) -> bool {
+        self.markets
+            .get(symbol)
+            .and_then(|market| self.cex_connections.get(&market.hedge_exchange).copied())
+            .unwrap_or(true)
+    }
+
+    fn apply_exchange_connection_status(&mut self, exchange: Exchange, connected: bool) {
+        if exchange == Exchange::Polymarket {
+            self.poly_connected = connected;
+            for state in self.states.values_mut() {
+                state.poly_connected = connected;
+            }
+            return;
+        }
+
+        self.cex_connections.insert(exchange, connected);
+        for (symbol, state) in self.states.iter_mut() {
+            let matches_exchange = self
+                .markets
+                .get(symbol)
+                .map(|market| market.hedge_exchange == exchange)
+                .unwrap_or(false);
+            if matches_exchange {
+                state.cex_connected = connected;
+            }
+        }
     }
 
     fn apply_market_event(&mut self, event: &MarketDataEvent) -> Option<Symbol> {
@@ -301,18 +681,26 @@ impl SimpleAlphaEngine {
                 let mut state = self
                     .states
                     .remove(&symbol)
-                    .unwrap_or_else(|| self.state_for_symbol());
+                    .unwrap_or_else(|| self.state_for_symbol(&symbol));
                 state.last_update_ms = snapshot.received_at_ms;
                 if let Some(mid) = mid_from_orderbook(snapshot) {
                     match snapshot.instrument {
                         InstrumentKind::PolyYes => {
-                            state.yes.update_mid(snapshot.received_at_ms, mid)
+                            state.mark_poly_update(snapshot.received_at_ms);
+                            self.poly_connected = true;
+                            state.yes.update_mid(snapshot.received_at_ms, mid);
                         }
-                        InstrumentKind::PolyNo => state.no.update_mid(snapshot.received_at_ms, mid),
+                        InstrumentKind::PolyNo => {
+                            state.mark_poly_update(snapshot.received_at_ms);
+                            self.poly_connected = true;
+                            state.no.update_mid(snapshot.received_at_ms, mid);
+                        }
                         InstrumentKind::CexPerp => {
+                            state.mark_cex_update(snapshot.received_at_ms);
+                            self.cex_connections.insert(snapshot.exchange, true);
                             state.cex_mid = Some(mid.max(Decimal::ZERO));
                             if let Some(price) = state.cex_mid.and_then(|value| value.to_f64()) {
-                                state.cex_minutes.ingest_price(
+                                let _ = state.cex_minutes.ingest_price(
                                     snapshot.received_at_ms,
                                     price,
                                     self.history_capacity(),
@@ -325,6 +713,7 @@ impl SimpleAlphaEngine {
                 Some(symbol)
             }
             MarketDataEvent::TradeUpdate {
+                exchange,
                 symbol,
                 instrument,
                 price,
@@ -335,15 +724,25 @@ impl SimpleAlphaEngine {
                 let mut state = self
                     .states
                     .remove(&symbol)
-                    .unwrap_or_else(|| self.state_for_symbol());
+                    .unwrap_or_else(|| self.state_for_symbol(&symbol));
                 state.last_update_ms = *timestamp_ms;
                 match instrument {
-                    InstrumentKind::PolyYes => state.yes.update_mid(*timestamp_ms, price.0),
-                    InstrumentKind::PolyNo => state.no.update_mid(*timestamp_ms, price.0),
+                    InstrumentKind::PolyYes => {
+                        state.mark_poly_update(*timestamp_ms);
+                        self.poly_connected = true;
+                        state.yes.update_mid(*timestamp_ms, price.0);
+                    }
+                    InstrumentKind::PolyNo => {
+                        state.mark_poly_update(*timestamp_ms);
+                        self.poly_connected = true;
+                        state.no.update_mid(*timestamp_ms, price.0);
+                    }
                     InstrumentKind::CexPerp => {
+                        state.mark_cex_update(*timestamp_ms);
+                        self.cex_connections.insert(*exchange, true);
                         state.cex_mid = Some(price.0.max(Decimal::ZERO));
                         if let Some(value) = state.cex_mid.and_then(|item| item.to_f64()) {
-                            state.cex_minutes.ingest_price(
+                            let _ = state.cex_minutes.ingest_price(
                                 *timestamp_ms,
                                 value,
                                 self.history_capacity(),
@@ -355,6 +754,7 @@ impl SimpleAlphaEngine {
                 Some(symbol)
             }
             MarketDataEvent::FundingRate {
+                exchange,
                 symbol,
                 next_funding_time_ms,
                 ..
@@ -363,8 +763,10 @@ impl SimpleAlphaEngine {
                 let mut state = self
                     .states
                     .remove(&symbol)
-                    .unwrap_or_else(|| self.state_for_symbol());
+                    .unwrap_or_else(|| self.state_for_symbol(&symbol));
                 state.last_update_ms = *next_funding_time_ms;
+                state.cex_connected = true;
+                self.cex_connections.insert(*exchange, true);
                 self.states.insert(symbol.clone(), state);
                 Some(symbol)
             }
@@ -377,13 +779,19 @@ impl SimpleAlphaEngine {
                 let mut state = self
                     .states
                     .remove(&symbol)
-                    .unwrap_or_else(|| self.state_for_symbol());
+                    .unwrap_or_else(|| self.state_for_symbol(&symbol));
                 state.last_update_ms = *timestamp_ms;
                 state.market_phase = phase.clone();
                 self.states.insert(symbol.clone(), state);
                 Some(symbol)
             }
-            MarketDataEvent::ConnectionEvent { .. } => None,
+            MarketDataEvent::ConnectionEvent { exchange, status } => {
+                self.apply_exchange_connection_status(
+                    *exchange,
+                    matches!(status, ConnectionStatus::Connected),
+                );
+                None
+            }
         }
     }
 
@@ -396,7 +804,7 @@ impl SimpleAlphaEngine {
         let mut state = self
             .states
             .remove(symbol)
-            .unwrap_or_else(|| self.state_for_symbol());
+            .unwrap_or_else(|| self.state_for_symbol(symbol));
         let mut output = AlphaEngineOutput::default();
 
         self.update_dmm_state(symbol, &mut state, &mut output);
@@ -478,54 +886,142 @@ impl SimpleAlphaEngine {
             state.set_basis_snapshot(None);
             return;
         };
-        let Some(cex_reference_price) = state.cex_minutes.reference_close() else {
-            if let Some(pending) = state.yes.pending_observation.take() {
-                state.yes.mark_processed(pending.minute_bucket_ms);
+        if !state.has_pending_observations() {
+            if state.last_basis_snapshot.is_none() {
+                output.push_warning(EngineWarning::NoPolyData {
+                    symbol: symbol.clone(),
+                });
             }
-            if let Some(pending) = state.no.pending_observation.take() {
-                state.no.mark_processed(pending.minute_bucket_ms);
-            }
+            return;
+        }
+
+        if self.config.enable_freshness_check
+            && self.config.reject_on_disconnect
+            && (!state.poly_connected || !state.cex_connected)
+        {
+            output.push_warning(EngineWarning::ConnectionLost {
+                symbol: symbol.clone(),
+                poly_connected: state.poly_connected,
+                cex_connected: state.cex_connected,
+            });
+            state.discard_pending_observations();
+            state.set_basis_snapshot(None);
+            return;
+        }
+
+        let Some((cex_reference_price, cex_reference_minute_ms)) =
+            state.cex_minutes.reference_close_with_time()
+        else {
+            output.push_warning(EngineWarning::NoCexData {
+                symbol: symbol.clone(),
+            });
+            state.discard_pending_observations();
             state.set_basis_snapshot(None);
             return;
         };
 
+        if self.config.enable_freshness_check {
+            let cex_age_ms = state
+                .last_update_ms
+                .saturating_sub(state.last_cex_update_ms);
+            if cex_age_ms > self.config.max_cex_data_age_ms {
+                output.push_warning(EngineWarning::CexPriceStale {
+                    symbol: symbol.clone(),
+                    cex_age_ms,
+                    max_age_ms: self.config.max_cex_data_age_ms,
+                });
+                state.discard_pending_observations();
+                state.set_basis_snapshot(None);
+                return;
+            }
+
+            let poly_age_ms = state
+                .last_update_ms
+                .saturating_sub(state.last_poly_update_ms);
+            if poly_age_ms > self.config.max_poly_data_age_ms {
+                output.push_warning(EngineWarning::PolyPriceStale {
+                    symbol: symbol.clone(),
+                    poly_age_ms,
+                    max_age_ms: self.config.max_poly_data_age_ms,
+                });
+                state.discard_pending_observations();
+                state.set_basis_snapshot(None);
+                return;
+            }
+        };
+
         let sigma = state.cex_minutes.sigma();
         let yes_evaluation = self.evaluate_token_pending(
+            symbol,
             &rule,
             &market,
             TokenSide::Yes,
             &state.yes,
             cex_reference_price,
+            cex_reference_minute_ms,
             sigma,
         );
         let no_evaluation = self.evaluate_token_pending(
+            symbol,
             &rule,
             &market,
             TokenSide::No,
             &state.no,
             cex_reference_price,
+            cex_reference_minute_ms,
             sigma,
         );
 
-        let preferred_snapshot = match state.active_token_side {
-            Some(token_side) => match token_side {
-                TokenSide::Yes => yes_evaluation
-                    .as_ref()
-                    .and_then(|evaluation| evaluation.snapshot.clone())
-                    .or_else(|| state.yes.last_snapshot.clone()),
-                TokenSide::No => no_evaluation
-                    .as_ref()
-                    .and_then(|evaluation| evaluation.snapshot.clone())
-                    .or_else(|| state.no.last_snapshot.clone()),
-            },
-            None => choose_preferred_snapshot([
-                yes_evaluation
-                    .as_ref()
-                    .and_then(|item| item.snapshot.clone()),
-                no_evaluation
-                    .as_ref()
-                    .and_then(|item| item.snapshot.clone()),
-            ]),
+        let mut data_quality_issue = false;
+        if let Some(warning) = yes_evaluation
+            .as_ref()
+            .and_then(|evaluation| evaluation.warning.clone())
+        {
+            output.push_warning(warning);
+            data_quality_issue = true;
+        }
+        if let Some(warning) = no_evaluation
+            .as_ref()
+            .and_then(|evaluation| evaluation.warning.clone())
+        {
+            output.push_warning(warning);
+            data_quality_issue = true;
+        }
+
+        let has_current_snapshot = yes_evaluation
+            .as_ref()
+            .and_then(|item| item.snapshot.as_ref())
+            .is_some()
+            || no_evaluation
+                .as_ref()
+                .and_then(|item| item.snapshot.as_ref())
+                .is_some();
+
+        let preferred_snapshot = if data_quality_issue && !has_current_snapshot {
+            None
+        } else {
+            match state.active_token_side {
+                Some(token_side) => match token_side {
+                    TokenSide::Yes => yes_evaluation
+                        .as_ref()
+                        .and_then(|evaluation| evaluation.snapshot.clone())
+                        .or_else(|| state.yes.last_snapshot.clone()),
+                    TokenSide::No => no_evaluation
+                        .as_ref()
+                        .and_then(|evaluation| evaluation.snapshot.clone())
+                        .or_else(|| state.no.last_snapshot.clone()),
+                },
+                None => choose_preferred_snapshot([
+                    yes_evaluation
+                        .as_ref()
+                        .and_then(|item| item.snapshot.clone())
+                        .or_else(|| state.yes.last_snapshot.clone()),
+                    no_evaluation
+                        .as_ref()
+                        .and_then(|item| item.snapshot.clone())
+                        .or_else(|| state.no.last_snapshot.clone()),
+                ]),
+            }
         };
         state.set_basis_snapshot(preferred_snapshot.clone());
 
@@ -549,7 +1045,9 @@ impl SimpleAlphaEngine {
 
             if let Some(snapshot) = maybe_snapshot {
                 if let Some(z_score) = snapshot.z_score {
-                    if z_score.abs() <= self.config.exit_z || z_score >= self.config.entry_z {
+                    let entry_z = self.get_entry_z(symbol);
+                    let exit_z = self.get_exit_z(symbol);
+                    if z_score.abs() <= exit_z || z_score >= entry_z {
                         state.active_token_side = None;
                         output.push_arb_signal(self.close_signal_at(
                             symbol,
@@ -568,7 +1066,7 @@ impl SimpleAlphaEngine {
                     .as_ref()
                     .and_then(|item| item.snapshot.clone()),
             ],
-            self.config.entry_z,
+            self.get_entry_z(symbol),
         ) {
             if let Some(signal) = self.build_basis_signal(symbol, &snapshot) {
                 state.active_token_side = Some(snapshot.token_side);
@@ -586,14 +1084,35 @@ impl SimpleAlphaEngine {
 
     fn evaluate_token_pending(
         &self,
+        symbol: &Symbol,
         rule: &MarketRule,
         market: &MarketConfig,
         token_side: TokenSide,
         token_state: &TokenMarketState,
         cex_reference_price: f64,
+        cex_reference_minute_ms: u64,
         sigma: Option<f64>,
     ) -> Option<EvaluatedToken> {
         let pending = token_state.pending_observation.clone()?;
+        if self.config.enable_freshness_check {
+            let time_diff_ms = if pending.minute_bucket_ms >= cex_reference_minute_ms {
+                pending.minute_bucket_ms - cex_reference_minute_ms
+            } else {
+                cex_reference_minute_ms - pending.minute_bucket_ms
+            };
+            if time_diff_ms > self.config.max_time_diff_ms {
+                return Some(EvaluatedToken {
+                    minute_bucket_ms: pending.minute_bucket_ms,
+                    snapshot: None,
+                    warning: Some(EngineWarning::DataMisaligned {
+                        symbol: symbol.clone(),
+                        poly_time_ms: pending.minute_bucket_ms,
+                        cex_time_ms: cex_reference_minute_ms,
+                        diff_ms: time_diff_ms,
+                    }),
+                });
+            }
+        }
         let settlement_ts_ms = market.settlement_timestamp.saturating_mul(1000);
         let minutes_to_expiry =
             (settlement_ts_ms.saturating_sub(pending.ts_ms) as f64) / ONE_MINUTE_MS as f64;
@@ -601,6 +1120,7 @@ impl SimpleAlphaEngine {
             return Some(EvaluatedToken {
                 minute_bucket_ms: pending.minute_bucket_ms,
                 snapshot: None,
+                warning: None,
             });
         }
 
@@ -638,6 +1158,7 @@ impl SimpleAlphaEngine {
                 sigma,
                 minutes_to_expiry,
             }),
+            warning: None,
         })
     }
 
@@ -672,9 +1193,15 @@ impl SimpleAlphaEngine {
         } else {
             OrderSide::Sell
         };
-        let cex_hedge_qty = polyalpha_core::CexBaseQty(
+        let mut cex_hedge_qty = polyalpha_core::CexBaseQty(
             Decimal::from_f64(hedge_qty_signed.abs()).unwrap_or_default(),
         );
+        if let Some(market) = self.markets.get(symbol) {
+            cex_hedge_qty = cex_hedge_qty.floor_to_step(market.cex_qty_step);
+        }
+        if cex_hedge_qty.0 <= Decimal::ZERO {
+            return None;
+        }
         let poly_target_notional = UsdNotional::from_poly(target_shares, Price(poly_price));
         let expected_pnl = UsdNotional(
             poly_target_notional.0
@@ -683,6 +1210,7 @@ impl SimpleAlphaEngine {
 
         Some(ArbSignalEvent {
             signal_id: self.next_signal_id(symbol, snapshot.token_side),
+            correlation_id: self.generate_correlation_id(),
             symbol: symbol.clone(),
             action: ArbSignalAction::BasisLong {
                 token_side: snapshot.token_side,
@@ -693,7 +1221,7 @@ impl SimpleAlphaEngine {
                 cex_hedge_qty,
                 delta: snapshot.delta,
             },
-            strength: self.signal_strength(snapshot.z_score),
+            strength: self.signal_strength(symbol, snapshot.z_score),
             basis_value: Some(Decimal::from_f64(snapshot.signal_basis).unwrap_or(Decimal::ZERO)),
             z_score: snapshot
                 .z_score
@@ -716,6 +1244,7 @@ impl SimpleAlphaEngine {
     ) -> ArbSignalEvent {
         ArbSignalEvent {
             signal_id: self.next_signal_id(symbol, TokenSide::Yes),
+            correlation_id: self.generate_correlation_id(),
             symbol: symbol.clone(),
             action: ArbSignalAction::ClosePosition {
                 reason: reason.to_owned(),
@@ -728,11 +1257,12 @@ impl SimpleAlphaEngine {
         }
     }
 
-    fn signal_strength(&self, z_score: Option<f64>) -> SignalStrength {
+    fn signal_strength(&self, symbol: &Symbol, z_score: Option<f64>) -> SignalStrength {
         let abs_z = z_score.unwrap_or_default().abs();
-        if abs_z >= self.config.entry_z + 1.0 {
+        let entry_z = self.get_entry_z(symbol);
+        if abs_z >= entry_z + 1.0 {
             SignalStrength::Strong
-        } else if abs_z >= self.config.entry_z {
+        } else if abs_z >= entry_z {
             SignalStrength::Normal
         } else {
             SignalStrength::Weak
@@ -742,6 +1272,11 @@ impl SimpleAlphaEngine {
     fn next_signal_id(&mut self, symbol: &Symbol, token_side: TokenSide) -> String {
         self.next_signal_seq += 1;
         format!("sig-{}-{:?}-{}", symbol.0, token_side, self.next_signal_seq)
+    }
+
+    fn generate_correlation_id(&mut self) -> String {
+        use uuid::Uuid;
+        format!("corr-{}", Uuid::new_v4())
     }
 }
 
@@ -778,6 +1313,10 @@ impl AlphaEngine for SimpleAlphaEngine {
             self.config.exit_z = exit.abs().min(self.config.entry_z.max(0.0));
         }
 
+        if let Some(window_secs) = params.rolling_window_secs {
+            self.config.rolling_window_minutes = ((window_secs / 60) as usize).max(2);
+        }
+
         self.max_position_usd = params.max_position_usd;
     }
 }
@@ -786,6 +1325,7 @@ impl AlphaEngine for SimpleAlphaEngine {
 struct EvaluatedToken {
     minute_bucket_ms: u64,
     snapshot: Option<BasisStrategySnapshot>,
+    warning: Option<EngineWarning>,
 }
 
 fn apply_token_evaluation(token_state: &mut TokenMarketState, evaluation: EvaluatedToken) {
@@ -859,8 +1399,17 @@ fn minute_bucket(ts_ms: u64) -> u64 {
 }
 
 fn mid_from_orderbook(snapshot: &OrderBookSnapshot) -> Option<Decimal> {
-    let best_bid = snapshot.bids.first().map(|level| level.price.0);
-    let best_ask = snapshot.asks.first().map(|level| level.price.0);
+    let best_bid = snapshot
+        .bids
+        .iter()
+        .max_by(|left, right| left.price.cmp(&right.price))
+        .map(|level| level.price.0);
+    let best_ask = snapshot
+        .asks
+        .iter()
+        .min_by(|left, right| left.price.cmp(&right.price))
+        .map(|level| level.price.0);
+
     match (best_bid, best_ask) {
         (Some(bid), Some(ask)) => Some((bid + ask) / Decimal::new(2, 0)),
         (Some(bid), None) => Some(bid),
@@ -994,6 +1543,24 @@ fn rolling_zscore(values: &VecDeque<f64>, latest: f64, min_signal_samples: usize
     Some((latest - mean) / std)
 }
 
+/// Calculate standard deviation from a list of returns
+fn calculate_sigma(returns: &[f64]) -> Option<f64> {
+    if returns.len() < 2 {
+        return None;
+    }
+    let n = returns.len() as f64;
+    let mean = returns.iter().sum::<f64>() / n;
+    let variance = returns
+        .iter()
+        .map(|value| {
+            let centered = value - mean;
+            centered * centered
+        })
+        .sum::<f64>()
+        / (n - 1.0);
+    Some(variance.max(0.0).sqrt())
+}
+
 pub fn crate_status() -> &'static str {
     "polyalpha-engine price-only basis parity ready"
 }
@@ -1001,8 +1568,8 @@ pub fn crate_status() -> &'static str {
 #[cfg(test)]
 mod tests {
     use polyalpha_core::{
-        AlphaEngine, CexBaseQty, Exchange, MarketDataEvent, PolymarketIds, PriceLevel,
-        VenueQuantity,
+        AlphaEngine, CexBaseQty, ConnectionStatus, Exchange, MarketDataEvent, PolymarketIds,
+        PriceLevel, VenueQuantity,
     };
 
     use super::*;
@@ -1057,6 +1624,7 @@ mod tests {
                 exchange_timestamp_ms: ts,
                 received_at_ms: ts,
                 sequence: ts,
+                last_trade_price: None,
             },
         }
     }
@@ -1078,6 +1646,7 @@ mod tests {
                 exchange_timestamp_ms: ts,
                 received_at_ms: ts,
                 sequence: ts,
+                last_trade_price: None,
             },
         }
     }
@@ -1090,7 +1659,29 @@ mod tests {
         }
     }
 
+    fn connection_event(exchange: Exchange, status: ConnectionStatus) -> MarketDataEvent {
+        MarketDataEvent::ConnectionEvent { exchange, status }
+    }
+
+    fn test_engine_with_config(config: SimpleEngineConfig) -> SimpleAlphaEngine {
+        SimpleAlphaEngine::with_markets(config, vec![sample_market()])
+    }
+
     fn test_engine() -> SimpleAlphaEngine {
+        test_engine_with_config(SimpleEngineConfig {
+            min_signal_samples: 2,
+            rolling_window_minutes: 4,
+            entry_z: 2.0,
+            exit_z: 0.5,
+            position_notional_usd: UsdNotional(Decimal::new(1_000, 0)),
+            cex_hedge_ratio: 1.0,
+            dmm_half_spread: Decimal::new(1, 2),
+            dmm_quote_size: PolyShares::ZERO,
+            ..SimpleEngineConfig::default()
+        })
+    }
+
+    fn relaxed_freshness_engine(max_data_age_ms: u64) -> SimpleAlphaEngine {
         SimpleAlphaEngine::with_markets(
             SimpleEngineConfig {
                 min_signal_samples: 2,
@@ -1101,9 +1692,57 @@ mod tests {
                 cex_hedge_ratio: 1.0,
                 dmm_half_spread: Decimal::new(1, 2),
                 dmm_quote_size: PolyShares::ZERO,
+                max_poly_data_age_ms: max_data_age_ms,
+                max_cex_data_age_ms: max_data_age_ms,
+                ..SimpleEngineConfig::default()
             },
             vec![sample_market()],
         )
+    }
+
+    async fn seed_basis_long_yes_signal(engine: &mut SimpleAlphaEngine) -> ArbSignalEvent {
+        let _ = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(100_000, 0),
+                Decimal::new(100_000, 0),
+                0,
+            ))
+            .await;
+
+        for (offset, yes_bid, yes_ask, no_bid, no_ask, cex_price) in [
+            (60_100, 51, 53, 47, 49, 100_100),
+            (120_100, 50, 52, 48, 50, 100_200),
+            (180_100, 35, 37, 63, 65, 100_300),
+        ] {
+            let _ = engine
+                .on_market_data(&poly_orderbook_event(
+                    InstrumentKind::PolyYes,
+                    Decimal::new(yes_bid, 2),
+                    Decimal::new(yes_ask, 2),
+                    offset,
+                ))
+                .await;
+            let _ = engine
+                .on_market_data(&poly_orderbook_event(
+                    InstrumentKind::PolyNo,
+                    Decimal::new(no_bid, 2),
+                    Decimal::new(no_ask, 2),
+                    offset + 20,
+                ))
+                .await;
+            let output = engine
+                .on_market_data(&cex_orderbook_event(
+                    Decimal::new(cex_price, 0),
+                    Decimal::new(cex_price, 0),
+                    offset + 100,
+                ))
+                .await;
+            if let Some(signal) = output.arb_signals.into_iter().next() {
+                return signal;
+            }
+        }
+
+        panic!("expected a BasisLong signal during warmup sequence");
     }
 
     #[tokio::test]
@@ -1140,7 +1779,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emits_basis_long_yes_when_yes_token_is_more_underpriced() {
+    async fn preserves_basis_snapshot_when_follow_up_cex_event_has_no_new_poly_data() {
         let mut engine = test_engine();
 
         let _ = engine
@@ -1150,91 +1789,76 @@ mod tests {
                 0,
             ))
             .await;
-
         let _ = engine
             .on_market_data(&poly_orderbook_event(
                 InstrumentKind::PolyYes,
-                Decimal::new(51, 2),
-                Decimal::new(53, 2),
+                Decimal::new(52, 2),
+                Decimal::new(54, 2),
                 60_100,
             ))
             .await;
         let _ = engine
             .on_market_data(&poly_orderbook_event(
                 InstrumentKind::PolyNo,
-                Decimal::new(47, 2),
-                Decimal::new(49, 2),
+                Decimal::new(46, 2),
+                Decimal::new(48, 2),
                 60_120,
             ))
             .await;
-        let _ = engine
+        let first_output = engine
             .on_market_data(&cex_orderbook_event(
-                Decimal::new(100_100, 0),
-                Decimal::new(100_100, 0),
+                Decimal::new(101_000, 0),
+                Decimal::new(101_000, 0),
                 60_200,
             ))
             .await;
+        assert!(first_output.warnings.is_empty());
 
-        let _ = engine
-            .on_market_data(&poly_orderbook_event(
-                InstrumentKind::PolyYes,
-                Decimal::new(50, 2),
-                Decimal::new(52, 2),
-                120_100,
-            ))
-            .await;
-        let _ = engine
-            .on_market_data(&poly_orderbook_event(
-                InstrumentKind::PolyNo,
-                Decimal::new(48, 2),
-                Decimal::new(50, 2),
-                120_120,
-            ))
-            .await;
-        let _ = engine
+        let initial_snapshot = engine
+            .basis_snapshot(&Symbol::new("btc-price-only"))
+            .expect("snapshot should exist after aligned poly/cex data");
+
+        let follow_up_output = engine
             .on_market_data(&cex_orderbook_event(
-                Decimal::new(100_200, 0),
-                Decimal::new(100_200, 0),
-                120_200,
+                Decimal::new(101_050, 0),
+                Decimal::new(101_050, 0),
+                60_300,
             ))
             .await;
 
-        let _ = engine
-            .on_market_data(&poly_orderbook_event(
-                InstrumentKind::PolyYes,
-                Decimal::new(35, 2),
-                Decimal::new(37, 2),
-                180_100,
-            ))
-            .await;
-        let _ = engine
-            .on_market_data(&poly_orderbook_event(
-                InstrumentKind::PolyNo,
-                Decimal::new(63, 2),
-                Decimal::new(65, 2),
-                180_120,
-            ))
-            .await;
-        let out = engine
-            .on_market_data(&cex_orderbook_event(
-                Decimal::new(100_300, 0),
-                Decimal::new(100_300, 0),
-                180_200,
-            ))
-            .await;
+        assert!(follow_up_output.warnings.is_empty());
+        let preserved_snapshot = engine
+            .basis_snapshot(&Symbol::new("btc-price-only"))
+            .expect("snapshot should be preserved until fresh poly data arrives");
+        assert_eq!(preserved_snapshot, initial_snapshot);
+    }
 
-        assert_eq!(out.arb_signals.len(), 1);
-        match &out.arb_signals[0].action {
+    #[tokio::test]
+    async fn emits_basis_long_yes_when_yes_token_is_more_underpriced() {
+        let mut engine = test_engine();
+        let signal = seed_basis_long_yes_signal(&mut engine).await;
+
+        match signal.action {
             ArbSignalAction::BasisLong { token_side, .. } => {
-                assert_eq!(*token_side, TokenSide::Yes);
+                assert_eq!(token_side, TokenSide::Yes);
             }
             other => panic!("unexpected action: {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn close_only_phase_closes_active_position() {
-        let mut engine = test_engine();
+    async fn does_not_emit_basis_signal_when_cex_hedge_qty_is_zero() {
+        let mut engine = test_engine_with_config(SimpleEngineConfig {
+            min_signal_samples: 2,
+            rolling_window_minutes: 4,
+            entry_z: 2.0,
+            exit_z: 0.5,
+            position_notional_usd: UsdNotional(Decimal::new(1_000, 0)),
+            cex_hedge_ratio: 0.0,
+            dmm_half_spread: Decimal::new(1, 2),
+            dmm_quote_size: PolyShares::ZERO,
+            ..SimpleEngineConfig::default()
+        });
 
         let _ = engine
             .on_market_data(&cex_orderbook_event(
@@ -1247,6 +1871,7 @@ mod tests {
         for (offset, yes_bid, yes_ask, no_bid, no_ask, cex_price) in [
             (60_100, 51, 53, 47, 49, 100_100),
             (120_100, 50, 52, 48, 50, 100_200),
+            (180_100, 35, 37, 63, 65, 100_300),
         ] {
             let _ = engine
                 .on_market_data(&poly_orderbook_event(
@@ -1264,39 +1889,26 @@ mod tests {
                     offset + 20,
                 ))
                 .await;
-            let _ = engine
+            let output = engine
                 .on_market_data(&cex_orderbook_event(
                     Decimal::new(cex_price, 0),
                     Decimal::new(cex_price, 0),
                     offset + 100,
                 ))
                 .await;
-        }
 
-        let _ = engine
-            .on_market_data(&poly_orderbook_event(
-                InstrumentKind::PolyYes,
-                Decimal::new(35, 2),
-                Decimal::new(37, 2),
-                180_100,
-            ))
-            .await;
-        let _ = engine
-            .on_market_data(&poly_orderbook_event(
-                InstrumentKind::PolyNo,
-                Decimal::new(63, 2),
-                Decimal::new(65, 2),
-                180_120,
-            ))
-            .await;
-        let open = engine
-            .on_market_data(&cex_orderbook_event(
-                Decimal::new(100_300, 0),
-                Decimal::new(100_300, 0),
-                180_200,
-            ))
-            .await;
-        assert_eq!(open.arb_signals.len(), 1);
+            assert!(
+                output.arb_signals.is_empty(),
+                "zero-hedge open signal must be suppressed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn close_only_phase_closes_active_position() {
+        let mut engine = test_engine();
+        let open = seed_basis_long_yes_signal(&mut engine).await;
+        assert!(matches!(open.action, ArbSignalAction::BasisLong { .. }));
 
         let close = engine
             .on_market_data(&lifecycle_event(
@@ -1311,5 +1923,170 @@ mod tests {
             close.arb_signals[0].action,
             ArbSignalAction::ClosePosition { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn blocks_signal_when_cex_price_is_stale() {
+        let mut engine = test_engine();
+
+        let _ = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(100_000, 0),
+                Decimal::new(100_000, 0),
+                0,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(100_100, 0),
+                Decimal::new(100_100, 0),
+                60_100,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&poly_orderbook_event(
+                InstrumentKind::PolyYes,
+                Decimal::new(52, 2),
+                Decimal::new(54, 2),
+                180_100,
+            ))
+            .await;
+
+        let output = engine.flush_symbol(&Symbol::new("btc-price-only"));
+
+        assert!(output.arb_signals.is_empty());
+        assert_eq!(output.warnings.len(), 1);
+        assert!(matches!(
+            output.warnings[0],
+            EngineWarning::CexPriceStale { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn blocks_signal_when_connection_is_lost() {
+        let mut engine = test_engine();
+
+        let _ = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(100_000, 0),
+                Decimal::new(100_000, 0),
+                0,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&poly_orderbook_event(
+                InstrumentKind::PolyYes,
+                Decimal::new(52, 2),
+                Decimal::new(54, 2),
+                60_100,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&connection_event(
+                Exchange::Polymarket,
+                ConnectionStatus::Disconnected,
+            ))
+            .await;
+
+        let output = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(101_000, 0),
+                Decimal::new(101_000, 0),
+                60_200,
+            ))
+            .await;
+
+        assert!(output.arb_signals.is_empty());
+        assert_eq!(output.warnings.len(), 1);
+        assert!(matches!(
+            output.warnings[0],
+            EngineWarning::ConnectionLost {
+                poly_connected: false,
+                cex_connected: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn blocks_signal_when_poly_and_cex_minutes_are_misaligned() {
+        let mut engine = relaxed_freshness_engine(5 * ONE_MINUTE_MS);
+
+        let _ = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(100_000, 0),
+                Decimal::new(100_000, 0),
+                0,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(100_100, 0),
+                Decimal::new(100_100, 0),
+                60_100,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&poly_orderbook_event(
+                InstrumentKind::PolyYes,
+                Decimal::new(52, 2),
+                Decimal::new(54, 2),
+                180_100,
+            ))
+            .await;
+
+        let output = engine.flush_symbol(&Symbol::new("btc-price-only"));
+
+        assert!(output.arb_signals.is_empty());
+        assert_eq!(output.warnings.len(), 1);
+        assert!(matches!(
+            output.warnings[0],
+            EngineWarning::DataMisaligned { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconnect_gap_carries_cex_reference_to_latest_completed_minute() {
+        let mut engine = relaxed_freshness_engine(10 * ONE_MINUTE_MS);
+
+        let _ = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(100_000, 0),
+                Decimal::new(100_000, 0),
+                0,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(100_100, 0),
+                Decimal::new(100_100, 0),
+                60_100,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(100_200, 0),
+                Decimal::new(100_200, 0),
+                300_100,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&poly_orderbook_event(
+                InstrumentKind::PolyYes,
+                Decimal::new(52, 2),
+                Decimal::new(54, 2),
+                300_100,
+            ))
+            .await;
+
+        let output = engine.flush_symbol(&Symbol::new("btc-price-only"));
+
+        assert!(
+            !output
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, EngineWarning::DataMisaligned { .. })),
+            "恢复连接后的分钟参考价不应继续落后多个整分钟"
+        );
     }
 }

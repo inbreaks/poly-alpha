@@ -140,6 +140,7 @@ async fn run_case(case: FixtureCase) {
         cex_hedge_ratio: case.config.cex_hedge_ratio,
         dmm_half_spread: Decimal::new(1, 2),
         dmm_quote_size: PolyShares::ZERO,
+        ..SimpleEngineConfig::default()
     };
     let mut engine = SimpleAlphaEngine::with_markets(engine_config, vec![market]);
 
@@ -399,6 +400,7 @@ fn poly_event(
             exchange_timestamp_ms: ts_ms,
             received_at_ms: ts_ms,
             sequence: ts_ms,
+            last_trade_price: None,
         },
     }
 }
@@ -421,6 +423,7 @@ fn cex_event(symbol: &Symbol, close: f64, ts_ms: u64) -> MarketDataEvent {
             exchange_timestamp_ms: ts_ms,
             received_at_ms: ts_ms,
             sequence: ts_ms,
+            last_trade_price: None,
         },
     }
 }

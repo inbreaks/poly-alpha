@@ -31,4 +31,6 @@ pub struct OrderBookSnapshot {
     pub exchange_timestamp_ms: u64,
     pub received_at_ms: u64,
     pub sequence: u64,
+    /// Last trade price from the API, useful when orderbook spread is wide
+    pub last_trade_price: Option<Price>,
 }

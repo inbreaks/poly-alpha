@@ -22,6 +22,8 @@ pub struct PolyBookUpdate {
     pub exchange_timestamp_ms: u64,
     pub received_at_ms: u64,
     pub sequence: u64,
+    /// Last trade price from the API, used when orderbook spread is too wide
+    pub last_trade_price: Option<Price>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,88 +83,113 @@ impl MarketDataNormalizer {
                 asset_id: update.asset_id.clone(),
             })?;
 
+        let mut bids: Vec<PriceLevel> = update
+            .bids
+            .into_iter()
+            .map(|level| PriceLevel {
+                price: level.price,
+                quantity: VenueQuantity::PolyShares(level.shares),
+            })
+            .collect();
+        let mut asks: Vec<PriceLevel> = update
+            .asks
+            .into_iter()
+            .map(|level| PriceLevel {
+                price: level.price,
+                quantity: VenueQuantity::PolyShares(level.shares),
+            })
+            .collect();
+        sort_book_levels(&mut bids, &mut asks);
+
         Ok(MarketDataEvent::OrderBookUpdate {
             snapshot: OrderBookSnapshot {
                 exchange: Exchange::Polymarket,
                 symbol,
                 instrument: instrument_from_token_side(token_side),
-                bids: update
-                    .bids
-                    .into_iter()
-                    .map(|level| PriceLevel {
-                        price: level.price,
-                        quantity: VenueQuantity::PolyShares(level.shares),
-                    })
-                    .collect(),
-                asks: update
-                    .asks
-                    .into_iter()
-                    .map(|level| PriceLevel {
-                        price: level.price,
-                        quantity: VenueQuantity::PolyShares(level.shares),
-                    })
-                    .collect(),
+                bids,
+                asks,
                 exchange_timestamp_ms: update.exchange_timestamp_ms,
                 received_at_ms: update.received_at_ms,
                 sequence: update.sequence,
+                last_trade_price: update.last_trade_price,
             },
         })
     }
 
-    pub fn normalize_cex_orderbook(&self, update: CexBookUpdate) -> Result<MarketDataEvent> {
-        let symbol = self.lookup_cex_symbol(update.exchange, &update.venue_symbol)?;
+    pub fn normalize_cex_orderbook(&self, update: CexBookUpdate) -> Result<Vec<MarketDataEvent>> {
+        let symbols = self.lookup_cex_symbols(update.exchange, &update.venue_symbol)?;
 
-        Ok(MarketDataEvent::OrderBookUpdate {
-            snapshot: OrderBookSnapshot {
+        let mut bids: Vec<PriceLevel> = update
+            .bids
+            .iter()
+            .map(|level| PriceLevel {
+                price: level.price,
+                quantity: VenueQuantity::CexBaseQty(level.base_qty),
+            })
+            .collect();
+        let mut asks: Vec<PriceLevel> = update
+            .asks
+            .iter()
+            .map(|level| PriceLevel {
+                price: level.price,
+                quantity: VenueQuantity::CexBaseQty(level.base_qty),
+            })
+            .collect();
+        sort_book_levels(&mut bids, &mut asks);
+
+        let events: Vec<MarketDataEvent> = symbols
+            .into_iter()
+            .map(|symbol| MarketDataEvent::OrderBookUpdate {
+                snapshot: OrderBookSnapshot {
+                    exchange: update.exchange,
+                    symbol,
+                    instrument: InstrumentKind::CexPerp,
+                    bids: bids.clone(),
+                    asks: asks.clone(),
+                    exchange_timestamp_ms: update.exchange_timestamp_ms,
+                    received_at_ms: update.received_at_ms,
+                    sequence: update.sequence,
+                    last_trade_price: None,
+                },
+            })
+            .collect();
+
+        Ok(events)
+    }
+
+    pub fn normalize_cex_trade(&self, update: CexTradeUpdate) -> Result<Vec<MarketDataEvent>> {
+        let symbols = self.lookup_cex_symbols(update.exchange, &update.venue_symbol)?;
+
+        let events: Vec<MarketDataEvent> = symbols
+            .into_iter()
+            .map(|symbol| MarketDataEvent::TradeUpdate {
                 exchange: update.exchange,
                 symbol,
                 instrument: InstrumentKind::CexPerp,
-                bids: update
-                    .bids
-                    .into_iter()
-                    .map(|level| PriceLevel {
-                        price: level.price,
-                        quantity: VenueQuantity::CexBaseQty(level.base_qty),
-                    })
-                    .collect(),
-                asks: update
-                    .asks
-                    .into_iter()
-                    .map(|level| PriceLevel {
-                        price: level.price,
-                        quantity: VenueQuantity::CexBaseQty(level.base_qty),
-                    })
-                    .collect(),
-                exchange_timestamp_ms: update.exchange_timestamp_ms,
-                received_at_ms: update.received_at_ms,
-                sequence: update.sequence,
-            },
-        })
+                price: update.price,
+                quantity: VenueQuantity::CexBaseQty(update.quantity),
+                side: update.side,
+                timestamp_ms: update.timestamp_ms,
+            })
+            .collect();
+
+        Ok(events)
     }
 
-    pub fn normalize_cex_trade(&self, update: CexTradeUpdate) -> Result<MarketDataEvent> {
-        let symbol = self.lookup_cex_symbol(update.exchange, &update.venue_symbol)?;
+    pub fn normalize_cex_funding(&self, update: CexFundingUpdate) -> Result<Vec<MarketDataEvent>> {
+        let symbols = self.lookup_cex_symbols(update.exchange, &update.venue_symbol)?;
 
-        Ok(MarketDataEvent::TradeUpdate {
-            exchange: update.exchange,
-            symbol,
-            instrument: InstrumentKind::CexPerp,
-            price: update.price,
-            quantity: VenueQuantity::CexBaseQty(update.quantity),
-            side: update.side,
-            timestamp_ms: update.timestamp_ms,
-        })
-    }
+        let events: Vec<MarketDataEvent> = symbols
+            .into_iter()
+            .map(|symbol| MarketDataEvent::FundingRate {
+                exchange: update.exchange,
+                symbol,
+                rate: update.rate,
+                next_funding_time_ms: update.next_funding_time_ms,
+            })
+            .collect();
 
-    pub fn normalize_cex_funding(&self, update: CexFundingUpdate) -> Result<MarketDataEvent> {
-        let symbol = self.lookup_cex_symbol(update.exchange, &update.venue_symbol)?;
-
-        Ok(MarketDataEvent::FundingRate {
-            exchange: update.exchange,
-            symbol,
-            rate: update.rate,
-            next_funding_time_ms: update.next_funding_time_ms,
-        })
+        Ok(events)
     }
 
     pub fn market_lifecycle(
@@ -190,10 +217,10 @@ impl MarketDataNormalizer {
         })
     }
 
-    fn lookup_cex_symbol(&self, exchange: Exchange, venue_symbol: &str) -> Result<Symbol> {
+    fn lookup_cex_symbols(&self, exchange: Exchange, venue_symbol: &str) -> Result<Vec<Symbol>> {
         self.registry
-            .lookup_cex_symbol(exchange, venue_symbol)
-            .cloned()
+            .lookup_cex_symbols(exchange, venue_symbol)
+            .map(|symbols| symbols.to_vec())
             .ok_or_else(|| DataError::UnknownCexSymbol {
                 exchange,
                 venue_symbol: venue_symbol.to_owned(),
@@ -206,6 +233,11 @@ fn instrument_from_token_side(token_side: TokenSide) -> InstrumentKind {
         TokenSide::Yes => InstrumentKind::PolyYes,
         TokenSide::No => InstrumentKind::PolyNo,
     }
+}
+
+fn sort_book_levels(bids: &mut [PriceLevel], asks: &mut [PriceLevel]) {
+    bids.sort_by(|left, right| right.price.cmp(&left.price));
+    asks.sort_by(|left, right| left.price.cmp(&right.price));
 }
 
 #[cfg(test)]
@@ -253,6 +285,7 @@ mod tests {
                 exchange_timestamp_ms: 10,
                 received_at_ms: 11,
                 sequence: 7,
+                last_trade_price: None,
             })
             .expect("poly orderbook should normalize");
 
@@ -268,9 +301,52 @@ mod tests {
     }
 
     #[test]
-    fn cex_trade_uses_symbol_registry_reverse_lookup() {
+    fn polymarket_books_are_sorted_best_first() {
         let normalizer = MarketDataNormalizer::new(sample_registry());
         let event = normalizer
+            .normalize_poly_orderbook(PolyBookUpdate {
+                asset_id: "no-1".to_owned(),
+                bids: vec![
+                    PolyBookLevel {
+                        price: Price(Decimal::new(1, 2)),
+                        shares: PolyShares(Decimal::new(10, 0)),
+                    },
+                    PolyBookLevel {
+                        price: Price(Decimal::new(73, 2)),
+                        shares: PolyShares(Decimal::new(10, 0)),
+                    },
+                ],
+                asks: vec![
+                    PolyBookLevel {
+                        price: Price(Decimal::new(99, 2)),
+                        shares: PolyShares(Decimal::new(10, 0)),
+                    },
+                    PolyBookLevel {
+                        price: Price(Decimal::new(74, 2)),
+                        shares: PolyShares(Decimal::new(10, 0)),
+                    },
+                ],
+                exchange_timestamp_ms: 10,
+                received_at_ms: 11,
+                sequence: 8,
+                last_trade_price: Some(Price(Decimal::new(73, 2))),
+            })
+            .expect("poly orderbook should normalize");
+
+        match event {
+            MarketDataEvent::OrderBookUpdate { snapshot } => {
+                assert_eq!(snapshot.instrument, InstrumentKind::PolyNo);
+                assert_eq!(snapshot.bids[0].price, Price(Decimal::new(73, 2)));
+                assert_eq!(snapshot.asks[0].price, Price(Decimal::new(74, 2)));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cex_trade_uses_symbol_registry_reverse_lookup() {
+        let normalizer = MarketDataNormalizer::new(sample_registry());
+        let events = normalizer
             .normalize_cex_trade(CexTradeUpdate {
                 exchange: Exchange::Binance,
                 venue_symbol: "BTCUSDT".to_owned(),
@@ -281,17 +357,18 @@ mod tests {
             })
             .expect("cex trade should normalize");
 
-        match event {
+        assert_eq!(events.len(), 1);
+        match &events[0] {
             MarketDataEvent::TradeUpdate {
                 exchange,
                 symbol,
                 quantity,
                 ..
             } => {
-                assert_eq!(exchange, Exchange::Binance);
-                assert_eq!(symbol, Symbol::new("btc-100k-mar-2026"));
+                assert_eq!(*exchange, Exchange::Binance);
+                assert_eq!(*symbol, Symbol::new("btc-100k-mar-2026"));
                 assert_eq!(
-                    quantity,
+                    *quantity,
                     VenueQuantity::CexBaseQty(CexBaseQty(Decimal::new(25, 3)))
                 );
             }

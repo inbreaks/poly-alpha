@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::str::FromStr;
 use tokio::sync::broadcast::error::TryRecvError;
@@ -29,6 +30,8 @@ struct DemoStats {
     order_cancelled: usize,
     fills: usize,
     state_changes: usize,
+    trades_closed: usize,
+    total_pnl_usd: f64,
 }
 
 pub fn run_check_config(env: &str) -> Result<()> {
@@ -80,12 +83,14 @@ pub async fn run_demo(env: &str) -> Result<()> {
             cex_hedge_ratio: 1.0,
             dmm_half_spread: Decimal::new(1, 2),
             dmm_quote_size: polyalpha_core::PolyShares::ZERO,
+            ..SimpleEngineConfig::default()
         },
         settings.markets.clone(),
     );
     engine.update_params(EngineParams {
         basis_entry_zscore: None,
         basis_exit_zscore: None,
+        rolling_window_secs: None,
         max_position_usd: Some(settings.strategy.basis.max_position_usd),
     });
 
@@ -340,13 +345,23 @@ pub(crate) async fn signal_allowed(
     registry: &SymbolRegistry,
     signal: &ArbSignalEvent,
 ) -> Result<bool> {
+    Ok(signal_rejection_reason(risk, registry, signal)
+        .await?
+        .is_none())
+}
+
+pub(crate) async fn signal_rejection_reason(
+    risk: &InMemoryRiskManager,
+    registry: &SymbolRegistry,
+    signal: &ArbSignalEvent,
+) -> Result<Option<String>> {
     for request in signal_requests(registry, signal)? {
-        if risk.pre_trade_check(request).await.is_err() {
-            return Ok(false);
+        if let Err(err) = risk.pre_trade_check(request).await {
+            return Ok(Some(err.to_string()));
         }
     }
 
-    Ok(true)
+    Ok(None)
 }
 
 async fn apply_execution_events(
@@ -370,6 +385,10 @@ async fn apply_execution_events(
                 stats.state_changes += 1;
             }
             ExecutionEvent::ReconcileRequired { .. } => {}
+            ExecutionEvent::TradeClosed { realized_pnl, .. } => {
+                stats.trades_closed += 1;
+                stats.total_pnl_usd += realized_pnl.0.to_f64().unwrap_or(0.0);
+            }
         }
     }
 
@@ -606,6 +625,7 @@ fn scripted_ticks(market: &MarketConfig) -> Vec<MockTick> {
             exchange_timestamp_ms: 3,
             received_at_ms: 3,
             sequence: 3,
+            last_trade_price: None,
         }),
         MockTick::PolyOrderBook(PolyBookUpdate {
             asset_id: market.poly_ids.yes_token_id.clone(),
@@ -620,6 +640,7 @@ fn scripted_ticks(market: &MarketConfig) -> Vec<MockTick> {
             exchange_timestamp_ms: 4,
             received_at_ms: 4,
             sequence: 4,
+            last_trade_price: None,
         }),
         MockTick::Lifecycle {
             symbol,

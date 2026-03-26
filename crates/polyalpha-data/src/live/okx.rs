@@ -10,7 +10,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use polyalpha_core::{
-    CexBaseQty, ConnectionStatus, CoreError, Exchange, MarketDataSource, OrderSide, Symbol,
+    CexBaseQty, ConnectionStatus, CoreError, Exchange, MarketDataEvent, MarketDataSource,
+    OrderSide, Symbol,
 };
 
 use crate::error::{DataError, Result};
@@ -29,6 +30,46 @@ pub struct OkxMarketDataSource {
 }
 
 impl OkxMarketDataSource {
+    fn publish_connection_event(&self, status: ConnectionStatus) {
+        let _ = self.manager.publish(MarketDataEvent::ConnectionEvent {
+            exchange: Exchange::Okx,
+            status,
+        });
+    }
+
+    fn set_status_if_changed(&self, new_status: ConnectionStatus) {
+        let mut guard = self.status.lock().expect("okx status lock poisoned");
+        if *guard == new_status {
+            return;
+        }
+        *guard = new_status;
+        drop(guard);
+        self.publish_connection_event(new_status);
+    }
+
+    fn mark_connected(&self) {
+        self.set_status_if_changed(ConnectionStatus::Connected);
+    }
+
+    fn mark_connecting(&self) {
+        self.set_status_if_changed(ConnectionStatus::Connecting);
+    }
+
+    fn mark_failure(&self) {
+        let mut guard = self.status.lock().expect("okx status lock poisoned");
+        let next = match *guard {
+            ConnectionStatus::Connected => ConnectionStatus::Reconnecting,
+            ConnectionStatus::Reconnecting => ConnectionStatus::Disconnected,
+            ConnectionStatus::Connecting => ConnectionStatus::Reconnecting,
+            _ => ConnectionStatus::Disconnected,
+        };
+        if next == *guard {
+            return;
+        }
+        *guard = next;
+        drop(guard);
+        self.publish_connection_event(next);
+    }
     pub fn new(manager: DataManager, rest_url: impl Into<String>) -> Self {
         Self {
             manager,
@@ -102,12 +143,30 @@ impl OkxMarketDataSource {
         venue_symbol: &str,
         depth: u16,
     ) -> Result<usize> {
-        let update = self.fetch_orderbook(venue_symbol, depth).await?;
+        let update = match self.fetch_orderbook(venue_symbol, depth).await {
+            Ok(u) => {
+                self.mark_connected();
+                u
+            }
+            Err(e) => {
+                self.mark_failure();
+                return Err(e);
+            }
+        };
         self.manager.normalize_and_publish_cex_orderbook(update)
     }
 
     pub async fn fetch_and_publish_funding_and_mark(&self, venue_symbol: &str) -> Result<usize> {
-        let (funding, mark) = self.fetch_funding_and_mark(venue_symbol).await?;
+        let (funding, mark) = match self.fetch_funding_and_mark(venue_symbol).await {
+            Ok(pair) => {
+                self.mark_connected();
+                pair
+            }
+            Err(e) => {
+                self.mark_failure();
+                return Err(e);
+            }
+        };
         let mut published = 0usize;
         published += usize::from(self.manager.normalize_and_publish_cex_funding(funding)? > 0);
         published += usize::from(self.manager.normalize_and_publish_cex_trade(mark)? > 0);
@@ -149,27 +208,41 @@ impl OkxMarketDataSource {
         json!({
             "op": "subscribe",
             "args": [{
-                "channel": "books",
+                "channel": "books5",
                 "instId": inst_id
             }]
         })
     }
 
     pub fn parse_orderbook_ws_payload(payload: &str, venue_symbol: &str) -> Result<CexBookUpdate> {
-        let ws: OkxWsBooksEvent = serde_json::from_str(payload)?;
+        Self::parse_orderbook_ws_message(payload, venue_symbol)?.ok_or_else(|| {
+            DataError::InvalidResponse("okx ws payload did not contain orderbook data".to_owned())
+        })
+    }
+
+    pub fn parse_orderbook_ws_message(
+        payload: &str,
+        venue_symbol: &str,
+    ) -> Result<Option<CexBookUpdate>> {
+        let value: Value = serde_json::from_str(payload)?;
+        if value.get("event").is_some() || value.get("op").is_some() {
+            return Ok(None);
+        }
+
+        let ws: OkxWsBooksEvent = serde_json::from_value(value)?;
         let first = ws
             .data
             .first()
             .ok_or_else(|| DataError::InvalidResponse("okx ws books data is empty".to_owned()))?;
-        Ok(CexBookUpdate {
+        Ok(Some(CexBookUpdate {
             exchange: Exchange::Okx,
             venue_symbol: venue_symbol.to_owned(),
             bids: parse_okx_levels(&first.bids)?,
             asks: parse_okx_levels(&first.asks)?,
             exchange_timestamp_ms: parse_ts(&first.ts),
             received_at_ms: now_millis(),
-            sequence: 0,
-        })
+            sequence: first.seq_id.unwrap_or(0),
+        }))
     }
 
     pub fn parse_orderbook_payload(payload: &str, venue_symbol: &str) -> Result<CexBookUpdate> {
@@ -247,11 +320,7 @@ impl OkxMarketDataSource {
 #[async_trait]
 impl MarketDataSource for OkxMarketDataSource {
     async fn connect(&mut self) -> polyalpha_core::Result<()> {
-        *self
-            .status
-            .lock()
-            .map_err(|_| CoreError::Channel("okx status lock poisoned".to_owned()))? =
-            ConnectionStatus::Connected;
+        self.mark_connecting();
         Ok(())
     }
 
@@ -283,6 +352,8 @@ struct OkxBooksData {
     bids: Vec<Vec<String>>,
     asks: Vec<Vec<String>>,
     ts: String,
+    #[serde(rename = "seqId")]
+    seq_id: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -394,7 +465,7 @@ mod tests {
     fn build_okx_subscribe_message() {
         let msg = OkxMarketDataSource::build_books_subscribe_message("BTC-USDT-SWAP");
         assert_eq!(msg["op"], "subscribe");
-        assert_eq!(msg["args"][0]["channel"], "books");
+        assert_eq!(msg["args"][0]["channel"], "books5");
         assert_eq!(msg["args"][0]["instId"], "BTC-USDT-SWAP");
     }
 
@@ -402,5 +473,14 @@ mod tests {
     fn convert_plain_symbol_to_okx_inst_id() {
         assert_eq!(okx_inst_id("BTCUSDT"), "BTC-USDT-SWAP");
         assert_eq!(okx_inst_id("BTC-USDT-SWAP"), "BTC-USDT-SWAP");
+    }
+
+    #[test]
+    fn parse_okx_ws_ack_as_none() {
+        let payload =
+            r#"{"event":"subscribe","arg":{"channel":"books5","instId":"BTC-USDT-SWAP"}}"#;
+        let result = OkxMarketDataSource::parse_orderbook_ws_message(payload, "BTC-USDT-SWAP")
+            .expect("parse ok");
+        assert!(result.is_none());
     }
 }

@@ -10,6 +10,7 @@ libm = "0.2"
 polyalpha-core = { path = "../polyalpha-core" }
 rust_decimal.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 serde.workspace = true

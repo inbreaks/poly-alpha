@@ -83,5 +83,7 @@ pub struct OrderResponse {
     pub status: OrderStatus,
     pub filled_quantity: VenueQuantity,
     pub average_price: Option<Price>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<String>,
     pub timestamp_ms: u64,
 }

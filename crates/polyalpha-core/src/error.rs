@@ -10,4 +10,8 @@ pub enum CoreError {
     InvalidFloatConversion { context: &'static str },
     #[error("channel operation failed: {0}")]
     Channel(String),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Generic(String),
 }

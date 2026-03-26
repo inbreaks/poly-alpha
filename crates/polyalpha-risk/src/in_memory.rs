@@ -5,11 +5,9 @@ use rust_decimal::Decimal;
 
 use polyalpha_core::{
     CexOrderRequest, CircuitBreakerStatus, Exchange, Fill, InstrumentKind, MarketPhase,
-    OrderRequest, OrderSide, PolyOrderRequest, PositionKey, RiskManager, RiskRejection,
-    RiskStateSnapshot, Symbol, TokenSide, UsdNotional,
+    OrderRequest, OrderSide, PolyOrderRequest, PositionKey, PositionTracker, RiskManager,
+    RiskRejection, RiskStateSnapshot, Symbol, TokenSide, UsdNotional,
 };
-
-use crate::position_tracker::PositionTracker;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RiskLimits {
@@ -45,6 +43,7 @@ pub struct InMemoryRiskManager {
     breaker_reason: Option<String>,
     market_phases: HashMap<Symbol, MarketPhase>,
     position_tracker: PositionTracker,
+    daily_realized_pnl: UsdNotional,
 }
 
 impl InMemoryRiskManager {
@@ -55,6 +54,7 @@ impl InMemoryRiskManager {
             breaker_reason: None,
             market_phases: HashMap::new(),
             position_tracker: PositionTracker::default(),
+            daily_realized_pnl: UsdNotional::ZERO,
         }
     }
 
@@ -75,7 +75,7 @@ impl InMemoryRiskManager {
             circuit_breaker: self.breaker_status,
             total_exposure_usd: self.position_tracker.total_exposure_usd(),
             positions: self.position_tracker.positions_snapshot(),
-            daily_pnl: self.position_tracker.daily_realized_pnl(),
+            daily_pnl: self.daily_realized_pnl,
             max_drawdown_pct: Decimal::ZERO,
             persistence_lag_secs: 0,
             timestamp_ms,
@@ -88,6 +88,21 @@ impl InMemoryRiskManager {
 
     pub fn market_phase(&self, symbol: &Symbol) -> Option<&MarketPhase> {
         self.market_phases.get(symbol)
+    }
+
+    /// Check if there's a CEX position for the given symbol
+    pub fn has_cex_position(&self, symbol: &Symbol) -> bool {
+        !self.cex_position_qty(symbol).is_zero()
+    }
+
+    /// Get CEX position quantity for a symbol (positive = long, negative = short)
+    pub fn cex_position_qty(&self, symbol: &Symbol) -> Decimal {
+        let key = PositionKey {
+            exchange: Exchange::Binance, // Default to Binance
+            symbol: symbol.clone(),
+            instrument: InstrumentKind::CexPerp,
+        };
+        self.position_tracker.net_qty_for(&key)
     }
 
     pub fn reset_circuit_breaker(&mut self) {
@@ -109,7 +124,7 @@ impl InMemoryRiskManager {
     }
 
     fn check_limits(&self, request: &OrderRequest) -> Result<(), RiskRejection> {
-        if self.position_tracker.daily_realized_pnl().0 <= -self.limits.max_daily_loss_usd.0 {
+        if self.daily_realized_pnl.0 <= -self.limits.max_daily_loss_usd.0 {
             return Err(RiskRejection::LimitBreached(
                 "daily realized pnl is below max loss".to_owned(),
             ));
@@ -246,9 +261,10 @@ impl RiskManager for InMemoryRiskManager {
     }
 
     async fn on_fill(&mut self, fill: &Fill) -> polyalpha_core::Result<()> {
-        self.position_tracker.apply_fill(fill);
+        let effect = self.position_tracker.apply_fill(fill);
+        self.daily_realized_pnl.0 += effect.realized_pnl_delta.0;
 
-        if self.position_tracker.daily_realized_pnl().0 <= -self.limits.max_daily_loss_usd.0 {
+        if self.daily_realized_pnl.0 <= -self.limits.max_daily_loss_usd.0 {
             self.trigger_circuit_breaker("daily loss limit reached");
         }
         Ok(())
@@ -357,6 +373,7 @@ mod tests {
     fn cex_fill(side: OrderSide, qty: i64, px: i64, fee: i64, ts: u64) -> Fill {
         Fill {
             fill_id: format!("fill-{ts}"),
+            correlation_id: format!("corr-{ts}"),
             exchange: Exchange::Binance,
             symbol: Symbol::new("btc-100k-mar-2026"),
             instrument: InstrumentKind::CexPerp,

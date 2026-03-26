@@ -1,14 +1,81 @@
 use ::config::{Config, Environment, File};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::types::{Exchange, MarketConfig, SettlementRules, UsdNotional};
 use crate::Result;
+
+fn default_enable_freshness_check() -> bool {
+    true
+}
+
+fn default_reject_on_disconnect() -> bool {
+    true
+}
+
+fn default_max_data_age_minutes() -> u64 {
+    1
+}
+
+fn default_max_time_diff_minutes() -> u64 {
+    1
+}
+
+fn default_initial_capital() -> f64 {
+    10_000.0
+}
+
+fn default_monitor_socket_path() -> String {
+    "/tmp/polyalpha.sock".to_owned()
+}
+
+fn default_market_data_mode() -> MarketDataMode {
+    MarketDataMode::Poll
+}
+
+fn default_max_stale_ms() -> u64 {
+    5_000
+}
+
+fn default_reconnect_backoff_ms() -> u64 {
+    1_000
+}
+
+fn default_snapshot_refresh_secs() -> u64 {
+    300
+}
+
+fn default_funding_poll_secs() -> u64 {
+    60
+}
+
+fn default_audit_enabled() -> bool {
+    true
+}
+
+fn default_audit_snapshot_interval_secs() -> u64 {
+    15
+}
+
+fn default_audit_checkpoint_interval_secs() -> u64 {
+    60
+}
+
+fn default_audit_warehouse_sync_interval_secs() -> u64 {
+    300
+}
+
+fn default_audit_raw_segment_max_bytes() -> u64 {
+    64 * 1024 * 1024
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GeneralConfig {
     pub log_level: String,
     pub data_dir: String,
+    #[serde(default = "default_monitor_socket_path")]
+    pub monitor_socket_path: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -31,6 +98,133 @@ pub struct OkxConfig {
     pub ws_private_url: String,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MarketDataMode {
+    #[default]
+    Poll,
+    Ws,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MarketDataConfig {
+    #[serde(default = "default_market_data_mode")]
+    pub mode: MarketDataMode,
+    #[serde(default = "default_max_stale_ms")]
+    pub max_stale_ms: u64,
+    #[serde(default)]
+    pub poly_open_max_quote_age_ms: Option<u64>,
+    #[serde(default)]
+    pub cex_open_max_quote_age_ms: Option<u64>,
+    #[serde(default)]
+    pub close_max_quote_age_ms: Option<u64>,
+    #[serde(default)]
+    pub max_cross_leg_skew_ms: Option<u64>,
+    #[serde(default)]
+    pub borderline_poly_quote_age_ms: Option<u64>,
+    #[serde(default = "default_reconnect_backoff_ms")]
+    pub reconnect_backoff_ms: u64,
+    #[serde(default = "default_snapshot_refresh_secs")]
+    pub snapshot_refresh_secs: u64,
+    #[serde(default = "default_funding_poll_secs")]
+    pub funding_poll_secs: u64,
+}
+
+impl Default for MarketDataConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_market_data_mode(),
+            max_stale_ms: default_max_stale_ms(),
+            poly_open_max_quote_age_ms: None,
+            cex_open_max_quote_age_ms: None,
+            close_max_quote_age_ms: None,
+            max_cross_leg_skew_ms: None,
+            borderline_poly_quote_age_ms: None,
+            reconnect_backoff_ms: default_reconnect_backoff_ms(),
+            snapshot_refresh_secs: default_snapshot_refresh_secs(),
+            funding_poll_secs: default_funding_poll_secs(),
+        }
+    }
+}
+
+impl MarketDataConfig {
+    pub fn resolved_poly_open_max_quote_age_ms(&self) -> u64 {
+        self.poly_open_max_quote_age_ms.unwrap_or(self.max_stale_ms)
+    }
+
+    pub fn resolved_cex_open_max_quote_age_ms(&self) -> u64 {
+        self.cex_open_max_quote_age_ms.unwrap_or(self.max_stale_ms)
+    }
+
+    pub fn resolved_close_max_quote_age_ms(&self) -> u64 {
+        self.close_max_quote_age_ms
+            .unwrap_or(self.max_stale_ms.saturating_mul(2))
+    }
+
+    pub fn resolved_max_cross_leg_skew_ms(&self) -> u64 {
+        self.max_cross_leg_skew_ms.unwrap_or(self.max_stale_ms)
+    }
+
+    pub fn resolved_borderline_poly_quote_age_ms(&self) -> u64 {
+        self.borderline_poly_quote_age_ms
+            .unwrap_or(self.max_stale_ms.saturating_mul(8) / 10)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditConfig {
+    #[serde(default = "default_audit_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_audit_snapshot_interval_secs")]
+    pub snapshot_interval_secs: u64,
+    #[serde(default = "default_audit_checkpoint_interval_secs")]
+    pub checkpoint_interval_secs: u64,
+    #[serde(default = "default_audit_warehouse_sync_interval_secs")]
+    pub warehouse_sync_interval_secs: u64,
+    #[serde(default = "default_audit_raw_segment_max_bytes")]
+    pub raw_segment_max_bytes: u64,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_audit_enabled(),
+            snapshot_interval_secs: default_audit_snapshot_interval_secs(),
+            checkpoint_interval_secs: default_audit_checkpoint_interval_secs(),
+            warehouse_sync_interval_secs: default_audit_warehouse_sync_interval_secs(),
+            raw_segment_max_bytes: default_audit_raw_segment_max_bytes(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BasisOverrideConfig {
+    /// Override entry Z-score threshold for specific asset
+    #[serde(default)]
+    pub entry_z_score_threshold: Option<Decimal>,
+    /// Override exit Z-score threshold for specific asset
+    #[serde(default)]
+    pub exit_z_score_threshold: Option<Decimal>,
+    /// Override rolling window in seconds
+    #[serde(default)]
+    pub rolling_window_secs: Option<u64>,
+    /// Override minimum warmup samples
+    #[serde(default)]
+    pub min_warmup_samples: Option<usize>,
+    /// Override minimum basis in basis points
+    #[serde(default)]
+    pub min_basis_bps: Option<Decimal>,
+    /// Override maximum position size in USD
+    #[serde(default)]
+    pub max_position_usd: Option<UsdNotional>,
+    /// Override minimum Polymarket price for trading
+    #[serde(default)]
+    pub min_poly_price: Option<Decimal>,
+    /// Override maximum Polymarket price for trading
+    #[serde(default)]
+    pub max_poly_price: Option<Decimal>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BasisStrategyConfig {
     pub entry_z_score_threshold: Decimal,
@@ -41,6 +235,21 @@ pub struct BasisStrategyConfig {
     pub max_position_usd: UsdNotional,
     pub delta_rebalance_threshold: Decimal,
     pub delta_rebalance_interval_secs: u64,
+    #[serde(default)]
+    pub min_poly_price: Option<Decimal>,
+    #[serde(default)]
+    pub max_poly_price: Option<Decimal>,
+    #[serde(default = "default_max_data_age_minutes")]
+    pub max_data_age_minutes: u64,
+    #[serde(default = "default_max_time_diff_minutes")]
+    pub max_time_diff_minutes: u64,
+    #[serde(default = "default_enable_freshness_check")]
+    pub enable_freshness_check: bool,
+    #[serde(default = "default_reject_on_disconnect")]
+    pub reject_on_disconnect: bool,
+    /// Per-asset parameter overrides, keyed by asset prefix (e.g., "btc", "eth")
+    #[serde(default)]
+    pub overrides: HashMap<String, BasisOverrideConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,6 +276,8 @@ pub struct StrategyConfig {
     pub dmm: DmmStrategyConfig,
     pub negrisk: NegRiskStrategyConfig,
     pub settlement: SettlementRules,
+    #[serde(default)]
+    pub market_data: MarketDataConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,7 +292,50 @@ pub struct RiskConfig {
     pub max_persistence_lag_secs: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PaperTradingConfig {
+    #[serde(default = "default_initial_capital")]
+    pub initial_capital: f64,
+    #[serde(default)]
+    pub timezone: Option<String>,
+}
+
+impl Default for PaperTradingConfig {
+    fn default() -> Self {
+        Self {
+            initial_capital: default_initial_capital(),
+            timezone: None,
+        }
+    }
+}
+
+/// Configuration for slippage and liquidity simulation in paper trading.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaperSlippageConfig {
+    /// Additional slippage for Polymarket orders (in basis points).
+    /// E.g., 50 means 0.5% extra slippage on top of orderbook spread.
+    pub poly_slippage_bps: u64,
+    /// Additional slippage for CEX orders (in basis points).
+    pub cex_slippage_bps: u64,
+    /// Minimum liquidity required (in shares for Poly, base qty for CEX).
+    /// Orders with less available liquidity will be rejected.
+    pub min_liquidity: Decimal,
+    /// Whether to allow partial fills when liquidity is insufficient.
+    pub allow_partial_fill: bool,
+}
+
+impl Default for PaperSlippageConfig {
+    fn default() -> Self {
+        Self {
+            poly_slippage_bps: 50,
+            cex_slippage_bps: 2,
+            min_liquidity: Decimal::new(100, 0),
+            allow_partial_fill: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
     pub general: GeneralConfig,
     pub polymarket: PolymarketConfig,
@@ -90,6 +344,12 @@ pub struct Settings {
     pub markets: Vec<MarketConfig>,
     pub strategy: StrategyConfig,
     pub risk: RiskConfig,
+    #[serde(default)]
+    pub paper: PaperTradingConfig,
+    #[serde(default)]
+    pub paper_slippage: PaperSlippageConfig,
+    #[serde(default)]
+    pub audit: AuditConfig,
 }
 
 impl Settings {
@@ -108,5 +368,77 @@ impl Settings {
             .iter()
             .find(|market| &market.symbol == symbol)
             .map(|market| market.hedge_exchange)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn market_data_config_defaults_to_poll_mode() {
+        let config: MarketDataConfig =
+            serde_json::from_str("{}").expect("default market data config");
+        assert_eq!(config.mode, MarketDataMode::Poll);
+        assert_eq!(config.max_stale_ms, 5_000);
+        assert_eq!(config.resolved_poly_open_max_quote_age_ms(), 5_000);
+        assert_eq!(config.resolved_cex_open_max_quote_age_ms(), 5_000);
+        assert_eq!(config.resolved_close_max_quote_age_ms(), 10_000);
+        assert_eq!(config.resolved_max_cross_leg_skew_ms(), 5_000);
+        assert_eq!(config.resolved_borderline_poly_quote_age_ms(), 4_000);
+        assert_eq!(config.reconnect_backoff_ms, 1_000);
+        assert_eq!(config.snapshot_refresh_secs, 300);
+        assert_eq!(config.funding_poll_secs, 60);
+    }
+
+    #[test]
+    fn market_data_config_deserializes_ws_mode() {
+        let config: MarketDataConfig = serde_json::from_str(
+            r#"{
+                "mode":"ws",
+                "max_stale_ms":1500,
+                "poly_open_max_quote_age_ms":2500,
+                "cex_open_max_quote_age_ms":1200,
+                "close_max_quote_age_ms":3000,
+                "max_cross_leg_skew_ms":900,
+                "borderline_poly_quote_age_ms":1800,
+                "reconnect_backoff_ms":2000,
+                "snapshot_refresh_secs":45,
+                "funding_poll_secs":30
+            }"#,
+        )
+        .expect("ws market data config");
+        assert_eq!(config.mode, MarketDataMode::Ws);
+        assert_eq!(config.max_stale_ms, 1_500);
+        assert_eq!(config.resolved_poly_open_max_quote_age_ms(), 2_500);
+        assert_eq!(config.resolved_cex_open_max_quote_age_ms(), 1_200);
+        assert_eq!(config.resolved_close_max_quote_age_ms(), 3_000);
+        assert_eq!(config.resolved_max_cross_leg_skew_ms(), 900);
+        assert_eq!(config.resolved_borderline_poly_quote_age_ms(), 1_800);
+        assert_eq!(config.reconnect_backoff_ms, 2_000);
+        assert_eq!(config.snapshot_refresh_secs, 45);
+        assert_eq!(config.funding_poll_secs, 30);
+    }
+
+    #[test]
+    fn general_config_defaults_monitor_socket_path() {
+        let config: GeneralConfig = serde_json::from_str(
+            r#"{
+                "log_level":"info",
+                "data_dir":"./data"
+            }"#,
+        )
+        .expect("general config with default socket path");
+        assert_eq!(config.monitor_socket_path, "/tmp/polyalpha.sock");
+    }
+
+    #[test]
+    fn audit_config_defaults_are_forward_compatible() {
+        let config: AuditConfig = serde_json::from_str("{}").expect("default audit config");
+        assert!(config.enabled);
+        assert_eq!(config.snapshot_interval_secs, 15);
+        assert_eq!(config.checkpoint_interval_secs, 60);
+        assert_eq!(config.warehouse_sync_interval_secs, 300);
+        assert_eq!(config.raw_segment_max_bytes, 64 * 1024 * 1024);
     }
 }

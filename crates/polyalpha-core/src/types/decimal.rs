@@ -81,6 +81,20 @@ impl PolyShares {
     }
 }
 
+impl CexBaseQty {
+    pub const ZERO: Self = Self(Decimal::ZERO);
+
+    pub fn floor_to_step(self, step: Decimal) -> Self {
+        let step = step.abs();
+        let value = self.0.max(Decimal::ZERO);
+        if step <= Decimal::ZERO {
+            return Self(value);
+        }
+
+        Self((value / step).floor() * step)
+    }
+}
+
 impl UsdNotional {
     pub const ZERO: Self = Self(Decimal::ZERO);
 

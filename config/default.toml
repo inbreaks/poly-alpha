@@ -1,6 +1,14 @@
 [general]
 log_level = "info"
 data_dir = "./data"
+monitor_socket_path = "/tmp/polyalpha.sock"
+
+[audit]
+enabled = true
+snapshot_interval_secs = 15
+checkpoint_interval_secs = 60
+warehouse_sync_interval_secs = 300
+raw_segment_max_bytes = 67108864
 
 [polymarket]
 clob_api_url = "https://clob.polymarket.com"
@@ -16,23 +24,6 @@ rest_url = "https://www.okx.com"
 ws_public_url = "wss://ws.okx.com:8443/ws/v5/public"
 ws_private_url = "wss://ws.okx.com:8443/ws/v5/private"
 
-[[markets]]
-symbol = "btc-100k-mar-2026"
-condition_id = "0x..."
-yes_token_id = "yes-placeholder..."
-no_token_id = "no-placeholder..."
-market_question = "Will the price of Bitcoin be above $100,000 on March 31, 2026?"
-market_rule = { kind = "above", lower_strike = 100000 }
-settlement_timestamp = 1775001600
-min_tick_size = 0.01
-neg_risk = false
-cex_symbol = "BTCUSDT"
-hedge_exchange = "Binance"
-strike_price = 100000
-cex_price_tick = 0.1
-cex_qty_step = 0.001
-cex_contract_multiplier = 1.0
-
 [strategy.basis]
 entry_z_score_threshold = 2.0
 exit_z_score_threshold = 0.5
@@ -42,6 +33,28 @@ min_basis_bps = 50.0
 max_position_usd = 10000.0
 delta_rebalance_threshold = 0.05
 delta_rebalance_interval_secs = 60
+max_data_age_minutes = 1
+max_time_diff_minutes = 1
+enable_freshness_check = true
+reject_on_disconnect = true
+
+[strategy.market_data]
+mode = "poll"
+max_stale_ms = 5000
+# WS 模式下可按腿拆分阈值；未单独配置时会回退到 max_stale_ms。
+# 下面这组是建议起点，不会改变当前默认行为：
+# poly_open_max_quote_age_ms = 2500
+# cex_open_max_quote_age_ms = 1200
+# close_max_quote_age_ms = 3000
+# max_cross_leg_skew_ms = 900
+# borderline_poly_quote_age_ms = 1800
+# 语义：
+# - 开仓用 Poly/CEX 分腿报价龄 + 双腿时差
+# - 平仓 / delta rebalance 用 close_max_quote_age_ms
+# - borderline_poly_quote_age_ms 会把 Poly 慢腿打成“慢腿临界”，便于 monitor / audit 识别
+reconnect_backoff_ms = 1000
+snapshot_refresh_secs = 300
+funding_poll_secs = 60
 
 [strategy.dmm]
 gamma = 0.1
@@ -74,3 +87,10 @@ max_open_orders = 50
 circuit_breaker_cooldown_secs = 300
 rate_limit_orders_per_sec = 5
 max_persistence_lag_secs = 10
+
+[paper_slippage]
+# Slippage simulation for paper trading
+poly_slippage_bps = 50      # 0.5% extra slippage for Polymarket
+cex_slippage_bps = 2        # 0.02% extra slippage for CEX
+min_liquidity = 100         # Minimum shares required for execution
+allow_partial_fill = false  # Reject orders if liquidity insufficient

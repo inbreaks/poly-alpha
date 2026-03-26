@@ -20,6 +20,8 @@ pub enum DataError {
     ChannelClosed,
     #[error("http request failed: {0}")]
     Http(String),
+    #[error("websocket error: {0}")]
+    Websocket(String),
     #[error("json parsing failed: {0}")]
     Json(String),
     #[error("decimal parsing failed: {0}")]
@@ -43,5 +45,11 @@ impl From<reqwest::Error> for DataError {
 impl From<serde_json::Error> for DataError {
     fn from(value: serde_json::Error) -> Self {
         Self::Json(value.to_string())
+    }
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for DataError {
+    fn from(value: tokio_tungstenite::tungstenite::Error) -> Self {
+        Self::Websocket(value.to_string())
     }
 }

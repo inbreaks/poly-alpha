@@ -1,5 +1,10 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
+fn default_monitor_socket_path() -> String {
+    std::env::var("POLYALPHA__GENERAL__MONITOR_SOCKET_PATH")
+        .unwrap_or_else(|_| "/tmp/polyalpha.sock".to_owned())
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "polyalpha-cli", about = "PolyAlpha MVP CLI")]
 pub struct Cli {
@@ -9,6 +14,10 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
     CheckConfig {
         #[arg(long, default_value = "default")]
         env: String,
@@ -59,6 +68,126 @@ pub enum Command {
         #[command(subcommand)]
         command: BacktestCommand,
     },
+    /// 启动监控 TUI
+    Monitor {
+        #[arg(long, default_value_t = default_monitor_socket_path())]
+        socket: String,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "JSON 流输出模式",
+            conflicts_with = "snapshot"
+        )]
+        json: bool,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "一次性状态快照",
+            conflicts_with = "json"
+        )]
+        snapshot: bool,
+        #[arg(long, default_value_t = 1000, help = "JSON 流最小输出间隔（毫秒）")]
+        interval_ms: u64,
+        #[arg(long, default_value_t = 5000, help = "快照等待超时（毫秒）")]
+        timeout_ms: u64,
+        #[arg(long, help = "仅监控指定市场")]
+        market: Option<String>,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "启用鼠标捕获（会阻止终端拖拽选中文本）"
+        )]
+        mouse_capture: bool,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "禁用 alternate screen，把界面保留在终端滚动历史里"
+        )]
+        no_alternate_screen: bool,
+    },
+    /// JSON 输出模式 (agent 友好)
+    MonitorJson {
+        #[arg(long, default_value_t = default_monitor_socket_path())]
+        socket: String,
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+        #[arg(long, help = "仅监控指定市场")]
+        market: Option<String>,
+    },
+    /// 一次性状态快照
+    MonitorSnapshot {
+        #[arg(long, default_value_t = default_monitor_socket_path())]
+        socket: String,
+        #[arg(long, default_value_t = 5000)]
+        timeout_ms: u64,
+        #[arg(long, help = "仅监控指定市场")]
+        market: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuditCommand {
+    Events {
+        #[arg(long, default_value = "default")]
+        env: String,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        symbol: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        gate: Option<String>,
+        #[arg(long)]
+        result: Option<String>,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+        #[arg(long, value_enum, default_value_t = AuditOutputFormat::Table)]
+        format: AuditOutputFormat,
+    },
+    SessionSummary {
+        #[arg(long, default_value = "default")]
+        env: String,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long, value_enum, default_value_t = AuditOutputFormat::Table)]
+        format: AuditOutputFormat,
+    },
+    Market {
+        #[arg(long, default_value = "default")]
+        env: String,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        symbol: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, value_enum, default_value_t = AuditOutputFormat::Table)]
+        format: AuditOutputFormat,
+    },
+    PositionExplain {
+        #[arg(long, default_value = "default")]
+        env: String,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        symbol: String,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, value_enum, default_value_t = AuditOutputFormat::Table)]
+        format: AuditOutputFormat,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Default)]
+pub enum AuditOutputFormat {
+    #[default]
+    Table,
+    Json,
 }
 
 #[derive(Subcommand, Debug)]
@@ -141,6 +270,27 @@ pub enum PaperCommand {
         include_funding: bool,
         #[arg(long, default_value_t = false)]
         json: bool,
+        #[arg(long, default_value_t = 600)]
+        warmup_klines: u16,
+    },
+    /// Run paper trading for ALL markets in a single process (shared risk management)
+    RunMulti {
+        #[arg(long, default_value = "default")]
+        env: String,
+        #[arg(long, default_value_t = 5_000)]
+        poll_interval_ms: u64,
+        #[arg(long, default_value_t = 1)]
+        print_every: usize,
+        #[arg(long, default_value_t = 0)]
+        max_ticks: usize,
+        #[arg(long, default_value_t = 20)]
+        depth: u16,
+        #[arg(long, default_value_t = true)]
+        include_funding: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long, default_value_t = 600)]
+        warmup_klines: u16,
     },
     Inspect {
         #[arg(long, default_value = "default")]
@@ -177,6 +327,8 @@ pub enum BacktestCommand {
             default_value = "data/btc_basis_backtest_price_only_ready.duckdb"
         )]
         output: String,
+        #[arg(long, default_value = "btc")]
+        asset: String,
         #[arg(long, default_value_t = 0)]
         max_events: usize,
         #[arg(long, default_value_t = 0)]
@@ -322,6 +474,12 @@ pub enum BacktestCommand {
         #[arg(long, default_value_t = 1.0)]
         entry_fill_ratio: f64,
         #[arg(long)]
+        min_poly_price: Option<f64>,
+        #[arg(long)]
+        max_poly_price: Option<f64>,
+        #[arg(long)]
+        max_holding_bars: Option<usize>,
+        #[arg(long)]
         report_json: Option<String>,
         #[arg(long)]
         equity_csv: Option<String>,
@@ -370,8 +528,8 @@ pub enum MarketCommand {
     DiscoverBtc {
         #[arg(long, default_value = "default")]
         env: String,
-        #[arg(long, default_value_t = 0)]
-        template_market_index: usize,
+        #[arg(long)]
+        template_market_index: Option<usize>,
         #[arg(long, default_value = "bitcoin")]
         query: String,
         #[arg(long)]
@@ -383,4 +541,199 @@ pub enum MarketCommand {
         #[arg(long)]
         output: Option<String>,
     },
+    DiscoverEth {
+        #[arg(long, default_value = "default")]
+        env: String,
+        #[arg(long)]
+        template_market_index: Option<usize>,
+        #[arg(long, default_value = "ethereum")]
+        query: String,
+        #[arg(long)]
+        match_text: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        pick: Option<usize>,
+        #[arg(long)]
+        output: Option<String>,
+    },
+    DiscoverSol {
+        #[arg(long, default_value = "default")]
+        env: String,
+        #[arg(long)]
+        template_market_index: Option<usize>,
+        #[arg(long, default_value = "solana")]
+        query: String,
+        #[arg(long)]
+        match_text: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        pick: Option<usize>,
+        #[arg(long)]
+        output: Option<String>,
+    },
+    DiscoverXrp {
+        #[arg(long, default_value = "default")]
+        env: String,
+        #[arg(long)]
+        template_market_index: Option<usize>,
+        #[arg(long, default_value = "xrp")]
+        query: String,
+        #[arg(long)]
+        match_text: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        pick: Option<usize>,
+        #[arg(long)]
+        output: Option<String>,
+    },
+    RefreshActive {
+        #[arg(long, default_value = "multi-market-active")]
+        base_env: String,
+        #[arg(long, default_value = "all-markets")]
+        catalog_env: String,
+        #[arg(long, value_enum)]
+        asset: Vec<MarketAsset>,
+        #[arg(long, default_value_t = 300)]
+        limit_per_asset: usize,
+        #[arg(long, default_value_t = 64)]
+        max_markets_per_asset: usize,
+        #[arg(long, default_value_t = 15)]
+        min_minutes_to_settlement: i64,
+        #[arg(long, default_value_t = 1_000.0)]
+        min_liquidity_usd: f64,
+        #[arg(long, default_value_t = 1_000.0)]
+        min_volume_24h_usd: f64,
+        #[arg(long)]
+        output: Option<String>,
+        #[arg(long)]
+        report_json: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq, Hash)]
+pub enum MarketAsset {
+    Btc,
+    Eth,
+    Sol,
+    Xrp,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command};
+    use clap::{error::ErrorKind, Parser};
+
+    #[test]
+    fn monitor_defaults_to_copy_friendly_mode() {
+        let cli = Cli::try_parse_from(["polyalpha-cli", "monitor", "--socket", "/tmp/custom.sock"])
+            .expect("monitor args should parse");
+
+        match cli.command {
+            Command::Monitor {
+                socket,
+                mouse_capture,
+                no_alternate_screen,
+                ..
+            } => {
+                assert_eq!(socket, "/tmp/custom.sock");
+                assert!(!mouse_capture);
+                assert!(!no_alternate_screen);
+            }
+            other => panic!("expected monitor command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn monitor_explicit_flags_override_defaults() {
+        let cli = Cli::try_parse_from([
+            "polyalpha-cli",
+            "monitor",
+            "--socket",
+            "/tmp/custom.sock",
+            "--mouse-capture",
+            "--no-alternate-screen",
+        ])
+        .expect("monitor args should parse");
+
+        match cli.command {
+            Command::Monitor {
+                socket,
+                mouse_capture,
+                no_alternate_screen,
+                ..
+            } => {
+                assert_eq!(socket, "/tmp/custom.sock");
+                assert!(mouse_capture);
+                assert!(no_alternate_screen);
+            }
+            other => panic!("expected monitor command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn monitor_root_supports_json_interval_and_market_flags() {
+        let cli = Cli::try_parse_from([
+            "polyalpha-cli",
+            "monitor",
+            "--json",
+            "--interval-ms",
+            "250",
+            "--market",
+            "sol-dip-80-mar",
+        ])
+        .expect("monitor json args should parse");
+
+        match cli.command {
+            Command::Monitor {
+                json,
+                snapshot,
+                interval_ms,
+                market,
+                ..
+            } => {
+                assert!(json);
+                assert!(!snapshot);
+                assert_eq!(interval_ms, 250);
+                assert_eq!(market.as_deref(), Some("sol-dip-80-mar"));
+            }
+            other => panic!("expected monitor command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn monitor_root_supports_snapshot_and_market_flags() {
+        let cli = Cli::try_parse_from([
+            "polyalpha-cli",
+            "monitor",
+            "--snapshot",
+            "--market",
+            "eth-reach-2400-mar",
+        ])
+        .expect("monitor snapshot args should parse");
+
+        match cli.command {
+            Command::Monitor {
+                json,
+                snapshot,
+                market,
+                ..
+            } => {
+                assert!(!json);
+                assert!(snapshot);
+                assert_eq!(market.as_deref(), Some("eth-reach-2400-mar"));
+            }
+            other => panic!("expected monitor command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn monitor_root_rejects_json_and_snapshot_together() {
+        let err = Cli::try_parse_from(["polyalpha-cli", "monitor", "--json", "--snapshot"])
+            .expect_err("monitor args should reject multiple output modes");
+
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
 }

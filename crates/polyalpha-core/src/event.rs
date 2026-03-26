@@ -11,8 +11,8 @@ use crate::types::{
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ConnectionStatus {
-    Connecting,
     #[default]
+    Connecting,
     Connected,
     Disconnected,
     Reconnecting,
@@ -55,6 +55,7 @@ pub enum ExecutionEvent {
         symbol: Symbol,
         exchange: Exchange,
         response: OrderResponse,
+        correlation_id: String,
     },
     OrderFilled(Fill),
     OrderCancelled {
@@ -72,6 +73,12 @@ pub enum ExecutionEvent {
     ReconcileRequired {
         symbol: Option<Symbol>,
         reason: String,
+    },
+    TradeClosed {
+        symbol: Symbol,
+        correlation_id: String,
+        realized_pnl: UsdNotional,
+        timestamp_ms: u64,
     },
 }
 
