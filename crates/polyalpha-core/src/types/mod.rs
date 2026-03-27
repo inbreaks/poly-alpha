@@ -5,6 +5,7 @@ pub mod hedge;
 pub mod market;
 pub mod order;
 pub mod orderbook;
+pub mod planning;
 pub mod position;
 pub mod position_tracker;
 pub mod risk;
@@ -23,6 +24,10 @@ pub use order::{
     OrderType, PolyOrderRequest, TimeInForce,
 };
 pub use orderbook::{InstrumentKind, OrderBookSnapshot, PriceLevel, Side};
+pub use planning::{
+    ExecutionResult, OpenCandidate, OrderLedgerEntry, PlanRejectionReason, PlanningIntent,
+    RecoveryDecisionReason, RevalidationFailureReason, TradePlan, PLANNING_SCHEMA_VERSION,
+};
 pub use position::{Position, PositionKey, PositionSide};
 pub use position_tracker::{FillEffect, PositionTracker};
 pub use risk::{CircuitBreakerStatus, PersistenceLag, RiskRejection};

@@ -3,10 +3,11 @@ use std::collections::HashMap;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::event::{ExecutionEvent, MarketDataEvent, RiskStateSnapshot, SystemCommand};
-use crate::types::{ArbSignalEvent, DmmQuoteSlot, Symbol};
+use crate::types::{ArbSignalEvent, DmmQuoteSlot, PlanningIntent, Symbol};
 
 pub const MARKET_DATA_CAPACITY: usize = 10_240;
 pub const ARB_SIGNAL_CAPACITY: usize = 64;
+pub const PLANNING_INTENT_CAPACITY: usize = 64;
 pub const EXECUTION_CAPACITY: usize = 256;
 pub const COMMAND_CAPACITY: usize = 64;
 
@@ -14,6 +15,8 @@ pub type MarketDataTx = broadcast::Sender<MarketDataEvent>;
 pub type MarketDataRx = broadcast::Receiver<MarketDataEvent>;
 pub type DmmSignalTx = watch::Sender<DmmQuoteSlot>;
 pub type DmmSignalRx = watch::Receiver<DmmQuoteSlot>;
+pub type PlanningIntentTx = mpsc::Sender<PlanningIntent>;
+pub type PlanningIntentRx = mpsc::Receiver<PlanningIntent>;
 pub type ArbSignalTx = mpsc::Sender<ArbSignalEvent>;
 pub type ArbSignalRx = mpsc::Receiver<ArbSignalEvent>;
 pub type ExecutionTx = mpsc::Sender<ExecutionEvent>;

@@ -1,7 +1,9 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use super::{CexBaseQty, OrderSide, PolyShares, Price, Symbol, TokenSide, UsdNotional};
+use super::{
+    CexBaseQty, OpenCandidate, OrderSide, PolyShares, Price, Symbol, TokenSide, UsdNotional,
+};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SignalStrength {
@@ -133,6 +135,8 @@ pub enum EngineWarning {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct AlphaEngineOutput {
     pub dmm_updates: Vec<DmmQuoteUpdate>,
+    #[serde(default)]
+    pub open_candidates: Vec<OpenCandidate>,
     pub arb_signals: Vec<ArbSignalEvent>,
     #[serde(default)]
     pub warnings: Vec<EngineWarning>,
@@ -140,7 +144,10 @@ pub struct AlphaEngineOutput {
 
 impl AlphaEngineOutput {
     pub fn is_empty(&self) -> bool {
-        self.dmm_updates.is_empty() && self.arb_signals.is_empty() && self.warnings.is_empty()
+        self.dmm_updates.is_empty()
+            && self.open_candidates.is_empty()
+            && self.arb_signals.is_empty()
+            && self.warnings.is_empty()
     }
 
     pub fn push_dmm_update(&mut self, update: DmmQuoteUpdate) {
@@ -153,6 +160,10 @@ impl AlphaEngineOutput {
 
     pub fn clear_quote(&mut self, symbol: Symbol) {
         self.push_dmm_update(DmmQuoteUpdate::clear(symbol));
+    }
+
+    pub fn push_open_candidate(&mut self, candidate: OpenCandidate) {
+        self.open_candidates.push(candidate);
     }
 
     pub fn push_arb_signal(&mut self, signal: ArbSignalEvent) {
