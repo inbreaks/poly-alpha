@@ -48,6 +48,40 @@ pub enum OrderRequest {
     Cex(CexOrderRequest),
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PolySizingInstruction {
+    BuyBudgetCap {
+        max_cost_usd: UsdNotional,
+        max_avg_price: Price,
+        max_shares: PolyShares,
+    },
+    SellExactShares {
+        shares: PolyShares,
+        min_avg_price: Price,
+    },
+    SellMinProceeds {
+        shares: PolyShares,
+        min_proceeds_usd: UsdNotional,
+    },
+}
+
+impl PolySizingInstruction {
+    pub fn requested_shares(self) -> PolyShares {
+        match self {
+            Self::BuyBudgetCap { max_shares, .. } => max_shares,
+            Self::SellExactShares { shares, .. } | Self::SellMinProceeds { shares, .. } => shares,
+        }
+    }
+
+    pub fn boundary_price(self) -> Option<Price> {
+        match self {
+            Self::BuyBudgetCap { max_avg_price, .. } => Some(max_avg_price),
+            Self::SellExactShares { min_avg_price, .. } => Some(min_avg_price),
+            Self::SellMinProceeds { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PolyOrderRequest {
     pub client_order_id: ClientOrderId,
@@ -55,9 +89,7 @@ pub struct PolyOrderRequest {
     pub token_side: TokenSide,
     pub side: OrderSide,
     pub order_type: OrderType,
-    pub limit_price: Option<Price>,
-    pub shares: Option<PolyShares>,
-    pub quote_notional: Option<UsdNotional>,
+    pub sizing: PolySizingInstruction,
     pub time_in_force: TimeInForce,
     pub post_only: bool,
 }

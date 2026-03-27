@@ -7,8 +7,8 @@ use polyalpha_core::{
     cex_venue_symbol, ArbSignalAction, ArbSignalEvent, CexOrderRequest, ClientOrderId,
     DmmQuoteState, DmmQuoteUpdate, Exchange, ExecutionEvent, Fill, HedgeState, InstrumentKind,
     OrderExecutor, OrderId, OrderRequest, OrderResponse, OrderSide, OrderStatus, OrderType,
-    PolyOrderRequest, PolyShares, PositionTracker, Price, Result, Symbol, SymbolRegistry,
-    TimeInForce, TokenSide, UsdNotional, VenueQuantity,
+    PolyOrderRequest, PolyShares, PolySizingInstruction, PositionTracker, Price, Result, Symbol,
+    SymbolRegistry, TimeInForce, TokenSide, UsdNotional, VenueQuantity,
 };
 
 #[derive(Clone, Debug)]
@@ -361,9 +361,17 @@ impl<E: OrderExecutor> ExecutionManager<E> {
             token_side: TokenSide::Yes,
             side,
             order_type: OrderType::Limit,
-            limit_price: Some(price),
-            shares: Some(quantity),
-            quote_notional: None,
+            sizing: match side {
+                OrderSide::Buy => PolySizingInstruction::BuyBudgetCap {
+                    max_cost_usd: UsdNotional::from_poly(quantity, price),
+                    max_avg_price: price,
+                    max_shares: quantity,
+                },
+                OrderSide::Sell => PolySizingInstruction::SellExactShares {
+                    shares: quantity,
+                    min_avg_price: price,
+                },
+            },
             time_in_force: TimeInForce::Gtc,
             post_only: true,
         })
@@ -435,7 +443,7 @@ impl<E: OrderExecutor> ExecutionManager<E> {
         token_side: TokenSide,
         side: OrderSide,
         shares: PolyShares,
-        quote_notional: Option<UsdNotional>,
+        _quote_notional: Option<UsdNotional>,
     ) -> OrderRequest {
         OrderRequest::Poly(PolyOrderRequest {
             client_order_id: self.next_client_order_id("arb-poly"),
@@ -443,9 +451,19 @@ impl<E: OrderExecutor> ExecutionManager<E> {
             token_side,
             side,
             order_type: OrderType::Market,
-            limit_price: None,
-            shares: Some(shares),
-            quote_notional,
+            sizing: match side {
+                OrderSide::Buy => PolySizingInstruction::BuyBudgetCap {
+                    // Legacy signal path is still fixed-shares market execution until the
+                    // planner hard-cut lands, so do not let the stale notional field shrink it.
+                    max_cost_usd: UsdNotional::from_poly(shares, Price::ONE),
+                    max_avg_price: Price::ONE,
+                    max_shares: shares,
+                },
+                OrderSide::Sell => PolySizingInstruction::SellExactShares {
+                    shares,
+                    min_avg_price: Price::ZERO,
+                },
+            },
             time_in_force: TimeInForce::Fok,
             post_only: false,
         })
@@ -1019,7 +1037,10 @@ mod tests {
         match &events[0] {
             ExecutionEvent::OrderSubmitted { response, .. } => {
                 assert_eq!(response.status, OrderStatus::Rejected);
-                assert_eq!(response.rejection_reason.as_deref(), Some("zero_cex_hedge_qty"));
+                assert_eq!(
+                    response.rejection_reason.as_deref(),
+                    Some("zero_cex_hedge_qty")
+                );
             }
             other => panic!("unexpected event: {other:?}"),
         }

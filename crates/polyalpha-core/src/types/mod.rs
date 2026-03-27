@@ -21,7 +21,7 @@ pub use market::{
 };
 pub use order::{
     CexOrderRequest, ClientOrderId, OrderId, OrderRequest, OrderResponse, OrderSide, OrderStatus,
-    OrderType, PolyOrderRequest, TimeInForce,
+    OrderType, PolyOrderRequest, PolySizingInstruction, TimeInForce,
 };
 pub use orderbook::{InstrumentKind, OrderBookSnapshot, PriceLevel, Side};
 pub use planning::{

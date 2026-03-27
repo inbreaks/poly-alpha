@@ -8,7 +8,7 @@ use polyalpha_core::{
     cex_venue_symbol, create_channels, AlphaEngine, ArbSignalAction, ArbSignalEvent, CexBaseQty,
     CexOrderRequest, ClientOrderId, ConnectionStatus, EngineParams, Exchange, ExecutionEvent,
     MarketConfig, MarketDataEvent, MarketDataSource, OrderRequest, OrderType, PolyOrderRequest,
-    Price, RiskManager, Settings, SymbolRegistry, TimeInForce, TokenSide,
+    PolySizingInstruction, Price, RiskManager, Settings, SymbolRegistry, TimeInForce, TokenSide,
 };
 use polyalpha_data::{
     BinanceFuturesDataSource, CexBookLevel, CexBookUpdate, DataManager, MarketDataNormalizer,
@@ -404,7 +404,7 @@ fn signal_requests(
             token_side,
             poly_side,
             poly_target_shares,
-            poly_target_notional,
+            poly_target_notional: _,
             cex_side,
             cex_hedge_qty,
             ..
@@ -413,7 +413,7 @@ fn signal_requests(
             token_side,
             poly_side,
             poly_target_shares,
-            poly_target_notional,
+            poly_target_notional: _,
             cex_side,
             cex_hedge_qty,
             ..
@@ -428,9 +428,20 @@ fn signal_requests(
                     token_side: *token_side,
                     side: *poly_side,
                     order_type: OrderType::Market,
-                    limit_price: None,
-                    shares: Some(*poly_target_shares),
-                    quote_notional: Some(*poly_target_notional),
+                    sizing: match poly_side {
+                        polyalpha_core::OrderSide::Buy => PolySizingInstruction::BuyBudgetCap {
+                            max_cost_usd: polyalpha_core::UsdNotional::from_poly(
+                                *poly_target_shares,
+                                Price::ONE,
+                            ),
+                            max_avg_price: Price::ONE,
+                            max_shares: *poly_target_shares,
+                        },
+                        polyalpha_core::OrderSide::Sell => PolySizingInstruction::SellExactShares {
+                            shares: *poly_target_shares,
+                            min_avg_price: Price::ZERO,
+                        },
+                    },
                     time_in_force: TimeInForce::Fok,
                     post_only: false,
                 }),
@@ -479,9 +490,20 @@ fn signal_requests(
                     token_side: leg.token_side,
                     side: leg.side,
                     order_type: OrderType::Market,
-                    limit_price: None,
-                    shares: Some(leg.quantity),
-                    quote_notional: None,
+                    sizing: match leg.side {
+                        polyalpha_core::OrderSide::Buy => PolySizingInstruction::BuyBudgetCap {
+                            max_cost_usd: polyalpha_core::UsdNotional::from_poly(
+                                leg.quantity,
+                                Price::ONE,
+                            ),
+                            max_avg_price: Price::ONE,
+                            max_shares: leg.quantity,
+                        },
+                        polyalpha_core::OrderSide::Sell => PolySizingInstruction::SellExactShares {
+                            shares: leg.quantity,
+                            min_avg_price: Price::ZERO,
+                        },
+                    },
                     time_in_force: TimeInForce::Fok,
                     post_only: false,
                 })

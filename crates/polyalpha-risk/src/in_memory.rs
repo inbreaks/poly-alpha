@@ -5,8 +5,8 @@ use rust_decimal::Decimal;
 
 use polyalpha_core::{
     CexOrderRequest, CircuitBreakerStatus, Exchange, Fill, InstrumentKind, MarketPhase,
-    OrderRequest, OrderSide, PolyOrderRequest, PositionKey, PositionTracker, RiskManager,
-    RiskRejection, RiskStateSnapshot, Symbol, TokenSide, UsdNotional,
+    OrderRequest, OrderSide, PolyOrderRequest, PolySizingInstruction, PositionKey, PositionTracker,
+    RiskManager, RiskRejection, RiskStateSnapshot, Symbol, TokenSide, UsdNotional,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,26 +161,28 @@ impl InMemoryRiskManager {
 
     fn request_notional_estimate(&self, request: &OrderRequest) -> UsdNotional {
         match request {
-            OrderRequest::Poly(order) => {
-                if let Some(notional) = order.quote_notional {
-                    return notional;
+            OrderRequest::Poly(order) => match order.sizing {
+                PolySizingInstruction::BuyBudgetCap { max_cost_usd, .. } => max_cost_usd,
+                PolySizingInstruction::SellExactShares {
+                    shares,
+                    min_avg_price,
+                } => {
+                    if min_avg_price.0 > Decimal::ZERO {
+                        UsdNotional(shares.0 * min_avg_price.0)
+                    } else {
+                        // 风控估值兜底：没有显式价格时回退到持仓均价，拿不到则按 0 处理。
+                        let key = poly_position_key(order);
+                        let fallback = self
+                            .position_tracker
+                            .entry_price_for(&key)
+                            .unwrap_or(polyalpha_core::Price::ZERO);
+                        UsdNotional(shares.0 * fallback.0)
+                    }
                 }
-                let Some(shares) = order.shares else {
-                    return UsdNotional::ZERO;
-                };
-
-                if let Some(price) = order.limit_price {
-                    return UsdNotional(shares.0 * price.0);
-                }
-
-                // 风控估值兜底：没有显式价格时回退到持仓均价，拿不到则按 0 处理。
-                let key = poly_position_key(order);
-                let fallback = self
-                    .position_tracker
-                    .entry_price_for(&key)
-                    .unwrap_or(polyalpha_core::Price::ZERO);
-                UsdNotional(shares.0 * fallback.0)
-            }
+                PolySizingInstruction::SellMinProceeds {
+                    min_proceeds_usd, ..
+                } => min_proceeds_usd,
+            },
             OrderRequest::Cex(order) => {
                 if let Some(price) = order.price {
                     return UsdNotional(order.base_qty.0 * price.0);
@@ -315,9 +317,10 @@ fn cex_position_key(order: &CexOrderRequest) -> PositionKey {
 
 fn request_signed_qty(request: &OrderRequest) -> Option<Decimal> {
     match request {
-        OrderRequest::Poly(order) => order
-            .shares
-            .map(|shares| signed_by_side(order.side, shares.0)),
+        OrderRequest::Poly(order) => Some(signed_by_side(
+            order.side,
+            order.sizing.requested_shares().0,
+        )),
         OrderRequest::Cex(order) => Some(signed_by_side(order.side, order.base_qty.0)),
     }
 }
