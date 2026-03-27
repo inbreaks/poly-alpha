@@ -8,8 +8,9 @@ use rust_decimal::Decimal;
 use polyalpha_core::{
     AlphaEngine, AlphaEngineOutput, ArbSignalAction, ArbSignalEvent, ConnectionStatus,
     DmmQuoteState, EngineParams, EngineWarning, Exchange, InstrumentKind, MarketConfig,
-    MarketDataEvent, MarketPhase, MarketRule, MarketRuleKind, OrderBookSnapshot, OrderSide,
-    PolyShares, Price, SignalStrength, Symbol, TokenSide, UsdNotional,
+    MarketDataEvent, MarketPhase, MarketRule, MarketRuleKind, OpenCandidate, OrderBookSnapshot,
+    OrderSide, PolyShares, Price, SignalStrength, Symbol, TokenSide, UsdNotional,
+    PLANNING_SCHEMA_VERSION,
 };
 
 const ONE_MINUTE_MS: u64 = 60_000;
@@ -1068,6 +1069,9 @@ impl SimpleAlphaEngine {
             ],
             self.get_entry_z(symbol),
         ) {
+            if let Some(candidate) = self.build_open_candidate(symbol, &snapshot) {
+                output.push_open_candidate(candidate);
+            }
             if let Some(signal) = self.build_basis_signal(symbol, &snapshot) {
                 state.active_token_side = Some(snapshot.token_side);
                 output.push_arb_signal(signal);
@@ -1159,6 +1163,40 @@ impl SimpleAlphaEngine {
                 minutes_to_expiry,
             }),
             warning: None,
+        })
+    }
+
+    fn build_open_candidate(
+        &mut self,
+        symbol: &Symbol,
+        snapshot: &BasisStrategySnapshot,
+    ) -> Option<OpenCandidate> {
+        let mut risk_budget = self.get_position_notional_usd(symbol);
+        if let Some(max_position_usd) = self.max_position_usd {
+            risk_budget = UsdNotional(risk_budget.0.min(max_position_usd.0));
+        }
+        if risk_budget.0 <= Decimal::ZERO {
+            return None;
+        }
+
+        Some(OpenCandidate {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            candidate_id: self.next_signal_id(symbol, snapshot.token_side),
+            correlation_id: self.generate_correlation_id(),
+            symbol: symbol.clone(),
+            token_side: snapshot.token_side,
+            direction: "long".to_owned(),
+            fair_value: snapshot.fair_value,
+            raw_mispricing: snapshot.signal_basis,
+            delta_estimate: snapshot.delta,
+            risk_budget_usd: risk_budget.0.to_f64().unwrap_or_default(),
+            strength: self.signal_strength(symbol, snapshot.z_score),
+            z_score: snapshot.z_score,
+            timestamp_ms: self
+                .states
+                .get(symbol)
+                .map(|state| state.last_update_ms)
+                .unwrap_or_default(),
         })
     }
 
@@ -1700,7 +1738,7 @@ mod tests {
         )
     }
 
-    async fn seed_basis_long_yes_signal(engine: &mut SimpleAlphaEngine) -> ArbSignalEvent {
+    async fn seed_basis_long_yes_output(engine: &mut SimpleAlphaEngine) -> AlphaEngineOutput {
         let _ = engine
             .on_market_data(&cex_orderbook_event(
                 Decimal::new(100_000, 0),
@@ -1739,12 +1777,21 @@ mod tests {
                     offset + 100,
                 ))
                 .await;
-            if let Some(signal) = output.arb_signals.into_iter().next() {
-                return signal;
+            if !output.open_candidates.is_empty() || !output.arb_signals.is_empty() {
+                return output;
             }
         }
 
-        panic!("expected a BasisLong signal during warmup sequence");
+        panic!("expected an open candidate during warmup sequence");
+    }
+
+    async fn seed_basis_long_yes_signal(engine: &mut SimpleAlphaEngine) -> ArbSignalEvent {
+        let output = seed_basis_long_yes_output(engine).await;
+        output
+            .arb_signals
+            .into_iter()
+            .next()
+            .expect("expected a BasisLong signal during warmup sequence")
     }
 
     #[tokio::test]
@@ -1846,6 +1893,22 @@ mod tests {
             }
             other => panic!("unexpected action: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn emits_open_candidate_without_execution_fields() {
+        let mut engine = test_engine();
+        let output = seed_basis_long_yes_output(&mut engine).await;
+
+        assert_eq!(output.open_candidates.len(), 1);
+        let candidate = &output.open_candidates[0];
+        assert_eq!(candidate.schema_version, PLANNING_SCHEMA_VERSION);
+        assert_eq!(candidate.symbol, Symbol::new("btc-price-only"));
+        assert_eq!(candidate.token_side, TokenSide::Yes);
+        assert_eq!(candidate.direction, "long");
+        assert_eq!(candidate.risk_budget_usd, 1_000.0);
+        assert!(candidate.raw_mispricing.abs() > 0.0);
+        assert!(candidate.delta_estimate.abs() > 0.0);
     }
 
     #[tokio::test]
