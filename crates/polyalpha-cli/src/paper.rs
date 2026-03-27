@@ -7391,6 +7391,40 @@ async fn apply_execution_events(
             audit.record_execution(&event, signal)?;
         }
         match &event {
+            ExecutionEvent::TradePlanCreated { plan } => {
+                push_event_with_context(
+                    recent_events,
+                    "plan",
+                    summarize_execution_event(&event),
+                    Some(plan.symbol.0.clone()),
+                    signal.map(|signal| signal.signal_id.clone()),
+                    Some(plan.correlation_id.clone()),
+                    build_execution_event_details(&event, signal),
+                );
+            }
+            ExecutionEvent::PlanSuperseded { symbol, .. } => {
+                let (_, correlation_id) = audit_execution_identity(&event, signal);
+                push_event_with_context(
+                    recent_events,
+                    "plan",
+                    summarize_execution_event(&event),
+                    Some(symbol.0.clone()),
+                    signal.map(|signal| signal.signal_id.clone()),
+                    correlation_id,
+                    build_execution_event_details(&event, signal),
+                );
+            }
+            ExecutionEvent::RecoveryPlanCreated { plan } => {
+                push_event_with_context(
+                    recent_events,
+                    "recovery",
+                    summarize_execution_event(&event),
+                    Some(plan.symbol.0.clone()),
+                    signal.map(|signal| signal.signal_id.clone()),
+                    Some(plan.correlation_id.clone()),
+                    build_execution_event_details(&event, signal),
+                );
+            }
             ExecutionEvent::OrderSubmitted {
                 symbol,
                 correlation_id,
@@ -7491,6 +7525,21 @@ async fn apply_execution_events(
 
 fn summarize_execution_event(event: &ExecutionEvent) -> String {
     match event {
+        ExecutionEvent::TradePlanCreated { plan } => format!(
+            "交易计划已生成 {} {} {} / {}",
+            plan.symbol.0, plan.plan_id, plan.intent_type, plan.priority
+        ),
+        ExecutionEvent::PlanSuperseded {
+            symbol,
+            superseded_plan_id,
+            next_plan_id,
+        } => format!(
+            "{} 计划已抢占 {} -> {}",
+            symbol.0, superseded_plan_id, next_plan_id
+        ),
+        ExecutionEvent::RecoveryPlanCreated { plan } => {
+            format!("恢复计划已生成 {} {}", plan.symbol.0, plan.plan_id)
+        }
         ExecutionEvent::OrderSubmitted {
             exchange, response, ..
         } => {
@@ -8309,6 +8358,28 @@ fn build_execution_event_details(
         add_signal_details(&mut details, signal);
     }
     match event {
+        ExecutionEvent::TradePlanCreated { plan } => {
+            insert_detail(&mut details, "市场", plan.symbol.0.clone());
+            insert_detail(&mut details, "计划ID", plan.plan_id.clone());
+            insert_detail(&mut details, "意图", plan.intent_type.clone());
+            insert_detail(&mut details, "优先级", plan.priority.clone());
+            insert_detail(&mut details, "关联ID", plan.correlation_id.clone());
+        }
+        ExecutionEvent::PlanSuperseded {
+            symbol,
+            superseded_plan_id,
+            next_plan_id,
+        } => {
+            insert_detail(&mut details, "市场", symbol.0.clone());
+            insert_detail(&mut details, "被替换计划", superseded_plan_id.clone());
+            insert_detail(&mut details, "新计划", next_plan_id.clone());
+        }
+        ExecutionEvent::RecoveryPlanCreated { plan } => {
+            insert_detail(&mut details, "市场", plan.symbol.0.clone());
+            insert_detail(&mut details, "恢复计划ID", plan.plan_id.clone());
+            insert_detail(&mut details, "关联ID", plan.correlation_id.clone());
+            insert_detail(&mut details, "优先级", plan.priority.clone());
+        }
         ExecutionEvent::OrderSubmitted {
             symbol,
             exchange,
@@ -9018,6 +9089,18 @@ fn audit_execution_identity(
     signal: Option<&ArbSignalEvent>,
 ) -> (Option<String>, Option<String>) {
     match event {
+        ExecutionEvent::TradePlanCreated { plan } => (
+            Some(plan.symbol.0.clone()),
+            Some(plan.correlation_id.clone()),
+        ),
+        ExecutionEvent::PlanSuperseded { symbol, .. } => (
+            Some(symbol.0.clone()),
+            signal.map(|signal| signal.correlation_id.clone()),
+        ),
+        ExecutionEvent::RecoveryPlanCreated { plan } => (
+            Some(plan.symbol.0.clone()),
+            Some(plan.correlation_id.clone()),
+        ),
         ExecutionEvent::OrderSubmitted {
             symbol,
             correlation_id,
@@ -9049,6 +9132,9 @@ fn audit_execution_identity(
 
 fn audit_execution_timestamp_ms(event: &ExecutionEvent) -> u64 {
     match event {
+        ExecutionEvent::TradePlanCreated { plan } => plan.created_at_ms,
+        ExecutionEvent::PlanSuperseded { .. } => now_millis(),
+        ExecutionEvent::RecoveryPlanCreated { plan } => plan.created_at_ms,
         ExecutionEvent::OrderSubmitted { response, .. } => response.timestamp_ms,
         ExecutionEvent::OrderFilled(fill) => fill.timestamp_ms,
         ExecutionEvent::OrderCancelled { .. } => now_millis(),

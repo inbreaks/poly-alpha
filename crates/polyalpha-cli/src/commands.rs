@@ -371,6 +371,9 @@ async fn apply_execution_events(
 ) -> Result<()> {
     for event in events {
         match event {
+            ExecutionEvent::TradePlanCreated { .. }
+            | ExecutionEvent::PlanSuperseded { .. }
+            | ExecutionEvent::RecoveryPlanCreated { .. } => {}
             ExecutionEvent::OrderSubmitted { .. } => {
                 stats.order_submitted += 1;
             }

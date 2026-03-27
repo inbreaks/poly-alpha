@@ -885,6 +885,15 @@ async fn apply_execution_events(
 ) -> Result<()> {
     for event in events {
         match &event {
+            ExecutionEvent::TradePlanCreated { .. } => {
+                push_event(recent_events, "plan", summarize_execution_event(&event));
+            }
+            ExecutionEvent::PlanSuperseded { .. } => {
+                push_event(recent_events, "plan", summarize_execution_event(&event));
+            }
+            ExecutionEvent::RecoveryPlanCreated { .. } => {
+                push_event(recent_events, "recovery", summarize_execution_event(&event));
+            }
             ExecutionEvent::OrderSubmitted { .. } => {
                 stats.order_submitted += 1;
                 push_event(
@@ -937,6 +946,21 @@ async fn apply_execution_events(
 
 fn summarize_execution_event(event: &ExecutionEvent) -> String {
     match event {
+        ExecutionEvent::TradePlanCreated { plan } => format!(
+            "交易计划已生成 {} {} {} / {}",
+            plan.symbol.0, plan.plan_id, plan.intent_type, plan.priority
+        ),
+        ExecutionEvent::PlanSuperseded {
+            symbol,
+            superseded_plan_id,
+            next_plan_id,
+        } => format!(
+            "{} 计划已抢占 {} -> {}",
+            symbol.0, superseded_plan_id, next_plan_id
+        ),
+        ExecutionEvent::RecoveryPlanCreated { plan } => {
+            format!("恢复计划已生成 {} {}", plan.symbol.0, plan.plan_id)
+        }
         ExecutionEvent::OrderSubmitted {
             exchange, response, ..
         } => {
