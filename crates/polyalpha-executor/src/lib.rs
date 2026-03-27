@@ -3,6 +3,7 @@ pub mod dry_run;
 pub mod manager;
 pub mod okx;
 pub mod orderbook_provider;
+pub mod planner;
 pub mod polymarket;
 pub mod router;
 
@@ -11,6 +12,7 @@ pub use dry_run::DryRunExecutor;
 pub use manager::ExecutionManager;
 pub use okx::{OkxExecutor, OkxSignedRequestPreview};
 pub use orderbook_provider::{InMemoryOrderbookProvider, NoOpOrderbookProvider, OrderbookProvider};
+pub use planner::{CanonicalPlanningContext, ExecutionPlanner, PlanRejection};
 pub use polymarket::PolymarketExecutor;
 pub use router::LiveExecutionRouter;
 
