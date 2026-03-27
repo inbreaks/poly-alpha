@@ -1709,10 +1709,12 @@ mod tests {
             ))
             .await;
 
+        // Keep the warmup path slightly volatile so sigma stays above the minimum
+        // and the resulting basis candidate remains hedgeable under current rules.
         for (offset, yes_bid, yes_ask, no_bid, no_ask, cex_price) in [
-            (60_100, 51, 53, 47, 49, 100_100),
-            (120_100, 50, 52, 48, 50, 100_200),
-            (180_100, 35, 37, 63, 65, 100_300),
+            (60_100, 51, 53, 47, 49, 100_150),
+            (120_100, 50, 52, 48, 50, 100_300),
+            (180_100, 35, 37, 63, 65, 100_450),
         ] {
             let _ = engine
                 .on_market_data(&poly_orderbook_event(
