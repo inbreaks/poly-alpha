@@ -87,3 +87,6 @@ htmlcov/
 
 # Auto-generated config overlays
 config/*.auto.toml
+
+# Local git worktrees
+.worktrees/
