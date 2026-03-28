@@ -3341,13 +3341,8 @@ pub async fn run_paper(
     });
 
     let executor_start_ms = now_millis();
-    let orderbook_provider = Arc::new(InMemoryOrderbookProvider::new());
-    let executor = DryRunExecutor::with_orderbook_and_start_timestamp(
-        orderbook_provider.clone(),
-        build_paper_slippage_config(&settings),
-        executor_start_ms,
-    );
-    let mut execution = ExecutionManager::with_symbol_registry(executor.clone(), registry.clone());
+    let (orderbook_provider, executor, mut execution) =
+        build_paper_execution_stack(&settings, &registry, executor_start_ms);
     let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
     let mut observed = ObservedState::default();
     let mut stats = PaperStats::default();
@@ -3875,13 +3870,8 @@ pub async fn run_paper_multi(
     });
 
     let executor_start_ms = now_millis();
-    let orderbook_provider = Arc::new(InMemoryOrderbookProvider::new());
-    let executor = DryRunExecutor::with_orderbook_and_start_timestamp(
-        orderbook_provider.clone(),
-        build_paper_slippage_config(&settings),
-        executor_start_ms,
-    );
-    let mut execution = ExecutionManager::with_symbol_registry(executor.clone(), registry.clone());
+    let (orderbook_provider, executor, mut execution) =
+        build_paper_execution_stack(&settings, &registry, executor_start_ms);
     let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
     let mut observed: HashMap<Symbol, ObservedState> = markets
         .iter()
@@ -6144,13 +6134,8 @@ async fn run_paper_ws_mode(
     });
 
     let executor_start_ms = now_millis();
-    let orderbook_provider = Arc::new(InMemoryOrderbookProvider::new());
-    let executor = DryRunExecutor::with_orderbook_and_start_timestamp(
-        orderbook_provider.clone(),
-        build_paper_slippage_config(&settings),
-        executor_start_ms,
-    );
-    let mut execution = ExecutionManager::with_symbol_registry(executor.clone(), registry.clone());
+    let (orderbook_provider, executor, mut execution) =
+        build_paper_execution_stack(&settings, &registry, executor_start_ms);
     let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
     let mut observed = ObservedState::default();
     let mut stats = PaperStats::default();
@@ -6574,13 +6559,8 @@ async fn run_paper_multi_ws_mode(
     });
 
     let executor_start_ms = now_millis();
-    let orderbook_provider = Arc::new(InMemoryOrderbookProvider::new());
-    let executor = DryRunExecutor::with_orderbook_and_start_timestamp(
-        orderbook_provider.clone(),
-        build_paper_slippage_config(&settings),
-        executor_start_ms,
-    );
-    let mut execution = ExecutionManager::with_symbol_registry(executor.clone(), registry.clone());
+    let (orderbook_provider, executor, mut execution) =
+        build_paper_execution_stack(&settings, &registry, executor_start_ms);
     let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
     let mut observed: HashMap<Symbol, ObservedState> = markets
         .iter()
@@ -10213,6 +10193,29 @@ fn build_paper_slippage_config(settings: &Settings) -> SlippageConfig {
     }
 }
 
+fn build_paper_execution_stack(
+    settings: &Settings,
+    registry: &SymbolRegistry,
+    executor_start_ms: u64,
+) -> (
+    Arc<InMemoryOrderbookProvider>,
+    DryRunExecutor,
+    ExecutionManager<DryRunExecutor>,
+) {
+    let orderbook_provider = Arc::new(InMemoryOrderbookProvider::new());
+    let executor = DryRunExecutor::with_orderbook_and_start_timestamp(
+        orderbook_provider.clone(),
+        build_paper_slippage_config(settings),
+        executor_start_ms,
+    );
+    let execution = ExecutionManager::with_symbol_registry_and_orderbook_provider(
+        executor.clone(),
+        registry.clone(),
+        orderbook_provider.clone(),
+    );
+    (orderbook_provider, executor, execution)
+}
+
 fn update_paper_orderbook(
     provider: &InMemoryOrderbookProvider,
     registry: &SymbolRegistry,
@@ -10999,6 +11002,17 @@ mod tests {
         let snapshot_detail = details.get("残余快照").expect("residual snapshot detail");
         assert!(snapshot_detail.contains("schema=1"));
         assert!(snapshot_detail.contains("preferred_cex_side=Buy"));
+    }
+
+    #[test]
+    fn paper_execution_stack_wires_orderbook_provider_into_execution_manager() {
+        let settings = test_settings_with_price_filter(None, None);
+        let registry = SymbolRegistry::new(settings.markets.clone());
+
+        let (_provider, _executor, execution) =
+            build_paper_execution_stack(&settings, &registry, 1_700_000_000_000);
+
+        assert!(execution.orderbook_provider().is_some());
     }
 
     #[test]
