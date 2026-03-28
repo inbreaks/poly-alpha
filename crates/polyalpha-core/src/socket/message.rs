@@ -6,11 +6,26 @@ use crate::{
     ConnectionStatus, ExecutionResult, OpenCandidate, PlanningIntent, TradePlan,
     PLANNING_SCHEMA_VERSION,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
 fn monitor_schema_version() -> u32 {
     PLANNING_SCHEMA_VERSION
+}
+
+fn deserialize_monitor_schema_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let schema_version = u32::deserialize(deserializer)?;
+    if schema_version == PLANNING_SCHEMA_VERSION {
+        Ok(schema_version)
+    } else {
+        Err(D::Error::custom(format!(
+            "incompatible monitor schema_version: expected {}, got {}",
+            PLANNING_SCHEMA_VERSION, schema_version
+        )))
+    }
 }
 
 /// 通信消息
@@ -49,8 +64,10 @@ pub enum Message {
 }
 
 /// 监控状态
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MonitorState {
+    #[serde(deserialize_with = "deserialize_monitor_schema_version")]
+    pub schema_version: u32,
     pub timestamp_ms: u64,
     pub mode: TradingMode,
     pub uptime_secs: u64,
@@ -72,6 +89,30 @@ pub struct MonitorState {
     pub recent_trades: Vec<TradeView>,
     #[serde(default)]
     pub recent_commands: Vec<CommandView>,
+}
+
+impl Default for MonitorState {
+    fn default() -> Self {
+        Self {
+            schema_version: monitor_schema_version(),
+            timestamp_ms: 0,
+            mode: TradingMode::default(),
+            uptime_secs: 0,
+            paused: false,
+            emergency: false,
+            performance: PerformanceMetrics::default(),
+            positions: Vec::new(),
+            markets: Vec::new(),
+            signals: SignalStats::default(),
+            evaluation: EvaluationStats::default(),
+            config: MonitorStrategyConfig::default(),
+            runtime: MonitorRuntimeStats::default(),
+            connections: HashMap::new(),
+            recent_events: Vec::new(),
+            recent_trades: Vec::new(),
+            recent_commands: Vec::new(),
+        }
+    }
 }
 
 /// 交易模式
@@ -464,7 +505,7 @@ pub struct CommandView {
 /// 监控事件
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MonitorEvent {
-    #[serde(default = "monitor_schema_version")]
+    #[serde(deserialize_with = "deserialize_monitor_schema_version")]
     pub schema_version: u32,
     pub timestamp_ms: u64,
     pub kind: EventKind,
@@ -498,7 +539,7 @@ impl MonitorEvent {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionPipelineView {
-    #[serde(default = "monitor_schema_version")]
+    #[serde(deserialize_with = "deserialize_monitor_schema_version")]
     pub schema_version: u32,
     #[serde(default)]
     pub candidate: Option<OpenCandidate>,
@@ -845,6 +886,7 @@ mod tests {
     #[test]
     fn monitor_state_deserializes_when_evaluation_stats_are_missing() {
         let raw = json!({
+            "schema_version": PLANNING_SCHEMA_VERSION,
             "timestamp_ms": 1,
             "mode": "Paper",
             "uptime_secs": 2,
@@ -886,6 +928,59 @@ mod tests {
         assert_eq!(state.evaluation.attempts, 0);
         assert_eq!(state.evaluation.skipped, 0);
         assert!(state.evaluation.skip_reasons.is_empty());
+    }
+
+    #[test]
+    fn monitor_state_serializes_schema_version() {
+        let encoded = serde_json::to_value(MonitorState::default()).unwrap();
+        assert_eq!(encoded["schema_version"], json!(PLANNING_SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn monitor_state_rejects_incompatible_schema_version() {
+        let raw = json!({
+            "schema_version": PLANNING_SCHEMA_VERSION + 1,
+            "timestamp_ms": 1,
+            "mode": "Paper",
+            "uptime_secs": 0,
+            "paused": false,
+            "emergency": false,
+            "performance": {
+                "total_pnl_usd": 0.0,
+                "today_pnl_usd": 0.0,
+                "win_rate_pct": 0.0,
+                "max_drawdown_pct": 0.0,
+                "profit_factor": 0.0,
+                "equity": 10000.0,
+                "initial_capital": 10000.0
+            },
+            "positions": [],
+            "markets": [],
+            "signals": {
+                "seen": 0,
+                "rejected": 0,
+                "rejection_reasons": {}
+            },
+            "config": {
+                "entry_z": 4.0,
+                "exit_z": 0.5,
+                "position_notional_usd": 10000.0,
+                "rolling_window": 600,
+                "min_poly_price": 0.2,
+                "max_poly_price": 0.5,
+                "poly_slippage_bps": 50,
+                "cex_slippage_bps": 2
+            },
+            "connections": {},
+            "recent_events": [],
+            "recent_trades": [],
+            "recent_commands": []
+        });
+
+        let err = serde_json::from_value::<MonitorState>(raw).expect_err("schema mismatch");
+        assert!(err
+            .to_string()
+            .contains("incompatible monitor schema_version"));
     }
 
     #[test]

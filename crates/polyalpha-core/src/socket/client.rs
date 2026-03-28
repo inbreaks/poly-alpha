@@ -369,6 +369,7 @@ mod tests {
 
     use super::*;
     use crate::{CommandStatus, EventKind, MonitorEvent, MonitorSocketServer};
+    use serde_json::json;
     use tokio::{io::AsyncWriteExt, net::UnixListener};
 
     fn unique_socket_path(name: &str) -> PathBuf {
@@ -559,6 +560,101 @@ mod tests {
         let client = SimpleMonitorClient::new(socket_path.to_string_lossy().into_owned());
         let snapshot = client.get_snapshot(500).await.unwrap();
         assert_eq!(snapshot.timestamp_ms, expected_timestamp);
+
+        server_task.await.unwrap();
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_incompatible_state_schema_version() {
+        let socket_path = unique_socket_path("schema-mismatch");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let raw = json!({
+                "StateUpdate": {
+                    "timestamp_ms": 1,
+                    "state": {
+                        "schema_version": 999,
+                        "timestamp_ms": 1,
+                        "mode": "Paper",
+                        "uptime_secs": 0,
+                        "paused": false,
+                        "emergency": false,
+                        "performance": {
+                            "total_pnl_usd": 0.0,
+                            "today_pnl_usd": 0.0,
+                            "win_rate_pct": 0.0,
+                            "max_drawdown_pct": 0.0,
+                            "profit_factor": 0.0,
+                            "equity": 10000.0,
+                            "initial_capital": 10000.0
+                        },
+                        "positions": [],
+                        "markets": [],
+                        "signals": {
+                            "seen": 0,
+                            "rejected": 0,
+                            "rejection_reasons": {}
+                        },
+                        "evaluation": {
+                            "attempts": 0,
+                            "skipped": 0,
+                            "skip_reasons": {}
+                        },
+                        "config": {
+                            "entry_z": 4.0,
+                            "exit_z": 0.5,
+                            "position_notional_usd": 10000.0,
+                            "rolling_window": 600,
+                            "market_data_mode": "poll",
+                            "max_stale_ms": 0,
+                            "poly_open_max_quote_age_ms": 0,
+                            "cex_open_max_quote_age_ms": 0,
+                            "close_max_quote_age_ms": 0,
+                            "max_cross_leg_skew_ms": 0,
+                            "borderline_poly_quote_age_ms": 0,
+                            "min_poly_price": 0.2,
+                            "max_poly_price": 0.5,
+                            "poly_slippage_bps": 50,
+                            "cex_slippage_bps": 2,
+                            "max_total_exposure_usd": 50000.0,
+                            "max_single_position_usd": 10000.0,
+                            "max_daily_loss_usd": 2000.0,
+                            "max_open_orders": 10,
+                            "rate_limit_orders_per_sec": 5,
+                            "min_liquidity": 100.0,
+                            "allow_partial_fill": false,
+                            "enable_freshness_check": true,
+                            "reject_on_disconnect": true
+                        },
+                        "runtime": {
+                            "snapshot_resync_count": 0,
+                            "funding_refresh_count": 0
+                        },
+                        "connections": {},
+                        "recent_events": [],
+                        "recent_trades": [],
+                        "recent_commands": []
+                    }
+                }
+            });
+            let mut bytes = serde_json::to_vec(&raw).unwrap();
+            bytes.push(b'\n');
+            stream.write_all(&bytes).await.unwrap();
+        });
+
+        let client = SimpleMonitorClient::new(socket_path.to_string_lossy().into_owned());
+        let error = client
+            .get_snapshot(500)
+            .await
+            .expect_err("snapshot must reject incompatible schema");
+
+        assert!(
+            error.to_string().contains("schema"),
+            "unexpected error: {error}"
+        );
 
         server_task.await.unwrap();
         let _ = std::fs::remove_file(&socket_path);

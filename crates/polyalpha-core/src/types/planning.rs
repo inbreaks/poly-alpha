@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
 use super::{
     CexBaseQty, OrderSide, PolyShares, Price, SignalStrength, Symbol, TokenSide, UsdNotional,
@@ -6,8 +6,24 @@ use super::{
 
 pub const PLANNING_SCHEMA_VERSION: u32 = 1;
 
+fn deserialize_planning_schema_version<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let schema_version = u32::deserialize(deserializer)?;
+    if schema_version == PLANNING_SCHEMA_VERSION {
+        Ok(schema_version)
+    } else {
+        Err(D::Error::custom(format!(
+            "incompatible planning schema_version: expected {}, got {}",
+            PLANNING_SCHEMA_VERSION, schema_version
+        )))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct OpenCandidate {
+    #[serde(deserialize_with = "deserialize_planning_schema_version")]
     pub schema_version: u32,
     pub candidate_id: String,
     pub correlation_id: String,
@@ -130,9 +146,21 @@ impl RecoveryDecisionReason {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ResidualSnapshot {
+    #[serde(deserialize_with = "deserialize_planning_schema_version")]
+    pub schema_version: u32,
+    pub residual_delta: f64,
+    pub planned_cex_qty: CexBaseQty,
+    pub current_poly_yes_shares: PolyShares,
+    pub current_poly_no_shares: PolyShares,
+    pub preferred_cex_side: OrderSide,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "intent_type", rename_all = "snake_case")]
 pub enum PlanningIntent {
     OpenPosition {
+        #[serde(deserialize_with = "deserialize_planning_schema_version")]
         schema_version: u32,
         intent_id: String,
         correlation_id: String,
@@ -143,6 +171,7 @@ pub enum PlanningIntent {
         max_shock_loss_usd: f64,
     },
     ClosePosition {
+        #[serde(deserialize_with = "deserialize_planning_schema_version")]
         schema_version: u32,
         intent_id: String,
         correlation_id: String,
@@ -151,6 +180,7 @@ pub enum PlanningIntent {
         target_close_ratio: f64,
     },
     DeltaRebalance {
+        #[serde(deserialize_with = "deserialize_planning_schema_version")]
         schema_version: u32,
         intent_id: String,
         correlation_id: String,
@@ -159,14 +189,16 @@ pub enum PlanningIntent {
         target_shock_loss_max: f64,
     },
     ResidualRecovery {
+        #[serde(deserialize_with = "deserialize_planning_schema_version")]
         schema_version: u32,
         intent_id: String,
         correlation_id: String,
         symbol: Symbol,
-        residual_snapshot: String,
+        residual_snapshot: ResidualSnapshot,
         recovery_reason: RecoveryDecisionReason,
     },
     ForceExit {
+        #[serde(deserialize_with = "deserialize_planning_schema_version")]
         schema_version: u32,
         intent_id: String,
         correlation_id: String,
@@ -244,6 +276,7 @@ pub struct OrderLedgerEntry {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TradePlan {
+    #[serde(deserialize_with = "deserialize_planning_schema_version")]
     pub schema_version: u32,
     pub plan_id: String,
     pub parent_plan_id: Option<String>,
@@ -303,6 +336,7 @@ pub struct TradePlan {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ExecutionResult {
+    #[serde(deserialize_with = "deserialize_planning_schema_version")]
     pub schema_version: u32,
     pub plan_id: String,
     pub correlation_id: String,
@@ -331,8 +365,9 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        AlphaEngineOutput, OpenCandidate, PlanRejectionReason, PlanningIntent, SignalStrength,
-        Symbol, TokenSide,
+        AlphaEngineOutput, OpenCandidate, PlanRejectionReason, PlanningIntent,
+        RecoveryDecisionReason, ResidualSnapshot, SignalStrength, Symbol, TokenSide,
+        PLANNING_SCHEMA_VERSION,
     };
 
     #[test]
@@ -423,5 +458,55 @@ mod tests {
         output.push_open_candidate(candidate);
         assert_eq!(output.open_candidates.len(), 1);
         assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn planning_objects_reject_incompatible_schema_version() {
+        let raw = json!({
+            "schema_version": PLANNING_SCHEMA_VERSION + 1,
+            "candidate_id": "cand-1",
+            "correlation_id": "corr-1",
+            "symbol": "btc-price-only",
+            "token_side": "yes",
+            "direction": "long",
+            "fair_value": 0.47,
+            "raw_mispricing": 0.06,
+            "delta_estimate": 0.18,
+            "risk_budget_usd": 200.0,
+            "strength": "normal",
+            "z_score": 2.1,
+            "timestamp_ms": 1_716_000_000_000u64
+        });
+
+        let err = serde_json::from_value::<OpenCandidate>(raw).expect_err("schema mismatch");
+        assert!(err
+            .to_string()
+            .contains("incompatible planning schema_version"));
+    }
+
+    #[test]
+    fn residual_recovery_requires_compatible_nested_snapshot_schema_version() {
+        let intent = PlanningIntent::ResidualRecovery {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            intent_id: "intent-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            symbol: Symbol::new("btc-price-only"),
+            residual_snapshot: ResidualSnapshot {
+                schema_version: PLANNING_SCHEMA_VERSION,
+                residual_delta: 0.12,
+                planned_cex_qty: crate::CexBaseQty(rust_decimal::Decimal::new(1, 0)),
+                current_poly_yes_shares: crate::PolyShares(rust_decimal::Decimal::new(3, 0)),
+                current_poly_no_shares: crate::PolyShares(rust_decimal::Decimal::new(1, 0)),
+                preferred_cex_side: crate::OrderSide::Buy,
+            },
+            recovery_reason: RecoveryDecisionReason::CexTopUpFaster,
+        };
+        let mut raw = serde_json::to_value(intent).unwrap();
+        raw["residual_snapshot"]["schema_version"] = json!(PLANNING_SCHEMA_VERSION + 1);
+
+        let err = serde_json::from_value::<PlanningIntent>(raw).expect_err("schema mismatch");
+        assert!(err
+            .to_string()
+            .contains("incompatible planning schema_version"));
     }
 }

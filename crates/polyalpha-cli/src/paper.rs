@@ -3,7 +3,7 @@ use chrono::{Local, TimeZone};
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -66,6 +66,22 @@ const MULTI_MARKET_FUNDING_MAX_CONCURRENCY: usize = 8;
 const MULTI_MARKET_SYNC_WARMUP_THRESHOLD: usize = 16;
 
 type EventDetails = HashMap<String, String>;
+const PAPER_ARTIFACT_SCHEMA_VERSION: u32 = PLANNING_SCHEMA_VERSION;
+
+fn deserialize_paper_schema_version<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let schema_version = u32::deserialize(deserializer)?;
+    if schema_version == PAPER_ARTIFACT_SCHEMA_VERSION {
+        Ok(schema_version)
+    } else {
+        Err(D::Error::custom(format!(
+            "incompatible paper artifact schema_version: expected {}, got {}",
+            PAPER_ARTIFACT_SCHEMA_VERSION, schema_version
+        )))
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum EvaluationSkipReason {
@@ -1122,6 +1138,8 @@ struct PaperSnapshot {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PaperArtifact {
+    #[serde(deserialize_with = "deserialize_paper_schema_version")]
+    schema_version: u32,
     env: String,
     market_index: usize,
     market: String,
@@ -3671,6 +3689,7 @@ pub async fn run_paper(
         .map(order_view_from_snapshot)
         .collect();
     let artifact = PaperArtifact {
+        schema_version: PAPER_ARTIFACT_SCHEMA_VERSION,
         env: env.to_owned(),
         market_index,
         market: market.symbol.0.clone(),
@@ -6422,6 +6441,7 @@ async fn run_paper_ws_mode(
         .map(order_view_from_snapshot)
         .collect();
     let artifact = PaperArtifact {
+        schema_version: PAPER_ARTIFACT_SCHEMA_VERSION,
         env: env.to_owned(),
         market_index,
         market: market.symbol.0.clone(),
@@ -8136,7 +8156,11 @@ fn add_trigger_details(details: &mut EventDetails, trigger: &RuntimeTrigger) {
                 recovery_reason,
                 ..
             } => {
-                insert_detail(details, "残余快照", residual_snapshot.clone());
+                insert_detail(
+                    details,
+                    "残余快照",
+                    format_residual_snapshot_detail(residual_snapshot),
+                );
                 insert_detail(details, "恢复原因", recovery_reason.code().to_owned());
             }
             PlanningIntent::ForceExit {
@@ -8149,6 +8173,18 @@ fn add_trigger_details(details: &mut EventDetails, trigger: &RuntimeTrigger) {
             }
         }
     }
+}
+
+fn format_residual_snapshot_detail(snapshot: &polyalpha_core::ResidualSnapshot) -> String {
+    format!(
+        "schema={} delta={} cex_qty={} poly_yes={} poly_no={} preferred_cex_side={:?}",
+        snapshot.schema_version,
+        format_detail_f64(snapshot.residual_delta),
+        snapshot.planned_cex_qty.0.normalize(),
+        snapshot.current_poly_yes_shares.0.normalize(),
+        snapshot.current_poly_no_shares.0.normalize(),
+        snapshot.preferred_cex_side
+    )
 }
 
 fn add_observed_details(details: &mut EventDetails, observed: &AuditObservedMarket) {
@@ -9651,6 +9687,7 @@ fn build_monitor_state_common(
         .unwrap_or_default();
 
     MonitorState {
+        schema_version: PLANNING_SCHEMA_VERSION,
         timestamp_ms: now_ms,
         mode: polyalpha_core::TradingMode::Paper,
         uptime_secs: (now_ms.saturating_sub(start_time_ms)) / 1000,
@@ -10600,6 +10637,7 @@ mod tests {
         MarketDataConfig, NegRiskStrategyConfig, OkxConfig, PaperSlippageConfig,
         PaperTradingConfig, PolymarketConfig, RiskConfig, SettlementRules, StrategyConfig,
     };
+    use serde_json::json;
 
     fn cex_evaluation_event() -> MarketDataEvent {
         MarketDataEvent::OrderBookUpdate {
@@ -10873,6 +10911,94 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn paper_artifact_rejects_incompatible_schema_version() {
+        let artifact = PaperArtifact {
+            schema_version: PAPER_ARTIFACT_SCHEMA_VERSION,
+            env: "test".to_owned(),
+            market_index: 0,
+            market: "btc-test".to_owned(),
+            hedge_exchange: "Binance".to_owned(),
+            market_data_mode: Some("poll".to_owned()),
+            poll_interval_ms: 1_000,
+            depth: 5,
+            include_funding: false,
+            ticks_processed: 0,
+            final_snapshot: PaperSnapshot {
+                tick_index: 0,
+                market: "btc-test".to_owned(),
+                hedge_exchange: "Binance".to_owned(),
+                hedge_symbol: "BTCUSDT".to_owned(),
+                market_phase: "Trading".to_owned(),
+                connections: Vec::new(),
+                poly_yes_mid: None,
+                poly_no_mid: None,
+                cex_mid: None,
+                current_basis: None,
+                signal_token_side: None,
+                current_zscore: None,
+                current_fair_value: None,
+                current_delta: None,
+                cex_reference_price: None,
+                hedge_state: "Idle".to_owned(),
+                last_signal_id: None,
+                open_orders: 0,
+                active_dmm_orders: 0,
+                signals_seen: 0,
+                signals_rejected: 0,
+                order_submitted: 0,
+                order_cancelled: 0,
+                fills: 0,
+                state_changes: 0,
+                poll_errors: 0,
+                total_exposure_usd: "0".to_owned(),
+                daily_pnl_usd: "0".to_owned(),
+                breaker: "Closed".to_owned(),
+                positions: Vec::new(),
+            },
+            open_orders: Vec::new(),
+            recent_events: Vec::new(),
+            snapshots: Vec::new(),
+        };
+        let mut raw = serde_json::to_value(artifact).expect("serialize artifact");
+        raw["schema_version"] = json!(PAPER_ARTIFACT_SCHEMA_VERSION + 1);
+
+        let err = serde_json::from_value::<PaperArtifact>(raw).expect_err("schema mismatch");
+        assert!(err
+            .to_string()
+            .contains("incompatible paper artifact schema_version"));
+    }
+
+    #[test]
+    fn add_trigger_details_formats_structured_residual_snapshot() {
+        let intent = PlanningIntent::ResidualRecovery {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            intent_id: "intent-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            symbol: Symbol::new("btc-test"),
+            residual_snapshot: polyalpha_core::ResidualSnapshot {
+                schema_version: PLANNING_SCHEMA_VERSION,
+                residual_delta: 0.125,
+                planned_cex_qty: polyalpha_core::CexBaseQty(Decimal::new(15, 3)),
+                current_poly_yes_shares: PolyShares(Decimal::new(30, 1)),
+                current_poly_no_shares: PolyShares(Decimal::new(10, 1)),
+                preferred_cex_side: polyalpha_core::OrderSide::Buy,
+            },
+            recovery_reason: polyalpha_core::RecoveryDecisionReason::CexTopUpFaster,
+        };
+        let trigger = RuntimeTrigger::Intent {
+            intent,
+            timestamp_ms: 1,
+        };
+
+        let mut details = EventDetails::new();
+        add_trigger_details(&mut details, &trigger);
+
+        let snapshot_detail = details.get("残余快照").expect("residual snapshot detail");
+        assert!(snapshot_detail.contains("schema=1"));
+        assert!(snapshot_detail.contains("preferred_cex_side=Buy"));
     }
 
     #[test]
