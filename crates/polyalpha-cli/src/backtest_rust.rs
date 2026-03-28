@@ -2781,8 +2781,10 @@ impl ReplayMinuteRow {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::env;
     use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -2878,6 +2880,432 @@ mod tests {
                 entry_fill_ratio,
             },
         }
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct PlannerRejectionSample {
+        ts_ms: u64,
+        market_id: String,
+        token_side: TokenSide,
+        yes_price: Option<f64>,
+        no_price: Option<f64>,
+        fair_value: f64,
+        raw_mispricing: f64,
+        z_score: Option<f64>,
+        delta_estimate: f64,
+        reason_code: String,
+        detail: String,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct PlannerWindowDiagnostic {
+        market_id: String,
+        start: String,
+        end: String,
+        signal_count: usize,
+        entry_count: usize,
+        planner_rejections: usize,
+        planner_reason_counts: BTreeMap<String, usize>,
+        samples: Vec<PlannerRejectionSample>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct SpikeRawPriceRow {
+        event_id: String,
+        market_id: String,
+        token_id: String,
+        token_side: String,
+        ts_ms: u64,
+        poly_price: f64,
+        market_question: String,
+    }
+
+    fn replay_fixture_db_path() -> PathBuf {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for ancestor in manifest_dir.ancestors() {
+            let candidate = ancestor.join("data/btc_basis_backtest_price_only_2025_2026.duckdb");
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+        manifest_dir.join("../../../../data/btc_basis_backtest_price_only_2025_2026.duckdb")
+    }
+
+    fn sample_replay_stress() -> ExecutionStressConfig {
+        ExecutionStressConfig {
+            label: "custom".to_owned(),
+            poly_fee_bps: 2.0,
+            poly_slippage_bps: 50.0,
+            cex_fee_bps: 2.0,
+            cex_slippage_bps: 2.0,
+            entry_fill_ratio: 1.0,
+        }
+    }
+
+    async fn diagnose_planner_rejections_for_window(
+        market_id: &str,
+        start: &str,
+        end: &str,
+    ) -> PlannerWindowDiagnostic {
+        let db_path = replay_fixture_db_path();
+        assert!(
+            db_path.exists(),
+            "expected replay fixture database at {}",
+            db_path.display()
+        );
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let filter = build_filter(Some(market_id.to_owned()), Some(start), Some(end))
+            .expect("window filter");
+        let dataset = load_dataset(&db_path_str, &filter).expect("load dataset");
+        let config = resolve_replay_config(
+            &db_path_str,
+            100_000.0,
+            360,
+            2.0,
+            0.5,
+            None,
+            0.25,
+            1.0,
+            0.1,
+            None,
+            None,
+            None,
+            sample_replay_stress(),
+        )
+        .expect("resolve config");
+        let markets = dataset
+            .markets
+            .values()
+            .map(|spec| spec.market_config.clone())
+            .collect::<Vec<_>>();
+        let engine_config = SimpleEngineConfig {
+            min_signal_samples: 2,
+            rolling_window_minutes: config.rolling_window,
+            entry_z: config.entry_z,
+            exit_z: config.exit_z,
+            position_notional_usd: UsdNotional(
+                decimal_from_f64(config.position_notional_usd).expect("position notional"),
+            ),
+            cex_hedge_ratio: config.cex_hedge_ratio,
+            dmm_half_spread: Decimal::new(1, 2),
+            dmm_quote_size: polyalpha_core::PolyShares::ZERO,
+            ..SimpleEngineConfig::default()
+        };
+        let mut engine = SimpleAlphaEngine::with_markets(engine_config, markets);
+        let mut runtime = dataset
+            .markets
+            .keys()
+            .map(|id| (id.clone(), ReplayRuntimeState::default()))
+            .collect::<HashMap<_, _>>();
+        let mut positions: HashMap<Symbol, ReplayPosition> = HashMap::new();
+        let mut trade_log = Vec::new();
+        let mut stats = ReplayStats::default();
+        let planner = replay_execution_planner(&config);
+        let mut cash = config.initial_capital;
+        let mut reason_counts = BTreeMap::new();
+        let mut samples = Vec::new();
+
+        let mut idx = 0usize;
+        while idx < dataset.rows.len() {
+            let ts_ms = dataset.rows[idx].ts_ms;
+            let mut batch_end = idx + 1;
+            while batch_end < dataset.rows.len() && dataset.rows[batch_end].ts_ms == ts_ms {
+                batch_end += 1;
+            }
+
+            let cex_reference_price = match ts_ms
+                .checked_sub(ONE_MINUTE_MS)
+                .and_then(|prior_ts| dataset.cex_close_by_ts.get(&prior_ts).copied())
+            {
+                Some(price) => price,
+                None => {
+                    idx = batch_end;
+                    continue;
+                }
+            };
+            let cex_advance_price = match dataset.cex_close_by_ts.get(&ts_ms).copied() {
+                Some(price) => price,
+                None => {
+                    idx = batch_end;
+                    continue;
+                }
+            };
+
+            for position in positions.values_mut() {
+                position.last_cex_price = cex_reference_price;
+            }
+
+            let mut pending_close_signals = Vec::new();
+            let mut pending_entry_signals = Vec::new();
+            for row in &dataset.rows[idx..batch_end] {
+                let Some(spec) = dataset.markets.get(&row.market_id) else {
+                    continue;
+                };
+                let state = runtime
+                    .get_mut(&row.market_id)
+                    .expect("runtime state for market");
+
+                if !state.bootstrapped {
+                    bootstrap_symbol_cex_state(
+                        &mut engine,
+                        &spec.symbol,
+                        &dataset.cex_close_by_ts,
+                        config.rolling_window,
+                        ts_ms,
+                    )
+                    .await
+                    .expect("bootstrap cex state");
+                    state.bootstrapped = true;
+                    state.last_cex_synced_minute_ms =
+                        Some(ts_ms.checked_sub(ONE_MINUTE_MS).unwrap_or_default());
+                }
+
+                advance_symbol_cex_state(
+                    &mut engine,
+                    &spec.symbol,
+                    &dataset.cex_close_by_ts,
+                    state,
+                    ts_ms,
+                )
+                .await
+                .expect("advance cex state");
+
+                if let Some(position) = positions.get_mut(&spec.symbol) {
+                    match position.token_side {
+                        TokenSide::Yes => {
+                            if let Some(price) = row.yes_price {
+                                position.last_poly_price = price;
+                            }
+                        }
+                        TokenSide::No => {
+                            if let Some(price) = row.no_price {
+                                position.last_poly_price = price;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(yes_price) = row.yes_price {
+                    let _ = engine
+                        .on_market_data(&poly_trade_event(
+                            &spec.symbol,
+                            InstrumentKind::PolyYes,
+                            yes_price,
+                            ts_ms,
+                        ))
+                        .await;
+                }
+                if let Some(no_price) = row.no_price {
+                    let _ = engine
+                        .on_market_data(&poly_trade_event(
+                            &spec.symbol,
+                            InstrumentKind::PolyNo,
+                            no_price,
+                            ts_ms,
+                        ))
+                        .await;
+                }
+
+                let output = engine
+                    .on_market_data(&cex_trade_event(&spec.symbol, cex_advance_price, ts_ms + 1))
+                    .await;
+                for candidate in output.open_candidates {
+                    pending_entry_signals.push(PendingReplayCandidate {
+                        candidate,
+                        spec: spec.clone(),
+                        row: row.clone(),
+                        cex_reference_price,
+                    });
+                }
+                if let Some(reason) = engine.close_reason(&spec.symbol) {
+                    pending_close_signals.push(PendingReplayClose {
+                        close_reason: reason,
+                        spec: spec.clone(),
+                        row: row.clone(),
+                        cex_reference_price,
+                    });
+                }
+            }
+
+            for pending in pending_close_signals {
+                handle_close_signal(
+                    &pending.close_reason,
+                    &pending.spec,
+                    &pending.row,
+                    pending.cex_reference_price,
+                    &config,
+                    &planner,
+                    &mut positions,
+                    &mut cash,
+                    &mut stats,
+                    &mut trade_log,
+                )
+                .expect("close handling");
+                engine.sync_position_state(
+                    &pending.spec.symbol,
+                    positions
+                        .get(&pending.spec.symbol)
+                        .map(|position| position.token_side),
+                );
+            }
+
+            pending_entry_signals.sort_by(|left, right| {
+                let left_z = left.candidate.z_score.unwrap_or(f64::INFINITY);
+                let right_z = right.candidate.z_score.unwrap_or(f64::INFINITY);
+                left_z
+                    .partial_cmp(&right_z)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        let left_basis = left.candidate.raw_mispricing.abs();
+                        let right_basis = right.candidate.raw_mispricing.abs();
+                        right_basis
+                            .partial_cmp(&left_basis)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+            });
+
+            for pending in pending_entry_signals {
+                if !positions.contains_key(&pending.spec.symbol) {
+                    let context = replay_planning_context(
+                        &pending.candidate.symbol,
+                        &pending.row,
+                        pending.cex_reference_price,
+                        pending.spec.market_config.cex_qty_step,
+                        &positions,
+                    )
+                    .expect("planning context");
+                    let intent = replay_open_intent(&pending.candidate);
+                    if let Err(rejection) = planner.plan(&intent, &context) {
+                        *reason_counts
+                            .entry(rejection.reason.code().to_owned())
+                            .or_insert(0) += 1;
+                        if samples.len() < 24 {
+                            samples.push(PlannerRejectionSample {
+                                ts_ms: pending.row.ts_ms,
+                                market_id: pending.spec.market_id.clone(),
+                                token_side: pending.candidate.token_side,
+                                yes_price: pending.row.yes_price,
+                                no_price: pending.row.no_price,
+                                fair_value: pending.candidate.fair_value,
+                                raw_mispricing: pending.candidate.raw_mispricing,
+                                z_score: pending.candidate.z_score,
+                                delta_estimate: pending.candidate.delta_estimate,
+                                reason_code: rejection.reason.code().to_owned(),
+                                detail: rejection.detail,
+                            });
+                        }
+                    }
+                }
+
+                handle_candidate(
+                    pending.candidate,
+                    &pending.spec,
+                    &pending.row,
+                    pending.cex_reference_price,
+                    &config,
+                    &planner,
+                    &mut positions,
+                    &mut cash,
+                    &mut stats,
+                    &mut trade_log,
+                )
+                .expect("candidate handling");
+                engine.sync_position_state(
+                    &pending.spec.symbol,
+                    positions
+                        .get(&pending.spec.symbol)
+                        .map(|position| position.token_side),
+                );
+            }
+
+            idx = batch_end;
+        }
+
+        PlannerWindowDiagnostic {
+            market_id: market_id.to_owned(),
+            start: start.to_owned(),
+            end: end.to_owned(),
+            signal_count: stats.signals_emitted,
+            entry_count: stats.entry_count,
+            planner_rejections: stats.signals_rejected_planner,
+            planner_reason_counts: reason_counts,
+            samples,
+        }
+    }
+
+    fn load_spike_raw_price_rows(
+        db_path: &str,
+        start_ts_ms: u64,
+        end_ts_ms: u64,
+    ) -> Result<Vec<SpikeRawPriceRow>> {
+        let config = DuckConfig::default()
+            .access_mode(AccessMode::ReadOnly)
+            .context("failed to configure read-only duckdb access")?;
+        let conn = Connection::open_with_flags(db_path, config)
+            .with_context(|| format!("failed to open duckdb database `{db_path}`"))?;
+
+        let sql = format!(
+            "
+            select
+                p.event_id,
+                p.market_id,
+                p.token_id,
+                lower(p.token_side) as token_side,
+                p.ts_ms,
+                p.poly_price,
+                c.market_question
+            from polymarket_price_history p
+            join polymarket_contracts c
+              on c.market_id = p.market_id
+             and c.token_id = p.token_id
+            where p.event_id in ('261279', '261299')
+              and p.ts_ms between {start_ts_ms} and {end_ts_ms}
+            order by p.ts_ms asc, p.event_id asc, p.market_id asc, token_side asc
+            "
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SpikeRawPriceRow {
+                event_id: row.get::<_, String>(0)?,
+                market_id: row.get::<_, String>(1)?,
+                token_id: row.get::<_, String>(2)?,
+                token_side: row.get::<_, String>(3)?,
+                ts_ms: row.get::<_, i64>(4)? as u64,
+                poly_price: row.get::<_, f64>(5)?,
+                market_question: row.get::<_, String>(6)?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    fn print_spike_grouped_rows(db_path: &str, start_ts_ms: u64, end_ts_ms: u64) -> Result<()> {
+        let filter = ReplayFilter {
+            market_id: None,
+            start_ts_ms: Some(start_ts_ms),
+            end_ts_ms: Some(end_ts_ms),
+        };
+        let dataset = load_dataset(db_path, &filter)?;
+        for row in dataset.rows.iter().filter(|row| {
+            matches!(
+                row.market_id.as_str(),
+                "1559492" | "1559491" | "1559402" | "1559400" | "1559404" | "1559403"
+            )
+        }) {
+            println!(
+                "GROUPED ts_ms={} market_id={} yes_price={:?} no_price={:?}",
+                row.ts_ms, row.market_id, row.yes_price, row.no_price
+            );
+        }
+        Ok(())
     }
 
     fn assert_f64_close(actual: f64, expected: f64) {
@@ -3314,5 +3742,56 @@ mod tests {
         );
         assert_f64_close(cash, expected_final_cash);
         assert_f64_close(trade.net_pnl, expected_round_trip_net);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "diagnostic: uses local replay fixture database"]
+    async fn diagnose_576713_tail_window_planner_rejections() {
+        let diagnostic =
+            diagnose_planner_rejections_for_window("576713", "2025-08-22", "2025-08-23").await;
+        println!("{diagnostic:#?}");
+        assert!(diagnostic.signal_count > 0);
+        assert!(diagnostic.planner_rejections > 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "diagnostic: uses local replay fixture database"]
+    async fn diagnose_1385950_tail_window_planner_rejections() {
+        let diagnostic =
+            diagnose_planner_rejections_for_window("1385950", "2026-02-22", "2026-02-24").await;
+        println!("{diagnostic:#?}");
+        assert!(diagnostic.signal_count > 0);
+        assert!(diagnostic.planner_rejections > 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "diagnostic: print raw polymarket price rows around 2026-03-11 spike"]
+    async fn diagnose_20260311_spike_raw_polymarket_rows() {
+        let db_path = replay_fixture_db_path();
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let rows = load_spike_raw_price_rows(&db_path_str, 1_773_246_000_000, 1_773_246_120_000)
+            .expect("load raw spike rows");
+        assert!(!rows.is_empty(), "expected raw rows around spike");
+        for row in rows {
+            println!(
+                "RAW ts_ms={} event_id={} market_id={} side={} token_id={} poly_price={:.6} question={}",
+                row.ts_ms,
+                row.event_id,
+                row.market_id,
+                row.token_side,
+                row.token_id,
+                row.poly_price,
+                row.market_question,
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "diagnostic: print grouped replay rows around 2026-03-11 spike"]
+    async fn diagnose_20260311_spike_grouped_rows() {
+        let db_path = replay_fixture_db_path();
+        let db_path_str = db_path.to_string_lossy().to_string();
+        print_spike_grouped_rows(&db_path_str, 1_773_246_000_000, 1_773_246_120_000)
+            .expect("print grouped spike rows");
     }
 }
