@@ -9,13 +9,13 @@ use polyalpha_core::{
     cex_venue_symbol, CexOrderRequest, ClientOrderId, CoreError, DmmQuoteState, DmmQuoteUpdate,
     Exchange, ExecutionEvent, ExecutionResult, Fill, HedgeState, InstrumentKind, OrderExecutor,
     OrderId, OrderLedgerEntry, OrderRequest, OrderResponse, OrderSide, OrderStatus, OrderType,
-    PlanningIntent, PolyOrderRequest, PolySizingInstruction, PositionTracker, Price,
-    RecoveryDecisionReason, Result, Symbol, SymbolRegistry, TimeInForce, TokenSide, TradePlan,
-    UsdNotional, VenueQuantity, PLANNING_SCHEMA_VERSION,
+    PlanRejectionReason, PlanningIntent, PolyOrderRequest, PolySizingInstruction, PositionTracker,
+    Price, Result, Symbol, SymbolRegistry, TimeInForce, TokenSide, TradePlan, UsdNotional,
+    VenueQuantity, PLANNING_SCHEMA_VERSION,
 };
 
 use crate::{
-    orderbook_provider::OrderbookProvider,
+    orderbook_provider::{OrderbookKey, OrderbookProvider},
     plan_state::{priority_for_intent, priority_rank, InFlightPlan, PlanLifecycleState},
     planner::{CanonicalPlanningContext, ExecutionPlanner},
 };
@@ -47,6 +47,12 @@ impl SessionBookkeeping {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ObservedBookState {
+    sequence: u64,
+    fingerprint: String,
+}
+
 #[derive(Clone)]
 pub struct ExecutionManager<E: OrderExecutor> {
     executor: E,
@@ -56,6 +62,7 @@ pub struct ExecutionManager<E: OrderExecutor> {
     dmm_quote_states: HashMap<Symbol, DmmQuoteState>,
     active_dmm_orders: HashMap<Symbol, ActiveDmmOrders>,
     active_plans: HashMap<Symbol, InFlightPlan>,
+    observed_books: HashMap<OrderbookKey, ObservedBookState>,
     position_tracker: PositionTracker,
     sessions: HashMap<Symbol, SessionBookkeeping>,
     next_client_order_seq: u64,
@@ -99,6 +106,7 @@ impl<E: OrderExecutor> ExecutionManager<E> {
             dmm_quote_states: HashMap::new(),
             active_dmm_orders: HashMap::new(),
             active_plans: HashMap::new(),
+            observed_books: HashMap::new(),
             position_tracker: PositionTracker::default(),
             sessions: HashMap::new(),
             next_client_order_seq: 1,
@@ -199,14 +207,7 @@ impl<E: OrderExecutor> ExecutionManager<E> {
     }
 
     pub async fn process_intent(&mut self, intent: PlanningIntent) -> Result<Vec<ExecutionEvent>> {
-        let context = self.build_planning_context(&intent)?;
-        let mut plan = self.planner.plan(&intent, &context).map_err(|rejection| {
-            CoreError::Generic(format!(
-                "plan rejected [{}]: {}",
-                rejection.reason.code(),
-                rejection.detail
-            ))
-        })?;
+        let mut plan = self.plan_intent(&intent)?;
 
         let mut events = Vec::new();
         if let Some(existing) = self.active_plans.get(intent.symbol()).cloned() {
@@ -247,6 +248,15 @@ impl<E: OrderExecutor> ExecutionManager<E> {
     }
 
     pub async fn process_plan(&mut self, plan: TradePlan) -> Result<Vec<ExecutionEvent>> {
+        if let Some(active) = self.active_plans.get(&plan.symbol) {
+            if active.plan.plan_id != plan.plan_id {
+                return Err(CoreError::Generic(format!(
+                    "plan rejected [{}]: {}",
+                    polyalpha_core::RevalidationFailureReason::PlanSuperseded.code(),
+                    plan.plan_id
+                )));
+            }
+        }
         self.install_plan(plan.clone(), PlanLifecycleState::SubmittingPoly);
         if plan.poly_planned_shares.0 > Decimal::ZERO {
             self.submit_poly_leg(&plan).await
@@ -257,11 +267,49 @@ impl<E: OrderExecutor> ExecutionManager<E> {
         }
     }
 
-    fn build_planning_context(&self, intent: &PlanningIntent) -> Result<CanonicalPlanningContext> {
-        let provider = self.orderbook_provider.as_ref().ok_or_else(|| {
+    fn plan_intent(&mut self, intent: &PlanningIntent) -> Result<TradePlan> {
+        let initial_context = self.build_planning_context(intent)?;
+        let mut plan = self
+            .planner
+            .plan(intent, &initial_context)
+            .map_err(|rejection| {
+                CoreError::Generic(format!(
+                    "plan rejected [{}]: {}",
+                    rejection.reason.code(),
+                    rejection.detail
+                ))
+            })?;
+        let latest_context = self.build_planning_context(intent)?;
+        if let Err(reason) = self.planner.revalidate(&plan, &latest_context) {
+            plan = self
+                .planner
+                .plan(intent, &latest_context)
+                .map_err(|rejection| {
+                    CoreError::Generic(format!(
+                        "plan revalidation failed [{}] and replan rejected [{}]: {}",
+                        reason.code(),
+                        rejection.reason.code(),
+                        rejection.detail
+                    ))
+                })?;
+        }
+        Ok(plan)
+    }
+
+    fn build_planning_context(
+        &mut self,
+        intent: &PlanningIntent,
+    ) -> Result<CanonicalPlanningContext> {
+        self.build_planning_context_for_symbol(intent.symbol())
+    }
+
+    fn build_planning_context_for_symbol(
+        &mut self,
+        symbol: &Symbol,
+    ) -> Result<CanonicalPlanningContext> {
+        let provider = self.orderbook_provider.clone().ok_or_else(|| {
             CoreError::Generic("planning orderbook provider is unavailable".to_owned())
         })?;
-        let symbol = intent.symbol();
         let (cex_exchange, venue_symbol) = self.resolve_cex_target(symbol);
         let poly_yes_book = provider
             .get_orderbook(Exchange::Polymarket, symbol, InstrumentKind::PolyYes)
@@ -301,8 +349,7 @@ impl<E: OrderExecutor> ExecutionManager<E> {
             .and_then(|registry| registry.get_config(symbol))
             .map(|config| config.cex_qty_step)
             .unwrap_or(Decimal::ZERO);
-
-        Ok(CanonicalPlanningContext {
+        let context = CanonicalPlanningContext {
             planner_depth_levels: 1,
             poly_yes_book,
             poly_no_book,
@@ -312,7 +359,56 @@ impl<E: OrderExecutor> ExecutionManager<E> {
             current_poly_no_shares,
             current_cex_net_qty,
             now_ms,
-        })
+        }
+        .canonicalize();
+
+        self.observe_book_snapshot(&context.poly_yes_book)?;
+        self.observe_book_snapshot(&context.poly_no_book)?;
+        self.observe_book_snapshot(&context.cex_book)?;
+
+        Ok(context)
+    }
+
+    fn observe_book_snapshot(&mut self, book: &polyalpha_core::OrderBookSnapshot) -> Result<()> {
+        if book.bids.is_empty() && book.asks.is_empty() {
+            return Ok(());
+        }
+
+        let key = OrderbookKey {
+            exchange: book.exchange,
+            symbol: book.symbol.clone(),
+            instrument: book.instrument,
+        };
+        let fingerprint = serde_json::to_string(book).map_err(|err| {
+            CoreError::Generic(format!("failed to fingerprint planning book: {err}"))
+        })?;
+        if let Some(previous) = self.observed_books.get(&key) {
+            if book.sequence < previous.sequence {
+                return Err(CoreError::Generic(format!(
+                    "planning context rejected [{}]: instrument={:?} sequence={} previous_sequence={}",
+                    PlanRejectionReason::StaleBookSequence.code(),
+                    key.instrument,
+                    book.sequence,
+                    previous.sequence
+                )));
+            }
+            if book.sequence == previous.sequence && fingerprint != previous.fingerprint {
+                return Err(CoreError::Generic(format!(
+                    "planning context rejected [{}]: instrument={:?} sequence={}",
+                    PlanRejectionReason::BookConflictSameSequence.code(),
+                    key.instrument,
+                    book.sequence
+                )));
+            }
+        }
+        self.observed_books.insert(
+            key,
+            ObservedBookState {
+                sequence: book.sequence,
+                fingerprint,
+            },
+        );
+        Ok(())
     }
 
     fn plan_is_noop(&self, plan: &TradePlan) -> bool {
@@ -509,7 +605,7 @@ impl<E: OrderExecutor> ExecutionManager<E> {
     }
 
     fn child_hedge_plan_from_fill(
-        &self,
+        &mut self,
         parent_plan: &TradePlan,
         fill: &Fill,
     ) -> Result<Option<TradePlan>> {
@@ -526,84 +622,32 @@ impl<E: OrderExecutor> ExecutionManager<E> {
             return Ok(None);
         }
 
-        let requested_qty = if parent_plan.poly_planned_shares.0 > Decimal::ZERO {
-            polyalpha_core::CexBaseQty(
-                parent_plan.cex_planned_qty.0 * actual_poly_shares.0
-                    / parent_plan.poly_planned_shares.0,
-            )
-        } else {
-            polyalpha_core::CexBaseQty::ZERO
-        };
-        let normalized_qty = self.normalize_cex_qty(&parent_plan.symbol, requested_qty);
-        if normalized_qty.0 <= Decimal::ZERO {
-            return Ok(None);
+        let context = self.build_planning_context_for_symbol(&parent_plan.symbol)?;
+        match self
+            .planner
+            .replan_from_execution(parent_plan, std::slice::from_ref(fill), &context)
+        {
+            Ok(mut child_plan) => {
+                child_plan.parent_plan_id = Some(parent_plan.plan_id.clone());
+                Ok(Some(child_plan))
+            }
+            Err(rejection)
+                if matches!(
+                    rejection.reason,
+                    PlanRejectionReason::ResidualDeltaTooLarge
+                        | PlanRejectionReason::InsufficientCexDepth
+                        | PlanRejectionReason::MissingCexBook
+                        | PlanRejectionReason::OneSidedCexBook
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(rejection) => Err(CoreError::Generic(format!(
+                "child hedge replan rejected [{}]: {}",
+                rejection.reason.code(),
+                rejection.detail
+            ))),
         }
-
-        let context = self.build_planning_context(&PlanningIntent::DeltaRebalance {
-            schema_version: PLANNING_SCHEMA_VERSION,
-            intent_id: format!("hedge-context-{}", parent_plan.plan_id),
-            correlation_id: parent_plan.correlation_id.clone(),
-            symbol: parent_plan.symbol.clone(),
-            target_residual_delta_max: parent_plan.max_residual_delta,
-            target_shock_loss_max: parent_plan
-                .max_shock_loss_usd
-                .0
-                .to_f64()
-                .unwrap_or_default(),
-        })?;
-        let plan_hash = Uuid::new_v5(
-            &Uuid::NAMESPACE_OID,
-            format!("{}:{}", parent_plan.plan_hash, fill.fill_id).as_bytes(),
-        )
-        .to_string();
-
-        let mut child_plan = parent_plan.clone();
-        child_plan.plan_id = format!("plan-{plan_hash}");
-        child_plan.parent_plan_id = Some(parent_plan.plan_id.clone());
-        child_plan.supersedes_plan_id = None;
-        child_plan.idempotency_key = format!("{}:{}", parent_plan.idempotency_key, fill.fill_id);
-        child_plan.plan_hash = plan_hash;
-        child_plan.intent_type = "child_hedge".to_owned();
-        child_plan.priority = "delta_rebalance".to_owned();
-        child_plan.created_at_ms = fill.timestamp_ms;
-        child_plan.poly_requested_shares = actual_poly_shares;
-        child_plan.poly_planned_shares = actual_poly_shares;
-        child_plan.poly_max_shares = actual_poly_shares;
-        child_plan.poly_max_cost_usd = fill.notional_usd;
-        child_plan.poly_executable_price = fill.price;
-        child_plan.cex_exchange_timestamp_ms = context.cex_book.exchange_timestamp_ms;
-        child_plan.cex_received_at_ms = context.cex_book.received_at_ms;
-        child_plan.cex_sequence = context.cex_book.sequence;
-        child_plan.cex_book_avg_price = best_bid_or_ask(&context.cex_book, child_plan.cex_side);
-        child_plan.cex_executable_price = child_plan.cex_book_avg_price;
-        child_plan.cex_planned_qty = normalized_qty;
-        let child_cex_notional = planned_cex_notional(&child_plan);
-        let child_economics = economics_for_notionals(
-            parent_plan,
-            &self.planner,
-            fill.notional_usd,
-            child_cex_notional,
-        );
-        let max_scale = scale_ratio(fill.notional_usd, planned_poly_notional(parent_plan)).max(
-            scale_ratio(child_cex_notional, planned_cex_notional(parent_plan)),
-        );
-        child_plan.raw_edge_usd = child_economics.raw_edge_usd;
-        child_plan.poly_friction_cost_usd = child_economics.poly_friction_cost_usd;
-        child_plan.cex_friction_cost_usd = child_economics.cex_friction_cost_usd;
-        child_plan.poly_fee_usd = child_economics.poly_fee_usd;
-        child_plan.cex_fee_usd = child_economics.cex_fee_usd;
-        child_plan.expected_funding_cost_usd = child_economics.funding_cost_usd;
-        child_plan.residual_risk_penalty_usd = child_economics.residual_risk_penalty_usd;
-        child_plan.planned_edge_usd = child_economics.realized_edge_usd;
-        child_plan.post_rounding_residual_delta =
-            scale_f64(parent_plan.post_rounding_residual_delta, max_scale);
-        child_plan.shock_loss_up_1pct = child_economics.shock_loss_up_1pct;
-        child_plan.shock_loss_down_1pct = child_economics.shock_loss_down_1pct;
-        child_plan.shock_loss_up_2pct = child_economics.shock_loss_up_2pct;
-        child_plan.shock_loss_down_2pct = child_economics.shock_loss_down_2pct;
-        child_plan.max_plan_vs_fill_deviation_usd =
-            scale_usd(parent_plan.max_plan_vs_fill_deviation_usd, max_scale);
-        Ok(Some(child_plan))
     }
 
     fn execution_result_for_plan(
@@ -698,14 +742,17 @@ impl<E: OrderExecutor> ExecutionManager<E> {
     }
 
     fn recovery_plan_from_result(
-        &self,
+        &mut self,
         plan: &TradePlan,
         result: &ExecutionResult,
     ) -> Result<Option<TradePlan>> {
-        let Some(intent) = self.recovery_intent_from_result(plan, result) else {
+        let context = self.build_planning_context_for_symbol(&plan.symbol)?;
+        let Some(intent) = self
+            .planner
+            .recovery_intent_from_result(plan, result, &context)
+        else {
             return Ok(None);
         };
-        let context = self.build_planning_context(&intent)?;
         let mut recovery_plan = self.planner.plan(&intent, &context).map_err(|rejection| {
             CoreError::Generic(format!(
                 "recovery plan rejected [{}]: {}",
@@ -716,28 +763,6 @@ impl<E: OrderExecutor> ExecutionManager<E> {
         recovery_plan.parent_plan_id = Some(result.plan_id.clone());
         recovery_plan.supersedes_plan_id = Some(plan.plan_id.clone());
         Ok(Some(recovery_plan))
-    }
-
-    fn recovery_intent_from_result(
-        &self,
-        plan: &TradePlan,
-        result: &ExecutionResult,
-    ) -> Option<PlanningIntent> {
-        if result.actual_residual_delta <= plan.max_residual_delta {
-            return None;
-        }
-
-        Some(PlanningIntent::ResidualRecovery {
-            schema_version: PLANNING_SCHEMA_VERSION,
-            intent_id: format!("recover-{}", result.plan_id),
-            correlation_id: result.correlation_id.clone(),
-            symbol: result.symbol.clone(),
-            residual_snapshot: format!(
-                "residual_delta={:.6};planned_qty={}",
-                result.actual_residual_delta, plan.cex_planned_qty.0
-            ),
-            recovery_reason: RecoveryDecisionReason::ForceExitRequired,
-        })
     }
 
     async fn cancel_active_quotes(
@@ -861,18 +886,6 @@ impl<E: OrderExecutor> ExecutionManager<E> {
             Exchange::Binance,
             symbol.0.to_ascii_uppercase().replace('-', ""),
         )
-    }
-
-    fn normalize_cex_qty(
-        &self,
-        symbol: &Symbol,
-        requested_qty: polyalpha_core::CexBaseQty,
-    ) -> polyalpha_core::CexBaseQty {
-        self.symbol_registry
-            .as_ref()
-            .and_then(|registry| registry.get_config(symbol))
-            .map(|config| requested_qty.floor_to_step(config.cex_qty_step))
-            .unwrap_or(requested_qty)
     }
 
     fn next_client_order_id(&mut self, prefix: &str) -> ClientOrderId {
@@ -1034,15 +1047,11 @@ fn scale_usd(value: UsdNotional, scale: Decimal) -> UsdNotional {
     UsdNotional((value.0 * scale).max(Decimal::ZERO))
 }
 
-fn scale_f64(value: f64, scale: Decimal) -> f64 {
-    let scaled = Decimal::from_f64_retain(value).unwrap_or(Decimal::ZERO) * scale;
-    scaled.to_f64().unwrap_or_default()
-}
-
 fn bps_fee(notional: UsdNotional, bps: u32) -> UsdNotional {
     UsdNotional(notional.0 * Decimal::from(bps) / Decimal::from(10_000u32))
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 struct ExecutionEconomics {
     raw_edge_usd: UsdNotional,
@@ -1157,23 +1166,6 @@ fn order_ledger_entry(
     }
 }
 
-fn best_bid_or_ask(book: &polyalpha_core::OrderBookSnapshot, side: OrderSide) -> Price {
-    match side {
-        OrderSide::Buy => book
-            .asks
-            .iter()
-            .min_by(|left, right| left.price.cmp(&right.price))
-            .map(|level| level.price)
-            .unwrap_or(Price::ZERO),
-        OrderSide::Sell => book
-            .bids
-            .iter()
-            .max_by(|left, right| left.price.cmp(&right.price))
-            .map(|level| level.price)
-            .unwrap_or(Price::ZERO),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1181,13 +1173,13 @@ mod tests {
     use rust_decimal::Decimal;
 
     use polyalpha_core::{
-        MarketConfig, OpenCandidate, PlanningIntent, PolyShares, PolymarketIds, SignalStrength,
-        PLANNING_SCHEMA_VERSION,
+        MarketConfig, OpenCandidate, OrderBookSnapshot, PlanningIntent, PolyShares, PolymarketIds,
+        SignalStrength, PLANNING_SCHEMA_VERSION,
     };
 
     use crate::{
         dry_run::{DryRunExecutor, SlippageConfig},
-        orderbook_provider::InMemoryOrderbookProvider,
+        orderbook_provider::{InMemoryOrderbookProvider, OrderbookProvider},
     };
 
     use super::*;
@@ -1411,6 +1403,99 @@ mod tests {
         provider
     }
 
+    struct RevalidatingProvider {
+        plan_poly_yes: OrderBookSnapshot,
+        live_poly_yes: OrderBookSnapshot,
+        poly_no: OrderBookSnapshot,
+        plan_cex: OrderBookSnapshot,
+        live_cex: OrderBookSnapshot,
+        poly_yes_reads: std::sync::atomic::AtomicUsize,
+        cex_reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RevalidatingProvider {
+        fn new() -> Self {
+            let provider = sample_planning_provider(Decimal::new(500, 0), Decimal::new(5, 0));
+            let plan_poly_yes = provider
+                .get_orderbook(
+                    Exchange::Polymarket,
+                    &sample_symbol(),
+                    InstrumentKind::PolyYes,
+                )
+                .expect("poly yes book");
+            let poly_no = provider
+                .get_orderbook(
+                    Exchange::Polymarket,
+                    &sample_symbol(),
+                    InstrumentKind::PolyNo,
+                )
+                .expect("poly no book");
+            let plan_cex = provider
+                .get_cex_orderbook(Exchange::Binance, "BTCUSDT")
+                .expect("cex book");
+            let mut live_poly_yes = plan_poly_yes.clone();
+            live_poly_yes.sequence += 5;
+            let mut live_cex = plan_cex.clone();
+            live_cex.sequence += 5;
+            Self {
+                plan_poly_yes,
+                live_poly_yes,
+                poly_no,
+                plan_cex,
+                live_cex,
+                poly_yes_reads: std::sync::atomic::AtomicUsize::new(0),
+                cex_reads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl OrderbookProvider for RevalidatingProvider {
+        fn get_orderbook(
+            &self,
+            exchange: Exchange,
+            symbol: &Symbol,
+            instrument: InstrumentKind,
+        ) -> Option<OrderBookSnapshot> {
+            if exchange != Exchange::Polymarket || symbol != &sample_symbol() {
+                return None;
+            }
+            match instrument {
+                InstrumentKind::PolyYes => {
+                    let reads = self
+                        .poly_yes_reads
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if reads == 0 {
+                        Some(self.plan_poly_yes.clone())
+                    } else {
+                        Some(self.live_poly_yes.clone())
+                    }
+                }
+                InstrumentKind::PolyNo => Some(self.poly_no.clone()),
+                InstrumentKind::CexPerp => None,
+            }
+        }
+
+        fn get_cex_orderbook(
+            &self,
+            exchange: Exchange,
+            venue_symbol: &str,
+        ) -> Option<OrderBookSnapshot> {
+            if exchange != Exchange::Binance
+                || (venue_symbol != "BTCUSDT" && venue_symbol != "BTC100KMAR2026")
+            {
+                return None;
+            }
+            let reads = self
+                .cex_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if reads == 0 {
+                Some(self.plan_cex.clone())
+            } else {
+                Some(self.live_cex.clone())
+            }
+        }
+    }
+
     #[tokio::test]
     async fn higher_priority_intent_supersedes_open_plan() {
         let planning_provider = sample_planning_provider(Decimal::new(500, 0), Decimal::new(5, 0));
@@ -1491,6 +1576,54 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, ExecutionEvent::RecoveryPlanCreated { .. })));
+    }
+
+    #[tokio::test]
+    async fn recovery_plan_prefers_cex_top_up_when_recovery_book_has_liquidity() {
+        let planning_provider = sample_planning_provider(Decimal::new(500, 0), Decimal::new(5, 0));
+        let executor = sample_executor_with_liquidity(Decimal::new(500, 0), Decimal::ZERO, false);
+        let mut manager = ExecutionManager::with_orderbook_provider(executor, planning_provider);
+
+        let events = manager
+            .process_intent(sample_open_intent_with_residual_limit(0.01))
+            .await
+            .expect("open intent should emit recovery plan");
+        let recovery_plan = events
+            .iter()
+            .find_map(|event| match event {
+                ExecutionEvent::RecoveryPlanCreated { plan } => Some(plan),
+                _ => None,
+            })
+            .expect("recovery plan should exist");
+
+        assert_eq!(recovery_plan.intent_type, "residual_recovery");
+        assert_eq!(recovery_plan.poly_planned_shares, PolyShares::ZERO);
+        assert!(recovery_plan.cex_planned_qty.0 > Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn process_intent_replans_against_revalidated_context_before_submit() {
+        let executor =
+            sample_executor_with_liquidity(Decimal::new(500, 0), Decimal::new(5, 0), false);
+        let provider = Arc::new(RevalidatingProvider::new());
+        let mut manager = ExecutionManager::with_orderbook_provider(executor, provider);
+
+        let events = manager
+            .process_intent(sample_open_intent())
+            .await
+            .expect("intent should still succeed after replan");
+        let plan = events
+            .iter()
+            .find_map(|event| match event {
+                ExecutionEvent::TradePlanCreated { plan } if plan.parent_plan_id.is_none() => {
+                    Some(plan)
+                }
+                _ => None,
+            })
+            .expect("trade plan should be emitted");
+
+        assert_eq!(plan.poly_sequence, 6);
+        assert_eq!(plan.cex_sequence, 6);
     }
 
     #[tokio::test]
