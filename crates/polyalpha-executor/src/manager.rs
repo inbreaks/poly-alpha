@@ -6,13 +6,12 @@ use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use polyalpha_core::{
-    cex_venue_symbol, ArbSignalAction, ArbSignalEvent, CexOrderRequest, ClientOrderId, CoreError,
-    DmmQuoteState, DmmQuoteUpdate, Exchange, ExecutionEvent, ExecutionResult, Fill, HedgeState,
-    InstrumentKind, OrderExecutor, OrderId, OrderLedgerEntry, OrderRequest, OrderResponse,
-    OrderSide, OrderStatus, OrderType, PlanningIntent, PolyOrderRequest, PolyShares,
-    PolySizingInstruction, PositionTracker, Price, RecoveryDecisionReason, Result, Symbol,
-    SymbolRegistry, TimeInForce, TokenSide, TradePlan, UsdNotional, VenueQuantity,
-    PLANNING_SCHEMA_VERSION,
+    cex_venue_symbol, CexOrderRequest, ClientOrderId, CoreError, DmmQuoteState, DmmQuoteUpdate,
+    Exchange, ExecutionEvent, ExecutionResult, Fill, HedgeState, InstrumentKind, OrderExecutor,
+    OrderId, OrderLedgerEntry, OrderRequest, OrderResponse, OrderSide, OrderStatus, OrderType,
+    PlanningIntent, PolyOrderRequest, PolySizingInstruction, PositionTracker, Price,
+    RecoveryDecisionReason, Result, Symbol, SymbolRegistry, TimeInForce, TokenSide, TradePlan,
+    UsdNotional, VenueQuantity, PLANNING_SCHEMA_VERSION,
 };
 
 use crate::{
@@ -199,127 +198,6 @@ impl<E: OrderExecutor> ExecutionManager<E> {
         Ok(events)
     }
 
-    pub async fn process_arb_signal(
-        &mut self,
-        signal: ArbSignalEvent,
-    ) -> Result<Vec<ExecutionEvent>> {
-        if let Some(reason) = self.invalid_open_signal_reason(&signal) {
-            return Ok(vec![self.rejected_signal_event(&signal, reason)]);
-        }
-
-        let mut events = Vec::new();
-        let symbol = signal.symbol.clone();
-        let correlation_id = signal.correlation_id.clone();
-        let (session_id, mut current_state) = self.session_identity(&symbol);
-
-        // Store correlation_id in session for tracking
-        if let Some(session) = self.sessions.get_mut(&symbol) {
-            session.correlation_id = Some(correlation_id.clone());
-        }
-
-        let is_close = matches!(signal.action, ArbSignalAction::ClosePosition { .. });
-        let position_before = !self.position_tracker.symbol_is_flat(&symbol);
-
-        let next_state = match &signal.action {
-            ArbSignalAction::BasisLong { .. }
-            | ArbSignalAction::BasisShort { .. }
-            | ArbSignalAction::NegRiskArb { .. } => HedgeState::SubmittingLegs,
-            ArbSignalAction::DeltaRebalance { .. } => HedgeState::Rebalancing,
-            ArbSignalAction::ClosePosition { .. } => HedgeState::Closing,
-        };
-        if current_state != next_state {
-            events.push(ExecutionEvent::HedgeStateChanged {
-                symbol: symbol.clone(),
-                session_id,
-                old_state: current_state,
-                new_state: next_state,
-                timestamp_ms: signal.timestamp_ms,
-            });
-            current_state = next_state;
-            self.update_session_state(&symbol, next_state);
-        }
-
-        let requests = self.requests_from_signal(&signal);
-        let mut all_requests_filled = true;
-        for request in requests {
-            let exchange = match &request {
-                OrderRequest::Poly(_) => Exchange::Polymarket,
-                OrderRequest::Cex(req) => req.exchange,
-            };
-            let response = self
-                .submit_order_with_events(
-                    symbol.clone(),
-                    exchange,
-                    request.clone(),
-                    Some(&correlation_id),
-                    &mut events,
-                )
-                .await?;
-            if matches!(response.status, OrderStatus::Filled) {
-                let fill = self.fill_from_request_and_response(request, response, &correlation_id);
-                self.apply_fill_to_position(&fill);
-                events.push(ExecutionEvent::OrderFilled(fill));
-            } else {
-                all_requests_filled = false;
-            }
-        }
-
-        let position_cleared = position_before && self.position_tracker.symbol_is_flat(&symbol);
-
-        // Check for single-leg failure scenario
-        if !all_requests_filled
-            && !is_close
-            && events
-                .iter()
-                .any(|event| matches!(event, ExecutionEvent::OrderFilled(_)))
-        {
-            events.push(ExecutionEvent::ReconcileRequired {
-                symbol: Some(symbol.clone()),
-                reason: "partial fill - single leg executed".to_owned(),
-            });
-        }
-
-        let final_state = if is_close {
-            if all_requests_filled && position_cleared {
-                // Generate TradeClosed event when position is fully closed
-                let realized_pnl = if let Some(session) = self.sessions.get_mut(&symbol) {
-                    let pnl = session.realized_pnl;
-                    session.realized_pnl = UsdNotional::ZERO;
-                    session.correlation_id = None;
-                    pnl
-                } else {
-                    UsdNotional::ZERO
-                };
-                events.push(ExecutionEvent::TradeClosed {
-                    symbol: symbol.clone(),
-                    correlation_id: correlation_id.clone(),
-                    realized_pnl,
-                    timestamp_ms: signal.timestamp_ms,
-                });
-                HedgeState::Idle
-            } else {
-                HedgeState::Closing
-            }
-        } else if all_requests_filled {
-            HedgeState::Hedged
-        } else {
-            current_state
-        };
-        if current_state != final_state {
-            events.push(ExecutionEvent::HedgeStateChanged {
-                symbol,
-                session_id,
-                old_state: current_state,
-                new_state: final_state,
-                timestamp_ms: signal.timestamp_ms,
-            });
-            self.update_session_state(&signal.symbol, final_state);
-        }
-        self.update_last_signal(&signal.symbol, signal.signal_id);
-
-        Ok(events)
-    }
-
     pub async fn process_intent(&mut self, intent: PlanningIntent) -> Result<Vec<ExecutionEvent>> {
         let context = self.build_planning_context(&intent)?;
         let mut plan = self.planner.plan(&intent, &context).map_err(|rejection| {
@@ -351,6 +229,11 @@ impl<E: OrderExecutor> ExecutionManager<E> {
             }
         }
 
+        self.session_identity(intent.symbol());
+        if let Some(session) = self.sessions.get_mut(intent.symbol()) {
+            session.correlation_id = Some(plan.correlation_id.clone());
+            session.last_signal_id = Some(plan.plan_id.clone());
+        }
         self.install_plan(plan.clone(), PlanLifecycleState::PlanReady);
         events.push(ExecutionEvent::TradePlanCreated { plan: plan.clone() });
 
@@ -403,12 +286,31 @@ impl<E: OrderExecutor> ExecutionManager<E> {
             .received_at_ms
             .max(poly_no_book.received_at_ms)
             .max(cex_book.received_at_ms);
+        let current_poly_yes_shares = self
+            .position_tracker
+            .net_symbol_qty(symbol, InstrumentKind::PolyYes);
+        let current_poly_no_shares = self
+            .position_tracker
+            .net_symbol_qty(symbol, InstrumentKind::PolyNo);
+        let current_cex_net_qty = self
+            .position_tracker
+            .net_symbol_qty(symbol, InstrumentKind::CexPerp);
+        let cex_qty_step = self
+            .symbol_registry
+            .as_ref()
+            .and_then(|registry| registry.get_config(symbol))
+            .map(|config| config.cex_qty_step)
+            .unwrap_or(Decimal::ZERO);
 
         Ok(CanonicalPlanningContext {
             planner_depth_levels: 1,
             poly_yes_book,
             poly_no_book,
             cex_book,
+            cex_qty_step,
+            current_poly_yes_shares,
+            current_poly_no_shares,
+            current_cex_net_qty,
             now_ms,
         })
     }
@@ -449,25 +351,48 @@ impl<E: OrderExecutor> ExecutionManager<E> {
         ) && has_filled_quantity(&response.filled_quantity)
         {
             let fill = self.fill_from_request_and_response(
-                request,
+                request.clone(),
                 response.clone(),
                 &plan.correlation_id,
             );
             self.apply_fill_to_position(&fill);
             events.push(ExecutionEvent::OrderFilled(fill.clone()));
-            events.extend(self.on_poly_fill(plan, &fill).await?);
+            events.extend(self.on_poly_fill(plan, &request, &response, &fill).await?);
         } else {
             self.update_plan_state(&plan.symbol, PlanLifecycleState::Frozen);
+            let result = self.execution_result_for_plan(
+                plan,
+                Some(&request),
+                Some(&response),
+                UsdNotional::ZERO,
+                0.0,
+            );
+            events.push(ExecutionEvent::ExecutionResultRecorded { result });
         }
 
         Ok(events)
     }
 
-    async fn on_poly_fill(&mut self, plan: &TradePlan, fill: &Fill) -> Result<Vec<ExecutionEvent>> {
+    async fn on_poly_fill(
+        &mut self,
+        plan: &TradePlan,
+        request: &OrderRequest,
+        response: &OrderResponse,
+        fill: &Fill,
+    ) -> Result<Vec<ExecutionEvent>> {
         let mut events = Vec::new();
         let Some(child_plan) = self.child_hedge_plan_from_fill(plan, fill)? else {
             self.update_plan_state(&plan.symbol, PlanLifecycleState::VerifyingResidual);
-            let result = self.execution_result_for_plan(plan, None, None, fill.notional_usd, 0.0);
+            let result = self.execution_result_for_plan(
+                plan,
+                Some(request),
+                Some(response),
+                fill.notional_usd,
+                0.0,
+            );
+            events.push(ExecutionEvent::ExecutionResultRecorded {
+                result: result.clone(),
+            });
             if let Some(recovery_plan) = self.recovery_plan_from_result(plan, &result)? {
                 self.install_plan(recovery_plan.clone(), PlanLifecycleState::Recovering);
                 events.push(ExecutionEvent::RecoveryPlanCreated {
@@ -526,9 +451,12 @@ impl<E: OrderExecutor> ExecutionManager<E> {
             plan,
             Some(&request),
             Some(&response),
-            UsdNotional::ZERO,
+            plan.poly_max_cost_usd,
             residual_delta,
         );
+        events.push(ExecutionEvent::ExecutionResultRecorded {
+            result: result.clone(),
+        });
         if let Some(recovery_plan) = self.recovery_plan_from_result(plan, &result)? {
             self.install_plan(recovery_plan.clone(), PlanLifecycleState::Recovering);
             events.push(ExecutionEvent::RecoveryPlanCreated {
@@ -649,6 +577,32 @@ impl<E: OrderExecutor> ExecutionManager<E> {
         child_plan.cex_book_avg_price = best_bid_or_ask(&context.cex_book, child_plan.cex_side);
         child_plan.cex_executable_price = child_plan.cex_book_avg_price;
         child_plan.cex_planned_qty = normalized_qty;
+        let child_cex_notional = planned_cex_notional(&child_plan);
+        let child_economics = economics_for_notionals(
+            parent_plan,
+            &self.planner,
+            fill.notional_usd,
+            child_cex_notional,
+        );
+        let max_scale = scale_ratio(fill.notional_usd, planned_poly_notional(parent_plan)).max(
+            scale_ratio(child_cex_notional, planned_cex_notional(parent_plan)),
+        );
+        child_plan.raw_edge_usd = child_economics.raw_edge_usd;
+        child_plan.poly_friction_cost_usd = child_economics.poly_friction_cost_usd;
+        child_plan.cex_friction_cost_usd = child_economics.cex_friction_cost_usd;
+        child_plan.poly_fee_usd = child_economics.poly_fee_usd;
+        child_plan.cex_fee_usd = child_economics.cex_fee_usd;
+        child_plan.expected_funding_cost_usd = child_economics.funding_cost_usd;
+        child_plan.residual_risk_penalty_usd = child_economics.residual_risk_penalty_usd;
+        child_plan.planned_edge_usd = child_economics.realized_edge_usd;
+        child_plan.post_rounding_residual_delta =
+            scale_f64(parent_plan.post_rounding_residual_delta, max_scale);
+        child_plan.shock_loss_up_1pct = child_economics.shock_loss_up_1pct;
+        child_plan.shock_loss_down_1pct = child_economics.shock_loss_down_1pct;
+        child_plan.shock_loss_up_2pct = child_economics.shock_loss_up_2pct;
+        child_plan.shock_loss_down_2pct = child_economics.shock_loss_down_2pct;
+        child_plan.max_plan_vs_fill_deviation_usd =
+            scale_usd(parent_plan.max_plan_vs_fill_deviation_usd, max_scale);
         Ok(Some(child_plan))
     }
 
@@ -660,9 +614,52 @@ impl<E: OrderExecutor> ExecutionManager<E> {
         actual_poly_cost_usd: UsdNotional,
         actual_residual_delta: f64,
     ) -> ExecutionResult {
-        let ledger_entry = match (request, response) {
-            (Some(request), Some(response)) => vec![order_ledger_entry(request, response)],
-            _ => Vec::new(),
+        let response_cost = response
+            .and_then(|item| {
+                item.average_price
+                    .map(|price| response_notional(item, price))
+            })
+            .unwrap_or(UsdNotional::ZERO);
+        let response_poly_cost = match request {
+            Some(OrderRequest::Poly(_)) => response_cost,
+            _ => UsdNotional::ZERO,
+        };
+        let response_cex_cost = match request {
+            Some(OrderRequest::Cex(_)) => response_cost,
+            _ => UsdNotional::ZERO,
+        };
+        let actual_poly_cost_usd = if response_poly_cost.0 > Decimal::ZERO {
+            response_poly_cost
+        } else {
+            actual_poly_cost_usd
+        };
+        let actual_cex_cost_usd = response_cex_cost;
+        let economics = economics_for_notionals(
+            plan,
+            &self.planner,
+            actual_poly_cost_usd,
+            actual_cex_cost_usd,
+        );
+        let shock_reference_price = response
+            .and_then(|item| item.average_price)
+            .filter(|_| matches!(request, Some(OrderRequest::Cex(_))))
+            .unwrap_or(plan.cex_executable_price);
+        let [actual_shock_loss_up_1pct, actual_shock_loss_down_1pct, actual_shock_loss_up_2pct, actual_shock_loss_down_2pct] =
+            shock_losses_for_residual_delta(actual_residual_delta, shock_reference_price);
+        let (poly_order_ledger, cex_order_ledger) = match (request, response) {
+            (Some(request @ OrderRequest::Poly(_)), Some(response)) => (
+                vec![order_ledger_entry(
+                    request,
+                    response,
+                    economics.poly_fee_usd,
+                )],
+                Vec::new(),
+            ),
+            (Some(request @ OrderRequest::Cex(_)), Some(response)) => (
+                Vec::new(),
+                vec![order_ledger_entry(request, response, economics.cex_fee_usd)],
+            ),
+            _ => (Vec::new(), Vec::new()),
         };
         ExecutionResult {
             schema_version: PLANNING_SCHEMA_VERSION,
@@ -677,25 +674,22 @@ impl<E: OrderExecutor> ExecutionManager<E> {
             } else {
                 "degraded".to_owned()
             },
-            poly_order_ledger: Vec::new(),
-            cex_order_ledger: ledger_entry,
+            poly_order_ledger,
+            cex_order_ledger,
             actual_poly_cost_usd,
-            actual_cex_cost_usd: response
-                .and_then(|item| {
-                    item.average_price
-                        .map(|price| response_notional(item, price))
-                })
-                .unwrap_or(UsdNotional::ZERO),
-            actual_poly_fee_usd: UsdNotional::ZERO,
-            actual_cex_fee_usd: UsdNotional::ZERO,
-            actual_funding_cost_usd: UsdNotional::ZERO,
-            realized_edge_usd: plan.planned_edge_usd,
-            plan_vs_fill_deviation_usd: UsdNotional::ZERO,
+            actual_cex_cost_usd,
+            actual_poly_fee_usd: economics.poly_fee_usd,
+            actual_cex_fee_usd: economics.cex_fee_usd,
+            actual_funding_cost_usd: economics.funding_cost_usd,
+            realized_edge_usd: economics.realized_edge_usd,
+            plan_vs_fill_deviation_usd: UsdNotional(
+                plan.planned_edge_usd.0 - economics.realized_edge_usd.0,
+            ),
             actual_residual_delta,
-            actual_shock_loss_up_1pct: UsdNotional::ZERO,
-            actual_shock_loss_down_1pct: UsdNotional::ZERO,
-            actual_shock_loss_up_2pct: UsdNotional::ZERO,
-            actual_shock_loss_down_2pct: UsdNotional::ZERO,
+            actual_shock_loss_up_1pct,
+            actual_shock_loss_down_1pct,
+            actual_shock_loss_up_2pct,
+            actual_shock_loss_down_2pct,
             recovery_required: actual_residual_delta > plan.max_residual_delta,
             timestamp_ms: response
                 .map(|item| item.timestamp_ms)
@@ -801,18 +795,6 @@ impl<E: OrderExecutor> ExecutionManager<E> {
         (session.session_id, session.state)
     }
 
-    fn update_session_state(&mut self, symbol: &Symbol, state: HedgeState) {
-        if let Some(session) = self.sessions.get_mut(symbol) {
-            session.state = state;
-        }
-    }
-
-    fn update_last_signal(&mut self, symbol: &Symbol, signal_id: String) {
-        if let Some(session) = self.sessions.get_mut(symbol) {
-            session.last_signal_id = Some(signal_id);
-        }
-    }
-
     fn build_dmm_order_request(&mut self, state: &DmmQuoteState, side: OrderSide) -> OrderRequest {
         let (price, quantity) = match side {
             OrderSide::Buy => (state.bid, state.bid_qty),
@@ -841,107 +823,6 @@ impl<E: OrderExecutor> ExecutionManager<E> {
         })
     }
 
-    fn requests_from_signal(&mut self, signal: &ArbSignalEvent) -> Vec<OrderRequest> {
-        match &signal.action {
-            ArbSignalAction::BasisLong {
-                token_side,
-                poly_side,
-                poly_target_shares,
-                poly_target_notional,
-                cex_side,
-                cex_hedge_qty,
-                ..
-            }
-            | ArbSignalAction::BasisShort {
-                token_side,
-                poly_side,
-                poly_target_shares,
-                poly_target_notional,
-                cex_side,
-                cex_hedge_qty,
-                ..
-            } => {
-                let effective_cex_qty = self.normalize_cex_qty(&signal.symbol, *cex_hedge_qty);
-                vec![
-                    self.poly_market_order(
-                        signal.symbol.clone(),
-                        *token_side,
-                        *poly_side,
-                        *poly_target_shares,
-                        Some(*poly_target_notional),
-                    ),
-                    self.cex_market_order(signal.symbol.clone(), *cex_side, effective_cex_qty),
-                ]
-            }
-            ArbSignalAction::DeltaRebalance {
-                cex_side,
-                cex_qty_adjust,
-                ..
-            } => {
-                let effective_cex_qty = self.normalize_cex_qty(&signal.symbol, *cex_qty_adjust);
-                if effective_cex_qty.0 <= Decimal::ZERO {
-                    Vec::new()
-                } else {
-                    vec![self.cex_market_order(signal.symbol.clone(), *cex_side, effective_cex_qty)]
-                }
-            }
-            ArbSignalAction::NegRiskArb { legs } => legs
-                .iter()
-                .map(|leg| {
-                    self.poly_market_order(
-                        leg.symbol.clone(),
-                        leg.token_side,
-                        leg.side,
-                        leg.quantity,
-                        None,
-                    )
-                })
-                .collect(),
-            ArbSignalAction::ClosePosition { .. } => self.close_orders_for_symbol(&signal.symbol),
-        }
-    }
-
-    fn poly_market_order(
-        &mut self,
-        symbol: Symbol,
-        token_side: TokenSide,
-        side: OrderSide,
-        shares: PolyShares,
-        _quote_notional: Option<UsdNotional>,
-    ) -> OrderRequest {
-        OrderRequest::Poly(PolyOrderRequest {
-            client_order_id: self.next_client_order_id("arb-poly"),
-            symbol,
-            token_side,
-            side,
-            order_type: OrderType::Market,
-            sizing: match side {
-                OrderSide::Buy => PolySizingInstruction::BuyBudgetCap {
-                    // Legacy signal path is still fixed-shares market execution until the
-                    // planner hard-cut lands, so do not let the stale notional field shrink it.
-                    max_cost_usd: UsdNotional::from_poly(shares, Price::ONE),
-                    max_avg_price: Price::ONE,
-                    max_shares: shares,
-                },
-                OrderSide::Sell => PolySizingInstruction::SellExactShares {
-                    shares,
-                    min_avg_price: Price::ZERO,
-                },
-            },
-            time_in_force: TimeInForce::Fok,
-            post_only: false,
-        })
-    }
-
-    fn cex_market_order(
-        &mut self,
-        symbol: Symbol,
-        side: OrderSide,
-        base_qty: polyalpha_core::CexBaseQty,
-    ) -> OrderRequest {
-        self.cex_market_order_with_options(symbol, side, base_qty, false)
-    }
-
     fn cex_market_order_with_options(
         &mut self,
         symbol: Symbol,
@@ -951,7 +832,7 @@ impl<E: OrderExecutor> ExecutionManager<E> {
     ) -> OrderRequest {
         let (exchange, venue_symbol) = self.resolve_cex_target(&symbol);
         OrderRequest::Cex(CexOrderRequest {
-            client_order_id: self.next_client_order_id("arb-cex"),
+            client_order_id: self.next_client_order_id("plan-cex"),
             exchange,
             symbol,
             venue_symbol,
@@ -994,43 +875,6 @@ impl<E: OrderExecutor> ExecutionManager<E> {
             .unwrap_or(requested_qty)
     }
 
-    fn invalid_open_signal_reason(&self, signal: &ArbSignalEvent) -> Option<&'static str> {
-        match &signal.action {
-            ArbSignalAction::BasisLong { cex_hedge_qty, .. }
-            | ArbSignalAction::BasisShort { cex_hedge_qty, .. } => {
-                let effective_qty = self.normalize_cex_qty(&signal.symbol, *cex_hedge_qty);
-                (effective_qty.0 <= Decimal::ZERO).then_some("zero_cex_hedge_qty")
-            }
-            _ => None,
-        }
-    }
-
-    fn rejected_signal_event(&self, signal: &ArbSignalEvent, reason: &str) -> ExecutionEvent {
-        let exchange = match &signal.action {
-            ArbSignalAction::BasisLong { .. }
-            | ArbSignalAction::BasisShort { .. }
-            | ArbSignalAction::DeltaRebalance { .. } => self.resolve_cex_target(&signal.symbol).0,
-            ArbSignalAction::NegRiskArb { .. } | ArbSignalAction::ClosePosition { .. } => {
-                Exchange::Polymarket
-            }
-        };
-
-        ExecutionEvent::OrderSubmitted {
-            symbol: signal.symbol.clone(),
-            exchange,
-            response: OrderResponse {
-                client_order_id: ClientOrderId(format!("rejected-{}", signal.signal_id)),
-                exchange_order_id: OrderId(format!("rejected-{}", signal.signal_id)),
-                status: OrderStatus::Rejected,
-                filled_quantity: VenueQuantity::CexBaseQty(polyalpha_core::CexBaseQty::ZERO),
-                average_price: None,
-                rejection_reason: Some(reason.to_owned()),
-                timestamp_ms: signal.timestamp_ms,
-            },
-            correlation_id: signal.correlation_id.clone(),
-        }
-    }
-
     fn next_client_order_id(&mut self, prefix: &str) -> ClientOrderId {
         let seq = self.next_client_order_seq;
         self.next_client_order_seq += 1;
@@ -1041,51 +885,6 @@ impl<E: OrderExecutor> ExecutionManager<E> {
         let seq = self.next_fill_seq;
         self.next_fill_seq += 1;
         format!("dry-fill-{seq}")
-    }
-
-    fn close_orders_for_symbol(&mut self, symbol: &Symbol) -> Vec<OrderRequest> {
-        if self.position_tracker.symbol_is_flat(symbol) {
-            return Vec::new();
-        }
-
-        let mut requests = Vec::new();
-        let poly_yes_shares = self
-            .position_tracker
-            .net_symbol_qty(symbol, InstrumentKind::PolyYes);
-        if !poly_yes_shares.is_zero() {
-            requests.push(self.poly_market_order(
-                symbol.clone(),
-                TokenSide::Yes,
-                close_side(poly_yes_shares),
-                PolyShares(poly_yes_shares.abs()),
-                None,
-            ));
-        }
-        let poly_no_shares = self
-            .position_tracker
-            .net_symbol_qty(symbol, InstrumentKind::PolyNo);
-        if !poly_no_shares.is_zero() {
-            requests.push(self.poly_market_order(
-                symbol.clone(),
-                TokenSide::No,
-                close_side(poly_no_shares),
-                PolyShares(poly_no_shares.abs()),
-                None,
-            ));
-        }
-        let cex_base_qty = self
-            .position_tracker
-            .net_symbol_qty(symbol, InstrumentKind::CexPerp);
-        if !cex_base_qty.is_zero() {
-            requests.push(self.cex_market_order_with_options(
-                symbol.clone(),
-                close_side(cex_base_qty),
-                polyalpha_core::CexBaseQty(cex_base_qty.abs()),
-                true,
-            ));
-        }
-
-        requests
     }
 
     fn apply_fill_to_position(&mut self, fill: &Fill) {
@@ -1159,14 +958,6 @@ impl<E: OrderExecutor> ExecutionManager<E> {
     }
 }
 
-fn close_side(net_qty: Decimal) -> OrderSide {
-    if net_qty > Decimal::ZERO {
-        OrderSide::Sell
-    } else {
-        OrderSide::Buy
-    }
-}
-
 fn empty_orderbook(
     exchange: Exchange,
     symbol: Symbol,
@@ -1199,10 +990,11 @@ fn residual_cex_delta(plan: &TradePlan, fill: Option<&Fill>) -> f64 {
             VenueQuantity::PolyShares(_) => Decimal::ZERO,
         })
         .unwrap_or(Decimal::ZERO);
-    (plan.cex_planned_qty.0 - filled_qty)
-        .abs()
-        .to_f64()
-        .unwrap_or_default()
+    plan.post_rounding_residual_delta
+        + (plan.cex_planned_qty.0 - filled_qty)
+            .abs()
+            .to_f64()
+            .unwrap_or_default()
 }
 
 fn response_notional(response: &OrderResponse, price: Price) -> UsdNotional {
@@ -1212,7 +1004,136 @@ fn response_notional(response: &OrderResponse, price: Price) -> UsdNotional {
     }
 }
 
-fn order_ledger_entry(request: &OrderRequest, response: &OrderResponse) -> OrderLedgerEntry {
+fn planned_poly_notional(plan: &TradePlan) -> UsdNotional {
+    if plan.poly_planned_shares.0 <= Decimal::ZERO || plan.poly_executable_price.0 <= Decimal::ZERO
+    {
+        UsdNotional::ZERO
+    } else {
+        plan.poly_planned_shares
+            .to_usd_notional(plan.poly_executable_price)
+    }
+}
+
+fn planned_cex_notional(plan: &TradePlan) -> UsdNotional {
+    if plan.cex_planned_qty.0 <= Decimal::ZERO || plan.cex_executable_price.0 <= Decimal::ZERO {
+        UsdNotional::ZERO
+    } else {
+        UsdNotional(plan.cex_planned_qty.0 * plan.cex_executable_price.0)
+    }
+}
+
+fn scale_ratio(actual: UsdNotional, planned: UsdNotional) -> Decimal {
+    if planned.0 <= Decimal::ZERO {
+        Decimal::ZERO
+    } else {
+        actual.0 / planned.0
+    }
+}
+
+fn scale_usd(value: UsdNotional, scale: Decimal) -> UsdNotional {
+    UsdNotional((value.0 * scale).max(Decimal::ZERO))
+}
+
+fn scale_f64(value: f64, scale: Decimal) -> f64 {
+    let scaled = Decimal::from_f64_retain(value).unwrap_or(Decimal::ZERO) * scale;
+    scaled.to_f64().unwrap_or_default()
+}
+
+fn bps_fee(notional: UsdNotional, bps: u32) -> UsdNotional {
+    UsdNotional(notional.0 * Decimal::from(bps) / Decimal::from(10_000u32))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExecutionEconomics {
+    raw_edge_usd: UsdNotional,
+    poly_friction_cost_usd: UsdNotional,
+    cex_friction_cost_usd: UsdNotional,
+    poly_fee_usd: UsdNotional,
+    cex_fee_usd: UsdNotional,
+    funding_cost_usd: UsdNotional,
+    residual_risk_penalty_usd: UsdNotional,
+    realized_edge_usd: UsdNotional,
+    shock_loss_up_1pct: UsdNotional,
+    shock_loss_down_1pct: UsdNotional,
+    shock_loss_up_2pct: UsdNotional,
+    shock_loss_down_2pct: UsdNotional,
+}
+
+fn economics_for_notionals(
+    reference: &TradePlan,
+    planner: &ExecutionPlanner,
+    poly_notional: UsdNotional,
+    cex_notional: UsdNotional,
+) -> ExecutionEconomics {
+    let poly_scale = scale_ratio(poly_notional, planned_poly_notional(reference));
+    let cex_scale = scale_ratio(cex_notional, planned_cex_notional(reference));
+    let max_scale = poly_scale.max(cex_scale);
+    let raw_edge_usd = scale_usd(reference.raw_edge_usd, poly_scale);
+    let poly_friction_cost_usd = scale_usd(reference.poly_friction_cost_usd, poly_scale);
+    let cex_friction_cost_usd = scale_usd(reference.cex_friction_cost_usd, cex_scale);
+    let poly_fee_usd = if poly_notional.0 > Decimal::ZERO {
+        bps_fee(poly_notional, planner.poly_fee_bps)
+    } else {
+        UsdNotional::ZERO
+    };
+    let cex_fee_usd = if cex_notional.0 > Decimal::ZERO {
+        bps_fee(cex_notional, planner.cex_fee_bps)
+    } else {
+        UsdNotional::ZERO
+    };
+    let funding_cost_usd = if cex_notional.0 > Decimal::ZERO {
+        bps_fee(cex_notional, planner.funding_bps_per_day)
+    } else {
+        UsdNotional::ZERO
+    };
+    let residual_risk_penalty_usd = scale_usd(reference.residual_risk_penalty_usd, max_scale);
+    let realized_edge_usd = UsdNotional(
+        raw_edge_usd.0
+            - poly_friction_cost_usd.0
+            - cex_friction_cost_usd.0
+            - poly_fee_usd.0
+            - cex_fee_usd.0
+            - funding_cost_usd.0
+            - residual_risk_penalty_usd.0,
+    );
+
+    ExecutionEconomics {
+        raw_edge_usd,
+        poly_friction_cost_usd,
+        cex_friction_cost_usd,
+        poly_fee_usd,
+        cex_fee_usd,
+        funding_cost_usd,
+        residual_risk_penalty_usd,
+        realized_edge_usd,
+        shock_loss_up_1pct: scale_usd(reference.shock_loss_up_1pct, cex_scale),
+        shock_loss_down_1pct: scale_usd(reference.shock_loss_down_1pct, cex_scale),
+        shock_loss_up_2pct: scale_usd(reference.shock_loss_up_2pct, cex_scale),
+        shock_loss_down_2pct: scale_usd(reference.shock_loss_down_2pct, cex_scale),
+    }
+}
+
+fn shock_losses_for_residual_delta(
+    residual_delta: f64,
+    reference_price: Price,
+) -> [UsdNotional; 4] {
+    let residual_qty = Decimal::from_f64_retain(residual_delta)
+        .unwrap_or(Decimal::ZERO)
+        .max(Decimal::ZERO);
+    let shock_base = UsdNotional(residual_qty * reference_price.0.max(Decimal::ZERO));
+    [
+        bps_fee(shock_base, 100),
+        bps_fee(shock_base, 100),
+        bps_fee(shock_base, 200),
+        bps_fee(shock_base, 200),
+    ]
+}
+
+fn order_ledger_entry(
+    request: &OrderRequest,
+    response: &OrderResponse,
+    fee_usd: UsdNotional,
+) -> OrderLedgerEntry {
     let requested_qty = match request {
         OrderRequest::Poly(req) => req.sizing.requested_shares().0.to_string(),
         OrderRequest::Cex(req) => req.base_qty.0.to_string(),
@@ -1229,7 +1150,7 @@ fn order_ledger_entry(request: &OrderRequest, response: &OrderResponse) -> Order
         filled_qty: filled_qty.clone(),
         cancelled_qty: Decimal::ZERO.to_string(),
         avg_price: response.average_price.unwrap_or(Price::ZERO).0.to_string(),
-        fee_usd: 0.0,
+        fee_usd: fee_usd.0.to_f64().unwrap_or_default(),
         exchange_timestamp_ms: response.timestamp_ms,
         received_at_ms: response.timestamp_ms,
         status: format!("{:?}", response.status).to_ascii_lowercase(),
@@ -1260,8 +1181,8 @@ mod tests {
     use rust_decimal::Decimal;
 
     use polyalpha_core::{
-        ArbSignalAction, MarketConfig, OpenCandidate, PlanningIntent, PolymarketIds,
-        SignalStrength, PLANNING_SCHEMA_VERSION,
+        MarketConfig, OpenCandidate, PlanningIntent, PolyShares, PolymarketIds, SignalStrength,
+        PLANNING_SCHEMA_VERSION,
     };
 
     use crate::{
@@ -1275,7 +1196,11 @@ mod tests {
         Symbol::new("btc-100k-mar-2026")
     }
 
-    fn sample_market(exchange: Exchange, cex_symbol: &str) -> MarketConfig {
+    fn sample_market_with_step(
+        exchange: Exchange,
+        cex_symbol: &str,
+        cex_qty_step: Decimal,
+    ) -> MarketConfig {
         MarketConfig {
             symbol: sample_symbol(),
             poly_ids: PolymarketIds {
@@ -1296,47 +1221,13 @@ mod tests {
             min_tick_size: Price(Decimal::new(1, 2)),
             neg_risk: false,
             cex_price_tick: Decimal::new(1, 1),
-            cex_qty_step: Decimal::new(1, 3),
+            cex_qty_step,
             cex_contract_multiplier: Decimal::ONE,
         }
     }
 
-    fn sample_basis_signal() -> ArbSignalEvent {
-        ArbSignalEvent {
-            signal_id: "sig-basis-1".to_owned(),
-            correlation_id: "corr-basis-1".to_owned(),
-            symbol: sample_symbol(),
-            action: ArbSignalAction::BasisLong {
-                token_side: TokenSide::Yes,
-                poly_side: OrderSide::Buy,
-                poly_target_shares: PolyShares(Decimal::new(25, 0)),
-                poly_target_notional: UsdNotional(Decimal::new(12, 1)),
-                cex_side: OrderSide::Sell,
-                cex_hedge_qty: polyalpha_core::CexBaseQty(Decimal::new(3, 1)),
-                delta: 0.012,
-            },
-            strength: SignalStrength::Strong,
-            basis_value: None,
-            z_score: None,
-            expected_pnl: UsdNotional(Decimal::new(3, 0)),
-            timestamp_ms: 1_715_000_000_123,
-        }
-    }
-
-    fn sample_close_signal() -> ArbSignalEvent {
-        ArbSignalEvent {
-            signal_id: "sig-close-1".to_owned(),
-            correlation_id: "corr-close-1".to_owned(),
-            symbol: sample_symbol(),
-            action: ArbSignalAction::ClosePosition {
-                reason: "basis reverted".to_owned(),
-            },
-            strength: SignalStrength::Normal,
-            basis_value: None,
-            z_score: None,
-            expected_pnl: UsdNotional::ZERO,
-            timestamp_ms: 1_715_000_000_456,
-        }
+    fn sample_market(exchange: Exchange, cex_symbol: &str) -> MarketConfig {
+        sample_market_with_step(exchange, cex_symbol, Decimal::new(1, 3))
     }
 
     fn sample_open_intent() -> PlanningIntent {
@@ -1352,9 +1243,9 @@ mod tests {
                 symbol: sample_symbol(),
                 token_side: TokenSide::Yes,
                 direction: "long".to_owned(),
-                fair_value: 0.49,
-                raw_mispricing: 0.04,
-                delta_estimate: 0.012,
+                fair_value: 0.69,
+                raw_mispricing: 0.20,
+                delta_estimate: 0.00012,
                 risk_budget_usd: 200.0,
                 strength: SignalStrength::Strong,
                 z_score: Some(2.8),
@@ -1362,7 +1253,18 @@ mod tests {
             },
             max_budget_usd: 200.0,
             max_residual_delta: 0.05,
-            max_shock_loss_usd: 20.0,
+            max_shock_loss_usd: 200.0,
+        }
+    }
+
+    fn sample_close_intent() -> PlanningIntent {
+        PlanningIntent::ClosePosition {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            intent_id: "intent-close-1".to_owned(),
+            correlation_id: "corr-open-1".to_owned(),
+            symbol: sample_symbol(),
+            close_reason: "basis reverted".to_owned(),
+            target_close_ratio: 1.0,
         }
     }
 
@@ -1374,6 +1276,31 @@ mod tests {
             symbol: sample_symbol(),
             force_reason: "operator_force_exit".to_owned(),
             allow_negative_edge: true,
+        }
+    }
+
+    fn sample_open_intent_with_residual_limit(max_residual_delta: f64) -> PlanningIntent {
+        match sample_open_intent() {
+            PlanningIntent::OpenPosition {
+                schema_version,
+                intent_id,
+                correlation_id,
+                symbol,
+                candidate,
+                max_budget_usd,
+                max_shock_loss_usd,
+                ..
+            } => PlanningIntent::OpenPosition {
+                schema_version,
+                intent_id,
+                correlation_id,
+                symbol,
+                candidate,
+                max_budget_usd,
+                max_residual_delta,
+                max_shock_loss_usd,
+            },
+            _ => unreachable!("sample open intent must be open_position"),
         }
     }
 
@@ -1436,6 +1363,26 @@ mod tests {
         };
         provider.update_cex(cex_snapshot.clone(), "BTC100KMAR2026".to_owned());
         provider.update_cex(cex_snapshot, "BTCUSDT".to_owned());
+        provider.update_cex(
+            polyalpha_core::OrderBookSnapshot {
+                exchange: Exchange::Okx,
+                symbol: sample_symbol(),
+                instrument: InstrumentKind::CexPerp,
+                bids: vec![polyalpha_core::PriceLevel {
+                    price: Price(Decimal::new(100_000, 0)),
+                    quantity: VenueQuantity::CexBaseQty(polyalpha_core::CexBaseQty(cex_liquidity)),
+                }],
+                asks: vec![polyalpha_core::PriceLevel {
+                    price: Price(Decimal::new(100_010, 0)),
+                    quantity: VenueQuantity::CexBaseQty(polyalpha_core::CexBaseQty(cex_liquidity)),
+                }],
+                exchange_timestamp_ms: 1_700_000_000_000,
+                received_at_ms: 1_700_000_000_000,
+                sequence: 1,
+                last_trade_price: None,
+            },
+            "BTC-USDT-SWAP".to_owned(),
+        );
     }
 
     fn sample_executor_with_liquidity(
@@ -1462,58 +1409,6 @@ mod tests {
         let provider = Arc::new(InMemoryOrderbookProvider::new());
         seed_liquidity(&provider, poly_liquidity, cex_liquidity);
         provider
-    }
-
-    fn fill_capable_executor() -> DryRunExecutor {
-        let provider = Arc::new(InMemoryOrderbookProvider::new());
-
-        provider.update(polyalpha_core::OrderBookSnapshot {
-            exchange: Exchange::Polymarket,
-            symbol: sample_symbol(),
-            instrument: InstrumentKind::PolyYes,
-            bids: vec![polyalpha_core::PriceLevel {
-                price: Price(Decimal::new(49, 2)),
-                quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(100, 0))),
-            }],
-            asks: vec![polyalpha_core::PriceLevel {
-                price: Price(Decimal::new(51, 2)),
-                quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(100, 0))),
-            }],
-            exchange_timestamp_ms: 1_700_000_000_000,
-            received_at_ms: 1_700_000_000_000,
-            sequence: 1,
-            last_trade_price: None,
-        });
-
-        let cex_snapshot = polyalpha_core::OrderBookSnapshot {
-            exchange: Exchange::Binance,
-            symbol: sample_symbol(),
-            instrument: InstrumentKind::CexPerp,
-            bids: vec![polyalpha_core::PriceLevel {
-                price: Price(Decimal::new(1000, 1)),
-                quantity: VenueQuantity::CexBaseQty(polyalpha_core::CexBaseQty(Decimal::ONE)),
-            }],
-            asks: vec![polyalpha_core::PriceLevel {
-                price: Price(Decimal::new(1010, 1)),
-                quantity: VenueQuantity::CexBaseQty(polyalpha_core::CexBaseQty(Decimal::ONE)),
-            }],
-            exchange_timestamp_ms: 1_700_000_000_000,
-            received_at_ms: 1_700_000_000_000,
-            sequence: 1,
-            last_trade_price: None,
-        };
-        provider.update_cex(cex_snapshot.clone(), "BTC100KMAR2026".to_owned());
-        provider.update_cex(cex_snapshot, "BTCUSDT".to_owned());
-
-        DryRunExecutor::with_orderbook(
-            provider,
-            SlippageConfig {
-                poly_slippage_bps: 50,
-                cex_slippage_bps: 2,
-                min_liquidity: Decimal::new(1, 0),
-                allow_partial_fill: false,
-            },
-        )
     }
 
     #[tokio::test]
@@ -1549,16 +1444,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partial_poly_fill_rescales_child_plan_economics() {
+        let planning_provider = sample_planning_provider(Decimal::new(500, 0), Decimal::new(5, 0));
+        let executor = sample_executor_with_liquidity(Decimal::new(5, 0), Decimal::new(5, 0), true);
+        let mut manager = ExecutionManager::with_orderbook_provider(executor, planning_provider);
+
+        let events = manager.process_intent(sample_open_intent()).await.unwrap();
+        let parent_plan = events
+            .iter()
+            .find_map(|event| match event {
+                ExecutionEvent::TradePlanCreated { plan } if plan.parent_plan_id.is_none() => {
+                    Some(plan.clone())
+                }
+                _ => None,
+            })
+            .expect("parent plan should be emitted");
+        let child_plan = events
+            .iter()
+            .find_map(|event| match event {
+                ExecutionEvent::TradePlanCreated { plan }
+                    if plan.parent_plan_id.as_deref() == Some(parent_plan.plan_id.as_str()) =>
+                {
+                    Some(plan.clone())
+                }
+                _ => None,
+            })
+            .expect("child hedge plan should be emitted");
+
+        assert!(child_plan.poly_planned_shares.0 < parent_plan.poly_planned_shares.0);
+        assert!(child_plan.poly_fee_usd.0 < parent_plan.poly_fee_usd.0);
+        assert!(child_plan.cex_fee_usd.0 < parent_plan.cex_fee_usd.0);
+        assert!(child_plan.planned_edge_usd.0 < parent_plan.planned_edge_usd.0);
+    }
+
+    #[tokio::test]
     async fn recovery_plan_is_emitted_when_cex_hedge_fails() {
         let planning_provider = sample_planning_provider(Decimal::new(500, 0), Decimal::new(5, 0));
         let executor = sample_executor_with_liquidity(Decimal::new(500, 0), Decimal::ZERO, false);
         let mut manager = ExecutionManager::with_orderbook_provider(executor, planning_provider);
 
-        let events = manager.process_intent(sample_open_intent()).await.unwrap();
+        let events = manager
+            .process_intent(sample_open_intent_with_residual_limit(0.01))
+            .await
+            .unwrap();
 
         assert!(events
             .iter()
             .any(|event| matches!(event, ExecutionEvent::RecoveryPlanCreated { .. })));
+    }
+
+    #[tokio::test]
+    async fn completed_open_intent_emits_execution_result() {
+        let planning_provider = sample_planning_provider(Decimal::new(500, 0), Decimal::new(5, 0));
+        let executor =
+            sample_executor_with_liquidity(Decimal::new(500, 0), Decimal::new(5, 0), false);
+        let mut manager = ExecutionManager::with_orderbook_provider(executor, planning_provider);
+
+        let events = manager.process_intent(sample_open_intent()).await.unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::ExecutionResultRecorded { result }
+                if result.schema_version == PLANNING_SCHEMA_VERSION
+                    && result.status == "completed"
+                    && result.plan_id.starts_with("plan-")
+        )));
+    }
+
+    #[tokio::test]
+    async fn execution_result_records_actual_fee_breakdown() {
+        let planning_provider = sample_planning_provider(Decimal::new(500, 0), Decimal::new(5, 0));
+        let executor =
+            sample_executor_with_liquidity(Decimal::new(500, 0), Decimal::new(5, 0), false);
+        let mut manager = ExecutionManager::with_orderbook_provider(executor, planning_provider);
+
+        let events = manager.process_intent(sample_open_intent()).await.unwrap();
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                ExecutionEvent::ExecutionResultRecorded { result } => Some(result),
+                _ => None,
+            })
+            .expect("execution result should be emitted");
+
+        assert!(result.actual_poly_fee_usd.0 > Decimal::ZERO);
+        assert!(result.actual_cex_fee_usd.0 > Decimal::ZERO);
+        assert!(result.actual_funding_cost_usd.0 > Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn planner_rejects_open_when_step_floor_pushes_residual_over_limit() {
+        let planning_provider = sample_planning_provider(Decimal::new(500, 0), Decimal::new(5, 0));
+        let executor =
+            sample_executor_with_liquidity(Decimal::new(500, 0), Decimal::new(5, 0), false);
+        let registry = SymbolRegistry::new(vec![sample_market_with_step(
+            Exchange::Binance,
+            "BTCUSDT",
+            Decimal::ONE,
+        )]);
+        let mut manager = ExecutionManager::with_symbol_registry_and_orderbook_provider(
+            executor,
+            registry,
+            planning_provider,
+        );
+
+        let error = manager
+            .process_intent(sample_open_intent_with_residual_limit(0.01))
+            .await
+            .expect_err("plan should be rejected once hedge is floored by venue step");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("residual_delta_too_large"),
+            "unexpected planner rejection: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn created_open_plan_uses_rounded_cex_qty_and_post_rounding_residual() {
+        let planning_provider = sample_planning_provider(Decimal::new(500, 0), Decimal::new(5, 0));
+        let executor =
+            sample_executor_with_liquidity(Decimal::new(500, 0), Decimal::new(5, 0), false);
+        let registry = SymbolRegistry::new(vec![sample_market_with_step(
+            Exchange::Binance,
+            "BTCUSDT",
+            Decimal::new(1, 2),
+        )]);
+        let mut manager = ExecutionManager::with_symbol_registry_and_orderbook_provider(
+            executor,
+            registry,
+            planning_provider,
+        );
+
+        let events = manager
+            .process_intent(sample_open_intent())
+            .await
+            .expect("open intent should still produce a plan");
+        let plan = events
+            .iter()
+            .find_map(|event| match event {
+                ExecutionEvent::TradePlanCreated { plan } if plan.parent_plan_id.is_none() => {
+                    Some(plan.clone())
+                }
+                _ => None,
+            })
+            .expect("plan should be emitted");
+
+        let exact_qty = plan.poly_planned_shares.to_cex_base_qty(0.00012);
+        let expected_qty = exact_qty.floor_to_step(Decimal::new(1, 2));
+        let expected_residual = (exact_qty.0 - expected_qty.0).max(Decimal::ZERO);
+        let expected_shock_2pct =
+            UsdNotional(expected_residual * plan.cex_executable_price.0 * Decimal::new(2, 2));
+
+        assert_eq!(plan.cex_planned_qty, expected_qty);
+        assert!(
+            (plan.post_rounding_residual_delta - expected_residual.to_f64().unwrap_or_default())
+                .abs()
+                < 1e-12,
+            "plan residual delta should use rounded hedge qty"
+        );
+        assert_eq!(plan.shock_loss_up_2pct, expected_shock_2pct);
+        assert_eq!(plan.shock_loss_down_2pct, expected_shock_2pct);
     }
 
     #[tokio::test]
@@ -1604,49 +1650,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn basis_signal_generates_submissions_fills_and_state_transitions() {
-        let executor = fill_capable_executor();
-        let mut manager = ExecutionManager::new(executor);
-        let signal = sample_basis_signal();
-
-        let events = manager
-            .process_arb_signal(signal)
-            .await
-            .expect("arb signal should process");
-
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, ExecutionEvent::OrderSubmitted { .. }))
-                .count(),
-            2
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, ExecutionEvent::OrderFilled(_)))
-                .count(),
-            2
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, ExecutionEvent::HedgeStateChanged { .. }))
-                .count(),
-            2
-        );
-    }
-
-    #[tokio::test]
     async fn registry_backed_cex_orders_use_configured_symbol_and_exchange() {
-        let executor = DryRunExecutor::new();
+        let executor =
+            sample_executor_with_liquidity(Decimal::new(500, 0), Decimal::new(5, 0), false);
         let registry = SymbolRegistry::new(vec![sample_market(Exchange::Binance, "BTCUSDT")]);
-        let mut manager = ExecutionManager::with_symbol_registry(executor.clone(), registry);
+        let provider = sample_planning_provider(Decimal::new(500, 0), Decimal::new(5, 0));
+        let mut manager = ExecutionManager::with_symbol_registry_and_orderbook_provider(
+            executor.clone(),
+            registry,
+            provider,
+        );
 
         manager
-            .process_arb_signal(sample_basis_signal())
+            .process_intent(sample_open_intent())
             .await
-            .expect("arb signal should process");
+            .expect("open intent should process");
 
         let orders = executor
             .order_snapshots()
@@ -1662,14 +1680,20 @@ mod tests {
 
     #[tokio::test]
     async fn registry_backed_okx_orders_use_swap_inst_id() {
-        let executor = DryRunExecutor::new();
+        let executor =
+            sample_executor_with_liquidity(Decimal::new(500, 0), Decimal::new(5, 0), false);
         let registry = SymbolRegistry::new(vec![sample_market(Exchange::Okx, "BTCUSDT")]);
-        let mut manager = ExecutionManager::with_symbol_registry(executor.clone(), registry);
+        let provider = sample_planning_provider(Decimal::new(500, 0), Decimal::new(5, 0));
+        let mut manager = ExecutionManager::with_symbol_registry_and_orderbook_provider(
+            executor.clone(),
+            registry,
+            provider,
+        );
 
         manager
-            .process_arb_signal(sample_basis_signal())
+            .process_intent(sample_open_intent())
             .await
-            .expect("arb signal should process");
+            .expect("open intent should process");
 
         let orders = executor
             .order_snapshots()
@@ -1684,97 +1708,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_position_signal_submits_flattening_orders_and_returns_idle() {
-        let executor = fill_capable_executor();
+    async fn close_position_intent_submits_flattening_orders() {
+        let executor =
+            sample_executor_with_liquidity(Decimal::new(500, 0), Decimal::new(5, 0), false);
         let registry = SymbolRegistry::new(vec![sample_market(Exchange::Binance, "BTCUSDT")]);
-        let mut manager = ExecutionManager::with_symbol_registry(executor.clone(), registry);
+        let provider = sample_planning_provider(Decimal::new(500, 0), Decimal::new(5, 0));
+        let mut manager = ExecutionManager::with_symbol_registry_and_orderbook_provider(
+            executor.clone(),
+            registry,
+            provider,
+        );
 
         manager
-            .process_arb_signal(sample_basis_signal())
+            .process_intent(sample_open_intent())
             .await
-            .expect("basis signal should process");
+            .expect("open intent should process");
 
         let close_events = manager
-            .process_arb_signal(sample_close_signal())
+            .process_intent(sample_close_intent())
             .await
-            .expect("close signal should process");
+            .expect("close intent should process");
 
-        assert_eq!(
+        assert!(
+            close_events
+                .iter()
+                .any(|event| matches!(event, ExecutionEvent::TradePlanCreated { plan } if plan.intent_type == "close_position"))
+        );
+        assert!(
             close_events
                 .iter()
                 .filter(|event| matches!(event, ExecutionEvent::OrderSubmitted { .. }))
-                .count(),
-            2
+                .count()
+                >= 2
         );
-        assert_eq!(
+        assert!(
             close_events
                 .iter()
                 .filter(|event| matches!(event, ExecutionEvent::OrderFilled(_)))
-                .count(),
-            2
-        );
-        assert_eq!(
-            close_events
-                .iter()
-                .filter(|event| matches!(event, ExecutionEvent::TradeClosed { .. }))
-                .count(),
-            1
-        );
-        let trade_closed = close_events
-            .iter()
-            .find_map(|event| match event {
-                ExecutionEvent::TradeClosed { realized_pnl, .. } => Some(realized_pnl),
-                _ => None,
-            })
-            .expect("trade closed event should exist");
-        assert_eq!(*trade_closed, UsdNotional(Decimal::new(-93_706, 5)));
-        assert_eq!(
-            manager.hedge_state(&sample_symbol()),
-            Some(HedgeState::Idle)
+                .count()
+                >= 2
         );
 
         let orders = executor
             .order_snapshots()
             .expect("dry run snapshot should succeed");
         assert_eq!(orders.len(), 4);
-    }
-
-    #[tokio::test]
-    async fn basis_signal_with_zero_effective_cex_hedge_qty_is_rejected_before_submission() {
-        let executor = fill_capable_executor();
-        let mut market = sample_market(Exchange::Binance, "BTCUSDT");
-        market.cex_qty_step = Decimal::ONE;
-        let registry = SymbolRegistry::new(vec![market]);
-        let mut manager = ExecutionManager::with_symbol_registry(executor.clone(), registry);
-        let mut signal = sample_basis_signal();
-        if let ArbSignalAction::BasisLong { cex_hedge_qty, .. } = &mut signal.action {
-            *cex_hedge_qty = polyalpha_core::CexBaseQty(Decimal::new(3, 1));
-        }
-
-        let events = manager
-            .process_arb_signal(signal)
-            .await
-            .expect("invalid open signal should return a rejection event");
-
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            ExecutionEvent::OrderSubmitted { response, .. } => {
-                assert_eq!(response.status, OrderStatus::Rejected);
-                assert_eq!(
-                    response.rejection_reason.as_deref(),
-                    Some("zero_cex_hedge_qty")
-                );
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
-        assert_eq!(manager.hedge_state(&sample_symbol()), None);
-
-        let orders = executor
-            .order_snapshots()
-            .expect("dry run snapshot should succeed");
-        assert!(
-            orders.is_empty(),
-            "invalid open signal must not submit any exchange order"
-        );
+        let close_cex_order = orders
+            .iter()
+            .rev()
+            .find(|order| order.exchange == Exchange::Binance)
+            .expect("close cex order should exist");
+        assert_eq!(close_cex_order.symbol.0, sample_symbol().0);
     }
 }

@@ -10,10 +10,11 @@ use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::{sleep, Duration};
 
 use polyalpha_core::{
-    cex_venue_symbol, create_channels, AlphaEngine, ArbSignalAction, ArbSignalEvent, CexBaseQty,
-    ConnectionStatus, EngineParams, EngineWarning, Exchange, ExecutionEvent, HedgeState,
-    InstrumentKind, MarketConfig, MarketDataEvent, MarketDataSource, MarketPhase, OrderStatus,
-    Position, Price, RiskManager, Settings, SymbolRegistry, VenueQuantity,
+    cex_venue_symbol, create_channels, AlphaEngine, CexBaseQty, ConnectionStatus, EngineParams,
+    EngineWarning, Exchange, ExecutionEvent, HedgeState, InstrumentKind, MarketConfig,
+    MarketDataEvent, MarketDataSource, MarketPhase, OpenCandidate, OrderStatus, PlanningIntent,
+    Position, Price, RiskManager, Settings, SymbolRegistry, TokenSide, VenueQuantity,
+    PLANNING_SCHEMA_VERSION,
 };
 use polyalpha_data::{
     CexBookLevel, CexBookUpdate, DataManager, MarketDataNormalizer, MockMarketDataSource, MockTick,
@@ -393,6 +394,70 @@ fn update_sim_orderbook(
     }
 }
 
+fn open_intent_from_candidate(candidate: &OpenCandidate) -> PlanningIntent {
+    PlanningIntent::OpenPosition {
+        schema_version: candidate.schema_version,
+        intent_id: format!("intent-open-{}", candidate.candidate_id),
+        correlation_id: candidate.correlation_id.clone(),
+        symbol: candidate.symbol.clone(),
+        candidate: candidate.clone(),
+        max_budget_usd: candidate.risk_budget_usd,
+        max_residual_delta: 0.05,
+        max_shock_loss_usd: candidate.risk_budget_usd.max(25.0),
+    }
+}
+
+fn close_intent_for_symbol(
+    symbol: &polyalpha_core::Symbol,
+    reason: &str,
+    now_ms: u64,
+) -> PlanningIntent {
+    PlanningIntent::ClosePosition {
+        schema_version: PLANNING_SCHEMA_VERSION,
+        intent_id: format!("intent-close-{}-{now_ms}", symbol.0),
+        correlation_id: format!("corr-close-{}-{now_ms}", symbol.0),
+        symbol: symbol.clone(),
+        close_reason: reason.to_owned(),
+        target_close_ratio: 1.0,
+    }
+}
+
+fn sync_engine_position_state(
+    engine: &mut SimpleAlphaEngine,
+    risk: &InMemoryRiskManager,
+    symbol: &polyalpha_core::Symbol,
+) {
+    let active_token_side = if risk
+        .position_tracker()
+        .net_symbol_qty(symbol, InstrumentKind::PolyYes)
+        > Decimal::ZERO
+    {
+        Some(TokenSide::Yes)
+    } else if risk
+        .position_tracker()
+        .net_symbol_qty(symbol, InstrumentKind::PolyNo)
+        > Decimal::ZERO
+    {
+        Some(TokenSide::No)
+    } else {
+        None
+    };
+    engine.sync_position_state(symbol, active_token_side);
+}
+
+fn event_timestamp_ms(event: &MarketDataEvent) -> u64 {
+    match event {
+        MarketDataEvent::OrderBookUpdate { snapshot } => snapshot.received_at_ms,
+        MarketDataEvent::TradeUpdate { timestamp_ms, .. } => *timestamp_ms,
+        MarketDataEvent::FundingRate {
+            next_funding_time_ms,
+            ..
+        } => *next_funding_time_ms,
+        MarketDataEvent::MarketLifecycle { timestamp_ms, .. } => *timestamp_ms,
+        MarketDataEvent::ConnectionEvent { .. } => 0,
+    }
+}
+
 async fn run_sim_with_mock_ticks(
     env: &str,
     settings: &Settings,
@@ -437,7 +502,11 @@ async fn run_sim_with_mock_ticks(
         orderbook_provider.clone(),
         build_sim_slippage_config(settings),
     );
-    let mut execution = ExecutionManager::with_symbol_registry(executor.clone(), registry.clone());
+    let mut execution = ExecutionManager::with_symbol_registry_and_orderbook_provider(
+        executor.clone(),
+        registry.clone(),
+        orderbook_provider.clone(),
+    );
     let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
     let mut observed = ObservedState::default();
     let mut stats = SimStats::default();
@@ -477,25 +546,66 @@ async fn run_sim_with_mock_ticks(
                         let events = execution.apply_dmm_quote_update(update).await?;
                         apply_execution_events(&mut risk, &mut stats, &mut recent_events, events)
                             .await?;
+                        sync_engine_position_state(&mut engine, &risk, &market.symbol);
                     }
 
-                    for signal in output.arb_signals {
+                    for candidate in output.open_candidates {
                         stats.signals_seen += 1;
-                        push_event(&mut recent_events, "signal", summarize_signal(&signal));
+                        push_event(
+                            &mut recent_events,
+                            "signal",
+                            summarize_candidate(&candidate),
+                        );
 
-                        if !signal_allowed(&risk, &registry, &signal).await? {
+                        if !signal_allowed(&risk, &registry, &candidate).await? {
                             stats.signals_rejected += 1;
                             push_event(
                                 &mut recent_events,
                                 "risk",
-                                format!("信号被拒绝：未通过风控检查 {}", signal.signal_id),
+                                format!("候选被拒绝：未通过风控检查 {}", candidate.candidate_id),
                             );
                             continue;
                         }
 
-                        let events = execution.process_arb_signal(signal).await?;
+                        match execution
+                            .process_intent(open_intent_from_candidate(&candidate))
+                            .await
+                        {
+                            Ok(events) => {
+                                apply_execution_events(
+                                    &mut risk,
+                                    &mut stats,
+                                    &mut recent_events,
+                                    events,
+                                )
+                                .await?;
+                                sync_engine_position_state(&mut engine, &risk, &market.symbol);
+                            }
+                            Err(err) => {
+                                stats.signals_rejected += 1;
+                                push_event(
+                                    &mut recent_events,
+                                    "risk",
+                                    format!(
+                                        "候选被执行规划拒绝 {}（{}）",
+                                        candidate.candidate_id, err
+                                    ),
+                                );
+                            }
+                        }
+                    }
+
+                    if let Some(reason) = engine.close_reason(&market.symbol) {
+                        let events = execution
+                            .process_intent(close_intent_for_symbol(
+                                &market.symbol,
+                                &reason,
+                                event_timestamp_ms(&event),
+                            ))
+                            .await?;
                         apply_execution_events(&mut risk, &mut stats, &mut recent_events, events)
                             .await?;
+                        sync_engine_position_state(&mut engine, &risk, &market.symbol);
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -894,6 +1004,9 @@ async fn apply_execution_events(
             ExecutionEvent::RecoveryPlanCreated { .. } => {
                 push_event(recent_events, "recovery", summarize_execution_event(&event));
             }
+            ExecutionEvent::ExecutionResultRecorded { .. } => {
+                push_event(recent_events, "result", summarize_execution_event(&event));
+            }
             ExecutionEvent::OrderSubmitted { .. } => {
                 stats.order_submitted += 1;
                 push_event(
@@ -961,6 +1074,13 @@ fn summarize_execution_event(event: &ExecutionEvent) -> String {
         ExecutionEvent::RecoveryPlanCreated { plan } => {
             format!("恢复计划已生成 {} {}", plan.symbol.0, plan.plan_id)
         }
+        ExecutionEvent::ExecutionResultRecorded { result } => format!(
+            "执行结果已记录 {} {} {} / 实际边际={}",
+            result.symbol.0,
+            result.plan_id,
+            result.status,
+            result.realized_edge_usd.0.normalize()
+        ),
         ExecutionEvent::OrderSubmitted {
             exchange, response, ..
         } => {
@@ -1113,15 +1233,13 @@ fn summarize_engine_warning(warning: &EngineWarning) -> String {
     }
 }
 
-fn summarize_signal(signal: &ArbSignalEvent) -> String {
-    let action = match &signal.action {
-        ArbSignalAction::BasisLong { .. } => "基差做多信号",
-        ArbSignalAction::BasisShort { .. } => "基差做空信号",
-        ArbSignalAction::DeltaRebalance { .. } => "Delta 再平衡信号",
-        ArbSignalAction::NegRiskArb { .. } => "负风险套利信号",
-        ArbSignalAction::ClosePosition { .. } => "平仓信号",
+fn summarize_candidate(candidate: &OpenCandidate) -> String {
+    let action = match candidate.direction.as_str() {
+        "long" => "开仓候选",
+        "short" => "反向候选",
+        _ => "候选机会",
     };
-    format!("{action} {}", signal.signal_id)
+    format!("{action} {}", candidate.candidate_id)
 }
 
 fn push_event(events: &mut VecDeque<SimEventLog>, kind: &str, summary: String) {
@@ -1683,7 +1801,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sim_round_trip_opens_and_closes_all_legs() {
+    async fn sim_rejects_non_executable_candidate_without_aborting() {
         let market = test_market(Decimal::new(1, 3));
         let settings = test_settings(market.clone(), Decimal::new(1_000, 0));
         let artifact = run_sim_with_mock_ticks(
@@ -1698,16 +1816,16 @@ mod tests {
             false,
         )
         .await
-        .expect("sim round-trip should succeed");
+        .expect("sim candidate rejection should not abort runtime");
 
         assert_eq!(
-            artifact.final_snapshot.signals_seen, 2,
+            artifact.final_snapshot.signals_seen, 1,
             "unexpected snapshots: {:#?}",
             artifact.snapshots
         );
-        assert_eq!(artifact.final_snapshot.signals_rejected, 0);
-        assert_eq!(artifact.final_snapshot.order_submitted, 4);
-        assert_eq!(artifact.final_snapshot.fills, 4);
+        assert_eq!(artifact.final_snapshot.signals_rejected, 1);
+        assert_eq!(artifact.final_snapshot.order_submitted, 0);
+        assert_eq!(artifact.final_snapshot.fills, 0);
         assert!(
             snapshot_positions_are_flat(&artifact.final_snapshot),
             "unexpected final snapshot: {:#?}\nrecent events: {:#?}",
@@ -1719,8 +1837,8 @@ mod tests {
             artifact
                 .recent_events
                 .iter()
-                .any(|event| event.kind == "trade_closed"),
-            "sim acceptance should emit TradeClosed"
+                .any(|event| event.summary.contains("候选被执行规划拒绝")),
+            "planner rejection should be visible in sim event log"
         );
     }
 
@@ -1753,7 +1871,8 @@ mod tests {
             }),
             "scenario should produce an entry-quality basis snapshot before hedge floor is applied"
         );
-        assert_eq!(artifact.final_snapshot.signals_seen, 0);
+        assert_eq!(artifact.final_snapshot.signals_seen, 1);
+        assert_eq!(artifact.final_snapshot.signals_rejected, 1);
         assert_eq!(artifact.final_snapshot.order_submitted, 0);
         assert_eq!(artifact.final_snapshot.fills, 0);
         assert!(snapshot_positions_are_flat(&artifact.final_snapshot));

@@ -1,14 +1,15 @@
 use anyhow::{anyhow, Context, Result};
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use std::str::FromStr;
 use tokio::sync::broadcast::error::TryRecvError;
 
 use polyalpha_core::{
-    cex_venue_symbol, create_channels, AlphaEngine, ArbSignalAction, ArbSignalEvent, CexBaseQty,
-    CexOrderRequest, ClientOrderId, ConnectionStatus, EngineParams, Exchange, ExecutionEvent,
-    MarketConfig, MarketDataEvent, MarketDataSource, OrderRequest, OrderType, PolyOrderRequest,
-    PolySizingInstruction, Price, RiskManager, Settings, SymbolRegistry, TimeInForce, TokenSide,
+    cex_venue_symbol, create_channels, AlphaEngine, CexBaseQty, CexOrderRequest, ClientOrderId,
+    ConnectionStatus, EngineParams, Exchange, ExecutionEvent, InstrumentKind, MarketConfig,
+    MarketDataEvent, MarketDataSource, OpenCandidate, OrderRequest, OrderType, PlanningIntent,
+    PolyOrderRequest, PolyShares, PolySizingInstruction, Price, RiskManager, Settings,
+    SymbolRegistry, TimeInForce, TokenSide,
 };
 use polyalpha_data::{
     BinanceFuturesDataSource, CexBookLevel, CexBookUpdate, DataManager, MarketDataNormalizer,
@@ -16,7 +17,10 @@ use polyalpha_data::{
     PolymarketLiveDataSource,
 };
 use polyalpha_engine::{SimpleAlphaEngine, SimpleEngineConfig};
-use polyalpha_executor::{BinanceFuturesExecutor, DryRunExecutor, ExecutionManager, OkxExecutor};
+use polyalpha_executor::{
+    dry_run::SlippageConfig, BinanceFuturesExecutor, DryRunExecutor, ExecutionManager,
+    InMemoryOrderbookProvider, OkxExecutor,
+};
 use polyalpha_risk::{InMemoryRiskManager, RiskLimits};
 
 use crate::args::{PreviewExchange, PreviewOrderType, PreviewSide};
@@ -95,8 +99,14 @@ pub async fn run_demo(env: &str) -> Result<()> {
     });
 
     let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
-    let mut execution =
-        ExecutionManager::with_symbol_registry(DryRunExecutor::new(), registry.clone());
+    let orderbook_provider = std::sync::Arc::new(InMemoryOrderbookProvider::new());
+    let executor =
+        DryRunExecutor::with_orderbook(orderbook_provider.clone(), SlippageConfig::default());
+    let mut execution = ExecutionManager::with_symbol_registry_and_orderbook_provider(
+        executor,
+        registry.clone(),
+        orderbook_provider.clone(),
+    );
     let mut stats = DemoStats::default();
 
     // 这里按 tick 顺序推进，保证 dry-run 的结果稳定可复现。
@@ -105,6 +115,9 @@ pub async fn run_demo(env: &str) -> Result<()> {
             match market_data_rx.try_recv() {
                 Ok(event) => {
                     stats.market_events += 1;
+                    if let MarketDataEvent::OrderBookUpdate { snapshot } = &event {
+                        update_demo_orderbook(&orderbook_provider, &registry, snapshot);
+                    }
                     if let MarketDataEvent::MarketLifecycle { symbol, phase, .. } = &event {
                         risk.update_market_phase(symbol.clone(), phase.clone());
                     }
@@ -113,9 +126,10 @@ pub async fn run_demo(env: &str) -> Result<()> {
                     for update in output.dmm_updates {
                         let events = execution.apply_dmm_quote_update(update).await?;
                         apply_execution_events(&mut risk, &mut stats, events).await?;
+                        sync_engine_position_state(&mut engine, &risk, &market.symbol);
                     }
 
-                    for signal in output.arb_signals {
+                    for signal in output.open_candidates {
                         stats.signals_seen += 1;
 
                         // 这里先在 CLI 做最小 pre-trade gate，避免 demo 把风控旁路掉。
@@ -124,8 +138,23 @@ pub async fn run_demo(env: &str) -> Result<()> {
                             continue;
                         }
 
-                        let events = execution.process_arb_signal(signal).await?;
+                        let events = execution
+                            .process_intent(open_intent_from_candidate(&signal))
+                            .await?;
                         apply_execution_events(&mut risk, &mut stats, events).await?;
+                        sync_engine_position_state(&mut engine, &risk, &market.symbol);
+                    }
+
+                    if let Some(reason) = engine.close_reason(&market.symbol) {
+                        let events = execution
+                            .process_intent(close_intent_for_symbol(
+                                &market.symbol,
+                                &reason,
+                                event_timestamp_ms(&event),
+                            ))
+                            .await?;
+                        apply_execution_events(&mut risk, &mut stats, events).await?;
+                        sync_engine_position_state(&mut engine, &risk, &market.symbol);
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -343,7 +372,7 @@ pub(crate) fn select_market(settings: &Settings, market_index: usize) -> Result<
 pub(crate) async fn signal_allowed(
     risk: &InMemoryRiskManager,
     registry: &SymbolRegistry,
-    signal: &ArbSignalEvent,
+    signal: &OpenCandidate,
 ) -> Result<bool> {
     Ok(signal_rejection_reason(risk, registry, signal)
         .await?
@@ -353,7 +382,7 @@ pub(crate) async fn signal_allowed(
 pub(crate) async fn signal_rejection_reason(
     risk: &InMemoryRiskManager,
     registry: &SymbolRegistry,
-    signal: &ArbSignalEvent,
+    signal: &OpenCandidate,
 ) -> Result<Option<String>> {
     for request in signal_requests(registry, signal)? {
         if let Err(err) = risk.pre_trade_check(request).await {
@@ -373,7 +402,8 @@ async fn apply_execution_events(
         match event {
             ExecutionEvent::TradePlanCreated { .. }
             | ExecutionEvent::PlanSuperseded { .. }
-            | ExecutionEvent::RecoveryPlanCreated { .. } => {}
+            | ExecutionEvent::RecoveryPlanCreated { .. }
+            | ExecutionEvent::ExecutionResultRecorded { .. } => {}
             ExecutionEvent::OrderSubmitted { .. } => {
                 stats.order_submitted += 1;
             }
@@ -399,123 +429,113 @@ async fn apply_execution_events(
 }
 
 fn signal_requests(
-    registry: &SymbolRegistry,
-    signal: &ArbSignalEvent,
+    _registry: &SymbolRegistry,
+    signal: &OpenCandidate,
 ) -> Result<Vec<OrderRequest>> {
-    let requests = match &signal.action {
-        ArbSignalAction::BasisLong {
-            token_side,
-            poly_side,
-            poly_target_shares,
-            poly_target_notional: _,
-            cex_side,
-            cex_hedge_qty,
-            ..
-        }
-        | ArbSignalAction::BasisShort {
-            token_side,
-            poly_side,
-            poly_target_shares,
-            poly_target_notional: _,
-            cex_side,
-            cex_hedge_qty,
-            ..
-        } => {
-            let market = registry
-                .get_config(&signal.symbol)
-                .ok_or_else(|| anyhow!("missing market config for symbol {}", signal.symbol.0))?;
-            vec![
-                OrderRequest::Poly(PolyOrderRequest {
-                    client_order_id: ClientOrderId("risk-poly".to_owned()),
-                    symbol: signal.symbol.clone(),
-                    token_side: *token_side,
-                    side: *poly_side,
-                    order_type: OrderType::Market,
-                    sizing: match poly_side {
-                        polyalpha_core::OrderSide::Buy => PolySizingInstruction::BuyBudgetCap {
-                            max_cost_usd: polyalpha_core::UsdNotional::from_poly(
-                                *poly_target_shares,
-                                Price::ONE,
-                            ),
-                            max_avg_price: Price::ONE,
-                            max_shares: *poly_target_shares,
-                        },
-                        polyalpha_core::OrderSide::Sell => PolySizingInstruction::SellExactShares {
-                            shares: *poly_target_shares,
-                            min_avg_price: Price::ZERO,
-                        },
-                    },
-                    time_in_force: TimeInForce::Fok,
-                    post_only: false,
-                }),
-                OrderRequest::Cex(CexOrderRequest {
-                    client_order_id: ClientOrderId("risk-cex".to_owned()),
-                    exchange: market.hedge_exchange,
-                    symbol: signal.symbol.clone(),
-                    venue_symbol: cex_venue_symbol(market.hedge_exchange, &market.cex_symbol),
-                    side: *cex_side,
-                    order_type: OrderType::Market,
-                    price: None,
-                    base_qty: *cex_hedge_qty,
-                    time_in_force: TimeInForce::Ioc,
-                    reduce_only: false,
-                }),
-            ]
-        }
-        ArbSignalAction::DeltaRebalance {
-            cex_side,
-            cex_qty_adjust,
-            ..
-        } => {
-            let market = registry
-                .get_config(&signal.symbol)
-                .ok_or_else(|| anyhow!("missing market config for symbol {}", signal.symbol.0))?;
-            vec![OrderRequest::Cex(CexOrderRequest {
-                client_order_id: ClientOrderId("risk-rebalance".to_owned()),
-                exchange: market.hedge_exchange,
-                symbol: signal.symbol.clone(),
-                venue_symbol: cex_venue_symbol(market.hedge_exchange, &market.cex_symbol),
-                side: *cex_side,
-                order_type: OrderType::Market,
-                price: None,
-                base_qty: *cex_qty_adjust,
-                time_in_force: TimeInForce::Ioc,
-                reduce_only: false,
-            })]
-        }
-        ArbSignalAction::NegRiskArb { legs } => legs
-            .iter()
-            .enumerate()
-            .map(|(idx, leg)| {
-                OrderRequest::Poly(PolyOrderRequest {
-                    client_order_id: ClientOrderId(format!("risk-leg-{idx}")),
-                    symbol: leg.symbol.clone(),
-                    token_side: leg.token_side,
-                    side: leg.side,
-                    order_type: OrderType::Market,
-                    sizing: match leg.side {
-                        polyalpha_core::OrderSide::Buy => PolySizingInstruction::BuyBudgetCap {
-                            max_cost_usd: polyalpha_core::UsdNotional::from_poly(
-                                leg.quantity,
-                                Price::ONE,
-                            ),
-                            max_avg_price: Price::ONE,
-                            max_shares: leg.quantity,
-                        },
-                        polyalpha_core::OrderSide::Sell => PolySizingInstruction::SellExactShares {
-                            shares: leg.quantity,
-                            min_avg_price: Price::ZERO,
-                        },
-                    },
-                    time_in_force: TimeInForce::Fok,
-                    post_only: false,
-                })
-            })
-            .collect(),
-        ArbSignalAction::ClosePosition { .. } => Vec::new(),
-    };
+    let budget = Decimal::from_f64(signal.risk_budget_usd).unwrap_or(Decimal::ZERO);
+    let max_shares = PolyShares(budget);
+    let requests = vec![OrderRequest::Poly(PolyOrderRequest {
+        client_order_id: ClientOrderId("risk-poly".to_owned()),
+        symbol: signal.symbol.clone(),
+        token_side: signal.token_side,
+        side: polyalpha_core::OrderSide::Buy,
+        order_type: OrderType::Market,
+        sizing: PolySizingInstruction::BuyBudgetCap {
+            max_cost_usd: polyalpha_core::UsdNotional(budget),
+            max_avg_price: Price::ONE,
+            max_shares,
+        },
+        time_in_force: TimeInForce::Fok,
+        post_only: false,
+    })];
 
     Ok(requests)
+}
+
+fn open_intent_from_candidate(candidate: &OpenCandidate) -> PlanningIntent {
+    PlanningIntent::OpenPosition {
+        schema_version: candidate.schema_version,
+        intent_id: format!("intent-open-{}", candidate.candidate_id),
+        correlation_id: candidate.correlation_id.clone(),
+        symbol: candidate.symbol.clone(),
+        candidate: candidate.clone(),
+        max_budget_usd: candidate.risk_budget_usd,
+        max_residual_delta: 0.05,
+        max_shock_loss_usd: candidate.risk_budget_usd.max(25.0),
+    }
+}
+
+fn close_intent_for_symbol(
+    symbol: &polyalpha_core::Symbol,
+    reason: &str,
+    now_ms: u64,
+) -> PlanningIntent {
+    PlanningIntent::ClosePosition {
+        schema_version: polyalpha_core::PLANNING_SCHEMA_VERSION,
+        intent_id: format!("intent-close-{}-{now_ms}", symbol.0),
+        correlation_id: format!("corr-close-{}-{now_ms}", symbol.0),
+        symbol: symbol.clone(),
+        close_reason: reason.to_owned(),
+        target_close_ratio: 1.0,
+    }
+}
+
+fn sync_engine_position_state(
+    engine: &mut SimpleAlphaEngine,
+    risk: &InMemoryRiskManager,
+    symbol: &polyalpha_core::Symbol,
+) {
+    let active_token_side = if risk
+        .position_tracker()
+        .net_symbol_qty(symbol, InstrumentKind::PolyYes)
+        > Decimal::ZERO
+    {
+        Some(TokenSide::Yes)
+    } else if risk
+        .position_tracker()
+        .net_symbol_qty(symbol, InstrumentKind::PolyNo)
+        > Decimal::ZERO
+    {
+        Some(TokenSide::No)
+    } else {
+        None
+    };
+    engine.sync_position_state(symbol, active_token_side);
+}
+
+fn update_demo_orderbook(
+    provider: &InMemoryOrderbookProvider,
+    registry: &SymbolRegistry,
+    snapshot: &polyalpha_core::OrderBookSnapshot,
+) {
+    match snapshot.instrument {
+        InstrumentKind::CexPerp => {
+            let venue_symbol = registry
+                .get_config(&snapshot.symbol)
+                .map(|config| cex_venue_symbol(config.hedge_exchange, &config.cex_symbol))
+                .unwrap_or_else(|| {
+                    cex_venue_symbol(
+                        snapshot.exchange,
+                        &snapshot.symbol.0.to_ascii_uppercase().replace('-', ""),
+                    )
+                });
+            provider.update_cex(snapshot.clone(), venue_symbol);
+        }
+        InstrumentKind::PolyYes | InstrumentKind::PolyNo => provider.update(snapshot.clone()),
+    }
+}
+
+fn event_timestamp_ms(event: &MarketDataEvent) -> u64 {
+    match event {
+        MarketDataEvent::OrderBookUpdate { snapshot } => snapshot.received_at_ms,
+        MarketDataEvent::TradeUpdate { timestamp_ms, .. } => *timestamp_ms,
+        MarketDataEvent::FundingRate {
+            next_funding_time_ms,
+            ..
+        } => *next_funding_time_ms,
+        MarketDataEvent::MarketLifecycle { timestamp_ms, .. } => *timestamp_ms,
+        MarketDataEvent::ConnectionEvent { .. } => 0,
+    }
 }
 
 fn required_env(name: &str) -> Result<String> {

@@ -6,9 +6,9 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 
 use polyalpha_core::{
-    AlphaEngine, ArbSignalAction, CexBaseQty, Exchange, InstrumentKind, MarketConfig,
-    MarketDataEvent, MarketRule, MarketRuleKind, OrderBookSnapshot, PolyShares, PolymarketIds,
-    Price, PriceLevel, SignalStrength, Symbol, TokenSide, UsdNotional, VenueQuantity,
+    AlphaEngine, CexBaseQty, Exchange, InstrumentKind, MarketConfig, MarketDataEvent, MarketRule,
+    MarketRuleKind, OrderBookSnapshot, PolyShares, PolymarketIds, Price, PriceLevel,
+    SignalStrength, Symbol, TokenSide, UsdNotional, VenueQuantity,
 };
 use polyalpha_engine::{BasisStrategySnapshot, SimpleAlphaEngine, SimpleEngineConfig};
 
@@ -189,13 +189,28 @@ async fn run_case(case: FixtureCase) {
                 observation.ts_ms + 1,
             ))
             .await;
+        let close_reason = engine.close_reason(&symbol);
 
         assert_snapshot(
             case.name.as_str(),
             &engine.basis_snapshot(&symbol),
             expected_step,
         );
-        assert_output(case.name.as_str(), &output, expected_step);
+        assert_output(case.name.as_str(), &output, expected_step, close_reason);
+
+        if let Some(expected) = &expected_step.signal {
+            match expected.kind.as_str() {
+                "open" => {
+                    let candidate = output
+                        .open_candidates
+                        .first()
+                        .expect("open step should produce a candidate");
+                    engine.sync_position_state(&symbol, Some(candidate.token_side));
+                }
+                "close" => engine.sync_position_state(&symbol, None),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -255,6 +270,7 @@ fn assert_output(
     case_name: &str,
     output: &polyalpha_core::AlphaEngineOutput,
     expected_step: &FixtureExpectedStep,
+    close_reason: Option<String>,
 ) {
     match &expected_step.signal {
         None => {
@@ -263,11 +279,7 @@ fn assert_output(
                 "case {case_name} expected no candidate, got {:?}",
                 output.open_candidates
             );
-            assert!(
-                output.arb_signals.is_empty(),
-                "case {case_name} expected no close signal, got {:?}",
-                output.arb_signals
-            );
+            assert_eq!(close_reason, None);
         }
         Some(expected) => match expected.kind.as_str() {
             "open" => {
@@ -303,20 +315,15 @@ fn assert_output(
                     actual.strength,
                     SignalStrength::Strong | SignalStrength::Normal | SignalStrength::Weak
                 ));
+                assert_eq!(close_reason, None);
             }
             "close" => {
+                assert!(output.open_candidates.is_empty());
                 assert_eq!(
-                    output.arb_signals.len(),
-                    1,
-                    "case {case_name} expected exactly one close signal"
+                    close_reason.as_deref(),
+                    expected.reason.as_deref(),
+                    "case {case_name} expected close reason mismatch"
                 );
-                let actual = &output.arb_signals[0];
-                match &actual.action {
-                    ArbSignalAction::ClosePosition { reason } => {
-                        assert_eq!(reason, expected.reason.as_deref().unwrap_or_default());
-                    }
-                    other => panic!("case {case_name} expected close signal, got {other:?}"),
-                }
             }
             other => panic!("unsupported expected signal kind {other}"),
         },

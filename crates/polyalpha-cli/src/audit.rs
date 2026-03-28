@@ -4,7 +4,7 @@ use polyalpha_audit::{
     AuditEvent, AuditEventPayload, AuditReader, AuditSessionSummary, AuditWarehouse,
     MarketMarkEvent, PositionMarkEvent, SignalEmittedEvent,
 };
-use polyalpha_core::{ArbSignalAction, Settings, TradeView};
+use polyalpha_core::{Settings, TradeView};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -426,7 +426,7 @@ fn run_position_explain(
         });
     let latest_signal_id = latest_signal
         .as_ref()
-        .map(|signal| signal.signal.signal_id.as_str());
+        .map(|signal| signal.candidate.candidate_id.as_str());
     let gate_chain = filtered
         .iter()
         .copied()
@@ -491,10 +491,10 @@ fn run_position_explain(
             );
             if let Some(signal) = &report.latest_signal {
                 println!(
-                    "最近信号: {} {} @ {}",
-                    signal.signal.signal_id,
-                    signal_action_text(&signal.signal.action),
-                    format_timestamp_ms(signal.signal.timestamp_ms)
+                    "最近候选: {} {} @ {}",
+                    signal.candidate.candidate_id,
+                    candidate_direction_text(&signal.candidate.direction),
+                    format_timestamp_ms(signal.candidate.timestamp_ms)
                 );
                 if let Some(observed) = &signal.observed {
                     println!(
@@ -516,7 +516,7 @@ fn run_position_explain(
                     );
                 }
             } else {
-                println!("最近信号: 无");
+                println!("最近候选: 无");
             }
             if let Some(position) = &report.latest_position_mark {
                 println!(
@@ -842,12 +842,10 @@ fn async_classification_label(classification: &str) -> String {
     }
 }
 
-fn signal_action_text(action: &ArbSignalAction) -> &'static str {
-    match action {
-        ArbSignalAction::BasisLong { .. } => "基差做多",
-        ArbSignalAction::BasisShort { .. } => "基差做空",
-        ArbSignalAction::DeltaRebalance { .. } => "Delta 再平衡",
-        ArbSignalAction::NegRiskArb { .. } => "负风险套利",
-        ArbSignalAction::ClosePosition { .. } => "平仓",
+fn candidate_direction_text(direction: &str) -> &str {
+    match direction {
+        "long" => "开仓候选",
+        "short" => "反向候选",
+        _ => direction,
     }
 }

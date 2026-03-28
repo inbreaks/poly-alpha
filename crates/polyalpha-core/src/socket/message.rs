@@ -2,9 +2,16 @@
 //!
 //! 用于 Paper Trading 进程和 Monitor 进程之间的通信。
 
-use crate::ConnectionStatus;
+use crate::{
+    ConnectionStatus, ExecutionResult, OpenCandidate, PlanningIntent, TradePlan,
+    PLANNING_SCHEMA_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+fn monitor_schema_version() -> u32 {
+    PLANNING_SCHEMA_VERSION
+}
 
 /// 通信消息
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -457,12 +464,16 @@ pub struct CommandView {
 /// 监控事件
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MonitorEvent {
+    #[serde(default = "monitor_schema_version")]
+    pub schema_version: u32,
     pub timestamp_ms: u64,
     pub kind: EventKind,
     pub market: Option<String>,
     pub correlation_id: Option<String>,
     pub summary: String,
     pub details: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub payload: Option<MonitorEventPayload>,
 }
 
 impl MonitorEvent {
@@ -473,11 +484,69 @@ impl MonitorEvent {
                 .correlation_id
                 .as_deref()
                 .is_some_and(|id| id.contains(market))
+            || self
+                .payload
+                .as_ref()
+                .is_some_and(|payload| payload.matches_market(market))
             || self.details.as_ref().is_some_and(|details| {
                 details
                     .iter()
                     .any(|(key, value)| key.contains(market) || value.contains(market))
             })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecutionPipelineView {
+    #[serde(default = "monitor_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub candidate: Option<OpenCandidate>,
+    #[serde(default)]
+    pub intent: Option<PlanningIntent>,
+    #[serde(default)]
+    pub plan: Option<TradePlan>,
+    #[serde(default)]
+    pub result: Option<ExecutionResult>,
+    #[serde(default)]
+    pub plan_rejection_reason: Option<String>,
+    #[serde(default)]
+    pub revalidation_failure_reason: Option<String>,
+    #[serde(default)]
+    pub recovery_decision_reason: Option<String>,
+}
+
+impl ExecutionPipelineView {
+    pub fn matches_market(&self, market: &str) -> bool {
+        self.candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.symbol.0.contains(market))
+            || self
+                .intent
+                .as_ref()
+                .is_some_and(|intent| intent.symbol().0.contains(market))
+            || self
+                .plan
+                .as_ref()
+                .is_some_and(|plan| plan.symbol.0.contains(market))
+            || self
+                .result
+                .as_ref()
+                .is_some_and(|result| result.symbol.0.contains(market))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MonitorEventPayload {
+    ExecutionPipeline(ExecutionPipelineView),
+}
+
+impl MonitorEventPayload {
+    pub fn matches_market(&self, market: &str) -> bool {
+        match self {
+            Self::ExecutionPipeline(view) => view.matches_market(market),
+        }
     }
 }
 
@@ -560,6 +629,11 @@ impl Message {
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        ExecutionResult, OpenCandidate, OrderSide, PlanningIntent, SignalStrength, Symbol,
+        TokenSide, TradePlan, PLANNING_SCHEMA_VERSION,
+    };
+    use rust_decimal::Decimal;
     use serde_json::json;
 
     use super::*;
@@ -604,6 +678,166 @@ mod tests {
                     _ => panic!("Wrong command kind"),
                 }
             }
+            _ => panic!("Wrong message type"),
+        }
+    }
+
+    #[test]
+    fn monitor_event_roundtrips_structured_planning_payload() {
+        let candidate = OpenCandidate {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            candidate_id: "cand-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            symbol: Symbol::new("btc-price-only"),
+            token_side: TokenSide::Yes,
+            direction: "long".to_owned(),
+            fair_value: 0.47,
+            raw_mispricing: 0.06,
+            delta_estimate: 0.18,
+            risk_budget_usd: 200.0,
+            strength: SignalStrength::Normal,
+            z_score: Some(2.1),
+            timestamp_ms: 1_716_000_000_000,
+        };
+        let intent = PlanningIntent::OpenPosition {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            intent_id: "intent-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            symbol: Symbol::new("btc-price-only"),
+            candidate: candidate.clone(),
+            max_budget_usd: 200.0,
+            max_residual_delta: 0.05,
+            max_shock_loss_usd: 12.0,
+        };
+        let plan = TradePlan {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            plan_id: "plan-1".to_owned(),
+            parent_plan_id: None,
+            supersedes_plan_id: None,
+            idempotency_key: "idem-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            symbol: Symbol::new("btc-price-only"),
+            intent_type: "open_position".to_owned(),
+            priority: "open_position".to_owned(),
+            created_at_ms: 1_716_000_000_001,
+            poly_exchange_timestamp_ms: 1_716_000_000_001,
+            poly_received_at_ms: 1_716_000_000_002,
+            poly_sequence: 101,
+            cex_exchange_timestamp_ms: 1_716_000_000_003,
+            cex_received_at_ms: 1_716_000_000_004,
+            cex_sequence: 202,
+            plan_hash: "hash-1".to_owned(),
+            poly_side: OrderSide::Buy,
+            poly_token_side: TokenSide::Yes,
+            poly_sizing_mode: "buy_budget_cap".to_owned(),
+            poly_requested_shares: crate::PolyShares(Decimal::new(10, 0)),
+            poly_planned_shares: crate::PolyShares(Decimal::new(10, 0)),
+            poly_max_cost_usd: crate::UsdNotional(Decimal::new(200, 0)),
+            poly_max_avg_price: crate::Price(Decimal::new(31, 2)),
+            poly_max_shares: crate::PolyShares(Decimal::new(10, 0)),
+            poly_min_avg_price: crate::Price(Decimal::ZERO),
+            poly_min_proceeds_usd: crate::UsdNotional::ZERO,
+            poly_book_avg_price: crate::Price(Decimal::new(305, 3)),
+            poly_executable_price: crate::Price(Decimal::new(31, 2)),
+            poly_friction_cost_usd: crate::UsdNotional(Decimal::new(5, 1)),
+            poly_fee_usd: crate::UsdNotional(Decimal::new(2, 1)),
+            cex_side: OrderSide::Sell,
+            cex_planned_qty: crate::CexBaseQty(Decimal::new(25, 2)),
+            cex_book_avg_price: crate::Price(Decimal::new(100000, 0)),
+            cex_executable_price: crate::Price(Decimal::new(100010, 0)),
+            cex_friction_cost_usd: crate::UsdNotional(Decimal::new(3, 1)),
+            cex_fee_usd: crate::UsdNotional(Decimal::new(1, 1)),
+            raw_edge_usd: crate::UsdNotional(Decimal::new(15, 0)),
+            planned_edge_usd: crate::UsdNotional(Decimal::new(12, 0)),
+            expected_funding_cost_usd: crate::UsdNotional(Decimal::new(1, 1)),
+            residual_risk_penalty_usd: crate::UsdNotional(Decimal::new(2, 1)),
+            post_rounding_residual_delta: 0.01,
+            shock_loss_up_1pct: crate::UsdNotional(Decimal::new(4, 0)),
+            shock_loss_down_1pct: crate::UsdNotional(Decimal::new(4, 0)),
+            shock_loss_up_2pct: crate::UsdNotional(Decimal::new(8, 0)),
+            shock_loss_down_2pct: crate::UsdNotional(Decimal::new(8, 0)),
+            plan_ttl_ms: 250,
+            max_poly_sequence_drift: 1,
+            max_cex_sequence_drift: 1,
+            max_poly_price_move: crate::Price(Decimal::new(1, 3)),
+            max_cex_price_move: crate::Price(Decimal::new(50, 0)),
+            min_planned_edge_usd: crate::UsdNotional(Decimal::new(1, 0)),
+            max_residual_delta: 0.05,
+            max_shock_loss_usd: crate::UsdNotional(Decimal::new(12, 0)),
+            max_plan_vs_fill_deviation_usd: crate::UsdNotional(Decimal::new(5, 0)),
+        };
+        let result = ExecutionResult {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            plan_id: plan.plan_id.clone(),
+            correlation_id: plan.correlation_id.clone(),
+            symbol: plan.symbol.clone(),
+            status: "completed".to_owned(),
+            poly_order_ledger: Vec::new(),
+            cex_order_ledger: Vec::new(),
+            actual_poly_cost_usd: crate::UsdNotional(Decimal::new(198, 0)),
+            actual_cex_cost_usd: crate::UsdNotional(Decimal::new(100, 0)),
+            actual_poly_fee_usd: crate::UsdNotional(Decimal::new(2, 1)),
+            actual_cex_fee_usd: crate::UsdNotional(Decimal::new(1, 1)),
+            actual_funding_cost_usd: crate::UsdNotional(Decimal::new(1, 1)),
+            realized_edge_usd: crate::UsdNotional(Decimal::new(11, 0)),
+            plan_vs_fill_deviation_usd: crate::UsdNotional(Decimal::new(1, 0)),
+            actual_residual_delta: 0.01,
+            actual_shock_loss_up_1pct: crate::UsdNotional(Decimal::new(4, 0)),
+            actual_shock_loss_down_1pct: crate::UsdNotional(Decimal::new(4, 0)),
+            actual_shock_loss_up_2pct: crate::UsdNotional(Decimal::new(8, 0)),
+            actual_shock_loss_down_2pct: crate::UsdNotional(Decimal::new(8, 0)),
+            recovery_required: false,
+            timestamp_ms: 1_716_000_000_010,
+        };
+
+        let event = MonitorEvent {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            timestamp_ms: result.timestamp_ms,
+            kind: EventKind::Trade,
+            market: Some("btc-price-only".to_owned()),
+            correlation_id: Some("corr-1".to_owned()),
+            summary: "plan completed".to_owned(),
+            details: None,
+            payload: Some(MonitorEventPayload::ExecutionPipeline(
+                ExecutionPipelineView {
+                    schema_version: PLANNING_SCHEMA_VERSION,
+                    candidate: Some(candidate),
+                    intent: Some(intent),
+                    plan: Some(plan),
+                    result: Some(result),
+                    plan_rejection_reason: None,
+                    revalidation_failure_reason: None,
+                    recovery_decision_reason: None,
+                },
+            )),
+        };
+
+        let bytes = Message::Event {
+            timestamp_ms: event.timestamp_ms,
+            event,
+        }
+        .to_bytes()
+        .unwrap();
+        let decoded = Message::from_bytes(&bytes[..bytes.len() - 1]).unwrap();
+
+        match decoded {
+            Message::Event { event, .. } => match event.payload {
+                Some(MonitorEventPayload::ExecutionPipeline(ExecutionPipelineView {
+                    schema_version,
+                    candidate,
+                    intent,
+                    plan,
+                    result,
+                    ..
+                })) => {
+                    assert_eq!(schema_version, PLANNING_SCHEMA_VERSION);
+                    assert_eq!(candidate.unwrap().candidate_id, "cand-1");
+                    assert_eq!(intent.unwrap().intent_type_code(), "open_position");
+                    assert_eq!(plan.unwrap().plan_hash, "hash-1");
+                    assert_eq!(result.unwrap().status, "completed");
+                }
+                other => panic!("unexpected payload: {other:?}"),
+            },
             _ => panic!("Wrong message type"),
         }
     }
@@ -754,20 +988,24 @@ mod tests {
         ];
         state.recent_events = vec![
             MonitorEvent {
+                schema_version: PLANNING_SCHEMA_VERSION,
                 timestamp_ms: 1,
                 kind: EventKind::Trade,
                 market: Some("sol-dip-80-mar".to_owned()),
                 correlation_id: None,
                 summary: "sol event".to_owned(),
                 details: None,
+                payload: None,
             },
             MonitorEvent {
+                schema_version: PLANNING_SCHEMA_VERSION,
                 timestamp_ms: 2,
                 kind: EventKind::Trade,
                 market: Some("eth-reach-2400-mar".to_owned()),
                 correlation_id: None,
                 summary: "eth event".to_owned(),
                 details: None,
+                payload: None,
             },
         ];
         state.recent_trades = vec![
@@ -847,6 +1085,7 @@ mod tests {
     #[test]
     fn monitor_event_matches_market_from_context_fields() {
         let event = MonitorEvent {
+            schema_version: PLANNING_SCHEMA_VERSION,
             timestamp_ms: 1,
             kind: EventKind::Risk,
             market: None,
@@ -856,6 +1095,7 @@ mod tests {
                 "symbol".to_owned(),
                 "sol-dip-80-mar".to_owned(),
             )])),
+            payload: None,
         };
 
         assert!(event.matches_market("sol-dip-80-mar"));

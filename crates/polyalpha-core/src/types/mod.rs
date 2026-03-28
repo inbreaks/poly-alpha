@@ -1,3 +1,9 @@
+//! Core type exports intentionally exclude the legacy executable signal surface.
+//!
+//! ```compile_fail
+//! use polyalpha_core::LegacyExecutableSignalSurface;
+//! ```
+
 pub mod decimal;
 pub mod engine;
 pub mod fill;
@@ -32,6 +38,5 @@ pub use position::{Position, PositionKey, PositionSide};
 pub use position_tracker::{FillEffect, PositionTracker};
 pub use risk::{CircuitBreakerStatus, PersistenceLag, RiskRejection};
 pub use signal::{
-    AlphaEngineOutput, ArbLeg, ArbSignalAction, ArbSignalEvent, DmmQuoteSlot, DmmQuoteState,
-    DmmQuoteUpdate, EngineWarning, SignalStrength,
+    AlphaEngineOutput, DmmQuoteSlot, DmmQuoteState, DmmQuoteUpdate, EngineWarning, SignalStrength,
 };

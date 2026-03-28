@@ -26,14 +26,15 @@ use polyalpha_audit::{
     PositionMarkEvent, SignalEmittedEvent,
 };
 use polyalpha_core::{
-    cex_venue_symbol, create_channels, AlphaEngine, ArbSignalAction, ArbSignalEvent,
-    AsyncClassification, CommandKind, CommandStatus, CommandView, ConnectionInfo, ConnectionStatus,
-    EngineParams, EngineWarning, EvaluableStatus, EvaluationStats, EventKind, Exchange,
-    ExecutionEvent, Fill, HedgeState, InstrumentKind, MarketConfig, MarketDataEvent,
-    MarketDataMode, MarketDataSource, MarketPhase, MarketView, MonitorEvent, MonitorRuntimeStats,
-    MonitorSocketServer, MonitorState, MonitorStrategyConfig, OrderStatus, PerformanceMetrics,
-    PolyShares, Position, Price, RiskManager, Settings, SignalStrength, Symbol, SymbolRegistry,
-    TokenSide, TradeView, UsdNotional, VenueQuantity,
+    cex_venue_symbol, create_channels, AlphaEngine, AsyncClassification, CommandKind,
+    CommandStatus, CommandView, ConnectionInfo, ConnectionStatus, EngineParams, EngineWarning,
+    EvaluableStatus, EvaluationStats, EventKind, Exchange, ExecutionEvent, ExecutionPipelineView,
+    ExecutionResult, Fill, HedgeState, InstrumentKind, MarketConfig, MarketDataEvent,
+    MarketDataMode, MarketDataSource, MarketPhase, MarketView, MonitorEvent, MonitorEventPayload,
+    MonitorRuntimeStats, MonitorSocketServer, MonitorState, MonitorStrategyConfig, OpenCandidate,
+    OrderStatus, PerformanceMetrics, PlanningIntent, PolyShares, Position, Price, RiskManager,
+    Settings, SignalStrength, Symbol, SymbolRegistry, TokenSide, TradePlan, TradeView, UsdNotional,
+    VenueQuantity, PLANNING_SCHEMA_VERSION,
 };
 use polyalpha_data::{
     BinanceFuturesDataSource, DataManager, MarketDataNormalizer, OkxMarketDataSource,
@@ -97,6 +98,71 @@ impl EvaluationSkipReason {
             Self::ConnectionLost => "行情连接异常",
             Self::NoCexReference => "缺少可用的交易所参考价",
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum RuntimeTrigger {
+    Candidate(OpenCandidate),
+    Intent {
+        intent: PlanningIntent,
+        timestamp_ms: u64,
+    },
+}
+
+impl RuntimeTrigger {
+    fn id(&self) -> &str {
+        match self {
+            Self::Candidate(candidate) => &candidate.candidate_id,
+            Self::Intent { intent, .. } => intent.intent_id(),
+        }
+    }
+
+    fn correlation_id(&self) -> &str {
+        match self {
+            Self::Candidate(candidate) => &candidate.correlation_id,
+            Self::Intent { intent, .. } => intent.correlation_id(),
+        }
+    }
+
+    fn symbol(&self) -> &Symbol {
+        match self {
+            Self::Candidate(candidate) => &candidate.symbol,
+            Self::Intent { intent, .. } => intent.symbol(),
+        }
+    }
+
+    fn timestamp_ms(&self) -> u64 {
+        match self {
+            Self::Candidate(candidate) => candidate.timestamp_ms,
+            Self::Intent { timestamp_ms, .. } => *timestamp_ms,
+        }
+    }
+
+    fn candidate(&self) -> Option<&OpenCandidate> {
+        match self {
+            Self::Candidate(candidate) => Some(candidate),
+            Self::Intent { .. } => None,
+        }
+    }
+
+    fn intent(&self) -> Option<&PlanningIntent> {
+        match self {
+            Self::Candidate(_) => None,
+            Self::Intent { intent, .. } => Some(intent),
+        }
+    }
+
+    fn is_close_like(&self) -> bool {
+        matches!(
+            self.intent(),
+            Some(
+                PlanningIntent::ClosePosition { .. }
+                    | PlanningIntent::DeltaRebalance { .. }
+                    | PlanningIntent::ResidualRecovery { .. }
+                    | PlanningIntent::ForceExit { .. }
+            )
+        )
     }
 }
 
@@ -510,37 +576,20 @@ fn require_connected_inputs(settings: &Settings) -> bool {
     settings.strategy.basis.enable_freshness_check && settings.strategy.basis.reject_on_disconnect
 }
 
-fn signal_reference_token_side(signal: &ArbSignalEvent) -> Option<TokenSide> {
-    match &signal.action {
-        ArbSignalAction::BasisLong { token_side, .. }
-        | ArbSignalAction::BasisShort { token_side, .. } => Some(*token_side),
-        ArbSignalAction::NegRiskArb { .. }
-        | ArbSignalAction::DeltaRebalance { .. }
-        | ArbSignalAction::ClosePosition { .. } => None,
-    }
-}
-
-fn signal_uses_close_thresholds(signal: &ArbSignalEvent) -> bool {
-    matches!(
-        signal.action,
-        ArbSignalAction::ClosePosition { .. } | ArbSignalAction::DeltaRebalance { .. }
-    )
-}
-
-fn audit_snapshot_for_signal(
+fn audit_snapshot_for_candidate(
     settings: &Settings,
     registry: &SymbolRegistry,
-    signal: &ArbSignalEvent,
+    candidate: &OpenCandidate,
     observed: &ObservedState,
 ) -> Option<AuditObservedMarket> {
-    registry.get_config(&signal.symbol).map(|market| {
+    registry.get_config(&candidate.symbol).map(|market| {
         build_audit_observed_market(
             now_millis(),
             market,
             observed,
             settings,
-            signal_reference_token_side(signal),
-            signal_uses_close_thresholds(signal),
+            Some(candidate.token_side),
+            false,
             require_connected_inputs(settings),
         )
     })
@@ -614,21 +663,21 @@ impl PaperAudit {
 
     fn record_signal_emitted(
         &mut self,
-        signal: &ArbSignalEvent,
+        candidate: &OpenCandidate,
         observed: Option<AuditObservedMarket>,
     ) -> Result<()> {
         self.record_event(NewAuditEvent {
-            timestamp_ms: signal.timestamp_ms,
+            timestamp_ms: candidate.timestamp_ms,
             kind: AuditEventKind::SignalEmitted,
-            symbol: Some(signal.symbol.0.clone()),
-            signal_id: Some(signal.signal_id.clone()),
-            correlation_id: Some(signal.correlation_id.clone()),
+            symbol: Some(candidate.symbol.0.clone()),
+            signal_id: Some(candidate.candidate_id.clone()),
+            correlation_id: Some(candidate.correlation_id.clone()),
             gate: None,
             result: None,
             reason: None,
-            summary: summarize_signal(signal),
+            summary: summarize_candidate(candidate),
             payload: AuditEventPayload::SignalEmitted(SignalEmittedEvent {
-                signal: signal.clone(),
+                candidate: candidate.clone(),
                 observed,
             }),
         })
@@ -636,7 +685,7 @@ impl PaperAudit {
 
     fn record_gate_decision(
         &mut self,
-        signal: &ArbSignalEvent,
+        candidate: &OpenCandidate,
         gate: &str,
         result: AuditGateResult,
         reason: &str,
@@ -646,9 +695,9 @@ impl PaperAudit {
         self.record_event(NewAuditEvent {
             timestamp_ms: now_millis(),
             kind: AuditEventKind::GateDecision,
-            symbol: Some(signal.symbol.0.clone()),
-            signal_id: Some(signal.signal_id.clone()),
-            correlation_id: Some(signal.correlation_id.clone()),
+            symbol: Some(candidate.symbol.0.clone()),
+            signal_id: Some(candidate.candidate_id.clone()),
+            correlation_id: Some(candidate.correlation_id.clone()),
             gate: Some(gate.to_owned()),
             result: Some(result.as_str().to_owned()),
             reason: Some(reason.to_owned()),
@@ -657,7 +706,7 @@ impl PaperAudit {
                 gate: gate.to_owned(),
                 result,
                 reason: reason.to_owned(),
-                signal: signal.clone(),
+                candidate: candidate.clone(),
                 observed,
             }),
         })
@@ -698,14 +747,14 @@ impl PaperAudit {
     fn record_execution(
         &mut self,
         event: &ExecutionEvent,
-        signal: Option<&ArbSignalEvent>,
+        trigger: Option<&RuntimeTrigger>,
     ) -> Result<()> {
-        let (symbol, correlation_id) = audit_execution_identity(event, signal);
+        let (symbol, correlation_id) = audit_execution_identity(event, trigger);
         self.record_event(NewAuditEvent {
             timestamp_ms: audit_execution_timestamp_ms(event),
             kind: AuditEventKind::Execution,
             symbol,
-            signal_id: signal.map(|signal| signal.signal_id.clone()),
+            signal_id: trigger.map(|trigger| trigger.id().to_owned()),
             correlation_id,
             gate: None,
             result: None,
@@ -719,33 +768,33 @@ impl PaperAudit {
 
     fn record_open_signal_rejected_post_submit(
         &mut self,
-        signal: &ArbSignalEvent,
+        candidate: &OpenCandidate,
         rejection_reasons: &[String],
     ) -> Result<()> {
         self.record_event(NewAuditEvent {
             timestamp_ms: now_millis(),
             kind: AuditEventKind::Anomaly,
-            symbol: Some(signal.symbol.0.clone()),
-            signal_id: Some(signal.signal_id.clone()),
-            correlation_id: Some(signal.correlation_id.clone()),
+            symbol: Some(candidate.symbol.0.clone()),
+            signal_id: Some(candidate.candidate_id.clone()),
+            correlation_id: Some(candidate.correlation_id.clone()),
             gate: None,
             result: None,
             reason: Some("post_submit_rejection".to_owned()),
             summary: format!(
-                "信号提交后被拒绝 {}（{}）",
-                signal.signal_id,
+                "候选提交后被拒绝 {}（{}）",
+                candidate.candidate_id,
                 rejection_reasons.join(", ")
             ),
             payload: AuditEventPayload::Anomaly(AuditAnomalyEvent {
                 severity: AuditSeverity::Warning,
                 code: "post_submit_rejection".to_owned(),
                 message: format!(
-                    "开仓信号提交后被交易执行层拒绝：{}",
+                    "开仓候选提交后被交易执行层拒绝：{}",
                     rejection_reasons.join(", ")
                 ),
-                symbol: Some(signal.symbol.0.clone()),
-                signal_id: Some(signal.signal_id.clone()),
-                correlation_id: Some(signal.correlation_id.clone()),
+                symbol: Some(candidate.symbol.0.clone()),
+                signal_id: Some(candidate.candidate_id.clone()),
+                correlation_id: Some(candidate.correlation_id.clone()),
             }),
         })
     }
@@ -1011,6 +1060,8 @@ struct PaperEventLog {
     correlation_id: Option<String>,
     #[serde(default)]
     details: Option<EventDetails>,
+    #[serde(default)]
+    payload: Option<MonitorEventPayload>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1623,6 +1674,7 @@ impl CommandCenter {
             signal_id: None,
             correlation_id,
             details,
+            payload: None,
         });
     }
 
@@ -1708,28 +1760,22 @@ struct TradeBook {
 impl TradeBook {
     fn register_open_signal(
         &mut self,
-        signal: &ArbSignalEvent,
+        candidate: &OpenCandidate,
         basis_entry_bps: i32,
         hedge_ratio: f64,
         delta: f64,
     ) {
-        let (direction, token_side) = match &signal.action {
-            ArbSignalAction::BasisLong { token_side, .. } => ("多".to_owned(), *token_side),
-            ArbSignalAction::BasisShort { token_side, .. } => ("空".to_owned(), *token_side),
-            _ => return,
-        };
-
         self.open.insert(
-            signal.symbol.clone(),
+            candidate.symbol.clone(),
             OpenTradeInfo {
-                market: signal.symbol.0.clone(),
-                direction,
-                token_side,
+                market: candidate.symbol.0.clone(),
+                direction: candidate_direction_zh(candidate.direction.as_str()).to_owned(),
+                token_side: candidate.token_side,
                 opened_at_ms: 0,
                 basis_entry_bps,
                 delta,
                 hedge_ratio,
-                correlation_id: signal.correlation_id.clone(),
+                correlation_id: candidate.correlation_id.clone(),
                 ..OpenTradeInfo::default()
             },
         );
@@ -1739,45 +1785,35 @@ impl TradeBook {
         self.open.remove(symbol);
     }
 
-    fn record_fill(&mut self, signal: Option<&ArbSignalEvent>, fill: &Fill) {
-        let Some(signal) = signal else {
+    fn record_fill(&mut self, trigger: Option<&RuntimeTrigger>, fill: &Fill) {
+        let Some(trigger) = trigger else {
             return;
         };
         let Some(open) = self.open.get_mut(&fill.symbol) else {
             return;
         };
 
-        if open.opened_at_ms == 0
-            && matches!(
-                &signal.action,
-                ArbSignalAction::BasisLong { .. } | ArbSignalAction::BasisShort { .. }
-            )
-        {
+        if open.opened_at_ms == 0 && trigger.candidate().is_some() {
             open.opened_at_ms = fill.timestamp_ms;
         }
 
-        match (&signal.action, fill.instrument) {
-            (
-                ArbSignalAction::BasisLong { .. } | ArbSignalAction::BasisShort { .. },
-                InstrumentKind::PolyYes | InstrumentKind::PolyNo,
-            ) => {
+        match (
+            trigger.candidate().is_some(),
+            trigger.is_close_like(),
+            fill.instrument,
+        ) {
+            (true, _, InstrumentKind::PolyYes | InstrumentKind::PolyNo) => {
                 open.poly_entry_price
                     .get_or_insert(fill.price.0.to_f64().unwrap_or_default());
             }
-            (
-                ArbSignalAction::BasisLong { .. } | ArbSignalAction::BasisShort { .. },
-                InstrumentKind::CexPerp,
-            ) => {
+            (true, _, InstrumentKind::CexPerp) => {
                 open.cex_entry_price
                     .get_or_insert(fill.price.0.to_f64().unwrap_or_default());
             }
-            (
-                ArbSignalAction::ClosePosition { .. },
-                InstrumentKind::PolyYes | InstrumentKind::PolyNo,
-            ) => {
+            (_, true, InstrumentKind::PolyYes | InstrumentKind::PolyNo) => {
                 open.poly_exit_price = Some(fill.price.0.to_f64().unwrap_or_default());
             }
-            (ArbSignalAction::ClosePosition { .. }, InstrumentKind::CexPerp) => {
+            (_, true, InstrumentKind::CexPerp) => {
                 open.cex_exit_price = Some(fill.price.0.to_f64().unwrap_or_default());
             }
             _ => {}
@@ -2573,19 +2609,32 @@ fn sync_engine_position_state_from_runtime(
     engine.sync_position_state(symbol, token_side);
 }
 
-fn manual_close_signal(symbol: &Symbol, command_id: &str, now_ms: u64) -> ArbSignalEvent {
-    ArbSignalEvent {
-        signal_id: format!("manual-close-{command_id}"),
-        correlation_id: format!("command-{command_id}"),
+fn open_intent_from_candidate(candidate: &OpenCandidate) -> PlanningIntent {
+    PlanningIntent::OpenPosition {
+        schema_version: candidate.schema_version,
+        intent_id: format!("intent-open-{}", candidate.candidate_id),
+        correlation_id: candidate.correlation_id.clone(),
+        symbol: candidate.symbol.clone(),
+        candidate: candidate.clone(),
+        max_budget_usd: candidate.risk_budget_usd,
+        max_residual_delta: 0.05,
+        max_shock_loss_usd: candidate.risk_budget_usd.max(25.0),
+    }
+}
+
+fn close_intent_for_symbol(
+    symbol: &Symbol,
+    reason: &str,
+    correlation_id: &str,
+    now_ms: u64,
+) -> PlanningIntent {
+    PlanningIntent::ClosePosition {
+        schema_version: PLANNING_SCHEMA_VERSION,
+        intent_id: format!("intent-close-{}-{now_ms}", symbol.0),
+        correlation_id: correlation_id.to_owned(),
         symbol: symbol.clone(),
-        action: ArbSignalAction::ClosePosition {
-            reason: "manual_command".to_owned(),
-        },
-        strength: SignalStrength::Strong,
-        basis_value: None,
-        z_score: None,
-        expected_pnl: UsdNotional::ZERO,
-        timestamp_ms: now_ms,
+        close_reason: reason.to_owned(),
+        target_close_ratio: 1.0,
     }
 }
 
@@ -2600,21 +2649,57 @@ async fn close_symbol_position(
     trade_book: &mut TradeBook,
     now_ms: u64,
 ) -> Result<()> {
-    let signal = manual_close_signal(symbol, command_id, now_ms);
-    let signal_for_events = signal.clone();
-    let events = execution.process_arb_signal(signal).await?;
+    let intent = close_intent_for_symbol(
+        symbol,
+        "manual_command",
+        &format!("command-{command_id}"),
+        now_ms,
+    );
+    execute_intent_trigger(
+        intent,
+        now_ms,
+        engine,
+        execution,
+        risk,
+        stats,
+        recent_events,
+        trade_book,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn execute_intent_trigger(
+    intent: PlanningIntent,
+    timestamp_ms: u64,
+    engine: &mut SimpleAlphaEngine,
+    execution: &mut ExecutionManager<DryRunExecutor>,
+    risk: &mut InMemoryRiskManager,
+    stats: &mut PaperStats,
+    recent_events: &mut VecDeque<PaperEventLog>,
+    trade_book: &mut TradeBook,
+) -> Result<()> {
+    let symbol = intent.symbol().clone();
+    let fallback_token_side = None;
+    let trigger = RuntimeTrigger::Intent {
+        intent,
+        timestamp_ms,
+    };
+    let events = execution
+        .process_intent(trigger.intent().cloned().expect("intent trigger"))
+        .await?;
     let mut no_audit = None;
     apply_execution_events(
         risk,
         stats,
         recent_events,
         trade_book,
-        Some(&signal_for_events),
+        Some(&trigger),
         events,
         &mut no_audit,
     )
     .await?;
-    sync_engine_position_state_from_runtime(engine, risk, trade_book, symbol, None);
+    sync_engine_position_state_from_runtime(engine, risk, trade_book, &symbol, fallback_token_side);
     Ok(())
 }
 
@@ -3086,21 +3171,15 @@ async fn process_pending_command_multi(
     Ok(())
 }
 
-fn signal_price_for_filter(signal: &ArbSignalEvent, observed: &ObservedState) -> Option<f64> {
-    let token_side = match &signal.action {
-        ArbSignalAction::BasisLong { token_side, .. }
-        | ArbSignalAction::BasisShort { token_side, .. } => Some(*token_side),
-        _ => None,
-    }?;
-
-    match token_side {
+fn candidate_price_for_filter(candidate: &OpenCandidate, observed: &ObservedState) -> Option<f64> {
+    match candidate.token_side {
         TokenSide::Yes => observed.poly_yes_mid.and_then(|value| value.to_f64()),
         TokenSide::No => observed.poly_no_mid.and_then(|value| value.to_f64()),
     }
 }
 
-fn signal_passes_price_filter(
-    signal: &ArbSignalEvent,
+fn candidate_passes_price_filter(
+    candidate: &OpenCandidate,
     observed: &ObservedState,
     settings: &Settings,
 ) -> bool {
@@ -3118,42 +3197,22 @@ fn signal_passes_price_filter(
         return true;
     }
 
-    if matches!(&signal.action, ArbSignalAction::ClosePosition { .. }) {
-        return true;
-    }
-
-    let Some(price) = signal_price_for_filter(signal, observed) else {
+    let Some(price) = candidate_price_for_filter(candidate, observed) else {
         return false;
     };
     min_price.map(|min| price >= min).unwrap_or(true)
         && max_price.map(|max| price <= max).unwrap_or(true)
 }
 
-fn signal_passes_price_filter_multi(
-    signal: &ArbSignalEvent,
+fn candidate_passes_price_filter_multi(
+    candidate: &OpenCandidate,
     observed_map: &HashMap<Symbol, ObservedState>,
     settings: &Settings,
 ) -> bool {
     observed_map
-        .get(&signal.symbol)
-        .map(|observed| signal_passes_price_filter(signal, observed, settings))
+        .get(&candidate.symbol)
+        .map(|observed| candidate_passes_price_filter(candidate, observed, settings))
         .unwrap_or(false)
-}
-
-fn effective_open_signal_cex_hedge_qty(
-    signal: &ArbSignalEvent,
-    registry: &SymbolRegistry,
-) -> Option<polyalpha_core::CexBaseQty> {
-    match &signal.action {
-        ArbSignalAction::BasisLong { cex_hedge_qty, .. }
-        | ArbSignalAction::BasisShort { cex_hedge_qty, .. } => Some(
-            registry
-                .get_config(&signal.symbol)
-                .map(|config| cex_hedge_qty.floor_to_step(config.cex_qty_step))
-                .unwrap_or(*cex_hedge_qty),
-        ),
-        _ => None,
-    }
 }
 
 pub async fn run_paper(
@@ -3474,9 +3533,9 @@ pub async fn run_paper(
                         .await?;
                     }
 
-                    for signal in output.arb_signals {
+                    for candidate in output.open_candidates {
                         process_signal_single(
-                            signal,
+                            candidate,
                             &settings,
                             &registry,
                             &observed,
@@ -3490,6 +3549,25 @@ pub async fn run_paper(
                             &emergency,
                             false,
                             &mut audit,
+                        )
+                        .await?;
+                    }
+
+                    if let Some(reason) = engine.close_reason(&market.symbol) {
+                        execute_intent_trigger(
+                            close_intent_for_symbol(
+                                &market.symbol,
+                                &reason,
+                                &format!("corr-close-{}-{}", market.symbol.0, now_millis()),
+                                now_millis(),
+                            ),
+                            now_millis(),
+                            &mut engine,
+                            &mut execution,
+                            &mut risk,
+                            &mut stats,
+                            &mut recent_events,
+                            &mut trade_book,
                         )
                         .await?;
                     }
@@ -3911,22 +3989,14 @@ pub async fn run_paper_multi(
                         ),
                     );
 
-                    // Create a ClosePosition signal for this market
-                    let close_signal = ArbSignalEvent {
-                        signal_id: format!("emergency-close-{}", symbol.0),
-                        correlation_id: format!("emergency-{}-{}", symbol.0, now_ms),
-                        symbol: symbol.clone(),
-                        action: ArbSignalAction::ClosePosition {
-                            reason: "market_settled".to_owned(),
-                        },
-                        strength: SignalStrength::Strong,
-                        timestamp_ms: now_ms,
-                        basis_value: None,
-                        z_score: None,
-                        expected_pnl: UsdNotional::ZERO,
-                    };
+                    let close_intent = close_intent_for_symbol(
+                        symbol,
+                        "market_settled",
+                        &format!("emergency-{}-{}", symbol.0, now_ms),
+                        now_ms,
+                    );
 
-                    match execution.process_arb_signal(close_signal).await {
+                    match execution.process_intent(close_intent).await {
                         Ok(events) => {
                             for event in events {
                                 push_event_simple(
@@ -4087,9 +4157,9 @@ pub async fn run_paper_multi(
                         .await?;
                     }
 
-                    for signal in output.arb_signals {
+                    for candidate in output.open_candidates {
                         process_signal_multi(
-                            signal,
+                            candidate,
                             &settings,
                             &registry,
                             &observed,
@@ -4105,6 +4175,28 @@ pub async fn run_paper_multi(
                             &mut audit,
                         )
                         .await?;
+                    }
+
+                    if let Some(symbol) = &event_symbol {
+                        if let Some(reason) = engine.close_reason(symbol) {
+                            let now_ms = now_millis();
+                            execute_intent_trigger(
+                                close_intent_for_symbol(
+                                    symbol,
+                                    &reason,
+                                    &format!("corr-close-{}-{now_ms}", symbol.0),
+                                    now_ms,
+                                ),
+                                now_ms,
+                                &mut engine,
+                                &mut execution,
+                                &mut risk,
+                                &mut stats,
+                                &mut recent_events,
+                                &mut trade_book,
+                            )
+                            .await?;
+                        }
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -4711,15 +4803,11 @@ fn parse_timestamp_value(value: Option<&Value>) -> Option<u64> {
 }
 
 #[cfg(test)]
-fn ws_signal_stale_reason(
-    signal: &ArbSignalEvent,
+fn ws_candidate_stale_reason(
+    candidate: &OpenCandidate,
     observed: &ObservedState,
     max_stale_ms: u64,
 ) -> Option<String> {
-    if matches!(&signal.action, ArbSignalAction::ClosePosition { .. }) {
-        return None;
-    }
-
     let now_ms = now_millis();
     let Some(cex_updated_at_ms) = observed.cex_updated_at_ms else {
         return Some("missing_cex".to_owned());
@@ -4728,15 +4816,9 @@ fn ws_signal_stale_reason(
         return Some("cex_stale".to_owned());
     }
 
-    let poly_updated_at_ms = match &signal.action {
-        ArbSignalAction::BasisLong { token_side, .. }
-        | ArbSignalAction::BasisShort { token_side, .. } => match token_side {
-            TokenSide::Yes => observed.poly_yes_updated_at_ms,
-            TokenSide::No => observed.poly_no_updated_at_ms,
-        },
-        ArbSignalAction::NegRiskArb { .. } => observed.latest_poly_update_ms(),
-        ArbSignalAction::DeltaRebalance { .. } => return None,
-        ArbSignalAction::ClosePosition { .. } => return None,
+    let poly_updated_at_ms = match candidate.token_side {
+        TokenSide::Yes => observed.poly_yes_updated_at_ms,
+        TokenSide::No => observed.poly_no_updated_at_ms,
     };
     let Some(poly_updated_at_ms) = poly_updated_at_ms else {
         return Some("missing_poly".to_owned());
@@ -4779,7 +4861,7 @@ fn ws_signal_gate_reason(observed: &AuditObservedMarket) -> Option<&'static str>
 }
 
 async fn process_signal_single(
-    signal: ArbSignalEvent,
+    candidate: OpenCandidate,
     settings: &Settings,
     registry: &SymbolRegistry,
     observed: &ObservedState,
@@ -4794,25 +4876,25 @@ async fn process_signal_single(
     ws_mode: bool,
     audit: &mut Option<PaperAudit>,
 ) -> Result<()> {
-    let fallback_token_side = signal_reference_token_side(&signal);
-    let observed_snapshot = audit_snapshot_for_signal(settings, registry, &signal, observed);
+    let fallback_token_side = Some(candidate.token_side);
+    let observed_snapshot = audit_snapshot_for_candidate(settings, registry, &candidate, observed);
     stats.signals_seen += 1;
     push_signal_event(
         recent_events,
         "signal",
-        summarize_signal(&signal),
-        &signal,
-        build_signal_event_details(&signal, observed_snapshot.as_ref()),
+        summarize_candidate(&candidate),
+        &candidate,
+        build_signal_event_details(&candidate, observed_snapshot.as_ref()),
     );
     if let Some(audit) = audit.as_mut() {
-        audit.record_signal_emitted(&signal, observed_snapshot.clone())?;
+        audit.record_signal_emitted(&candidate, observed_snapshot.clone())?;
     }
 
     if emergency.load(Ordering::SeqCst) {
-        let summary = format!("信号被拒绝：处于紧急停止状态 {}", signal.signal_id);
+        let summary = format!("候选被拒绝：处于紧急停止状态 {}", candidate.candidate_id);
         if let Some(audit) = audit.as_mut() {
             audit.record_gate_decision(
-                &signal,
+                &candidate,
                 "emergency_stop",
                 AuditGateResult::Rejected,
                 "emergency_stop",
@@ -4823,12 +4905,12 @@ async fn process_signal_single(
         reject_signal(
             stats,
             recent_events,
-            &signal,
+            &candidate,
             "emergency",
             "emergency_stop",
             summary,
             build_gate_event_details(
-                &signal,
+                &candidate,
                 observed_snapshot.as_ref(),
                 settings,
                 "emergency_stop",
@@ -4841,17 +4923,17 @@ async fn process_signal_single(
             engine,
             risk,
             trade_book,
-            &signal.symbol,
+            &candidate.symbol,
             fallback_token_side,
         );
         return Ok(());
     }
 
     if paused.load(Ordering::SeqCst) {
-        let summary = format!("信号被拒绝：交易已暂停 {}", signal.signal_id);
+        let summary = format!("候选被拒绝：交易已暂停 {}", candidate.candidate_id);
         if let Some(audit) = audit.as_mut() {
             audit.record_gate_decision(
-                &signal,
+                &candidate,
                 "trading_pause",
                 AuditGateResult::Rejected,
                 "trading_paused",
@@ -4862,12 +4944,12 @@ async fn process_signal_single(
         reject_signal(
             stats,
             recent_events,
-            &signal,
+            &candidate,
             "paused",
             "trading_paused",
             summary,
             build_gate_event_details(
-                &signal,
+                &candidate,
                 observed_snapshot.as_ref(),
                 settings,
                 "trading_pause",
@@ -4880,56 +4962,22 @@ async fn process_signal_single(
             engine,
             risk,
             trade_book,
-            &signal.symbol,
+            &candidate.symbol,
             fallback_token_side,
         );
         return Ok(());
     }
 
     if ws_mode {
-        let bypass_reason = match &signal.action {
-            ArbSignalAction::ClosePosition { .. } => Some("close_position"),
-            ArbSignalAction::DeltaRebalance { .. } => Some("delta_rebalance"),
-            _ => None,
-        };
-        if let Some(reason) = bypass_reason {
+        if let Some(reason) = observed_snapshot.as_ref().and_then(ws_signal_gate_reason) {
             let summary = format!(
-                "信号绕过 WS 行情新鲜度检查 {}（{}）",
-                signal.signal_id, reason
-            );
-            if let Some(audit) = audit.as_mut() {
-                audit.record_gate_decision(
-                    &signal,
-                    "ws_freshness",
-                    AuditGateResult::Bypassed,
-                    reason,
-                    summary.clone(),
-                    observed_snapshot.clone(),
-                )?;
-            }
-            push_gate_event(
-                recent_events,
-                &signal,
-                summary,
-                build_gate_event_details(
-                    &signal,
-                    observed_snapshot.as_ref(),
-                    settings,
-                    "ws_freshness",
-                    AuditGateResult::Bypassed,
-                    reason,
-                    None,
-                ),
-            );
-        } else if let Some(reason) = observed_snapshot.as_ref().and_then(ws_signal_gate_reason) {
-            let summary = format!(
-                "信号被拒绝：WS 行情新鲜度检查未通过 {}（{}）",
-                signal.signal_id,
+                "候选被拒绝：WS 行情新鲜度检查未通过 {}（{}）",
+                candidate.candidate_id,
                 format_ws_freshness_reason(&reason)
             );
             if let Some(audit) = audit.as_mut() {
                 audit.record_gate_decision(
-                    &signal,
+                    &candidate,
                     "ws_freshness",
                     AuditGateResult::Rejected,
                     &reason,
@@ -4940,12 +4988,12 @@ async fn process_signal_single(
             reject_signal(
                 stats,
                 recent_events,
-                &signal,
+                &candidate,
                 "stale",
                 reason,
                 summary,
                 build_gate_event_details(
-                    &signal,
+                    &candidate,
                     observed_snapshot.as_ref(),
                     settings,
                     "ws_freshness",
@@ -4958,19 +5006,19 @@ async fn process_signal_single(
                 engine,
                 risk,
                 trade_book,
-                &signal.symbol,
+                &candidate.symbol,
                 fallback_token_side,
             );
             return Ok(());
         } else if observed_snapshot.is_none() {
             let summary = format!(
-                "信号被拒绝：WS 行情新鲜度检查未通过 {}（{}）",
-                signal.signal_id,
+                "候选被拒绝：WS 行情新鲜度检查未通过 {}（{}）",
+                candidate.candidate_id,
                 format_ws_freshness_reason("missing_observed_state")
             );
             if let Some(audit) = audit.as_mut() {
                 audit.record_gate_decision(
-                    &signal,
+                    &candidate,
                     "ws_freshness",
                     AuditGateResult::Rejected,
                     "missing_observed_state",
@@ -4981,12 +5029,12 @@ async fn process_signal_single(
             reject_signal(
                 stats,
                 recent_events,
-                &signal,
+                &candidate,
                 "stale",
                 "missing_observed_state",
                 summary,
                 build_gate_event_details(
-                    &signal,
+                    &candidate,
                     None,
                     settings,
                     "ws_freshness",
@@ -4999,15 +5047,15 @@ async fn process_signal_single(
                 engine,
                 risk,
                 trade_book,
-                &signal.symbol,
+                &candidate.symbol,
                 fallback_token_side,
             );
             return Ok(());
         } else {
-            let summary = format!("信号通过 WS 行情新鲜度检查 {}", signal.signal_id);
+            let summary = format!("候选通过 WS 行情新鲜度检查 {}", candidate.candidate_id);
             if let Some(audit) = audit.as_mut() {
                 audit.record_gate_decision(
-                    &signal,
+                    &candidate,
                     "ws_freshness",
                     AuditGateResult::Passed,
                     "ok",
@@ -5017,10 +5065,10 @@ async fn process_signal_single(
             }
             push_gate_event(
                 recent_events,
-                &signal,
+                &candidate,
                 summary,
                 build_gate_event_details(
-                    &signal,
+                    &candidate,
                     observed_snapshot.as_ref(),
                     settings,
                     "ws_freshness",
@@ -5032,15 +5080,15 @@ async fn process_signal_single(
         }
     }
 
-    if let Some(risk_rejection) = signal_rejection_reason(risk, registry, &signal).await? {
+    if let Some(risk_rejection) = signal_rejection_reason(risk, registry, &candidate).await? {
         let summary = format!(
-            "信号被拒绝：未通过风控检查 {}（{}）",
-            signal.signal_id,
+            "候选被拒绝：未通过风控检查 {}（{}）",
+            candidate.candidate_id,
             translate_risk_rejection(&risk_rejection)
         );
         if let Some(audit) = audit.as_mut() {
             audit.record_gate_decision(
-                &signal,
+                &candidate,
                 "risk_guard",
                 AuditGateResult::Rejected,
                 &risk_rejection,
@@ -5051,12 +5099,12 @@ async fn process_signal_single(
         reject_signal(
             stats,
             recent_events,
-            &signal,
+            &candidate,
             "risk",
             "risk_guard",
             summary,
             build_gate_event_details(
-                &signal,
+                &candidate,
                 observed_snapshot.as_ref(),
                 settings,
                 "risk_guard",
@@ -5069,15 +5117,15 @@ async fn process_signal_single(
             engine,
             risk,
             trade_book,
-            &signal.symbol,
+            &candidate.symbol,
             fallback_token_side,
         );
         return Ok(());
     }
-    let risk_pass_summary = format!("信号通过风控检查 {}", signal.signal_id);
+    let risk_pass_summary = format!("候选通过风控检查 {}", candidate.candidate_id);
     if let Some(audit) = audit.as_mut() {
         audit.record_gate_decision(
-            &signal,
+            &candidate,
             "risk_guard",
             AuditGateResult::Passed,
             "ok",
@@ -5087,10 +5135,10 @@ async fn process_signal_single(
     }
     push_gate_event(
         recent_events,
-        &signal,
+        &candidate,
         risk_pass_summary,
         build_gate_event_details(
-            &signal,
+            &candidate,
             observed_snapshot.as_ref(),
             settings,
             "risk_guard",
@@ -5100,88 +5148,21 @@ async fn process_signal_single(
         ),
     );
 
-    if let Some(effective_cex_hedge_qty) = effective_open_signal_cex_hedge_qty(&signal, registry) {
-        if effective_cex_hedge_qty.0 <= Decimal::ZERO {
-            let summary = format!("信号被拒绝：CEX 对冲量为 0，禁止开仓 {}", signal.signal_id);
-            if let Some(audit) = audit.as_mut() {
-                audit.record_gate_decision(
-                    &signal,
-                    "hedge_qty_guard",
-                    AuditGateResult::Rejected,
-                    "zero_cex_hedge_qty",
-                    summary.clone(),
-                    observed_snapshot.clone(),
-                )?;
-            }
-            reject_signal(
-                stats,
-                recent_events,
-                &signal,
-                "risk",
-                "hedge_qty_guard",
-                summary,
-                build_gate_event_details(
-                    &signal,
-                    observed_snapshot.as_ref(),
-                    settings,
-                    "hedge_qty_guard",
-                    AuditGateResult::Rejected,
-                    "zero_cex_hedge_qty",
-                    None,
-                ),
-            );
-            sync_engine_position_state_from_runtime(
-                engine,
-                risk,
-                trade_book,
-                &signal.symbol,
-                fallback_token_side,
-            );
-            return Ok(());
-        }
-
-        let summary = format!("信号通过 CEX 对冲量检查 {}", signal.signal_id);
-        if let Some(audit) = audit.as_mut() {
-            audit.record_gate_decision(
-                &signal,
-                "hedge_qty_guard",
-                AuditGateResult::Passed,
-                "ok",
-                summary.clone(),
-                observed_snapshot.clone(),
-            )?;
-        }
-        push_gate_event(
-            recent_events,
-            &signal,
-            summary,
-            build_gate_event_details(
-                &signal,
-                observed_snapshot.as_ref(),
-                settings,
-                "hedge_qty_guard",
-                AuditGateResult::Passed,
-                "ok",
-                None,
-            ),
-        );
-    }
-
-    if !signal_passes_price_filter(&signal, observed, settings) {
+    if !candidate_passes_price_filter(&candidate, observed, settings) {
         let filter_price = observed_snapshot
             .as_ref()
-            .and_then(|observed| signal_price_for_audit_observed(&signal, observed))
+            .and_then(|observed| candidate_price_for_audit_observed(&candidate, observed))
             .map(format_detail_f64)
             .unwrap_or_else(|| "无可用价格".to_owned());
         let summary = format!(
-            "信号被拒绝：价格过滤未通过 {}（价格 {}，区间 {}）",
-            signal.signal_id,
+            "候选被拒绝：价格过滤未通过 {}（价格 {}，区间 {}）",
+            candidate.candidate_id,
             filter_price,
             price_filter_window_text(settings)
         );
         if let Some(audit) = audit.as_mut() {
             audit.record_gate_decision(
-                &signal,
+                &candidate,
                 "price_filter",
                 AuditGateResult::Rejected,
                 "price_filter",
@@ -5192,12 +5173,12 @@ async fn process_signal_single(
         reject_signal(
             stats,
             recent_events,
-            &signal,
+            &candidate,
             "price_filter",
             "price_filter",
             summary,
             build_gate_event_details(
-                &signal,
+                &candidate,
                 observed_snapshot.as_ref(),
                 settings,
                 "price_filter",
@@ -5210,28 +5191,19 @@ async fn process_signal_single(
             engine,
             risk,
             trade_book,
-            &signal.symbol,
+            &candidate.symbol,
             fallback_token_side,
         );
         return Ok(());
     }
-    let (result, reason, price_summary) =
-        if matches!(&signal.action, ArbSignalAction::ClosePosition { .. }) {
-            (
-                AuditGateResult::Bypassed,
-                "close_position",
-                format!("平仓信号绕过价格过滤 {}", signal.signal_id),
-            )
-        } else {
-            (
-                AuditGateResult::Passed,
-                "ok",
-                format!("信号通过价格过滤 {}", signal.signal_id),
-            )
-        };
+    let (result, reason, price_summary) = (
+        AuditGateResult::Passed,
+        "ok",
+        format!("候选通过价格过滤 {}", candidate.candidate_id),
+    );
     if let Some(audit) = audit.as_mut() {
         audit.record_gate_decision(
-            &signal,
+            &candidate,
             "price_filter",
             result,
             reason,
@@ -5241,10 +5213,10 @@ async fn process_signal_single(
     }
     push_gate_event(
         recent_events,
-        &signal,
+        &candidate,
         price_summary,
         build_gate_event_details(
-            &signal,
+            &candidate,
             observed_snapshot.as_ref(),
             settings,
             "price_filter",
@@ -5254,14 +5226,54 @@ async fn process_signal_single(
         ),
     );
 
-    register_open_trade_from_signal(trade_book, &signal, engine);
-    let signal_for_events = signal.clone();
-    let events = execution.process_arb_signal(signal).await?;
+    register_open_trade_from_candidate(trade_book, &candidate, engine);
+    let trigger = RuntimeTrigger::Candidate(candidate.clone());
+    let events = match execution
+        .process_intent(open_intent_from_candidate(&candidate))
+        .await
+    {
+        Ok(events) => events,
+        Err(err) => {
+            stats.signals_rejected += 1;
+            stats.execution_rejected += 1;
+            record_signal_rejection(stats, "execution_planner");
+            trade_book.discard_open_trade(&candidate.symbol);
+            let rejection_reasons = vec![err.to_string()];
+            push_event_with_context_and_payload(
+                recent_events,
+                "risk",
+                format!(
+                    "候选被执行规划拒绝 {}（{}）",
+                    candidate.candidate_id,
+                    rejection_reasons.join(", ")
+                ),
+                Some(candidate.symbol.0.clone()),
+                Some(candidate.candidate_id.clone()),
+                Some(candidate.correlation_id.clone()),
+                build_post_submit_rejection_details(&candidate, &rejection_reasons),
+                Some(post_submit_rejection_payload(
+                    &candidate,
+                    &rejection_reasons,
+                )),
+            );
+            if let Some(audit) = audit.as_mut() {
+                audit.record_open_signal_rejected_post_submit(&candidate, &rejection_reasons)?;
+            }
+            sync_engine_position_state_from_runtime(
+                engine,
+                risk,
+                trade_book,
+                &candidate.symbol,
+                fallback_token_side,
+            );
+            return Ok(());
+        }
+    };
     track_open_signal_execution_outcome(
         stats,
         recent_events,
         trade_book,
-        &signal_for_events,
+        &candidate,
         &events,
         audit,
     )?;
@@ -5270,7 +5282,7 @@ async fn process_signal_single(
         stats,
         recent_events,
         trade_book,
-        Some(&signal_for_events),
+        Some(&trigger),
         events,
         audit,
     )
@@ -5279,14 +5291,14 @@ async fn process_signal_single(
         engine,
         risk,
         trade_book,
-        &signal_for_events.symbol,
+        &candidate.symbol,
         fallback_token_side,
     );
     Ok(())
 }
 
 async fn process_signal_multi(
-    signal: ArbSignalEvent,
+    candidate: OpenCandidate,
     settings: &Settings,
     registry: &SymbolRegistry,
     observed_map: &HashMap<Symbol, ObservedState>,
@@ -5301,27 +5313,27 @@ async fn process_signal_multi(
     ws_mode: bool,
     audit: &mut Option<PaperAudit>,
 ) -> Result<()> {
-    let fallback_token_side = signal_reference_token_side(&signal);
-    let observed_snapshot = observed_map
-        .get(&signal.symbol)
-        .and_then(|observed| audit_snapshot_for_signal(settings, registry, &signal, observed));
+    let fallback_token_side = Some(candidate.token_side);
+    let observed_snapshot = observed_map.get(&candidate.symbol).and_then(|observed| {
+        audit_snapshot_for_candidate(settings, registry, &candidate, observed)
+    });
     stats.signals_seen += 1;
     push_signal_event(
         recent_events,
         "signal",
-        summarize_signal(&signal),
-        &signal,
-        build_signal_event_details(&signal, observed_snapshot.as_ref()),
+        summarize_candidate(&candidate),
+        &candidate,
+        build_signal_event_details(&candidate, observed_snapshot.as_ref()),
     );
     if let Some(audit) = audit.as_mut() {
-        audit.record_signal_emitted(&signal, observed_snapshot.clone())?;
+        audit.record_signal_emitted(&candidate, observed_snapshot.clone())?;
     }
 
     if emergency.load(Ordering::SeqCst) {
-        let summary = format!("信号被拒绝：处于紧急停止状态 {}", signal.signal_id);
+        let summary = format!("候选被拒绝：处于紧急停止状态 {}", candidate.candidate_id);
         if let Some(audit) = audit.as_mut() {
             audit.record_gate_decision(
-                &signal,
+                &candidate,
                 "emergency_stop",
                 AuditGateResult::Rejected,
                 "emergency_stop",
@@ -5332,12 +5344,12 @@ async fn process_signal_multi(
         reject_signal(
             stats,
             recent_events,
-            &signal,
+            &candidate,
             "emergency",
             "emergency_stop",
             summary,
             build_gate_event_details(
-                &signal,
+                &candidate,
                 observed_snapshot.as_ref(),
                 settings,
                 "emergency_stop",
@@ -5350,17 +5362,17 @@ async fn process_signal_multi(
             engine,
             risk,
             trade_book,
-            &signal.symbol,
+            &candidate.symbol,
             fallback_token_side,
         );
         return Ok(());
     }
 
     if paused.load(Ordering::SeqCst) {
-        let summary = format!("信号被拒绝：交易已暂停 {}", signal.signal_id);
+        let summary = format!("候选被拒绝：交易已暂停 {}", candidate.candidate_id);
         if let Some(audit) = audit.as_mut() {
             audit.record_gate_decision(
-                &signal,
+                &candidate,
                 "trading_pause",
                 AuditGateResult::Rejected,
                 "trading_paused",
@@ -5371,12 +5383,12 @@ async fn process_signal_multi(
         reject_signal(
             stats,
             recent_events,
-            &signal,
+            &candidate,
             "paused",
             "trading_paused",
             summary,
             build_gate_event_details(
-                &signal,
+                &candidate,
                 observed_snapshot.as_ref(),
                 settings,
                 "trading_pause",
@@ -5389,56 +5401,22 @@ async fn process_signal_multi(
             engine,
             risk,
             trade_book,
-            &signal.symbol,
+            &candidate.symbol,
             fallback_token_side,
         );
         return Ok(());
     }
 
     if ws_mode {
-        let bypass_reason = match &signal.action {
-            ArbSignalAction::ClosePosition { .. } => Some("close_position"),
-            ArbSignalAction::DeltaRebalance { .. } => Some("delta_rebalance"),
-            _ => None,
-        };
-        if let Some(reason) = bypass_reason {
+        if let Some(reason) = observed_snapshot.as_ref().and_then(ws_signal_gate_reason) {
             let summary = format!(
-                "信号绕过 WS 行情新鲜度检查 {}（{}）",
-                signal.signal_id, reason
-            );
-            if let Some(audit) = audit.as_mut() {
-                audit.record_gate_decision(
-                    &signal,
-                    "ws_freshness",
-                    AuditGateResult::Bypassed,
-                    reason,
-                    summary.clone(),
-                    observed_snapshot.clone(),
-                )?;
-            }
-            push_gate_event(
-                recent_events,
-                &signal,
-                summary,
-                build_gate_event_details(
-                    &signal,
-                    observed_snapshot.as_ref(),
-                    settings,
-                    "ws_freshness",
-                    AuditGateResult::Bypassed,
-                    reason,
-                    None,
-                ),
-            );
-        } else if let Some(reason) = observed_snapshot.as_ref().and_then(ws_signal_gate_reason) {
-            let summary = format!(
-                "信号被拒绝：WS 行情新鲜度检查未通过 {}（{}）",
-                signal.signal_id,
+                "候选被拒绝：WS 行情新鲜度检查未通过 {}（{}）",
+                candidate.candidate_id,
                 format_ws_freshness_reason(&reason)
             );
             if let Some(audit) = audit.as_mut() {
                 audit.record_gate_decision(
-                    &signal,
+                    &candidate,
                     "ws_freshness",
                     AuditGateResult::Rejected,
                     &reason,
@@ -5449,12 +5427,12 @@ async fn process_signal_multi(
             reject_signal(
                 stats,
                 recent_events,
-                &signal,
+                &candidate,
                 "stale",
                 reason,
                 summary,
                 build_gate_event_details(
-                    &signal,
+                    &candidate,
                     observed_snapshot.as_ref(),
                     settings,
                     "ws_freshness",
@@ -5467,19 +5445,19 @@ async fn process_signal_multi(
                 engine,
                 risk,
                 trade_book,
-                &signal.symbol,
+                &candidate.symbol,
                 fallback_token_side,
             );
             return Ok(());
         } else if observed_snapshot.is_none() {
             let summary = format!(
-                "信号被拒绝：WS 行情新鲜度检查未通过 {}（{}）",
-                signal.signal_id,
+                "候选被拒绝：WS 行情新鲜度检查未通过 {}（{}）",
+                candidate.candidate_id,
                 format_ws_freshness_reason("missing_observed_state")
             );
             if let Some(audit) = audit.as_mut() {
                 audit.record_gate_decision(
-                    &signal,
+                    &candidate,
                     "ws_freshness",
                     AuditGateResult::Rejected,
                     "missing_observed_state",
@@ -5490,12 +5468,12 @@ async fn process_signal_multi(
             reject_signal(
                 stats,
                 recent_events,
-                &signal,
+                &candidate,
                 "stale",
                 "missing_observed_state",
                 summary,
                 build_gate_event_details(
-                    &signal,
+                    &candidate,
                     None,
                     settings,
                     "ws_freshness",
@@ -5508,15 +5486,15 @@ async fn process_signal_multi(
                 engine,
                 risk,
                 trade_book,
-                &signal.symbol,
+                &candidate.symbol,
                 fallback_token_side,
             );
             return Ok(());
         } else {
-            let summary = format!("信号通过 WS 行情新鲜度检查 {}", signal.signal_id);
+            let summary = format!("候选通过 WS 行情新鲜度检查 {}", candidate.candidate_id);
             if let Some(audit) = audit.as_mut() {
                 audit.record_gate_decision(
-                    &signal,
+                    &candidate,
                     "ws_freshness",
                     AuditGateResult::Passed,
                     "ok",
@@ -5526,10 +5504,10 @@ async fn process_signal_multi(
             }
             push_gate_event(
                 recent_events,
-                &signal,
+                &candidate,
                 summary,
                 build_gate_event_details(
-                    &signal,
+                    &candidate,
                     observed_snapshot.as_ref(),
                     settings,
                     "ws_freshness",
@@ -5541,15 +5519,15 @@ async fn process_signal_multi(
         }
     }
 
-    if let Some(risk_rejection) = signal_rejection_reason(risk, registry, &signal).await? {
+    if let Some(risk_rejection) = signal_rejection_reason(risk, registry, &candidate).await? {
         let summary = format!(
-            "信号被拒绝：未通过风控检查 {}（{}）",
-            signal.signal_id,
+            "候选被拒绝：未通过风控检查 {}（{}）",
+            candidate.candidate_id,
             translate_risk_rejection(&risk_rejection)
         );
         if let Some(audit) = audit.as_mut() {
             audit.record_gate_decision(
-                &signal,
+                &candidate,
                 "risk_guard",
                 AuditGateResult::Rejected,
                 &risk_rejection,
@@ -5560,12 +5538,12 @@ async fn process_signal_multi(
         reject_signal(
             stats,
             recent_events,
-            &signal,
+            &candidate,
             "risk",
             "risk_guard",
             summary,
             build_gate_event_details(
-                &signal,
+                &candidate,
                 observed_snapshot.as_ref(),
                 settings,
                 "risk_guard",
@@ -5578,15 +5556,15 @@ async fn process_signal_multi(
             engine,
             risk,
             trade_book,
-            &signal.symbol,
+            &candidate.symbol,
             fallback_token_side,
         );
         return Ok(());
     }
-    let risk_pass_summary = format!("信号通过风控检查 {}", signal.signal_id);
+    let risk_pass_summary = format!("候选通过风控检查 {}", candidate.candidate_id);
     if let Some(audit) = audit.as_mut() {
         audit.record_gate_decision(
-            &signal,
+            &candidate,
             "risk_guard",
             AuditGateResult::Passed,
             "ok",
@@ -5596,10 +5574,10 @@ async fn process_signal_multi(
     }
     push_gate_event(
         recent_events,
-        &signal,
+        &candidate,
         risk_pass_summary,
         build_gate_event_details(
-            &signal,
+            &candidate,
             observed_snapshot.as_ref(),
             settings,
             "risk_guard",
@@ -5609,88 +5587,21 @@ async fn process_signal_multi(
         ),
     );
 
-    if let Some(effective_cex_hedge_qty) = effective_open_signal_cex_hedge_qty(&signal, registry) {
-        if effective_cex_hedge_qty.0 <= Decimal::ZERO {
-            let summary = format!("信号被拒绝：CEX 对冲量为 0，禁止开仓 {}", signal.signal_id);
-            if let Some(audit) = audit.as_mut() {
-                audit.record_gate_decision(
-                    &signal,
-                    "hedge_qty_guard",
-                    AuditGateResult::Rejected,
-                    "zero_cex_hedge_qty",
-                    summary.clone(),
-                    observed_snapshot.clone(),
-                )?;
-            }
-            reject_signal(
-                stats,
-                recent_events,
-                &signal,
-                "risk",
-                "hedge_qty_guard",
-                summary,
-                build_gate_event_details(
-                    &signal,
-                    observed_snapshot.as_ref(),
-                    settings,
-                    "hedge_qty_guard",
-                    AuditGateResult::Rejected,
-                    "zero_cex_hedge_qty",
-                    None,
-                ),
-            );
-            sync_engine_position_state_from_runtime(
-                engine,
-                risk,
-                trade_book,
-                &signal.symbol,
-                fallback_token_side,
-            );
-            return Ok(());
-        }
-
-        let summary = format!("信号通过 CEX 对冲量检查 {}", signal.signal_id);
-        if let Some(audit) = audit.as_mut() {
-            audit.record_gate_decision(
-                &signal,
-                "hedge_qty_guard",
-                AuditGateResult::Passed,
-                "ok",
-                summary.clone(),
-                observed_snapshot.clone(),
-            )?;
-        }
-        push_gate_event(
-            recent_events,
-            &signal,
-            summary,
-            build_gate_event_details(
-                &signal,
-                observed_snapshot.as_ref(),
-                settings,
-                "hedge_qty_guard",
-                AuditGateResult::Passed,
-                "ok",
-                None,
-            ),
-        );
-    }
-
-    if !signal_passes_price_filter_multi(&signal, observed_map, settings) {
+    if !candidate_passes_price_filter_multi(&candidate, observed_map, settings) {
         let filter_price = observed_snapshot
             .as_ref()
-            .and_then(|observed| signal_price_for_audit_observed(&signal, observed))
+            .and_then(|observed| candidate_price_for_audit_observed(&candidate, observed))
             .map(format_detail_f64)
             .unwrap_or_else(|| "无可用价格".to_owned());
         let summary = format!(
-            "信号被拒绝：价格过滤未通过 {}（价格 {}，区间 {}）",
-            signal.signal_id,
+            "候选被拒绝：价格过滤未通过 {}（价格 {}，区间 {}）",
+            candidate.candidate_id,
             filter_price,
             price_filter_window_text(settings)
         );
         if let Some(audit) = audit.as_mut() {
             audit.record_gate_decision(
-                &signal,
+                &candidate,
                 "price_filter",
                 AuditGateResult::Rejected,
                 "price_filter",
@@ -5701,12 +5612,12 @@ async fn process_signal_multi(
         reject_signal(
             stats,
             recent_events,
-            &signal,
+            &candidate,
             "price_filter",
             "price_filter",
             summary,
             build_gate_event_details(
-                &signal,
+                &candidate,
                 observed_snapshot.as_ref(),
                 settings,
                 "price_filter",
@@ -5719,28 +5630,19 @@ async fn process_signal_multi(
             engine,
             risk,
             trade_book,
-            &signal.symbol,
+            &candidate.symbol,
             fallback_token_side,
         );
         return Ok(());
     }
-    let (result, reason, price_summary) =
-        if matches!(&signal.action, ArbSignalAction::ClosePosition { .. }) {
-            (
-                AuditGateResult::Bypassed,
-                "close_position",
-                format!("平仓信号绕过价格过滤 {}", signal.signal_id),
-            )
-        } else {
-            (
-                AuditGateResult::Passed,
-                "ok",
-                format!("信号通过价格过滤 {}", signal.signal_id),
-            )
-        };
+    let (result, reason, price_summary) = (
+        AuditGateResult::Passed,
+        "ok",
+        format!("候选通过价格过滤 {}", candidate.candidate_id),
+    );
     if let Some(audit) = audit.as_mut() {
         audit.record_gate_decision(
-            &signal,
+            &candidate,
             "price_filter",
             result,
             reason,
@@ -5750,10 +5652,10 @@ async fn process_signal_multi(
     }
     push_gate_event(
         recent_events,
-        &signal,
+        &candidate,
         price_summary,
         build_gate_event_details(
-            &signal,
+            &candidate,
             observed_snapshot.as_ref(),
             settings,
             "price_filter",
@@ -5763,14 +5665,54 @@ async fn process_signal_multi(
         ),
     );
 
-    register_open_trade_from_signal(trade_book, &signal, engine);
-    let signal_for_events = signal.clone();
-    let events = execution.process_arb_signal(signal).await?;
+    register_open_trade_from_candidate(trade_book, &candidate, engine);
+    let trigger = RuntimeTrigger::Candidate(candidate.clone());
+    let events = match execution
+        .process_intent(open_intent_from_candidate(&candidate))
+        .await
+    {
+        Ok(events) => events,
+        Err(err) => {
+            stats.signals_rejected += 1;
+            stats.execution_rejected += 1;
+            record_signal_rejection(stats, "execution_planner");
+            trade_book.discard_open_trade(&candidate.symbol);
+            let rejection_reasons = vec![err.to_string()];
+            push_event_with_context_and_payload(
+                recent_events,
+                "risk",
+                format!(
+                    "候选被执行规划拒绝 {}（{}）",
+                    candidate.candidate_id,
+                    rejection_reasons.join(", ")
+                ),
+                Some(candidate.symbol.0.clone()),
+                Some(candidate.candidate_id.clone()),
+                Some(candidate.correlation_id.clone()),
+                build_post_submit_rejection_details(&candidate, &rejection_reasons),
+                Some(post_submit_rejection_payload(
+                    &candidate,
+                    &rejection_reasons,
+                )),
+            );
+            if let Some(audit) = audit.as_mut() {
+                audit.record_open_signal_rejected_post_submit(&candidate, &rejection_reasons)?;
+            }
+            sync_engine_position_state_from_runtime(
+                engine,
+                risk,
+                trade_book,
+                &candidate.symbol,
+                fallback_token_side,
+            );
+            return Ok(());
+        }
+    };
     track_open_signal_execution_outcome(
         stats,
         recent_events,
         trade_book,
-        &signal_for_events,
+        &candidate,
         &events,
         audit,
     )?;
@@ -5779,7 +5721,7 @@ async fn process_signal_multi(
         stats,
         recent_events,
         trade_book,
-        Some(&signal_for_events),
+        Some(&trigger),
         events,
         audit,
     )
@@ -5788,7 +5730,7 @@ async fn process_signal_multi(
         engine,
         risk,
         trade_book,
-        &signal_for_events.symbol,
+        &candidate.symbol,
         fallback_token_side,
     );
     Ok(())
@@ -5889,9 +5831,9 @@ async fn handle_single_market_event(
         apply_execution_events(risk, stats, recent_events, trade_book, None, events, audit).await?;
     }
 
-    for signal in output.arb_signals {
+    for candidate in output.open_candidates {
         process_signal_single(
-            signal,
+            candidate,
             settings,
             registry,
             observed,
@@ -5905,6 +5847,26 @@ async fn handle_single_market_event(
             emergency,
             matches!(settings.strategy.market_data.mode, MarketDataMode::Ws),
             audit,
+        )
+        .await?;
+    }
+
+    if let Some(reason) = engine.close_reason(&market.symbol) {
+        let now_ms = now_millis();
+        execute_intent_trigger(
+            close_intent_for_symbol(
+                &market.symbol,
+                &reason,
+                &format!("corr-close-{}-{now_ms}", market.symbol.0),
+                now_ms,
+            ),
+            now_ms,
+            engine,
+            execution,
+            risk,
+            stats,
+            recent_events,
+            trade_book,
         )
         .await?;
     }
@@ -6033,9 +5995,9 @@ async fn handle_multi_market_event(
         apply_execution_events(risk, stats, recent_events, trade_book, None, events, audit).await?;
     }
 
-    for signal in output.arb_signals {
+    for candidate in output.open_candidates {
         process_signal_multi(
-            signal,
+            candidate,
             settings,
             registry,
             observed,
@@ -6051,6 +6013,28 @@ async fn handle_multi_market_event(
             audit,
         )
         .await?;
+    }
+
+    if let Some(symbol) = &event_symbol {
+        if let Some(reason) = engine.close_reason(symbol) {
+            let now_ms = now_millis();
+            execute_intent_trigger(
+                close_intent_for_symbol(
+                    symbol,
+                    &reason,
+                    &format!("corr-close-{}-{now_ms}", symbol.0),
+                    now_ms,
+                ),
+                now_ms,
+                engine,
+                execution,
+                risk,
+                stats,
+                recent_events,
+                trade_book,
+            )
+            .await?;
+        }
     }
 
     Ok(())
@@ -7382,47 +7366,61 @@ async fn apply_execution_events(
     stats: &mut PaperStats,
     recent_events: &mut VecDeque<PaperEventLog>,
     trade_book: &mut TradeBook,
-    signal: Option<&ArbSignalEvent>,
+    trigger: Option<&RuntimeTrigger>,
     events: Vec<ExecutionEvent>,
     audit: &mut Option<PaperAudit>,
 ) -> Result<()> {
     for event in events {
         if let Some(audit) = audit.as_mut() {
-            audit.record_execution(&event, signal)?;
+            audit.record_execution(&event, trigger)?;
         }
         match &event {
             ExecutionEvent::TradePlanCreated { plan } => {
-                push_event_with_context(
+                push_event_with_context_and_payload(
                     recent_events,
                     "plan",
                     summarize_execution_event(&event),
                     Some(plan.symbol.0.clone()),
-                    signal.map(|signal| signal.signal_id.clone()),
+                    trigger.map(|trigger| trigger.id().to_owned()),
                     Some(plan.correlation_id.clone()),
-                    build_execution_event_details(&event, signal),
+                    build_execution_event_details(&event, trigger),
+                    execution_event_monitor_payload(&event, trigger),
                 );
             }
             ExecutionEvent::PlanSuperseded { symbol, .. } => {
-                let (_, correlation_id) = audit_execution_identity(&event, signal);
+                let (_, correlation_id) = audit_execution_identity(&event, trigger);
                 push_event_with_context(
                     recent_events,
                     "plan",
                     summarize_execution_event(&event),
                     Some(symbol.0.clone()),
-                    signal.map(|signal| signal.signal_id.clone()),
+                    trigger.map(|trigger| trigger.id().to_owned()),
                     correlation_id,
-                    build_execution_event_details(&event, signal),
+                    build_execution_event_details(&event, trigger),
                 );
             }
             ExecutionEvent::RecoveryPlanCreated { plan } => {
-                push_event_with_context(
+                push_event_with_context_and_payload(
                     recent_events,
                     "recovery",
                     summarize_execution_event(&event),
                     Some(plan.symbol.0.clone()),
-                    signal.map(|signal| signal.signal_id.clone()),
+                    trigger.map(|trigger| trigger.id().to_owned()),
                     Some(plan.correlation_id.clone()),
-                    build_execution_event_details(&event, signal),
+                    build_execution_event_details(&event, trigger),
+                    execution_event_monitor_payload(&event, trigger),
+                );
+            }
+            ExecutionEvent::ExecutionResultRecorded { result } => {
+                push_event_with_context_and_payload(
+                    recent_events,
+                    "result",
+                    summarize_execution_event(&event),
+                    Some(result.symbol.0.clone()),
+                    trigger.map(|trigger| trigger.id().to_owned()),
+                    Some(result.correlation_id.clone()),
+                    build_execution_event_details(&event, trigger),
+                    execution_event_monitor_payload(&event, trigger),
                 );
             }
             ExecutionEvent::OrderSubmitted {
@@ -7437,61 +7435,61 @@ async fn apply_execution_events(
                     "execution",
                     summarize_execution_event(&event),
                     Some(symbol.0.clone()),
-                    signal.map(|signal| signal.signal_id.clone()),
+                    trigger.map(|trigger| trigger.id().to_owned()),
                     correlation_id,
-                    build_execution_event_details(&event, signal),
+                    build_execution_event_details(&event, trigger),
                 );
             }
             ExecutionEvent::OrderFilled(fill) => {
                 stats.fills += 1;
                 risk.on_fill(fill).await?;
-                trade_book.record_fill(signal, fill);
+                trade_book.record_fill(trigger, fill);
                 push_event_with_context(
                     recent_events,
                     "execution",
                     summarize_execution_event(&event),
                     Some(fill.symbol.0.clone()),
-                    signal.map(|signal| signal.signal_id.clone()),
+                    trigger.map(|trigger| trigger.id().to_owned()),
                     Some(fill.correlation_id.clone()),
-                    build_execution_event_details(&event, signal),
+                    build_execution_event_details(&event, trigger),
                 );
             }
             ExecutionEvent::OrderCancelled { .. } => {
                 stats.order_cancelled += 1;
-                let (market, correlation_id) = audit_execution_identity(&event, signal);
+                let (market, correlation_id) = audit_execution_identity(&event, trigger);
                 push_event_with_context(
                     recent_events,
                     "execution",
                     summarize_execution_event(&event),
                     market,
-                    signal.map(|signal| signal.signal_id.clone()),
+                    trigger.map(|trigger| trigger.id().to_owned()),
                     correlation_id,
-                    build_execution_event_details(&event, signal),
+                    build_execution_event_details(&event, trigger),
                 );
             }
             ExecutionEvent::HedgeStateChanged { .. } => {
                 stats.state_changes += 1;
-                let (market, correlation_id) = audit_execution_identity(&event, signal);
+                let (market, correlation_id) = audit_execution_identity(&event, trigger);
                 push_event_with_context(
                     recent_events,
                     "state",
                     summarize_execution_event(&event),
                     market,
-                    signal.map(|signal| signal.signal_id.clone()),
+                    trigger.map(|trigger| trigger.id().to_owned()),
                     correlation_id,
-                    build_execution_event_details(&event, signal),
+                    build_execution_event_details(&event, trigger),
                 );
             }
             ExecutionEvent::ReconcileRequired { .. } => {
-                let (market, correlation_id) = audit_execution_identity(&event, signal);
+                let (market, correlation_id) = audit_execution_identity(&event, trigger);
                 push_event_with_context(
                     recent_events,
                     "reconcile",
                     summarize_execution_event(&event),
                     market,
-                    signal.map(|signal| signal.signal_id.clone()),
+                    trigger.map(|trigger| trigger.id().to_owned()),
                     correlation_id,
-                    build_execution_event_details(&event, signal),
+                    build_execution_event_details(&event, trigger),
                 );
             }
             ExecutionEvent::TradeClosed {
@@ -7513,9 +7511,9 @@ async fn apply_execution_events(
                     "trade_closed",
                     summarize_execution_event(&event),
                     Some(symbol.0.clone()),
-                    signal.map(|signal| signal.signal_id.clone()),
+                    trigger.map(|trigger| trigger.id().to_owned()),
                     Some(correlation_id.clone()),
-                    build_execution_event_details(&event, signal),
+                    build_execution_event_details(&event, trigger),
                 );
             }
         }
@@ -7540,6 +7538,13 @@ fn summarize_execution_event(event: &ExecutionEvent) -> String {
         ExecutionEvent::RecoveryPlanCreated { plan } => {
             format!("恢复计划已生成 {} {}", plan.symbol.0, plan.plan_id)
         }
+        ExecutionEvent::ExecutionResultRecorded { result } => format!(
+            "执行结果已记录 {} {} {} / 实际边际={}",
+            result.symbol.0,
+            result.plan_id,
+            result.status,
+            result.realized_edge_usd.0.normalize()
+        ),
         ExecutionEvent::OrderSubmitted {
             exchange, response, ..
         } => {
@@ -7708,15 +7713,12 @@ fn summarize_engine_warning(warning: &EngineWarning) -> String {
     }
 }
 
-fn summarize_signal(signal: &ArbSignalEvent) -> String {
-    let action = match &signal.action {
-        ArbSignalAction::BasisLong { .. } => "基差做多信号",
-        ArbSignalAction::BasisShort { .. } => "基差做空信号",
-        ArbSignalAction::DeltaRebalance { .. } => "Delta 再平衡信号",
-        ArbSignalAction::NegRiskArb { .. } => "负风险套利信号",
-        ArbSignalAction::ClosePosition { .. } => "平仓信号",
-    };
-    format!("{action} {}", signal.signal_id)
+fn summarize_candidate(candidate: &OpenCandidate) -> String {
+    format!(
+        "{} {}",
+        candidate_kind_label_zh(candidate.direction.as_str()),
+        candidate.candidate_id
+    )
 }
 
 fn trim_float_string(mut value: String) -> String {
@@ -7739,10 +7741,6 @@ fn format_detail_decimal(value: Decimal) -> String {
     value.normalize().to_string()
 }
 
-fn format_detail_decimal_opt(value: Option<Decimal>) -> Option<String> {
-    value.map(format_detail_decimal)
-}
-
 fn format_detail_ms(value: u64) -> String {
     format!("{value}ms")
 }
@@ -7763,6 +7761,90 @@ fn bool_zh(value: bool) -> &'static str {
     }
 }
 
+fn execution_pipeline_payload(
+    candidate: Option<OpenCandidate>,
+    intent: Option<PlanningIntent>,
+    plan: Option<TradePlan>,
+    result: Option<ExecutionResult>,
+    plan_rejection_reason: Option<String>,
+    revalidation_failure_reason: Option<String>,
+    recovery_decision_reason: Option<String>,
+) -> MonitorEventPayload {
+    MonitorEventPayload::ExecutionPipeline(ExecutionPipelineView {
+        schema_version: PLANNING_SCHEMA_VERSION,
+        candidate,
+        intent,
+        plan,
+        result,
+        plan_rejection_reason,
+        revalidation_failure_reason,
+        recovery_decision_reason,
+    })
+}
+
+fn candidate_monitor_payload(candidate: &OpenCandidate) -> MonitorEventPayload {
+    execution_pipeline_payload(Some(candidate.clone()), None, None, None, None, None, None)
+}
+
+fn execution_event_monitor_payload(
+    event: &ExecutionEvent,
+    trigger: Option<&RuntimeTrigger>,
+) -> Option<MonitorEventPayload> {
+    let (candidate, intent) = match trigger {
+        Some(RuntimeTrigger::Candidate(candidate)) => (Some(candidate.clone()), None),
+        Some(RuntimeTrigger::Intent { intent, .. }) => (None, Some(intent.clone())),
+        None => (None, None),
+    };
+
+    match event {
+        ExecutionEvent::TradePlanCreated { plan }
+        | ExecutionEvent::RecoveryPlanCreated { plan } => Some(execution_pipeline_payload(
+            candidate,
+            intent,
+            Some(plan.clone()),
+            None,
+            None,
+            None,
+            None,
+        )),
+        ExecutionEvent::ExecutionResultRecorded { result } => Some(execution_pipeline_payload(
+            candidate,
+            intent,
+            None,
+            Some(result.clone()),
+            None,
+            None,
+            None,
+        )),
+        _ => None,
+    }
+}
+
+fn extract_plan_rejection_reason(message: &str) -> Option<String> {
+    let prefix = "plan rejected [";
+    let rest = message.strip_prefix(prefix)?;
+    let (code, _) = rest.split_once(']')?;
+    (!code.is_empty()).then(|| code.to_owned())
+}
+
+fn post_submit_rejection_payload(
+    candidate: &OpenCandidate,
+    rejection_reasons: &[String],
+) -> MonitorEventPayload {
+    let plan_rejection_reason = rejection_reasons
+        .iter()
+        .find_map(|reason| extract_plan_rejection_reason(reason));
+    execution_pipeline_payload(
+        Some(candidate.clone()),
+        None,
+        None,
+        None,
+        plan_rejection_reason,
+        None,
+        None,
+    )
+}
+
 fn maybe_details(details: EventDetails) -> Option<EventDetails> {
     (!details.is_empty()).then_some(details)
 }
@@ -7780,13 +7862,34 @@ fn insert_detail_opt(details: &mut EventDetails, key: &str, value: Option<String
     }
 }
 
-fn signal_action_label_zh(signal: &ArbSignalEvent) -> &'static str {
-    match &signal.action {
-        ArbSignalAction::BasisLong { .. } => "基差做多",
-        ArbSignalAction::BasisShort { .. } => "基差做空",
-        ArbSignalAction::DeltaRebalance { .. } => "Delta 再平衡",
-        ArbSignalAction::NegRiskArb { .. } => "负风险套利",
-        ArbSignalAction::ClosePosition { .. } => "平仓",
+fn candidate_kind_label_zh(direction: &str) -> &'static str {
+    match direction {
+        "long" => "开仓候选",
+        "short" => "反向候选",
+        _ => "候选机会",
+    }
+}
+
+fn candidate_direction_zh(direction: &str) -> &'static str {
+    match direction {
+        "long" => "多",
+        "short" => "空",
+        _ => "未知",
+    }
+}
+
+fn trigger_action_label_zh(trigger: &RuntimeTrigger) -> String {
+    match trigger {
+        RuntimeTrigger::Candidate(candidate) => {
+            candidate_kind_label_zh(candidate.direction.as_str()).to_owned()
+        }
+        RuntimeTrigger::Intent { intent, .. } => match intent {
+            PlanningIntent::OpenPosition { .. } => "开仓意图".to_owned(),
+            PlanningIntent::ClosePosition { .. } => "平仓意图".to_owned(),
+            PlanningIntent::DeltaRebalance { .. } => "Delta 再平衡意图".to_owned(),
+            PlanningIntent::ResidualRecovery { .. } => "残余恢复意图".to_owned(),
+            PlanningIntent::ForceExit { .. } => "强制退出意图".to_owned(),
+        },
     }
 }
 
@@ -7869,16 +7972,11 @@ fn translate_risk_rejection(reason: &str) -> String {
     reason.to_owned()
 }
 
-fn signal_price_for_audit_observed(
-    signal: &ArbSignalEvent,
+fn candidate_price_for_audit_observed(
+    candidate: &OpenCandidate,
     observed: &AuditObservedMarket,
 ) -> Option<f64> {
-    let token_side = match &signal.action {
-        ArbSignalAction::BasisLong { token_side, .. }
-        | ArbSignalAction::BasisShort { token_side, .. } => Some(*token_side),
-        _ => None,
-    }?;
-    match token_side {
+    match candidate.token_side {
         TokenSide::Yes => observed.poly_yes_mid,
         TokenSide::No => observed.poly_no_mid,
     }
@@ -7941,99 +8039,114 @@ fn connection_idle_summary_zh(idles: &HashMap<String, u64>) -> Option<String> {
     Some(items.join("，"))
 }
 
-fn add_signal_details(details: &mut EventDetails, signal: &ArbSignalEvent) {
-    insert_detail(details, "市场", signal.symbol.0.clone());
-    insert_detail(details, "信号ID", signal.signal_id.clone());
-    insert_detail(details, "关联ID", signal.correlation_id.clone());
-    insert_detail(details, "动作", signal_action_label_zh(signal));
-    insert_detail(details, "强度", signal_strength_label_zh(signal.strength));
-    insert_detail_opt(
-        details,
-        "基差值",
-        format_detail_decimal_opt(signal.basis_value),
-    );
-    insert_detail_opt(details, "Z值", format_detail_decimal_opt(signal.z_score));
+fn add_trigger_details(details: &mut EventDetails, trigger: &RuntimeTrigger) {
+    insert_detail(details, "市场", trigger.symbol().0.clone());
+    insert_detail(details, "触发ID", trigger.id().to_owned());
+    insert_detail(details, "关联ID", trigger.correlation_id().to_owned());
+    insert_detail(details, "动作", trigger_action_label_zh(trigger));
     insert_detail(
         details,
-        "预期收益",
-        format_detail_decimal(signal.expected_pnl.0),
+        "时间",
+        format_detail_timestamp(trigger.timestamp_ms()),
     );
 
-    match &signal.action {
-        ArbSignalAction::BasisLong {
-            token_side,
-            poly_side,
-            poly_target_shares,
-            poly_target_notional,
-            cex_side,
-            cex_hedge_qty,
-            delta,
-        }
-        | ArbSignalAction::BasisShort {
-            token_side,
-            poly_side,
-            poly_target_shares,
-            poly_target_notional,
-            cex_side,
-            cex_hedge_qty,
-            delta,
-        } => {
-            insert_detail(details, "Token方向", format_token_side_label(*token_side));
-            insert_detail(
-                details,
-                "Polymarket方向",
-                format_order_side_label(*poly_side),
-            );
-            insert_detail(
-                details,
-                "Polymarket目标股数",
-                format_detail_decimal(poly_target_shares.0),
-            );
-            insert_detail(
-                details,
-                "Polymarket目标名义",
-                format_detail_decimal(poly_target_notional.0),
-            );
-            insert_detail(details, "CEX方向", format_order_side_label(*cex_side));
-            insert_detail(
-                details,
-                "CEX对冲数量",
-                format_detail_decimal(cex_hedge_qty.0),
-            );
-            insert_detail(details, "目标Delta", format_detail_f64(*delta));
-        }
-        ArbSignalAction::DeltaRebalance {
-            cex_side,
-            cex_qty_adjust,
-            new_delta,
-        } => {
-            insert_detail(details, "CEX方向", format_order_side_label(*cex_side));
-            insert_detail(
-                details,
-                "再平衡数量",
-                format_detail_decimal(cex_qty_adjust.0),
-            );
-            insert_detail(details, "新Delta", format_detail_f64(*new_delta));
-        }
-        ArbSignalAction::NegRiskArb { legs } => {
-            insert_detail(details, "套利腿数", legs.len().to_string());
-            let summary = legs
-                .iter()
-                .map(|leg| {
-                    format!(
-                        "{} {} {} {}",
-                        leg.symbol.0,
-                        format_token_side_label(leg.token_side),
-                        format_order_side_label(leg.side),
-                        format_detail_decimal(leg.quantity.0)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" | ");
-            insert_detail(details, "套利腿摘要", summary);
-        }
-        ArbSignalAction::ClosePosition { reason } => {
-            insert_detail(details, "平仓原因", reason.clone());
+    if let Some(candidate) = trigger.candidate() {
+        insert_detail(
+            details,
+            "强度",
+            signal_strength_label_zh(candidate.strength),
+        );
+        insert_detail(
+            details,
+            "方向",
+            candidate_direction_zh(candidate.direction.as_str()),
+        );
+        insert_detail(
+            details,
+            "Token方向",
+            format_token_side_label(candidate.token_side),
+        );
+        insert_detail(details, "公允值", format_detail_f64(candidate.fair_value));
+        insert_detail(
+            details,
+            "原始错价",
+            format_detail_f64(candidate.raw_mispricing),
+        );
+        insert_detail(
+            details,
+            "Delta估计",
+            format_detail_f64(candidate.delta_estimate),
+        );
+        insert_detail(
+            details,
+            "预算上限USD",
+            format_detail_f64(candidate.risk_budget_usd),
+        );
+        insert_detail_opt(details, "Z值", candidate.z_score.map(format_detail_f64));
+        return;
+    }
+
+    if let Some(intent) = trigger.intent() {
+        insert_detail(details, "意图类型", intent.intent_type_code().to_owned());
+        match intent {
+            PlanningIntent::OpenPosition {
+                max_budget_usd,
+                max_residual_delta,
+                max_shock_loss_usd,
+                ..
+            } => {
+                insert_detail(details, "预算上限USD", format_detail_f64(*max_budget_usd));
+                insert_detail(
+                    details,
+                    "残余Delta阈值",
+                    format_detail_f64(*max_residual_delta),
+                );
+                insert_detail(
+                    details,
+                    "冲击亏损阈值USD",
+                    format_detail_f64(*max_shock_loss_usd),
+                );
+            }
+            PlanningIntent::ClosePosition {
+                close_reason,
+                target_close_ratio,
+                ..
+            } => {
+                insert_detail(details, "平仓原因", close_reason.clone());
+                insert_detail(details, "平仓比例", format_detail_f64(*target_close_ratio));
+            }
+            PlanningIntent::DeltaRebalance {
+                target_residual_delta_max,
+                target_shock_loss_max,
+                ..
+            } => {
+                insert_detail(
+                    details,
+                    "残余Delta阈值",
+                    format_detail_f64(*target_residual_delta_max),
+                );
+                insert_detail(
+                    details,
+                    "冲击亏损阈值",
+                    format_detail_f64(*target_shock_loss_max),
+                );
+            }
+            PlanningIntent::ResidualRecovery {
+                residual_snapshot,
+                recovery_reason,
+                ..
+            } => {
+                insert_detail(details, "残余快照", residual_snapshot.clone());
+                insert_detail(details, "恢复原因", recovery_reason.code().to_owned());
+            }
+            PlanningIntent::ForceExit {
+                force_reason,
+                allow_negative_edge,
+                ..
+            } => {
+                insert_detail(details, "强退原因", force_reason.clone());
+                insert_detail(details, "允许负边际", bool_zh(*allow_negative_edge));
+            }
         }
     }
 }
@@ -8097,7 +8210,7 @@ fn add_observed_details(details: &mut EventDetails, observed: &AuditObservedMark
 fn add_risk_details(
     details: &mut EventDetails,
     risk: &InMemoryRiskManager,
-    signal: &ArbSignalEvent,
+    candidate: &OpenCandidate,
     rejection_reason: Option<&str>,
 ) {
     let snapshot = risk.build_snapshot(now_millis());
@@ -8111,7 +8224,7 @@ fn add_risk_details(
         "当前单市场敞口",
         format_detail_decimal(
             risk.position_tracker()
-                .symbol_exposure_usd(&signal.symbol)
+                .symbol_exposure_usd(&candidate.symbol)
                 .0,
         ),
     );
@@ -8148,7 +8261,7 @@ fn add_risk_details(
     insert_detail_opt(
         details,
         "市场阶段",
-        risk.market_phase(&signal.symbol)
+        risk.market_phase(&candidate.symbol)
             .map(|phase| format_market_phase_label(phase).to_owned()),
     );
     if let Some(reason) = rejection_reason {
@@ -8157,12 +8270,245 @@ fn add_risk_details(
     }
 }
 
+fn add_trade_plan_details(details: &mut EventDetails, plan: &TradePlan) {
+    insert_detail(details, "Schema版本", plan.schema_version.to_string());
+    insert_detail(details, "计划哈希", plan.plan_hash.clone());
+    insert_detail_opt(details, "父计划ID", plan.parent_plan_id.clone());
+    insert_detail_opt(details, "替换前计划ID", plan.supersedes_plan_id.clone());
+    insert_detail(details, "幂等键", plan.idempotency_key.clone());
+    insert_detail(details, "Poly定价模式", plan.poly_sizing_mode.clone());
+    insert_detail(
+        details,
+        "Poly请求股数",
+        format_detail_decimal(plan.poly_requested_shares.0),
+    );
+    insert_detail(
+        details,
+        "Poly计划股数",
+        format_detail_decimal(plan.poly_planned_shares.0),
+    );
+    insert_detail(
+        details,
+        "Poly预算上限USD",
+        format_detail_decimal(plan.poly_max_cost_usd.0),
+    );
+    insert_detail(
+        details,
+        "Poly最大均价",
+        format_detail_decimal(plan.poly_max_avg_price.0),
+    );
+    insert_detail(
+        details,
+        "Poly最小均价",
+        format_detail_decimal(plan.poly_min_avg_price.0),
+    );
+    insert_detail(
+        details,
+        "Poly最小收入USD",
+        format_detail_decimal(plan.poly_min_proceeds_usd.0),
+    );
+    insert_detail(
+        details,
+        "Poly簿面均价",
+        format_detail_decimal(plan.poly_book_avg_price.0),
+    );
+    insert_detail(
+        details,
+        "Poly可成交价",
+        format_detail_decimal(plan.poly_executable_price.0),
+    );
+    insert_detail(
+        details,
+        "Poly吃簿成本USD",
+        format_detail_decimal(plan.poly_friction_cost_usd.0),
+    );
+    insert_detail(
+        details,
+        "Poly手续费USD",
+        format_detail_decimal(plan.poly_fee_usd.0),
+    );
+    insert_detail(
+        details,
+        "CEX计划数量",
+        format_detail_decimal(plan.cex_planned_qty.0),
+    );
+    insert_detail(
+        details,
+        "CEX簿面均价",
+        format_detail_decimal(plan.cex_book_avg_price.0),
+    );
+    insert_detail(
+        details,
+        "CEX可成交价",
+        format_detail_decimal(plan.cex_executable_price.0),
+    );
+    insert_detail(
+        details,
+        "CEX摩擦成本USD",
+        format_detail_decimal(plan.cex_friction_cost_usd.0),
+    );
+    insert_detail(
+        details,
+        "CEX手续费USD",
+        format_detail_decimal(plan.cex_fee_usd.0),
+    );
+    insert_detail(
+        details,
+        "理论边际USD",
+        format_detail_decimal(plan.raw_edge_usd.0),
+    );
+    insert_detail(
+        details,
+        "计划边际USD",
+        format_detail_decimal(plan.planned_edge_usd.0),
+    );
+    insert_detail(
+        details,
+        "Funding成本USD",
+        format_detail_decimal(plan.expected_funding_cost_usd.0),
+    );
+    insert_detail(
+        details,
+        "残余风险惩罚USD",
+        format_detail_decimal(plan.residual_risk_penalty_usd.0),
+    );
+    insert_detail(
+        details,
+        "计划残余Delta",
+        format_detail_f64(plan.post_rounding_residual_delta),
+    );
+    insert_detail(
+        details,
+        "计划冲击亏损+1%USD",
+        format_detail_decimal(plan.shock_loss_up_1pct.0),
+    );
+    insert_detail(
+        details,
+        "计划冲击亏损-1%USD",
+        format_detail_decimal(plan.shock_loss_down_1pct.0),
+    );
+    insert_detail(
+        details,
+        "计划冲击亏损+2%USD",
+        format_detail_decimal(plan.shock_loss_up_2pct.0),
+    );
+    insert_detail(
+        details,
+        "计划冲击亏损-2%USD",
+        format_detail_decimal(plan.shock_loss_down_2pct.0),
+    );
+    insert_detail(details, "计划TTL", format_detail_ms(plan.plan_ttl_ms));
+    insert_detail(details, "Poly序列", plan.poly_sequence.to_string());
+    insert_detail(
+        details,
+        "Poly交易所时间",
+        format_detail_timestamp(plan.poly_exchange_timestamp_ms),
+    );
+    insert_detail(
+        details,
+        "Poly接收时间",
+        format_detail_timestamp(plan.poly_received_at_ms),
+    );
+    insert_detail(details, "CEX序列", plan.cex_sequence.to_string());
+    insert_detail(
+        details,
+        "CEX交易所时间",
+        format_detail_timestamp(plan.cex_exchange_timestamp_ms),
+    );
+    insert_detail(
+        details,
+        "CEX接收时间",
+        format_detail_timestamp(plan.cex_received_at_ms),
+    );
+}
+
+fn add_execution_result_details(details: &mut EventDetails, result: &ExecutionResult) {
+    insert_detail(details, "Schema版本", result.schema_version.to_string());
+    insert_detail(details, "结果状态", result.status.clone());
+    insert_detail(
+        details,
+        "实际Poly成本USD",
+        format_detail_decimal(result.actual_poly_cost_usd.0),
+    );
+    insert_detail(
+        details,
+        "实际CEX成本USD",
+        format_detail_decimal(result.actual_cex_cost_usd.0),
+    );
+    insert_detail(
+        details,
+        "实际Poly手续费USD",
+        format_detail_decimal(result.actual_poly_fee_usd.0),
+    );
+    insert_detail(
+        details,
+        "实际CEX手续费USD",
+        format_detail_decimal(result.actual_cex_fee_usd.0),
+    );
+    insert_detail(
+        details,
+        "实际Funding成本USD",
+        format_detail_decimal(result.actual_funding_cost_usd.0),
+    );
+    insert_detail(
+        details,
+        "实际边际USD",
+        format_detail_decimal(result.realized_edge_usd.0),
+    );
+    insert_detail(
+        details,
+        "计划偏差USD",
+        format_detail_decimal(result.plan_vs_fill_deviation_usd.0),
+    );
+    insert_detail(
+        details,
+        "实际残余Delta",
+        format_detail_f64(result.actual_residual_delta),
+    );
+    insert_detail(
+        details,
+        "实际冲击亏损+1%USD",
+        format_detail_decimal(result.actual_shock_loss_up_1pct.0),
+    );
+    insert_detail(
+        details,
+        "实际冲击亏损-1%USD",
+        format_detail_decimal(result.actual_shock_loss_down_1pct.0),
+    );
+    insert_detail(
+        details,
+        "实际冲击亏损+2%USD",
+        format_detail_decimal(result.actual_shock_loss_up_2pct.0),
+    );
+    insert_detail(
+        details,
+        "实际冲击亏损-2%USD",
+        format_detail_decimal(result.actual_shock_loss_down_2pct.0),
+    );
+    insert_detail(details, "需要恢复", bool_zh(result.recovery_required));
+    insert_detail(
+        details,
+        "Poly账本条数",
+        result.poly_order_ledger.len().to_string(),
+    );
+    insert_detail(
+        details,
+        "CEX账本条数",
+        result.cex_order_ledger.len().to_string(),
+    );
+    insert_detail(
+        details,
+        "结果时间",
+        format_detail_timestamp(result.timestamp_ms),
+    );
+}
+
 fn build_signal_event_details(
-    signal: &ArbSignalEvent,
+    candidate: &OpenCandidate,
     observed: Option<&AuditObservedMarket>,
 ) -> Option<EventDetails> {
     let mut details = EventDetails::new();
-    add_signal_details(&mut details, signal);
+    add_trigger_details(&mut details, &RuntimeTrigger::Candidate(candidate.clone()));
     if let Some(observed) = observed {
         add_observed_details(&mut details, observed);
     }
@@ -8170,7 +8516,7 @@ fn build_signal_event_details(
 }
 
 fn build_gate_event_details(
-    signal: &ArbSignalEvent,
+    candidate: &OpenCandidate,
     observed: Option<&AuditObservedMarket>,
     settings: &Settings,
     gate: &str,
@@ -8179,7 +8525,7 @@ fn build_gate_event_details(
     risk: Option<&InMemoryRiskManager>,
 ) -> Option<EventDetails> {
     let mut details = EventDetails::new();
-    add_signal_details(&mut details, signal);
+    add_trigger_details(&mut details, &RuntimeTrigger::Candidate(candidate.clone()));
     if let Some(observed) = observed {
         add_observed_details(&mut details, observed);
     }
@@ -8214,7 +8560,7 @@ fn build_gate_event_details(
                 insert_detail_opt(
                     &mut details,
                     "过滤价格",
-                    signal_price_for_audit_observed(signal, observed).map(format_detail_f64),
+                    candidate_price_for_audit_observed(candidate, observed).map(format_detail_f64),
                 );
             }
         }
@@ -8265,7 +8611,7 @@ fn build_gate_event_details(
                 add_risk_details(
                     &mut details,
                     risk,
-                    signal,
+                    candidate,
                     (result == AuditGateResult::Rejected).then_some(reason),
                 );
             }
@@ -8351,11 +8697,11 @@ fn build_skip_event_details(
 
 fn build_execution_event_details(
     event: &ExecutionEvent,
-    signal: Option<&ArbSignalEvent>,
+    trigger: Option<&RuntimeTrigger>,
 ) -> Option<EventDetails> {
     let mut details = EventDetails::new();
-    if let Some(signal) = signal {
-        add_signal_details(&mut details, signal);
+    if let Some(trigger) = trigger {
+        add_trigger_details(&mut details, trigger);
     }
     match event {
         ExecutionEvent::TradePlanCreated { plan } => {
@@ -8364,6 +8710,7 @@ fn build_execution_event_details(
             insert_detail(&mut details, "意图", plan.intent_type.clone());
             insert_detail(&mut details, "优先级", plan.priority.clone());
             insert_detail(&mut details, "关联ID", plan.correlation_id.clone());
+            add_trade_plan_details(&mut details, plan);
         }
         ExecutionEvent::PlanSuperseded {
             symbol,
@@ -8379,6 +8726,13 @@ fn build_execution_event_details(
             insert_detail(&mut details, "恢复计划ID", plan.plan_id.clone());
             insert_detail(&mut details, "关联ID", plan.correlation_id.clone());
             insert_detail(&mut details, "优先级", plan.priority.clone());
+            add_trade_plan_details(&mut details, plan);
+        }
+        ExecutionEvent::ExecutionResultRecorded { result } => {
+            insert_detail(&mut details, "市场", result.symbol.0.clone());
+            insert_detail(&mut details, "计划ID", result.plan_id.clone());
+            insert_detail(&mut details, "关联ID", result.correlation_id.clone());
+            add_execution_result_details(&mut details, result);
         }
         ExecutionEvent::OrderSubmitted {
             symbol,
@@ -8497,14 +8851,21 @@ fn build_execution_event_details(
 }
 
 fn build_post_submit_rejection_details(
-    signal: &ArbSignalEvent,
+    candidate: &OpenCandidate,
     rejection_reasons: &[String],
 ) -> Option<EventDetails> {
     let mut details = EventDetails::new();
-    add_signal_details(&mut details, signal);
+    add_trigger_details(&mut details, &RuntimeTrigger::Candidate(candidate.clone()));
     insert_detail(&mut details, "闸门", "执行层");
     insert_detail(&mut details, "闸门结果", "拒绝");
     insert_detail(&mut details, "原因", rejection_reasons.join("，"));
+    insert_detail_opt(
+        &mut details,
+        "计划拒绝代码",
+        rejection_reasons
+            .iter()
+            .find_map(|reason| extract_plan_rejection_reason(reason)),
+    );
     maybe_details(details)
 }
 
@@ -8585,7 +8946,7 @@ fn build_market_phase_event_details(
     maybe_details(details)
 }
 
-fn push_event_with_context(
+fn push_event_with_context_and_payload(
     events: &mut VecDeque<PaperEventLog>,
     kind: &str,
     summary: String,
@@ -8593,6 +8954,7 @@ fn push_event_with_context(
     signal_id: Option<String>,
     correlation_id: Option<String>,
     details: Option<EventDetails>,
+    payload: Option<MonitorEventPayload>,
 ) {
     insert_recent_event(
         events,
@@ -8605,7 +8967,29 @@ fn push_event_with_context(
             signal_id,
             correlation_id,
             details,
+            payload,
         },
+    );
+}
+
+fn push_event_with_context(
+    events: &mut VecDeque<PaperEventLog>,
+    kind: &str,
+    summary: String,
+    market: Option<String>,
+    signal_id: Option<String>,
+    correlation_id: Option<String>,
+    details: Option<EventDetails>,
+) {
+    push_event_with_context_and_payload(
+        events,
+        kind,
+        summary,
+        market,
+        signal_id,
+        correlation_id,
+        details,
+        None,
     );
 }
 
@@ -8617,27 +9001,28 @@ fn push_signal_event(
     events: &mut VecDeque<PaperEventLog>,
     kind: &str,
     summary: String,
-    signal: &ArbSignalEvent,
+    candidate: &OpenCandidate,
     details: Option<EventDetails>,
 ) {
-    push_event_with_context(
+    push_event_with_context_and_payload(
         events,
         kind,
         summary,
-        Some(signal.symbol.0.clone()),
-        Some(signal.signal_id.clone()),
-        Some(signal.correlation_id.clone()),
+        Some(candidate.symbol.0.clone()),
+        Some(candidate.candidate_id.clone()),
+        Some(candidate.correlation_id.clone()),
         details,
+        Some(candidate_monitor_payload(candidate)),
     );
 }
 
 fn push_gate_event(
     events: &mut VecDeque<PaperEventLog>,
-    signal: &ArbSignalEvent,
+    candidate: &OpenCandidate,
     summary: String,
     details: Option<EventDetails>,
 ) {
-    push_signal_event(events, "gate", summary, signal, details);
+    push_signal_event(events, "gate", summary, candidate, details);
 }
 
 fn push_event(
@@ -9086,7 +9471,7 @@ fn warning_symbol_opt(warning: Option<&EngineWarning>) -> Option<&Symbol> {
 
 fn audit_execution_identity(
     event: &ExecutionEvent,
-    signal: Option<&ArbSignalEvent>,
+    trigger: Option<&RuntimeTrigger>,
 ) -> (Option<String>, Option<String>) {
     match event {
         ExecutionEvent::TradePlanCreated { plan } => (
@@ -9095,11 +9480,15 @@ fn audit_execution_identity(
         ),
         ExecutionEvent::PlanSuperseded { symbol, .. } => (
             Some(symbol.0.clone()),
-            signal.map(|signal| signal.correlation_id.clone()),
+            trigger.map(|trigger| trigger.correlation_id().to_owned()),
         ),
         ExecutionEvent::RecoveryPlanCreated { plan } => (
             Some(plan.symbol.0.clone()),
             Some(plan.correlation_id.clone()),
+        ),
+        ExecutionEvent::ExecutionResultRecorded { result } => (
+            Some(result.symbol.0.clone()),
+            Some(result.correlation_id.clone()),
         ),
         ExecutionEvent::OrderSubmitted {
             symbol,
@@ -9108,19 +9497,19 @@ fn audit_execution_identity(
         } => (Some(symbol.0.clone()), Some(correlation_id.clone())),
         ExecutionEvent::OrderFilled(fill) => (
             Some(fill.symbol.0.clone()),
-            signal.map(|signal| signal.correlation_id.clone()),
+            trigger.map(|trigger| trigger.correlation_id().to_owned()),
         ),
         ExecutionEvent::OrderCancelled { symbol, .. } => (
             Some(symbol.0.clone()),
-            signal.map(|signal| signal.correlation_id.clone()),
+            trigger.map(|trigger| trigger.correlation_id().to_owned()),
         ),
         ExecutionEvent::HedgeStateChanged { symbol, .. } => (
             Some(symbol.0.clone()),
-            signal.map(|signal| signal.correlation_id.clone()),
+            trigger.map(|trigger| trigger.correlation_id().to_owned()),
         ),
         ExecutionEvent::ReconcileRequired { symbol, .. } => (
             symbol.as_ref().map(|symbol| symbol.0.clone()),
-            signal.map(|signal| signal.correlation_id.clone()),
+            trigger.map(|trigger| trigger.correlation_id().to_owned()),
         ),
         ExecutionEvent::TradeClosed {
             symbol,
@@ -9135,6 +9524,7 @@ fn audit_execution_timestamp_ms(event: &ExecutionEvent) -> u64 {
         ExecutionEvent::TradePlanCreated { plan } => plan.created_at_ms,
         ExecutionEvent::PlanSuperseded { .. } => now_millis(),
         ExecutionEvent::RecoveryPlanCreated { plan } => plan.created_at_ms,
+        ExecutionEvent::ExecutionResultRecorded { result } => result.timestamp_ms,
         ExecutionEvent::OrderSubmitted { response, .. } => response.timestamp_ms,
         ExecutionEvent::OrderFilled(fill) => fill.timestamp_ms,
         ExecutionEvent::OrderCancelled { .. } => now_millis(),
@@ -9435,12 +9825,14 @@ fn build_monitor_events(recent_events: &VecDeque<PaperEventLog>) -> Vec<MonitorE
 
 fn paper_event_to_monitor_event(event: &PaperEventLog) -> MonitorEvent {
     MonitorEvent {
+        schema_version: PLANNING_SCHEMA_VERSION,
         timestamp_ms: event.timestamp_ms,
         kind: classify_monitor_event_kind(&event.kind),
         market: event.market.clone(),
         correlation_id: monitor_event_correlation_id(event),
         summary: event.summary.clone(),
         details: event.details.clone(),
+        payload: event.payload.clone(),
     }
 }
 
@@ -9460,7 +9852,7 @@ fn classify_monitor_event_kind(kind: &str) -> EventKind {
     match kind {
         "signal" => EventKind::Signal,
         "gate" => EventKind::Gate,
-        "fill" | "execution" => EventKind::Trade,
+        "plan" | "recovery" | "result" | "fill" | "execution" => EventKind::Trade,
         "skip" => EventKind::Skip,
         "risk" | "price_filter" | "spread_filter" | "paused" | "emergency" | "stale"
         | "reconcile" => EventKind::Risk,
@@ -9763,47 +10155,16 @@ fn signed_pnl_for_position(
     }
 }
 
-fn register_open_trade_from_signal(
+fn register_open_trade_from_candidate(
     trade_book: &mut TradeBook,
-    signal: &ArbSignalEvent,
+    candidate: &OpenCandidate,
     engine: &SimpleAlphaEngine,
 ) {
-    let Some(snapshot) = engine.basis_snapshot(&signal.symbol) else {
+    let Some(snapshot) = engine.basis_snapshot(&candidate.symbol) else {
         return;
     };
-    let basis_entry_bps = signal
-        .basis_value
-        .and_then(|value| value.to_f64())
-        .map(|value| (value * 10_000.0).round() as i32)
-        .unwrap_or_else(|| (snapshot.signal_basis * 10_000.0).round() as i32);
-    let hedge_ratio = match &signal.action {
-        ArbSignalAction::BasisLong {
-            poly_target_notional,
-            cex_hedge_qty,
-            ..
-        }
-        | ArbSignalAction::BasisShort {
-            poly_target_notional,
-            cex_hedge_qty,
-            ..
-        } => {
-            let poly_notional = poly_target_notional.0.to_f64().unwrap_or_default().abs();
-            if poly_notional <= f64::EPSILON {
-                1.0
-            } else {
-                (cex_hedge_qty.0.to_f64().unwrap_or_default().abs() * snapshot.cex_reference_price)
-                    / poly_notional
-            }
-        }
-        _ => 1.0,
-    };
-    let delta = match &signal.action {
-        ArbSignalAction::BasisLong { delta, .. } | ArbSignalAction::BasisShort { delta, .. } => {
-            *delta
-        }
-        _ => snapshot.delta,
-    };
-    trade_book.register_open_signal(signal, basis_entry_bps, hedge_ratio, delta);
+    let basis_entry_bps = (snapshot.signal_basis * 10_000.0).round() as i32;
+    trade_book.register_open_signal(candidate, basis_entry_bps, 1.0, candidate.delta_estimate);
 }
 
 fn build_paper_slippage_config(settings: &Settings) -> SlippageConfig {
@@ -9956,7 +10317,7 @@ fn record_evaluation_attempt(
 fn reject_signal(
     stats: &mut PaperStats,
     recent_events: &mut VecDeque<PaperEventLog>,
-    signal: &ArbSignalEvent,
+    candidate: &OpenCandidate,
     kind: &str,
     reason: impl Into<String>,
     summary: String,
@@ -9964,7 +10325,7 @@ fn reject_signal(
 ) {
     stats.signals_rejected += 1;
     record_signal_rejection(stats, reason);
-    push_signal_event(recent_events, kind, summary, signal, details);
+    push_signal_event(recent_events, kind, summary, candidate, details);
 }
 
 fn opening_signal_rejection_reasons(events: &[ExecutionEvent]) -> Vec<String> {
@@ -9992,17 +10353,10 @@ fn track_open_signal_execution_outcome(
     stats: &mut PaperStats,
     recent_events: &mut VecDeque<PaperEventLog>,
     trade_book: &mut TradeBook,
-    signal: &ArbSignalEvent,
+    candidate: &OpenCandidate,
     events: &[ExecutionEvent],
     audit: &mut Option<PaperAudit>,
 ) -> Result<()> {
-    if !matches!(
-        &signal.action,
-        ArbSignalAction::BasisLong { .. } | ArbSignalAction::BasisShort { .. }
-    ) {
-        return Ok(());
-    }
-
     let any_fill = events
         .iter()
         .any(|event| matches!(event, ExecutionEvent::OrderFilled(_)));
@@ -10016,20 +10370,20 @@ fn track_open_signal_execution_outcome(
     for reason in &rejection_reasons {
         record_signal_rejection(stats, reason.clone());
     }
-    trade_book.discard_open_trade(&signal.symbol);
+    trade_book.discard_open_trade(&candidate.symbol);
     push_signal_event(
         recent_events,
         "risk",
         format!(
-            "信号提交后被拒绝 {}（{}）",
-            signal.signal_id,
+            "候选提交后被拒绝 {}（{}）",
+            candidate.candidate_id,
             rejection_reasons.join(", ")
         ),
-        signal,
-        build_post_submit_rejection_details(signal, &rejection_reasons),
+        candidate,
+        build_post_submit_rejection_details(candidate, &rejection_reasons),
     );
     if let Some(audit) = audit.as_mut() {
-        audit.record_open_signal_rejected_post_submit(signal, &rejection_reasons)?;
+        audit.record_open_signal_rejected_post_submit(candidate, &rejection_reasons)?;
     }
     Ok(())
 }
@@ -10263,24 +10617,20 @@ mod tests {
         }
     }
 
-    fn basis_signal(token_side: TokenSide) -> ArbSignalEvent {
-        ArbSignalEvent {
-            signal_id: "sig-1".to_owned(),
+    fn open_candidate(token_side: TokenSide) -> OpenCandidate {
+        OpenCandidate {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            candidate_id: "cand-1".to_owned(),
             correlation_id: "corr-1".to_owned(),
             symbol: Symbol::new("btc-test"),
-            action: ArbSignalAction::BasisLong {
-                token_side,
-                poly_side: polyalpha_core::OrderSide::Buy,
-                poly_target_shares: PolyShares(Decimal::new(10, 0)),
-                poly_target_notional: UsdNotional(Decimal::new(100, 0)),
-                cex_side: polyalpha_core::OrderSide::Sell,
-                cex_hedge_qty: polyalpha_core::CexBaseQty(Decimal::new(1, 3)),
-                delta: 0.25,
-            },
+            token_side,
+            direction: "long".to_owned(),
+            fair_value: 0.47,
+            raw_mispricing: 0.05,
+            delta_estimate: 0.25,
+            risk_budget_usd: 100.0,
             strength: SignalStrength::Normal,
-            basis_value: None,
-            z_score: None,
-            expected_pnl: UsdNotional::ZERO,
+            z_score: Some(2.1),
             timestamp_ms: 1,
         }
     }
@@ -10353,6 +10703,7 @@ mod tests {
             signal_id: None,
             correlation_id: None,
             details: None,
+            payload: None,
         }
     }
 
@@ -10612,27 +10963,11 @@ mod tests {
     }
 
     #[test]
-    fn summarize_signal_uses_chinese_labels() {
+    fn summarize_candidate_uses_chinese_labels() {
         assert_eq!(
-            summarize_signal(&basis_signal(TokenSide::Yes)),
-            "基差做多信号 sig-1"
+            summarize_candidate(&open_candidate(TokenSide::Yes)),
+            "开仓候选 cand-1"
         );
-
-        let close_signal = ArbSignalEvent {
-            signal_id: "sig-close".to_owned(),
-            correlation_id: "corr-close".to_owned(),
-            symbol: Symbol::new("btc-test"),
-            action: ArbSignalAction::ClosePosition {
-                reason: "basis_normalized".to_owned(),
-            },
-            strength: SignalStrength::Normal,
-            basis_value: None,
-            z_score: None,
-            expected_pnl: UsdNotional::ZERO,
-            timestamp_ms: 2,
-        };
-
-        assert_eq!(summarize_signal(&close_signal), "平仓信号 sig-close");
     }
 
     #[test]
@@ -10752,14 +11087,14 @@ mod tests {
         let mut stats = PaperStats::default();
         let mut recent_events = VecDeque::new();
         let mut trade_book = TradeBook::default();
-        let signal = basis_signal(TokenSide::Yes);
+        let candidate = open_candidate(TokenSide::Yes);
         let mut audit = None;
 
         track_open_signal_execution_outcome(
             &mut stats,
             &mut recent_events,
             &mut trade_book,
-            &signal,
+            &candidate,
             &[rejected_order_submitted_event("price_filter")],
             &mut audit,
         )
@@ -10770,7 +11105,7 @@ mod tests {
         assert_eq!(recent_events[0].kind, "risk");
         assert_eq!(
             recent_events[0].summary,
-            "信号提交后被拒绝 sig-1（price_filter）"
+            "候选提交后被拒绝 cand-1（price_filter）"
         );
     }
 
@@ -10782,7 +11117,7 @@ mod tests {
             .expect("apply poly fill");
 
         let mut trade_book = TradeBook::default();
-        trade_book.register_open_signal(&basis_signal(TokenSide::No), 0, 1.0, 0.25);
+        trade_book.register_open_signal(&open_candidate(TokenSide::No), 0, 1.0, 0.25);
 
         assert_eq!(
             resolved_active_token_side(
@@ -10803,7 +11138,7 @@ mod tests {
             .expect("apply cex fill");
 
         let mut trade_book = TradeBook::default();
-        trade_book.register_open_signal(&basis_signal(TokenSide::Yes), 0, 1.0, 0.25);
+        trade_book.register_open_signal(&open_candidate(TokenSide::Yes), 0, 1.0, 0.25);
 
         assert_eq!(
             resolved_active_token_side(&risk, &trade_book, &Symbol::new("btc-test"), None),
@@ -10819,33 +11154,21 @@ mod tests {
             cex_updated_at_ms: Some(now_ms.saturating_sub(100)),
             ..ObservedState::default()
         };
-        let reason = ws_signal_stale_reason(&basis_signal(TokenSide::Yes), &observed, 5_000);
+        let reason = ws_candidate_stale_reason(&open_candidate(TokenSide::Yes), &observed, 5_000);
         assert_eq!(reason.as_deref(), Some("poly_stale"));
     }
 
     #[test]
-    fn ws_freshness_allows_delta_rebalance_without_poly_update() {
+    fn ws_freshness_accepts_fresh_candidate() {
         let now_ms = now_millis();
-        let signal = ArbSignalEvent {
-            signal_id: "sig-2".to_owned(),
-            correlation_id: "corr-2".to_owned(),
-            symbol: Symbol::new("btc-test"),
-            action: ArbSignalAction::DeltaRebalance {
-                cex_side: polyalpha_core::OrderSide::Buy,
-                cex_qty_adjust: polyalpha_core::CexBaseQty(Decimal::new(5, 3)),
-                new_delta: 0.0,
-            },
-            strength: SignalStrength::Normal,
-            basis_value: None,
-            z_score: None,
-            expected_pnl: UsdNotional::ZERO,
-            timestamp_ms: 1,
-        };
         let observed = ObservedState {
+            poly_yes_updated_at_ms: Some(now_ms.saturating_sub(100)),
             cex_updated_at_ms: Some(now_ms.saturating_sub(100)),
             ..ObservedState::default()
         };
-        assert!(ws_signal_stale_reason(&signal, &observed, 5_000).is_none());
+        assert!(
+            ws_candidate_stale_reason(&open_candidate(TokenSide::Yes), &observed, 5_000).is_none()
+        );
     }
 
     #[test]
@@ -10904,37 +11227,7 @@ mod tests {
     }
 
     #[test]
-    fn signal_passes_price_filter_allows_close_position_when_limits_exist() {
-        let settings =
-            test_settings_with_price_filter(Some(Decimal::new(2, 1)), Some(Decimal::new(8, 1)));
-        let observed = ObservedState {
-            poly_yes_mid: Some(Decimal::new(9, 1)),
-            poly_no_mid: Some(Decimal::new(1, 1)),
-            ..ObservedState::default()
-        };
-        let close_signal = ArbSignalEvent {
-            signal_id: "sig-close".to_owned(),
-            correlation_id: "corr-close".to_owned(),
-            symbol: Symbol::new("btc-test"),
-            action: ArbSignalAction::ClosePosition {
-                reason: "basis_normalized".to_owned(),
-            },
-            strength: SignalStrength::Normal,
-            basis_value: None,
-            z_score: None,
-            expected_pnl: UsdNotional::ZERO,
-            timestamp_ms: 1,
-        };
-
-        assert!(signal_passes_price_filter(
-            &close_signal,
-            &observed,
-            &settings
-        ));
-    }
-
-    #[test]
-    fn signal_passes_price_filter_keeps_entry_limits_for_open_signal() {
+    fn candidate_passes_price_filter_keeps_entry_limits_for_open_signal() {
         let settings =
             test_settings_with_price_filter(Some(Decimal::new(2, 1)), Some(Decimal::new(8, 1)));
         let observed = ObservedState {
@@ -10942,15 +11235,15 @@ mod tests {
             ..ObservedState::default()
         };
 
-        assert!(!signal_passes_price_filter(
-            &basis_signal(TokenSide::Yes),
+        assert!(!candidate_passes_price_filter(
+            &open_candidate(TokenSide::Yes),
             &observed,
             &settings
         ));
     }
 
     #[test]
-    fn signal_passes_price_filter_multi_allows_close_position_when_limits_exist() {
+    fn candidate_passes_price_filter_multi_keeps_entry_limits_for_open_signal() {
         let settings =
             test_settings_with_price_filter(Some(Decimal::new(2, 1)), Some(Decimal::new(8, 1)));
         let observed_map = HashMap::from([(
@@ -10960,38 +11253,11 @@ mod tests {
                 ..ObservedState::default()
             },
         )]);
-        let close_signal = ArbSignalEvent {
-            signal_id: "sig-close".to_owned(),
-            correlation_id: "corr-close".to_owned(),
-            symbol: Symbol::new("btc-test"),
-            action: ArbSignalAction::ClosePosition {
-                reason: "basis_normalized".to_owned(),
-            },
-            strength: SignalStrength::Normal,
-            basis_value: None,
-            z_score: None,
-            expected_pnl: UsdNotional::ZERO,
-            timestamp_ms: 1,
-        };
-
-        assert!(signal_passes_price_filter_multi(
-            &close_signal,
+        assert!(!candidate_passes_price_filter_multi(
+            &open_candidate(TokenSide::Yes),
             &observed_map,
             &settings
         ));
-    }
-
-    #[test]
-    fn effective_open_signal_cex_hedge_qty_respects_cex_qty_step() {
-        let signal = basis_signal(TokenSide::Yes);
-        let mut market = test_market("btc-test", Exchange::Binance, "BTCUSDT");
-        market.cex_qty_step = Decimal::ONE;
-        let registry = SymbolRegistry::new(vec![market]);
-
-        let effective = effective_open_signal_cex_hedge_qty(&signal, &registry)
-            .expect("basis signal should expose cex hedge qty");
-
-        assert_eq!(effective.0, Decimal::ZERO);
     }
 
     #[test]

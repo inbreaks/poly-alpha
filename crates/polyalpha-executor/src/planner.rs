@@ -1,15 +1,14 @@
 use std::sync::Arc;
 
-use rust_decimal::prelude::FromPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use polyalpha_core::{
-    CexBaseQty, OpenCandidate, OrderBookSnapshot, OrderRequest, OrderSide, PlanningIntent, Price,
-    PolyOrderRequest, PolyShares, PolySizingInstruction, PlanRejectionReason,
-    RevalidationFailureReason, TradePlan, UsdNotional,
-    PLANNING_SCHEMA_VERSION,
+    CexBaseQty, OpenCandidate, OrderBookSnapshot, OrderRequest, OrderSide, PlanRejectionReason,
+    PlanningIntent, PolyOrderRequest, PolyShares, PolySizingInstruction, Price,
+    RevalidationFailureReason, Symbol, TokenSide, TradePlan, UsdNotional, PLANNING_SCHEMA_VERSION,
 };
 
 use crate::{
@@ -34,6 +33,10 @@ pub struct CanonicalPlanningContext {
     pub poly_yes_book: OrderBookSnapshot,
     pub poly_no_book: OrderBookSnapshot,
     pub cex_book: OrderBookSnapshot,
+    pub cex_qty_step: Decimal,
+    pub current_poly_yes_shares: Decimal,
+    pub current_poly_no_shares: Decimal,
+    pub current_cex_net_qty: Decimal,
     pub now_ms: u64,
 }
 
@@ -48,6 +51,8 @@ pub struct ExecutionPlanner {
     pub poly_fee_bps: u32,
     pub cex_fee_bps: u32,
     pub funding_bps_per_day: u32,
+    pub poly_slippage_bps: u32,
+    pub cex_slippage_bps: u32,
 }
 
 impl Default for ExecutionPlanner {
@@ -56,6 +61,8 @@ impl Default for ExecutionPlanner {
             poly_fee_bps: 20,
             cex_fee_bps: 5,
             funding_bps_per_day: 1,
+            poly_slippage_bps: DEFAULT_POLY_SLIPPAGE_BPS as u32,
+            cex_slippage_bps: DEFAULT_CEX_SLIPPAGE_BPS as u32,
         }
     }
 }
@@ -100,11 +107,7 @@ impl ExecutionPlanner {
         {
             return Err(RevalidationFailureReason::PolySequenceDriftExceeded);
         }
-        if context
-            .cex_book
-            .sequence
-            .saturating_sub(plan.cex_sequence)
-            > plan.max_cex_sequence_drift
+        if context.cex_book.sequence.saturating_sub(plan.cex_sequence) > plan.max_cex_sequence_drift
         {
             return Err(RevalidationFailureReason::CexSequenceDriftExceeded);
         }
@@ -118,10 +121,7 @@ impl ExecutionPlanner {
         Ok(())
     }
 
-    fn validate_book(
-        book: &OrderBookSnapshot,
-        is_poly: bool,
-    ) -> Result<(), PlanRejection> {
+    fn validate_book(book: &OrderBookSnapshot, is_poly: bool) -> Result<(), PlanRejection> {
         if book.bids.is_empty() && book.asks.is_empty() {
             return Err(PlanRejection {
                 reason: if is_poly {
@@ -201,7 +201,8 @@ impl ExecutionPlanner {
             });
         }
 
-        let poly_estimate = self.estimate_poly_open(candidate, context, budget_cap_usd, capped_max_shares);
+        let poly_estimate =
+            self.estimate_poly_open(candidate, context, budget_cap_usd, capped_max_shares);
         if poly_estimate.status == polyalpha_core::OrderStatus::Rejected {
             return Err(PlanRejection {
                 reason: map_estimate_rejection(poly_estimate.rejection_reason.as_deref()),
@@ -215,7 +216,15 @@ impl ExecutionPlanner {
             polyalpha_core::VenueQuantity::PolyShares(shares) => shares,
             polyalpha_core::VenueQuantity::CexBaseQty(_) => PolyShares::ZERO,
         };
-        let cex_planned_qty = poly_planned_shares.to_cex_base_qty(candidate.delta_estimate);
+        let exact_cex_qty = poly_planned_shares.to_cex_base_qty(candidate.delta_estimate);
+        let cex_planned_qty = exact_cex_qty.floor_to_step(context.cex_qty_step);
+        let post_rounding_residual_qty = (exact_cex_qty.0 - cex_planned_qty.0).max(Decimal::ZERO);
+        if exact_cex_qty.0 > Decimal::ZERO && cex_planned_qty.0 <= Decimal::ZERO {
+            return Err(PlanRejection {
+                reason: PlanRejectionReason::ResidualDeltaTooLarge,
+                detail: "rounded hedge qty floors to zero".to_owned(),
+            });
+        }
         if cex_planned_qty.0 > cex_depth {
             return Err(PlanRejection {
                 reason: PlanRejectionReason::InsufficientCexDepth,
@@ -223,12 +232,23 @@ impl ExecutionPlanner {
             });
         }
 
-        let cex_estimate = self.estimate_cex_follow(candidate, context, cex_side, cex_planned_qty);
-        let raw_edge_usd = poly_estimate
+        let cex_estimate = if cex_planned_qty.0 > Decimal::ZERO {
+            self.estimate_cex_order(context, cex_side, cex_planned_qty)
+        } else {
+            empty_estimate(
+                context,
+                context.cex_book.exchange,
+                context.cex_book.symbol.clone(),
+                context.cex_book.instrument,
+                cex_side,
+            )
+        };
+        let raw_edge_usd = poly_estimate.executable_notional_usd.0
+            * Decimal::from_f64(candidate.raw_mispricing.abs()).unwrap_or(Decimal::ZERO);
+        let hedge_notional_proxy = cex_estimate
             .executable_notional_usd
             .0
-            * Decimal::from_f64(candidate.raw_mispricing.abs()).unwrap_or(Decimal::ZERO);
-        let hedge_notional_proxy = poly_estimate.executable_notional_usd.0 * delta_abs;
+            .max(poly_estimate.executable_notional_usd.0 * delta_abs);
         let poly_fee_usd = bps_fee(poly_estimate.executable_notional_usd, self.poly_fee_bps);
         let cex_fee_usd = bps_fee(UsdNotional(hedge_notional_proxy), self.cex_fee_bps);
         let expected_funding_cost_usd =
@@ -256,7 +276,19 @@ impl ExecutionPlanner {
             });
         }
 
-        let shock_base = UsdNotional(hedge_notional_proxy.max(Decimal::ZERO));
+        let post_rounding_residual_delta = post_rounding_residual_qty.to_f64().unwrap_or_default();
+        let max_residual_delta = (*max_residual_delta).max(0.0);
+        if post_rounding_residual_delta > max_residual_delta {
+            return Err(PlanRejection {
+                reason: PlanRejectionReason::ResidualDeltaTooLarge,
+                detail: "post-rounding residual delta exceeds intent threshold".to_owned(),
+            });
+        }
+
+        let shock_reference_price = cex_estimate
+            .executable_price
+            .unwrap_or_else(|| best_level_price(&context.cex_book, cex_side));
+        let shock_base = UsdNotional(post_rounding_residual_qty * shock_reference_price.0);
         let shock_loss_up_1pct = bps_fee(shock_base, 100);
         let shock_loss_down_1pct = shock_loss_up_1pct;
         let shock_loss_up_2pct = bps_fee(shock_base, 200);
@@ -297,13 +329,9 @@ impl ExecutionPlanner {
             poly_max_shares: capped_max_shares,
             poly_min_avg_price: Price::ZERO,
             poly_min_proceeds_usd: UsdNotional::ZERO,
-            poly_book_avg_price: poly_estimate
-                .book_average_price
-                .unwrap_or(poly_best_ask),
+            poly_book_avg_price: poly_estimate.book_average_price.unwrap_or(poly_best_ask),
             poly_executable_price: poly_estimate.executable_price.unwrap_or(poly_best_ask),
-            poly_friction_cost_usd: poly_estimate
-                .friction_cost_usd
-                .unwrap_or(UsdNotional::ZERO),
+            poly_friction_cost_usd: poly_estimate.friction_cost_usd.unwrap_or(UsdNotional::ZERO),
             poly_fee_usd,
             cex_side,
             cex_planned_qty,
@@ -313,15 +341,13 @@ impl ExecutionPlanner {
             cex_executable_price: cex_estimate
                 .executable_price
                 .unwrap_or_else(|| best_level_price(&context.cex_book, cex_side)),
-            cex_friction_cost_usd: cex_estimate
-                .friction_cost_usd
-                .unwrap_or(UsdNotional::ZERO),
+            cex_friction_cost_usd: cex_estimate.friction_cost_usd.unwrap_or(UsdNotional::ZERO),
             cex_fee_usd,
             raw_edge_usd: UsdNotional(raw_edge_usd),
             planned_edge_usd,
             expected_funding_cost_usd,
             residual_risk_penalty_usd,
-            post_rounding_residual_delta: 0.0_f64.max(candidate.delta_estimate.abs() - *max_residual_delta),
+            post_rounding_residual_delta,
             shock_loss_up_1pct,
             shock_loss_down_1pct,
             shock_loss_up_2pct,
@@ -332,7 +358,7 @@ impl ExecutionPlanner {
             max_poly_price_move: default_max_poly_price_move(),
             max_cex_price_move: default_max_cex_price_move(),
             min_planned_edge_usd: UsdNotional(Decimal::new(1, 2)),
-            max_residual_delta: *max_residual_delta,
+            max_residual_delta,
             max_shock_loss_usd: UsdNotional(max_shock_loss),
             max_plan_vs_fill_deviation_usd: UsdNotional(Decimal::new(5, 0)),
         })
@@ -345,6 +371,64 @@ impl ExecutionPlanner {
         priority: &str,
         poly_sizing_mode: &str,
     ) -> Result<TradePlan, PlanRejection> {
+        let close_ratio = close_ratio_for_intent(intent);
+        let (poly_token_side, requested_poly_shares) = flatten_poly_position(context, close_ratio)?;
+        let desired_cex_qty = flatten_cex_position(context, close_ratio);
+        let poly_book = match poly_token_side {
+            TokenSide::No => &context.poly_no_book,
+            TokenSide::Yes => &context.poly_yes_book,
+        };
+        let poly_estimate = if requested_poly_shares.0 > Decimal::ZERO {
+            let estimate = self.estimate_poly_close(
+                intent.symbol(),
+                poly_token_side,
+                context,
+                requested_poly_shares,
+            );
+            if estimate.status == polyalpha_core::OrderStatus::Rejected {
+                return Err(PlanRejection {
+                    reason: map_estimate_rejection(estimate.rejection_reason.as_deref()),
+                    detail: estimate
+                        .rejection_reason
+                        .unwrap_or_else(|| "poly close estimate rejected".to_owned()),
+                });
+            }
+            estimate
+        } else {
+            empty_estimate(
+                context,
+                poly_book.exchange,
+                poly_book.symbol.clone(),
+                poly_book.instrument,
+                OrderSide::Sell,
+            )
+        };
+        let cex_side = flatten_cex_side(context.current_cex_net_qty);
+        let cex_estimate = if desired_cex_qty.0 > Decimal::ZERO {
+            self.estimate_cex_order(context, cex_side, desired_cex_qty)
+        } else {
+            empty_estimate(
+                context,
+                context.cex_book.exchange,
+                context.cex_book.symbol.clone(),
+                context.cex_book.instrument,
+                cex_side,
+            )
+        };
+        let poly_fee_usd = bps_fee(poly_estimate.executable_notional_usd, self.poly_fee_bps);
+        let cex_fee_usd = bps_fee(cex_estimate.executable_notional_usd, self.cex_fee_bps);
+        let planned_edge_usd = UsdNotional(
+            -poly_estimate
+                .friction_cost_usd
+                .unwrap_or(UsdNotional::ZERO)
+                .0
+                - cex_estimate
+                    .friction_cost_usd
+                    .unwrap_or(UsdNotional::ZERO)
+                    .0
+                - poly_fee_usd.0
+                - cex_fee_usd.0,
+        );
         let plan_hash = stable_plan_hash(intent, context);
         Ok(TradePlan {
             schema_version: PLANNING_SCHEMA_VERSION,
@@ -365,27 +449,38 @@ impl ExecutionPlanner {
             cex_sequence: context.cex_book.sequence,
             plan_hash,
             poly_side: OrderSide::Sell,
-            poly_token_side: polyalpha_core::TokenSide::Yes,
+            poly_token_side,
             poly_sizing_mode: poly_sizing_mode.to_owned(),
-            poly_requested_shares: PolyShares::ZERO,
-            poly_planned_shares: PolyShares::ZERO,
+            poly_requested_shares: requested_poly_shares,
+            poly_planned_shares: match poly_estimate.filled_quantity {
+                polyalpha_core::VenueQuantity::PolyShares(shares) => shares,
+                polyalpha_core::VenueQuantity::CexBaseQty(_) => PolyShares::ZERO,
+            },
             poly_max_cost_usd: UsdNotional::ZERO,
             poly_max_avg_price: Price::ZERO,
             poly_max_shares: PolyShares::ZERO,
-            poly_min_avg_price: Price::ZERO,
+            poly_min_avg_price: poly_estimate.executable_price.unwrap_or(Price::ZERO),
             poly_min_proceeds_usd: UsdNotional::ZERO,
-            poly_book_avg_price: best_level_price(&context.poly_yes_book, OrderSide::Sell),
-            poly_executable_price: best_level_price(&context.poly_yes_book, OrderSide::Sell),
-            poly_friction_cost_usd: UsdNotional::ZERO,
-            poly_fee_usd: UsdNotional::ZERO,
-            cex_side: OrderSide::Buy,
-            cex_planned_qty: CexBaseQty::ZERO,
-            cex_book_avg_price: best_level_price(&context.cex_book, OrderSide::Buy),
-            cex_executable_price: best_level_price(&context.cex_book, OrderSide::Buy),
-            cex_friction_cost_usd: UsdNotional::ZERO,
-            cex_fee_usd: UsdNotional::ZERO,
+            poly_book_avg_price: poly_estimate
+                .book_average_price
+                .unwrap_or_else(|| best_level_price(poly_book, OrderSide::Sell)),
+            poly_executable_price: poly_estimate
+                .executable_price
+                .unwrap_or_else(|| best_level_price(poly_book, OrderSide::Sell)),
+            poly_friction_cost_usd: poly_estimate.friction_cost_usd.unwrap_or(UsdNotional::ZERO),
+            poly_fee_usd,
+            cex_side,
+            cex_planned_qty: desired_cex_qty,
+            cex_book_avg_price: cex_estimate
+                .book_average_price
+                .unwrap_or_else(|| best_level_price(&context.cex_book, cex_side)),
+            cex_executable_price: cex_estimate
+                .executable_price
+                .unwrap_or_else(|| best_level_price(&context.cex_book, cex_side)),
+            cex_friction_cost_usd: cex_estimate.friction_cost_usd.unwrap_or(UsdNotional::ZERO),
+            cex_fee_usd,
             raw_edge_usd: UsdNotional::ZERO,
-            planned_edge_usd: UsdNotional::ZERO,
+            planned_edge_usd,
             expected_funding_cost_usd: UsdNotional::ZERO,
             residual_risk_penalty_usd: UsdNotional::ZERO,
             post_rounding_residual_delta: 0.0,
@@ -437,20 +532,7 @@ impl ExecutionPlanner {
         budget_cap_usd: Decimal,
         capped_max_shares: PolyShares,
     ) -> OrderExecutionEstimate {
-        let provider = Arc::new(InMemoryOrderbookProvider::new());
-        provider.update(context.poly_yes_book.clone());
-        provider.update(context.poly_no_book.clone());
-        provider.update_cex(context.cex_book.clone(), context.cex_book.symbol.0.clone());
-
-        let executor = DryRunExecutor::with_orderbook(
-            provider,
-            SlippageConfig {
-                poly_slippage_bps: DEFAULT_POLY_SLIPPAGE_BPS,
-                cex_slippage_bps: DEFAULT_CEX_SLIPPAGE_BPS,
-                min_liquidity: Decimal::new(1, 0),
-                allow_partial_fill: false,
-            },
-        );
+        let executor = self.dry_run_executor(context);
 
         executor.estimate_order_request(&OrderRequest::Poly(PolyOrderRequest {
             client_order_id: polyalpha_core::ClientOrderId("planner-poly-open".to_owned()),
@@ -468,9 +550,49 @@ impl ExecutionPlanner {
         }))
     }
 
-    fn estimate_cex_follow(
+    fn estimate_poly_close(
         &self,
-        candidate: &OpenCandidate,
+        symbol: &Symbol,
+        token_side: TokenSide,
+        context: &CanonicalPlanningContext,
+        shares: PolyShares,
+    ) -> OrderExecutionEstimate {
+        let executor = self.dry_run_executor(context);
+
+        executor.estimate_order_request(&OrderRequest::Poly(PolyOrderRequest {
+            client_order_id: polyalpha_core::ClientOrderId("planner-poly-close".to_owned()),
+            symbol: symbol.clone(),
+            token_side,
+            side: OrderSide::Sell,
+            order_type: polyalpha_core::OrderType::Market,
+            sizing: PolySizingInstruction::SellExactShares {
+                shares,
+                min_avg_price: Price::ZERO,
+            },
+            time_in_force: polyalpha_core::TimeInForce::Fok,
+            post_only: false,
+        }))
+    }
+
+    fn dry_run_executor(&self, context: &CanonicalPlanningContext) -> DryRunExecutor {
+        let provider = Arc::new(InMemoryOrderbookProvider::new());
+        provider.update(context.poly_yes_book.clone());
+        provider.update(context.poly_no_book.clone());
+        provider.update_cex(context.cex_book.clone(), context.cex_book.symbol.0.clone());
+
+        DryRunExecutor::with_orderbook(
+            provider,
+            SlippageConfig {
+                poly_slippage_bps: self.poly_slippage_bps as u64,
+                cex_slippage_bps: self.cex_slippage_bps as u64,
+                min_liquidity: Decimal::new(1, 0),
+                allow_partial_fill: false,
+            },
+        )
+    }
+
+    fn estimate_cex_order(
+        &self,
         context: &CanonicalPlanningContext,
         side: OrderSide,
         qty: CexBaseQty,
@@ -503,11 +625,12 @@ impl ExecutionPlanner {
         } else {
             None
         };
-        let executable_price = book_average_price.map(|price| apply_linear_slippage(price, side, DEFAULT_CEX_SLIPPAGE_BPS, false));
-        let hedge_notional_proxy = polyalpha_core::UsdNotional(
-            Decimal::from_f64(candidate.risk_budget_usd).unwrap_or(Decimal::ZERO)
-                * Decimal::from_f64(candidate.delta_estimate.abs()).unwrap_or(Decimal::ZERO),
-        );
+        let executable_price = book_average_price
+            .map(|price| apply_linear_slippage(price, side, self.cex_slippage_bps.into(), false));
+        let executable_notional_usd = match executable_price {
+            Some(price) => UsdNotional(filled * price.0),
+            None => UsdNotional::ZERO,
+        };
 
         OrderExecutionEstimate {
             exchange: context.cex_book.exchange,
@@ -524,9 +647,9 @@ impl ExecutionPlanner {
             orderbook_mid_price: mid_price(&context.cex_book),
             book_average_price,
             executable_price,
-            executable_notional_usd: hedge_notional_proxy,
-            friction_cost_usd: Some(bps_fee(hedge_notional_proxy, DEFAULT_CEX_SLIPPAGE_BPS as u32)),
-            fee_usd: Some(bps_fee(hedge_notional_proxy, self.cex_fee_bps)),
+            executable_notional_usd,
+            friction_cost_usd: Some(bps_fee(executable_notional_usd, self.cex_slippage_bps)),
+            fee_usd: Some(bps_fee(executable_notional_usd, self.cex_fee_bps)),
             rejection_reason: if remaining <= Decimal::ZERO {
                 None
             } else {
@@ -557,6 +680,45 @@ fn cex_side_for_delta(delta_estimate: f64) -> OrderSide {
     }
 }
 
+fn close_ratio_for_intent(intent: &PlanningIntent) -> Decimal {
+    let ratio = match intent {
+        PlanningIntent::ClosePosition {
+            target_close_ratio, ..
+        } => (*target_close_ratio).clamp(0.0, 1.0),
+        _ => 1.0,
+    };
+    Decimal::from_f64(ratio).unwrap_or(Decimal::ONE)
+}
+
+fn flatten_poly_position(
+    context: &CanonicalPlanningContext,
+    close_ratio: Decimal,
+) -> Result<(TokenSide, PolyShares), PlanRejection> {
+    let yes = context.current_poly_yes_shares.max(Decimal::ZERO);
+    let no = context.current_poly_no_shares.max(Decimal::ZERO);
+    match (yes > Decimal::ZERO, no > Decimal::ZERO) {
+        (true, false) => Ok((TokenSide::Yes, PolyShares(yes * close_ratio))),
+        (false, true) => Ok((TokenSide::No, PolyShares(no * close_ratio))),
+        (false, false) => Ok((TokenSide::Yes, PolyShares::ZERO)),
+        (true, true) => Err(PlanRejection {
+            reason: PlanRejectionReason::AdapterCannotPreserveConstraints,
+            detail: "multi-leg poly close is not supported in a single trade plan".to_owned(),
+        }),
+    }
+}
+
+fn flatten_cex_position(context: &CanonicalPlanningContext, close_ratio: Decimal) -> CexBaseQty {
+    CexBaseQty(context.current_cex_net_qty.abs() * close_ratio)
+}
+
+fn flatten_cex_side(current_cex_net_qty: Decimal) -> OrderSide {
+    if current_cex_net_qty >= Decimal::ZERO {
+        OrderSide::Sell
+    } else {
+        OrderSide::Buy
+    }
+}
+
 fn map_estimate_rejection(reason: Option<&str>) -> PlanRejectionReason {
     match reason {
         Some("insufficient_poly_depth") => PlanRejectionReason::InsufficientPolyDepth,
@@ -564,6 +726,36 @@ fn map_estimate_rejection(reason: Option<&str>) -> PlanRejectionReason {
         Some("poly_min_proceeds_not_met") => PlanRejectionReason::PolyMinProceedsNotMet,
         Some("insufficient_cex_depth") => PlanRejectionReason::InsufficientCexDepth,
         _ => PlanRejectionReason::NonPositivePlannedEdge,
+    }
+}
+
+fn empty_estimate(
+    context: &CanonicalPlanningContext,
+    exchange: polyalpha_core::Exchange,
+    symbol: Symbol,
+    instrument: polyalpha_core::InstrumentKind,
+    side: OrderSide,
+) -> OrderExecutionEstimate {
+    OrderExecutionEstimate {
+        exchange,
+        symbol,
+        instrument,
+        side,
+        status: polyalpha_core::OrderStatus::Filled,
+        requested_quantity: polyalpha_core::VenueQuantity::PolyShares(PolyShares::ZERO),
+        filled_quantity: polyalpha_core::VenueQuantity::PolyShares(PolyShares::ZERO),
+        orderbook_mid_price: mid_price(match instrument {
+            polyalpha_core::InstrumentKind::PolyYes => &context.poly_yes_book,
+            polyalpha_core::InstrumentKind::PolyNo => &context.poly_no_book,
+            polyalpha_core::InstrumentKind::CexPerp => &context.cex_book,
+        }),
+        book_average_price: Some(Price::ZERO),
+        executable_price: Some(Price::ZERO),
+        executable_notional_usd: UsdNotional::ZERO,
+        friction_cost_usd: Some(UsdNotional::ZERO),
+        fee_usd: Some(UsdNotional::ZERO),
+        rejection_reason: None,
+        is_complete: true,
     }
 }
 
@@ -597,10 +789,17 @@ fn mid_price(book: &OrderBookSnapshot) -> Option<Price> {
         .asks
         .iter()
         .min_by(|left, right| left.price.cmp(&right.price))?;
-    Some(Price((best_bid.price.0 + best_ask.price.0) / Decimal::from(2)))
+    Some(Price(
+        (best_bid.price.0 + best_ask.price.0) / Decimal::from(2),
+    ))
 }
 
-fn apply_linear_slippage(price: Price, side: OrderSide, bps: u64, clamp_probability: bool) -> Price {
+fn apply_linear_slippage(
+    price: Price,
+    side: OrderSide,
+    bps: u64,
+    clamp_probability: bool,
+) -> Price {
     let multiplier = Decimal::from(bps) / Decimal::from(10_000);
     let raw = match side {
         OrderSide::Buy => price.0 * (Decimal::ONE + multiplier),
@@ -618,8 +817,8 @@ mod tests {
     use rust_decimal::Decimal;
 
     use polyalpha_core::{
-        CexBaseQty, Exchange, OpenCandidate, OrderBookSnapshot, PlanRejectionReason,
-        PlanningIntent, Price, PriceLevel, PolyShares, SignalStrength, Symbol, TokenSide,
+        CexBaseQty, Exchange, OpenCandidate, OrderBookSnapshot, OrderSide, PlanRejectionReason,
+        PlanningIntent, PolyShares, Price, PriceLevel, SignalStrength, Symbol, TokenSide,
         VenueQuantity,
     };
 
@@ -633,9 +832,9 @@ mod tests {
             symbol: Symbol::new("btc-price-only"),
             token_side: TokenSide::Yes,
             direction: "long".to_owned(),
-            fair_value: 0.47,
-            raw_mispricing: 0.06,
-            delta_estimate: 0.18,
+            fair_value: 0.69,
+            raw_mispricing: 0.20,
+            delta_estimate: 0.00012,
             risk_budget_usd: 200.0,
             strength: SignalStrength::Normal,
             z_score: Some(2.4),
@@ -650,7 +849,7 @@ mod tests {
             candidate,
             max_budget_usd: 200.0,
             max_residual_delta: 0.05,
-            max_shock_loss_usd: 20.0,
+            max_shock_loss_usd: 200.0,
         }
     }
 
@@ -708,6 +907,10 @@ mod tests {
                 sequence: 200,
                 last_trade_price: None,
             },
+            cex_qty_step: Decimal::new(1, 3),
+            current_poly_yes_shares: Decimal::ZERO,
+            current_poly_no_shares: Decimal::ZERO,
+            current_cex_net_qty: Decimal::ZERO,
             now_ms: 1_716_000_000_100,
         }
     }
@@ -738,11 +941,39 @@ mod tests {
     #[test]
     fn planner_planned_edge_includes_fees_and_funding() {
         let planner = ExecutionPlanner::default();
-        let plan = planner.plan(&sample_open_intent(), &sample_context()).unwrap();
+        let plan = planner
+            .plan(&sample_open_intent(), &sample_context())
+            .unwrap();
 
         assert!(plan.poly_fee_usd.0 > Decimal::ZERO);
         assert!(plan.cex_fee_usd.0 > Decimal::ZERO);
         assert!(plan.expected_funding_cost_usd.0 >= Decimal::ZERO);
         assert!(plan.planned_edge_usd.0 < plan.raw_edge_usd.0);
+    }
+
+    #[test]
+    fn close_plan_uses_existing_position_snapshot() {
+        let planner = ExecutionPlanner::default();
+        let mut context = sample_context();
+        context.current_poly_yes_shares = Decimal::new(25, 0);
+        context.current_cex_net_qty = Decimal::new(-3, 1);
+        let intent = PlanningIntent::ClosePosition {
+            schema_version: 1,
+            intent_id: "intent-close-1".to_owned(),
+            correlation_id: "corr-close-1".to_owned(),
+            symbol: Symbol::new("btc-price-only"),
+            close_reason: "basis reverted".to_owned(),
+            target_close_ratio: 1.0,
+        };
+
+        let plan = planner.plan(&intent, &context).unwrap();
+
+        assert_eq!(plan.intent_type, "close_position");
+        assert_eq!(plan.poly_sizing_mode, "sell_exact_shares");
+        assert_eq!(plan.poly_token_side, TokenSide::Yes);
+        assert_eq!(plan.poly_planned_shares, PolyShares(Decimal::new(25, 0)));
+        assert_eq!(plan.cex_side, OrderSide::Buy);
+        assert_eq!(plan.cex_planned_qty, CexBaseQty(Decimal::new(3, 1)));
+        assert!(plan.poly_min_avg_price.0 > Decimal::ZERO);
     }
 }

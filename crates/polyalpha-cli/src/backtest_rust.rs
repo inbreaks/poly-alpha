@@ -13,10 +13,12 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 
 use polyalpha_core::{
-    AlphaEngine, ArbSignalAction, Exchange, InstrumentKind, MarketConfig, MarketDataEvent,
-    MarketRule, MarketRuleKind, OrderSide, PolymarketIds, Price, Symbol, TokenSide, UsdNotional,
+    AlphaEngine, CexBaseQty, Exchange, InstrumentKind, MarketConfig, MarketDataEvent, MarketRule,
+    MarketRuleKind, OpenCandidate, OrderBookSnapshot, OrderSide, PlanningIntent, PolyShares,
+    PolymarketIds, Price, PriceLevel, Symbol, TokenSide, TradePlan, UsdNotional, VenueQuantity,
 };
 use polyalpha_engine::{SimpleAlphaEngine, SimpleEngineConfig};
+use polyalpha_executor::{CanonicalPlanningContext, ExecutionPlanner};
 
 use crate::args::RustStressPreset;
 
@@ -176,8 +178,16 @@ struct ReplayPosition {
 }
 
 #[derive(Clone, Debug)]
-struct PendingReplaySignal {
-    signal: polyalpha_core::ArbSignalEvent,
+struct PendingReplayCandidate {
+    candidate: OpenCandidate,
+    spec: ReplayMarketSpec,
+    row: ReplayMinuteRow,
+    cex_reference_price: f64,
+}
+
+#[derive(Clone, Debug)]
+struct PendingReplayClose {
+    close_reason: String,
     spec: ReplayMarketSpec,
     row: ReplayMinuteRow,
     cex_reference_price: f64,
@@ -192,6 +202,7 @@ struct ReplayStats {
     signals_emitted: usize,
     signals_rejected_capital: usize,
     signals_rejected_missing_price: usize,
+    signals_rejected_planner: usize,
     signals_ignored_existing_position: usize,
     unsupported_signals: usize,
     entry_count: usize,
@@ -253,6 +264,7 @@ struct RustReplaySummary {
     signal_count: usize,
     signal_rejected_capital: usize,
     signal_rejected_missing_price: usize,
+    signal_rejected_planner: usize,
     signal_ignored_existing_position: usize,
     entry_count: usize,
     close_count: usize,
@@ -901,6 +913,7 @@ async fn run_single_replay(
     let mut trade_log = Vec::new();
     let mut snapshot_log = Vec::new();
     let mut stats = ReplayStats::default();
+    let planner = replay_execution_planner(config);
     let mut cash = config.initial_capital;
     let mut peak_equity = config.initial_capital;
     let mut last_batch_ts = None;
@@ -943,7 +956,6 @@ async fn run_single_replay(
 
         let mut pending_close_signals = Vec::new();
         let mut pending_entry_signals = Vec::new();
-        let mut pending_other_signals = Vec::new();
         for row in &dataset.rows[idx..batch_end] {
             let Some(spec) = dataset.markets.get(&row.market_id) else {
                 continue;
@@ -1022,7 +1034,7 @@ async fn run_single_replay(
 
             if capture_snapshots {
                 let snapshot = engine.basis_snapshot(&spec.symbol);
-                let first_signal = output.arb_signals.first();
+                let first_candidate = output.open_candidates.first();
                 snapshot_log.push(ReplaySnapshotRow {
                     ts_ms,
                     event_id: spec.event_id.clone(),
@@ -1032,18 +1044,15 @@ async fn run_single_replay(
                     no_price: row.no_price,
                     cex_reference_price,
                     cex_advance_price,
-                    signal_count: output.arb_signals.len(),
-                    signal_action: first_signal.map(|s| signal_action_label(&s.action)),
-                    signal_token_side: first_signal
-                        .and_then(|s| signal_token_side(&s.action))
+                    signal_count: output.open_candidates.len(),
+                    signal_action: first_candidate.map(candidate_action_label),
+                    signal_token_side: first_candidate
+                        .map(|candidate| candidate.token_side)
                         .map(token_side_label)
                         .map(|s| s.to_string()),
-                    signal_basis_bps: first_signal
-                        .and_then(|signal| signal.basis_value.as_ref())
-                        .and_then(Decimal::to_f64),
-                    signal_z_score: first_signal
-                        .and_then(|signal| signal.z_score.as_ref())
-                        .and_then(Decimal::to_f64),
+                    signal_basis_bps: first_candidate
+                        .map(|candidate| candidate.raw_mispricing * 10_000.0),
+                    signal_z_score: first_candidate.and_then(|candidate| candidate.z_score),
                     snapshot_token_side: snapshot
                         .as_ref()
                         .map(|item| token_side_label(item.token_side).to_string()),
@@ -1059,28 +1068,34 @@ async fn run_single_replay(
                 });
             }
 
-            for signal in output.arb_signals {
-                let pending = PendingReplaySignal {
-                    signal,
+            for candidate in output.open_candidates {
+                let pending = PendingReplayCandidate {
+                    candidate,
                     spec: spec.clone(),
                     row: row.clone(),
                     cex_reference_price,
                 };
-                match pending.signal.action {
-                    ArbSignalAction::ClosePosition { .. } => pending_close_signals.push(pending),
-                    ArbSignalAction::BasisLong { .. } => pending_entry_signals.push(pending),
-                    _ => pending_other_signals.push(pending),
-                }
+                pending_entry_signals.push(pending);
+            }
+
+            if let Some(reason) = engine.close_reason(&spec.symbol) {
+                pending_close_signals.push(PendingReplayClose {
+                    close_reason: reason,
+                    spec: spec.clone(),
+                    row: row.clone(),
+                    cex_reference_price,
+                });
             }
         }
 
         for pending in pending_close_signals {
-            handle_signal(
-                pending.signal,
+            handle_close_signal(
+                &pending.close_reason,
                 &pending.spec,
                 &pending.row,
                 pending.cex_reference_price,
                 config,
+                &planner,
                 &mut positions,
                 &mut cash,
                 &mut stats,
@@ -1120,6 +1135,7 @@ async fn run_single_replay(
                 true,
                 "settled",
                 config,
+                &planner,
                 &mut positions,
                 &mut cash,
                 &mut stats,
@@ -1168,6 +1184,7 @@ async fn run_single_replay(
                     false,
                     &reason,
                     config,
+                    &planner,
                     &mut positions,
                     &mut cash,
                     &mut stats,
@@ -1182,36 +1199,14 @@ async fn run_single_replay(
         }
 
         pending_entry_signals.sort_by(|left, right| {
-            let left_z = left
-                .signal
-                .z_score
-                .as_ref()
-                .and_then(Decimal::to_f64)
-                .unwrap_or(f64::INFINITY);
-            let right_z = right
-                .signal
-                .z_score
-                .as_ref()
-                .and_then(Decimal::to_f64)
-                .unwrap_or(f64::INFINITY);
+            let left_z = left.candidate.z_score.unwrap_or(f64::INFINITY);
+            let right_z = right.candidate.z_score.unwrap_or(f64::INFINITY);
             left_z
                 .partial_cmp(&right_z)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| {
-                    let left_basis = left
-                        .signal
-                        .basis_value
-                        .as_ref()
-                        .and_then(Decimal::to_f64)
-                        .unwrap_or_default()
-                        .abs();
-                    let right_basis = right
-                        .signal
-                        .basis_value
-                        .as_ref()
-                        .and_then(Decimal::to_f64)
-                        .unwrap_or_default()
-                        .abs();
+                    let left_basis = left.candidate.raw_mispricing.abs();
+                    let right_basis = right.candidate.raw_mispricing.abs();
                     right_basis
                         .partial_cmp(&left_basis)
                         .unwrap_or(std::cmp::Ordering::Equal)
@@ -1219,32 +1214,13 @@ async fn run_single_replay(
         });
 
         for pending in pending_entry_signals {
-            handle_signal(
-                pending.signal,
+            handle_candidate(
+                pending.candidate,
                 &pending.spec,
                 &pending.row,
                 pending.cex_reference_price,
                 config,
-                &mut positions,
-                &mut cash,
-                &mut stats,
-                &mut trade_log,
-            )?;
-            engine.sync_position_state(
-                &pending.spec.symbol,
-                positions
-                    .get(&pending.spec.symbol)
-                    .map(|position| position.token_side),
-            );
-        }
-
-        for pending in pending_other_signals {
-            handle_signal(
-                pending.signal,
-                &pending.spec,
-                &pending.row,
-                pending.cex_reference_price,
-                config,
+                &planner,
                 &mut positions,
                 &mut cash,
                 &mut stats,
@@ -1297,6 +1273,7 @@ async fn run_single_replay(
                 true,
                 "settled",
                 config,
+                &planner,
                 &mut positions,
                 &mut cash,
                 &mut stats,
@@ -1349,6 +1326,7 @@ async fn run_single_replay(
         signal_count: stats.signals_emitted,
         signal_rejected_capital: stats.signals_rejected_capital,
         signal_rejected_missing_price: stats.signals_rejected_missing_price,
+        signal_rejected_planner: stats.signals_rejected_planner,
         signal_ignored_existing_position: stats.signals_ignored_existing_position,
         entry_count: stats.entry_count,
         close_count: stats.close_count,
@@ -1451,191 +1429,454 @@ async fn advance_symbol_cex_state(
     Ok(())
 }
 
-fn handle_signal(
-    signal: polyalpha_core::ArbSignalEvent,
+fn replay_execution_planner(config: &ResolvedReplayConfig) -> ExecutionPlanner {
+    ExecutionPlanner {
+        poly_fee_bps: rounded_bps(config.stress.poly_fee_bps),
+        cex_fee_bps: rounded_bps(config.stress.cex_fee_bps),
+        funding_bps_per_day: 0,
+        poly_slippage_bps: rounded_bps(config.stress.poly_slippage_bps),
+        cex_slippage_bps: rounded_bps(config.stress.cex_slippage_bps),
+    }
+}
+
+fn rounded_bps(value: f64) -> u32 {
+    value.max(0.0).round() as u32
+}
+
+fn replay_open_intent(candidate: &OpenCandidate) -> PlanningIntent {
+    PlanningIntent::OpenPosition {
+        schema_version: candidate.schema_version,
+        intent_id: format!("replay-open-{}", candidate.candidate_id),
+        correlation_id: candidate.correlation_id.clone(),
+        symbol: candidate.symbol.clone(),
+        candidate: candidate.clone(),
+        max_budget_usd: candidate.risk_budget_usd,
+        max_residual_delta: 0.05,
+        max_shock_loss_usd: candidate.risk_budget_usd.max(25.0),
+    }
+}
+
+fn replay_close_intent(symbol: &Symbol, close_reason: &str, ts_ms: u64) -> PlanningIntent {
+    PlanningIntent::ClosePosition {
+        schema_version: 1,
+        intent_id: format!("replay-close-{}-{ts_ms}", symbol.0),
+        correlation_id: format!("replay-close-{}-{ts_ms}", symbol.0),
+        symbol: symbol.clone(),
+        close_reason: close_reason.to_owned(),
+        target_close_ratio: 1.0,
+    }
+}
+
+fn synthetic_book_quantity() -> Decimal {
+    Decimal::new(1_000_000, 0)
+}
+
+fn decimal_price(value: f64, label: &str) -> Result<Decimal> {
+    Decimal::from_f64(value).ok_or_else(|| anyhow!("invalid {label} price `{value}`"))
+}
+
+fn synthetic_poly_book(
+    symbol: &Symbol,
+    token_side: TokenSide,
+    price: f64,
+    ts_ms: u64,
+) -> Result<OrderBookSnapshot> {
+    let price = Price(decimal_price(price, "poly")?);
+    Ok(OrderBookSnapshot {
+        exchange: Exchange::Polymarket,
+        symbol: symbol.clone(),
+        instrument: match token_side {
+            TokenSide::Yes => InstrumentKind::PolyYes,
+            TokenSide::No => InstrumentKind::PolyNo,
+        },
+        bids: vec![PriceLevel {
+            price,
+            quantity: VenueQuantity::PolyShares(PolyShares(synthetic_book_quantity())),
+        }],
+        asks: vec![PriceLevel {
+            price,
+            quantity: VenueQuantity::PolyShares(PolyShares(synthetic_book_quantity())),
+        }],
+        exchange_timestamp_ms: ts_ms,
+        received_at_ms: ts_ms,
+        sequence: ts_ms,
+        last_trade_price: Some(price),
+    })
+}
+
+fn synthetic_cex_book(symbol: &Symbol, price: f64, ts_ms: u64) -> Result<OrderBookSnapshot> {
+    let price = Price(decimal_price(price, "cex")?);
+    Ok(OrderBookSnapshot {
+        exchange: Exchange::Binance,
+        symbol: symbol.clone(),
+        instrument: InstrumentKind::CexPerp,
+        bids: vec![PriceLevel {
+            price,
+            quantity: VenueQuantity::CexBaseQty(CexBaseQty(synthetic_book_quantity())),
+        }],
+        asks: vec![PriceLevel {
+            price,
+            quantity: VenueQuantity::CexBaseQty(CexBaseQty(synthetic_book_quantity())),
+        }],
+        exchange_timestamp_ms: ts_ms,
+        received_at_ms: ts_ms,
+        sequence: ts_ms,
+        last_trade_price: Some(price),
+    })
+}
+
+fn replay_planning_context(
+    symbol: &Symbol,
+    row: &ReplayMinuteRow,
+    cex_reference_price: f64,
+    cex_qty_step: Decimal,
+    positions: &HashMap<Symbol, ReplayPosition>,
+) -> Result<CanonicalPlanningContext> {
+    let yes_price = row
+        .yes_price
+        .ok_or_else(|| anyhow!("missing yes price for `{}` at {}", symbol.0, row.ts_ms))?;
+    let no_price = row
+        .no_price
+        .ok_or_else(|| anyhow!("missing no price for `{}` at {}", symbol.0, row.ts_ms))?;
+    if cex_reference_price <= 0.0 {
+        bail!(
+            "missing cex reference price for `{}` at {}",
+            symbol.0,
+            row.ts_ms
+        );
+    }
+
+    let current_position = positions.get(symbol);
+    let (current_poly_yes_shares, current_poly_no_shares, current_cex_net_qty) =
+        match current_position {
+            Some(position) => match position.token_side {
+                TokenSide::Yes => (
+                    Decimal::from_f64(position.shares).unwrap_or(Decimal::ZERO),
+                    Decimal::ZERO,
+                    Decimal::from_f64(position.cex_qty_btc).unwrap_or(Decimal::ZERO),
+                ),
+                TokenSide::No => (
+                    Decimal::ZERO,
+                    Decimal::from_f64(position.shares).unwrap_or(Decimal::ZERO),
+                    Decimal::from_f64(position.cex_qty_btc).unwrap_or(Decimal::ZERO),
+                ),
+            },
+            None => (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO),
+        };
+
+    Ok(CanonicalPlanningContext {
+        planner_depth_levels: 1,
+        poly_yes_book: synthetic_poly_book(symbol, TokenSide::Yes, yes_price, row.ts_ms)?,
+        poly_no_book: synthetic_poly_book(symbol, TokenSide::No, no_price, row.ts_ms)?,
+        cex_book: synthetic_cex_book(symbol, cex_reference_price, row.ts_ms)?,
+        cex_qty_step,
+        current_poly_yes_shares,
+        current_poly_no_shares,
+        current_cex_net_qty,
+        now_ms: row.ts_ms,
+    })
+}
+
+fn plan_replay_open_candidate(
+    planner: &ExecutionPlanner,
+    candidate: &OpenCandidate,
+    row: &ReplayMinuteRow,
+    cex_reference_price: f64,
+    cex_qty_step: Decimal,
+    positions: &HashMap<Symbol, ReplayPosition>,
+) -> Result<TradePlan> {
+    let intent = replay_open_intent(candidate);
+    let context = replay_planning_context(
+        &candidate.symbol,
+        row,
+        cex_reference_price,
+        cex_qty_step,
+        positions,
+    )?;
+    planner.plan(&intent, &context).map_err(|rejection| {
+        anyhow!(
+            "replay planner rejected [{}]: {}",
+            rejection.reason.code(),
+            rejection.detail
+        )
+    })
+}
+
+fn plan_replay_close_position(
+    planner: &ExecutionPlanner,
+    symbol: &Symbol,
+    close_reason: &str,
+    row: &ReplayMinuteRow,
+    cex_reference_price: f64,
+    cex_qty_step: Decimal,
+    positions: &HashMap<Symbol, ReplayPosition>,
+) -> Result<TradePlan> {
+    let intent = replay_close_intent(symbol, close_reason, row.ts_ms);
+    let context =
+        replay_planning_context(symbol, row, cex_reference_price, cex_qty_step, positions)?;
+    planner.plan(&intent, &context).map_err(|rejection| {
+        anyhow!(
+            "replay close planner rejected [{}]: {}",
+            rejection.reason.code(),
+            rejection.detail
+        )
+    })
+}
+
+fn scaled_decimal(value: Decimal, ratio: Decimal) -> Decimal {
+    (value * ratio).max(Decimal::ZERO)
+}
+
+fn replay_close_row(
+    spec: &ReplayMarketSpec,
+    position: &ReplayPosition,
+    market_exit_price: Option<f64>,
+    ts_ms: u64,
+) -> ReplayMinuteRow {
+    let current_side_price =
+        clamp_probability_value(market_exit_price.unwrap_or(position.last_poly_price));
+    let complementary_price = clamp_probability_value(1.0 - current_side_price);
+    let (yes_price, no_price) = match position.token_side {
+        TokenSide::Yes => (Some(current_side_price), Some(complementary_price)),
+        TokenSide::No => (Some(complementary_price), Some(current_side_price)),
+    };
+    ReplayMinuteRow {
+        ts_ms,
+        market_id: spec.market_id.clone(),
+        yes_price,
+        no_price,
+    }
+}
+
+fn replay_slipped_price(
+    price: f64,
+    side: OrderSide,
+    slippage_bps: f64,
+    clamp_probability: bool,
+) -> f64 {
+    let multiplier = 1.0
+        + match side {
+            OrderSide::Buy => slippage_bps / 10_000.0,
+            OrderSide::Sell => -slippage_bps / 10_000.0,
+        };
+    let slipped = price * multiplier;
+    if clamp_probability {
+        slipped.clamp(0.0, 1.0)
+    } else {
+        slipped.max(0.0)
+    }
+}
+
+fn handle_candidate(
+    candidate: OpenCandidate,
     spec: &ReplayMarketSpec,
     row: &ReplayMinuteRow,
     cex_reference_price: f64,
     config: &ResolvedReplayConfig,
+    planner: &ExecutionPlanner,
     positions: &mut HashMap<Symbol, ReplayPosition>,
     cash: &mut f64,
     stats: &mut ReplayStats,
-    trade_log: &mut Vec<ReplayTradeRow>,
+    _trade_log: &mut Vec<ReplayTradeRow>,
 ) -> Result<()> {
     stats.signals_emitted += 1;
     *stats
         .signals_by_market
         .entry(spec.market_id.clone())
         .or_insert(0) += 1;
-    let entry_z_score = signal
-        .z_score
-        .as_ref()
-        .and_then(Decimal::to_f64)
+    let entry_z_score = candidate.z_score.unwrap_or_default();
+    let entry_basis_bps = candidate.raw_mispricing * 10_000.0;
+    if positions.contains_key(&spec.symbol) {
+        stats.signals_ignored_existing_position += 1;
+        return Ok(());
+    }
+
+    let token_side = candidate.token_side;
+    let Some(poly_entry_price) = row.price_for(token_side) else {
+        stats.signals_rejected_missing_price += 1;
+        return Ok(());
+    };
+    if poly_entry_price <= 0.0 || cex_reference_price <= 0.0 {
+        stats.signals_rejected_missing_price += 1;
+        return Ok(());
+    }
+
+    if let Some(min_price) = config.min_poly_price {
+        if poly_entry_price < min_price {
+            stats.signals_rejected_missing_price += 1;
+            return Ok(());
+        }
+    }
+    if let Some(max_price) = config.max_poly_price {
+        if poly_entry_price >= max_price {
+            stats.signals_rejected_missing_price += 1;
+            return Ok(());
+        }
+    }
+
+    let plan = match plan_replay_open_candidate(
+        planner,
+        &candidate,
+        row,
+        cex_reference_price,
+        spec.market_config.cex_qty_step,
+        positions,
+    ) {
+        Ok(plan) => plan,
+        Err(_) => {
+            stats.signals_rejected_planner += 1;
+            return Ok(());
+        }
+    };
+    let fill_ratio =
+        Decimal::from_f64(config.stress.entry_fill_ratio.clamp(0.0, 1.0)).unwrap_or(Decimal::ONE);
+    let planned_shares = plan.poly_planned_shares.0;
+    let actual_poly_shares = scaled_decimal(planned_shares, fill_ratio);
+    if actual_poly_shares <= Decimal::ZERO {
+        stats.signals_rejected_planner += 1;
+        return Ok(());
+    }
+    let actual_fill_ratio = if planned_shares > Decimal::ZERO {
+        actual_poly_shares / planned_shares
+    } else {
+        Decimal::ZERO
+    };
+    let shares = actual_poly_shares.to_f64().unwrap_or_default();
+
+    let poly_entry_price = plan
+        .poly_executable_price
+        .0
+        .to_f64()
+        .unwrap_or(poly_entry_price);
+    let poly_entry_notional = (actual_poly_shares * plan.poly_executable_price.0)
+        .to_f64()
         .unwrap_or_default();
-    let entry_basis_bps = signal
-        .basis_value
-        .as_ref()
-        .and_then(Decimal::to_f64)
-        .unwrap_or_default()
-        * 10_000.0;
-    match signal.action {
-        ArbSignalAction::BasisLong {
+    let actual_cex_qty = scaled_decimal(plan.cex_planned_qty.0, actual_fill_ratio);
+    let cex_qty_abs = actual_cex_qty.to_f64().unwrap_or_default();
+    let cex_side = plan.cex_side;
+    let cex_qty_btc = if matches!(cex_side, OrderSide::Buy) {
+        cex_qty_abs
+    } else {
+        -cex_qty_abs
+    };
+    let cex_entry_price = plan
+        .cex_executable_price
+        .0
+        .to_f64()
+        .unwrap_or(cex_reference_price);
+    let cex_entry_notional = (actual_cex_qty * plan.cex_executable_price.0)
+        .to_f64()
+        .unwrap_or_default();
+    let margin_required = cex_entry_notional * config.cex_margin_ratio;
+    let (_, capital_in_use) = portfolio_usage(positions);
+    let reserved_margin_total = portfolio_usage(positions).0;
+    let available_cash = *cash - reserved_margin_total;
+    let poly_fee_paid = scaled_decimal(plan.poly_fee_usd.0, actual_fill_ratio)
+        .to_f64()
+        .unwrap_or_default();
+    let poly_slippage_paid = scaled_decimal(plan.poly_friction_cost_usd.0, actual_fill_ratio)
+        .to_f64()
+        .unwrap_or_default();
+    let cex_fee_paid = scaled_decimal(plan.cex_fee_usd.0, actual_fill_ratio)
+        .to_f64()
+        .unwrap_or_default();
+    let cex_slippage_paid = scaled_decimal(plan.cex_friction_cost_usd.0, actual_fill_ratio)
+        .to_f64()
+        .unwrap_or_default();
+    let estimated_entry_costs = poly_fee_paid + cex_fee_paid;
+    let required_cash = poly_entry_notional + margin_required + estimated_entry_costs;
+    let capital_limit = config.initial_capital * config.max_capital_usage;
+    if available_cash + 1e-12 < required_cash
+        || capital_in_use + poly_entry_notional + margin_required > capital_limit + 1e-12
+    {
+        stats.signals_rejected_capital += 1;
+        *stats
+            .rejected_capital_by_market
+            .entry(spec.market_id.clone())
+            .or_insert(0) += 1;
+        return Ok(());
+    }
+
+    *cash -= poly_entry_notional;
+    *cash -= poly_fee_paid;
+    record_costs(
+        stats,
+        poly_fee_paid,
+        poly_slippage_paid,
+        true,
+        true,
+        poly_entry_notional > 0.0,
+    );
+
+    let mut round_trip_pnl = -poly_fee_paid;
+    let mut entry_fees_paid = poly_fee_paid;
+    let mut entry_slippage_paid = poly_slippage_paid;
+    if cex_entry_notional > 0.0 {
+        *cash -= cex_fee_paid;
+        round_trip_pnl -= cex_fee_paid;
+        record_costs(stats, cex_fee_paid, cex_slippage_paid, false, true, true);
+        entry_fees_paid += cex_fee_paid;
+        entry_slippage_paid += cex_slippage_paid;
+    }
+
+    positions.insert(
+        spec.symbol.clone(),
+        ReplayPosition {
+            market_id: spec.market_id.clone(),
             token_side,
-            poly_target_shares,
-            cex_side,
-            cex_hedge_qty,
-            delta,
-            ..
-        } => {
-            if positions.contains_key(&spec.symbol) {
-                stats.signals_ignored_existing_position += 1;
-                return Ok(());
-            }
+            shares,
+            poly_entry_notional,
+            last_poly_price: poly_entry_price,
+            cex_entry_price,
+            cex_qty_btc,
+            last_cex_price: cex_entry_price,
+            reserved_margin: margin_required,
+            round_trip_pnl,
+            entry_ts_ms: row.ts_ms,
+            entry_poly_price: poly_entry_price,
+            entry_fees_paid,
+            entry_slippage_paid,
+            entry_z_score,
+            entry_basis_bps,
+            entry_delta: candidate.delta_estimate,
+        },
+    );
+    stats.entry_count += 1;
+    *stats
+        .entries_by_market
+        .entry(spec.market_id.clone())
+        .or_insert(0) += 1;
+    Ok(())
+}
 
-            let Some(poly_entry_price) = row.price_for(token_side) else {
-                stats.signals_rejected_missing_price += 1;
-                return Ok(());
-            };
-
-            let shares =
-                poly_target_shares.0.to_f64().unwrap_or_default() * config.stress.entry_fill_ratio;
-            if shares <= 0.0 || poly_entry_price <= 0.0 || cex_reference_price <= 0.0 {
-                stats.signals_rejected_missing_price += 1;
-                return Ok(());
-            }
-
-            // Price range filter: reject signals outside the configured price range
-            if let Some(min_price) = config.min_poly_price {
-                if poly_entry_price < min_price {
-                    stats.signals_rejected_missing_price += 1;
-                    return Ok(());
-                }
-            }
-            if let Some(max_price) = config.max_poly_price {
-                if poly_entry_price >= max_price {
-                    stats.signals_rejected_missing_price += 1;
-                    return Ok(());
-                }
-            }
-
-            let poly_entry_notional = shares * poly_entry_price;
-            let cex_qty_abs =
-                cex_hedge_qty.0.to_f64().unwrap_or_default() * config.stress.entry_fill_ratio;
-            let cex_qty_btc = if matches!(cex_side, OrderSide::Buy) {
-                cex_qty_abs
-            } else {
-                -cex_qty_abs
-            };
-            let cex_entry_notional = cex_qty_abs * cex_reference_price;
-            let margin_required = cex_entry_notional * config.cex_margin_ratio;
-            let (_, capital_in_use) = portfolio_usage(positions);
-            let reserved_margin_total = portfolio_usage(positions).0;
-            let available_cash = *cash - reserved_margin_total;
-            let estimated_entry_costs = trade_cost(
-                poly_entry_notional,
-                config.stress.poly_fee_bps,
-                config.stress.poly_slippage_bps,
-            )
-            .0 + trade_cost(
-                cex_entry_notional,
-                config.stress.cex_fee_bps,
-                config.stress.cex_slippage_bps,
-            )
-            .0;
-            let required_cash = poly_entry_notional + margin_required + estimated_entry_costs;
-            let capital_limit = config.initial_capital * config.max_capital_usage;
-            if available_cash + 1e-12 < required_cash
-                || capital_in_use + poly_entry_notional + margin_required > capital_limit + 1e-12
-            {
-                stats.signals_rejected_capital += 1;
-                *stats
-                    .rejected_capital_by_market
-                    .entry(spec.market_id.clone())
-                    .or_insert(0) += 1;
-                return Ok(());
-            }
-
-            *cash -= poly_entry_notional;
-            let (poly_costs, poly_fee_paid, poly_slippage_paid) = trade_cost(
-                poly_entry_notional,
-                config.stress.poly_fee_bps,
-                config.stress.poly_slippage_bps,
-            );
-            *cash -= poly_costs;
-            record_costs(
-                stats,
-                poly_fee_paid,
-                poly_slippage_paid,
-                true,
-                true,
-                poly_entry_notional > 0.0,
-            );
-
-            let mut round_trip_pnl = -(poly_costs);
-            let mut entry_fees_paid = poly_fee_paid;
-            let mut entry_slippage_paid = poly_slippage_paid;
-            if cex_entry_notional > 0.0 {
-                let (cex_costs, cex_fee_paid, cex_slippage_paid) = trade_cost(
-                    cex_entry_notional,
-                    config.stress.cex_fee_bps,
-                    config.stress.cex_slippage_bps,
-                );
-                *cash -= cex_costs;
-                round_trip_pnl -= cex_costs;
-                record_costs(stats, cex_fee_paid, cex_slippage_paid, false, true, true);
-                entry_fees_paid += cex_fee_paid;
-                entry_slippage_paid += cex_slippage_paid;
-            }
-
-            positions.insert(
-                spec.symbol.clone(),
-                ReplayPosition {
-                    market_id: spec.market_id.clone(),
-                    token_side,
-                    shares,
-                    poly_entry_notional,
-                    last_poly_price: poly_entry_price,
-                    cex_entry_price: cex_reference_price,
-                    cex_qty_btc,
-                    last_cex_price: cex_reference_price,
-                    reserved_margin: margin_required,
-                    round_trip_pnl,
-                    entry_ts_ms: row.ts_ms,
-                    entry_poly_price: poly_entry_price,
-                    entry_fees_paid,
-                    entry_slippage_paid,
-                    entry_z_score,
-                    entry_basis_bps,
-                    entry_delta: delta,
-                },
-            );
-            stats.entry_count += 1;
-            *stats
-                .entries_by_market
-                .entry(spec.market_id.clone())
-                .or_insert(0) += 1;
-        }
-        ArbSignalAction::ClosePosition { reason } => {
-            if positions.contains_key(&spec.symbol) {
-                close_position(
-                    &spec.symbol,
-                    spec,
-                    row.current_price_for_position(positions.get(&spec.symbol)),
-                    cex_reference_price,
-                    false,
-                    &reason,
-                    config,
-                    positions,
-                    cash,
-                    stats,
-                    trade_log,
-                    row.ts_ms,
-                )?;
-            }
-        }
-        _ => {
-            stats.unsupported_signals += 1;
-        }
+fn handle_close_signal(
+    close_reason: &str,
+    spec: &ReplayMarketSpec,
+    row: &ReplayMinuteRow,
+    cex_reference_price: f64,
+    config: &ResolvedReplayConfig,
+    planner: &ExecutionPlanner,
+    positions: &mut HashMap<Symbol, ReplayPosition>,
+    cash: &mut f64,
+    stats: &mut ReplayStats,
+    trade_log: &mut Vec<ReplayTradeRow>,
+) -> Result<()> {
+    if positions.contains_key(&spec.symbol) {
+        close_position(
+            &spec.symbol,
+            spec,
+            row.current_price_for_position(positions.get(&spec.symbol)),
+            cex_reference_price,
+            false,
+            close_reason,
+            config,
+            planner,
+            positions,
+            cash,
+            stats,
+            trade_log,
+            row.ts_ms,
+        )?;
     }
     Ok(())
 }
@@ -1768,12 +2009,34 @@ fn close_position(
     settle_to_payout: bool,
     close_reason: &str,
     config: &ResolvedReplayConfig,
+    planner: &ExecutionPlanner,
     positions: &mut HashMap<Symbol, ReplayPosition>,
     cash: &mut f64,
     stats: &mut ReplayStats,
     trade_log: &mut Vec<ReplayTradeRow>,
     ts_ms: u64,
 ) -> Result<()> {
+    let Some(existing_position) = positions.get(symbol).cloned() else {
+        return Ok(());
+    };
+    let close_plan = if settle_to_payout {
+        None
+    } else {
+        let close_row = replay_close_row(spec, &existing_position, market_exit_price, ts_ms);
+        match plan_replay_close_position(
+            planner,
+            symbol,
+            close_reason,
+            &close_row,
+            exit_cex_price,
+            spec.market_config.cex_qty_step,
+            positions,
+        ) {
+            Ok(plan) => Some(plan),
+            Err(_) => return Ok(()),
+        }
+    };
+
     let Some(mut position) = positions.remove(symbol) else {
         return Ok(());
     };
@@ -1781,47 +2044,92 @@ fn close_position(
     let used_exit_poly_price = if settle_to_payout {
         settlement_payout(spec, position.token_side, exit_cex_price)
     } else {
-        market_exit_price.unwrap_or(position.last_poly_price)
+        close_plan
+            .as_ref()
+            .and_then(|plan| plan.poly_executable_price.0.to_f64())
+            .or(market_exit_price)
+            .unwrap_or(position.last_poly_price)
     };
-    let sale_value = position.shares * used_exit_poly_price;
+    let sale_value = if settle_to_payout {
+        position.shares * used_exit_poly_price
+    } else {
+        close_plan
+            .as_ref()
+            .map(|plan| {
+                (plan.poly_planned_shares.0 * plan.poly_executable_price.0)
+                    .to_f64()
+                    .unwrap_or_default()
+            })
+            .unwrap_or_else(|| position.shares * used_exit_poly_price)
+    };
     let poly_gross_pnl = sale_value - position.poly_entry_notional;
     *cash += sale_value;
     stats.poly_realized_gross += poly_gross_pnl;
     position.round_trip_pnl += poly_gross_pnl;
-    let mut exit_fees_paid = 0.0;
-    let mut exit_slippage_paid = 0.0;
+    let exit_poly_fee_paid = close_plan
+        .as_ref()
+        .and_then(|plan| plan.poly_fee_usd.0.to_f64())
+        .unwrap_or_default();
+    let exit_poly_slippage_paid = close_plan
+        .as_ref()
+        .and_then(|plan| plan.poly_friction_cost_usd.0.to_f64())
+        .unwrap_or_default();
+    let mut exit_fees_paid = exit_poly_fee_paid;
+    let mut exit_slippage_paid = exit_poly_slippage_paid;
 
     if !settle_to_payout && sale_value > 0.0 {
-        let (poly_costs, poly_fee_paid, poly_slippage_paid) = trade_cost(
-            sale_value,
-            config.stress.poly_fee_bps,
-            config.stress.poly_slippage_bps,
+        *cash -= exit_poly_fee_paid;
+        position.round_trip_pnl -= exit_poly_fee_paid;
+        record_costs(
+            stats,
+            exit_poly_fee_paid,
+            exit_poly_slippage_paid,
+            true,
+            false,
+            true,
         );
-        *cash -= poly_costs;
-        position.round_trip_pnl -= poly_costs;
-        record_costs(stats, poly_fee_paid, poly_slippage_paid, true, false, true);
-        exit_fees_paid += poly_fee_paid;
-        exit_slippage_paid += poly_slippage_paid;
     }
 
+    let used_exit_cex_price = if settle_to_payout {
+        replay_slipped_price(
+            exit_cex_price,
+            if position.cex_qty_btc >= 0.0 {
+                OrderSide::Sell
+            } else {
+                OrderSide::Buy
+            },
+            config.stress.cex_slippage_bps,
+            false,
+        )
+    } else {
+        close_plan
+            .as_ref()
+            .and_then(|plan| plan.cex_executable_price.0.to_f64())
+            .unwrap_or(exit_cex_price)
+    };
     let cex_gross_pnl = linear_cex_pnl(
         position.cex_entry_price,
-        exit_cex_price,
+        used_exit_cex_price,
         position.cex_qty_btc,
     );
     *cash += cex_gross_pnl;
     stats.cex_realized_gross += cex_gross_pnl;
     position.round_trip_pnl += cex_gross_pnl;
 
-    let exit_cex_notional = position.cex_qty_btc.abs() * exit_cex_price;
+    let exit_cex_notional = position.cex_qty_btc.abs() * used_exit_cex_price;
     if exit_cex_notional > 0.0 {
-        let (cex_costs, cex_fee_paid, cex_slippage_paid) = trade_cost(
-            exit_cex_notional,
-            config.stress.cex_fee_bps,
-            config.stress.cex_slippage_bps,
-        );
-        *cash -= cex_costs;
-        position.round_trip_pnl -= cex_costs;
+        let cex_fee_paid = close_plan
+            .as_ref()
+            .and_then(|plan| plan.cex_fee_usd.0.to_f64())
+            .unwrap_or_else(|| exit_cex_notional * config.stress.cex_fee_bps / 10_000.0);
+        let cex_slippage_paid = close_plan
+            .as_ref()
+            .and_then(|plan| plan.cex_friction_cost_usd.0.to_f64())
+            .unwrap_or_else(|| {
+                (position.cex_qty_btc.abs() * (used_exit_cex_price - exit_cex_price).abs()).max(0.0)
+            });
+        *cash -= cex_fee_paid;
+        position.round_trip_pnl -= cex_fee_paid;
         record_costs(stats, cex_fee_paid, cex_slippage_paid, false, false, true);
         exit_fees_paid += cex_fee_paid;
         exit_slippage_paid += cex_slippage_paid;
@@ -1830,7 +2138,7 @@ fn close_position(
     let round_trip_gross_pnl = poly_gross_pnl + cex_gross_pnl;
     let total_fees_paid = position.entry_fees_paid + exit_fees_paid;
     let total_slippage_paid = position.entry_slippage_paid + exit_slippage_paid;
-    let round_trip_net_pnl = round_trip_gross_pnl - total_fees_paid - total_slippage_paid;
+    let round_trip_net_pnl = round_trip_gross_pnl - total_fees_paid;
 
     trade_log.push(ReplayTradeRow {
         trade_id: trade_log.len() + 1,
@@ -1844,7 +2152,7 @@ fn close_position(
         entry_poly_price: position.entry_poly_price,
         exit_poly_price: used_exit_poly_price,
         entry_cex_price: position.cex_entry_price,
-        exit_cex_price,
+        exit_cex_price: used_exit_cex_price,
         poly_shares: position.shares,
         cex_qty: position.cex_qty_btc.abs(),
         gross_pnl: round_trip_gross_pnl,
@@ -2194,13 +2502,6 @@ fn cex_trade_event(symbol: &Symbol, price: f64, ts_ms: u64) -> MarketDataEvent {
     }
 }
 
-fn trade_cost(notional: f64, fee_bps: f64, slippage_bps: f64) -> (f64, f64, f64) {
-    let abs_notional = notional.abs();
-    let fee_paid = abs_notional * fee_bps / 10_000.0;
-    let slippage_paid = abs_notional * slippage_bps / 10_000.0;
-    (fee_paid + slippage_paid, fee_paid, slippage_paid)
-}
-
 fn record_costs(
     stats: &mut ReplayStats,
     fee_paid: f64,
@@ -2304,21 +2605,11 @@ fn token_side_label(token_side: TokenSide) -> &'static str {
     }
 }
 
-fn signal_action_label(action: &ArbSignalAction) -> String {
-    match action {
-        ArbSignalAction::BasisLong { .. } => "basis_long".to_string(),
-        ArbSignalAction::BasisShort { .. } => "basis_short".to_string(),
-        ArbSignalAction::DeltaRebalance { .. } => "delta_rebalance".to_string(),
-        ArbSignalAction::NegRiskArb { .. } => "neg_risk_arb".to_string(),
-        ArbSignalAction::ClosePosition { reason } => format!("close_position:{}", reason),
-    }
-}
-
-fn signal_token_side(action: &ArbSignalAction) -> Option<TokenSide> {
-    match action {
-        ArbSignalAction::BasisLong { token_side, .. } => Some(*token_side),
-        ArbSignalAction::BasisShort { token_side, .. } => Some(*token_side),
-        _ => None,
+fn candidate_action_label(candidate: &OpenCandidate) -> String {
+    match candidate.direction.as_str() {
+        "long" => "open_candidate".to_string(),
+        "short" => "reverse_candidate".to_string(),
+        _ => "candidate".to_string(),
     }
 }
 
@@ -2496,6 +2787,118 @@ mod tests {
 
     use super::*;
 
+    fn sample_replay_spec() -> ReplayMarketSpec {
+        ReplayMarketSpec {
+            event_id: "evt-1".to_owned(),
+            market_id: "mkt-1".to_owned(),
+            market_slug: "btc-above-100k".to_owned(),
+            symbol: Symbol::new("btc-above-100k"),
+            market_config: MarketConfig {
+                symbol: Symbol::new("btc-above-100k"),
+                poly_ids: PolymarketIds {
+                    condition_id: "cond-1".to_owned(),
+                    yes_token_id: "yes-1".to_owned(),
+                    no_token_id: "no-1".to_owned(),
+                },
+                market_question: Some("Will Bitcoin be above $100,000 on Friday?".to_owned()),
+                market_rule: Some(MarketRule {
+                    kind: MarketRuleKind::Above,
+                    lower_strike: Some(Price(Decimal::new(100_000, 0))),
+                    upper_strike: None,
+                }),
+                cex_symbol: "BTCUSDT".to_owned(),
+                hedge_exchange: Exchange::Binance,
+                strike_price: Some(Price(Decimal::new(100_000, 0))),
+                settlement_timestamp: 1_750_000_000,
+                min_tick_size: Price(Decimal::new(1, 2)),
+                neg_risk: false,
+                cex_price_tick: Decimal::new(1, 1),
+                cex_qty_step: Decimal::new(1, 3),
+                cex_contract_multiplier: Decimal::ONE,
+            },
+            settlement_ts_ms: 1_750_000_000_000,
+            yes_payout: None,
+            no_payout: None,
+        }
+    }
+
+    fn sample_replay_row(spec: &ReplayMarketSpec) -> ReplayMinuteRow {
+        ReplayMinuteRow {
+            ts_ms: 1_749_999_940_000,
+            market_id: spec.market_id.clone(),
+            yes_price: Some(0.50),
+            no_price: Some(0.50),
+        }
+    }
+
+    fn sample_open_candidate(spec: &ReplayMarketSpec, row: &ReplayMinuteRow) -> OpenCandidate {
+        OpenCandidate {
+            schema_version: 1,
+            candidate_id: "cand-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            symbol: spec.symbol.clone(),
+            token_side: TokenSide::Yes,
+            direction: "long".to_owned(),
+            fair_value: 0.69,
+            raw_mispricing: 0.20,
+            delta_estimate: 0.00012,
+            risk_budget_usd: 100.0,
+            strength: polyalpha_core::SignalStrength::Normal,
+            z_score: Some(-2.4),
+            timestamp_ms: row.ts_ms,
+        }
+    }
+
+    fn sample_replay_config(
+        entry_fill_ratio: f64,
+        poly_fee_bps: f64,
+        poly_slippage_bps: f64,
+        cex_fee_bps: f64,
+        cex_slippage_bps: f64,
+    ) -> ResolvedReplayConfig {
+        ResolvedReplayConfig {
+            db_path: ":memory:".to_owned(),
+            initial_capital: 10_000.0,
+            rolling_window: 60,
+            entry_z: 2.0,
+            exit_z: 0.5,
+            position_notional_usd: 100.0,
+            max_capital_usage: 1.0,
+            cex_hedge_ratio: 1.0,
+            cex_margin_ratio: 0.1,
+            min_poly_price: None,
+            max_poly_price: None,
+            max_holding_bars: None,
+            stress: ExecutionStressConfig {
+                label: "stress".to_owned(),
+                poly_fee_bps,
+                poly_slippage_bps,
+                cex_fee_bps,
+                cex_slippage_bps,
+                entry_fill_ratio,
+            },
+        }
+    }
+
+    fn assert_f64_close(actual: f64, expected: f64) {
+        let diff = (actual - expected).abs();
+        assert!(
+            diff <= 1e-9,
+            "expected {expected:.12}, got {actual:.12}, diff {diff:.12}"
+        );
+    }
+
+    fn sample_close_intent(spec: &ReplayMarketSpec) -> PlanningIntent {
+        PlanningIntent::ClosePosition {
+            schema_version: 1,
+            intent_id: format!("replay-close-{}", spec.symbol.0),
+            correlation_id: "corr-close-1".to_owned(),
+            symbol: spec.symbol.clone(),
+            close_reason: "basis_reverted".to_owned(),
+            target_close_ratio: 1.0,
+        }
+    }
+
     #[test]
     fn parses_supported_market_rules() {
         let above = parse_market_rule("Will Bitcoin be above $100,000 on Friday?").unwrap();
@@ -2610,5 +3013,306 @@ mod tests {
         assert!(payload.contains("yes_settled"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn handle_candidate_rejects_non_positive_planned_edge() {
+        let spec = sample_replay_spec();
+        let row = sample_replay_row(&spec);
+        let candidate = OpenCandidate {
+            schema_version: 1,
+            candidate_id: "cand-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            symbol: spec.symbol.clone(),
+            token_side: TokenSide::Yes,
+            direction: "long".to_owned(),
+            fair_value: 0.5001,
+            raw_mispricing: 0.0001,
+            delta_estimate: 0.10,
+            risk_budget_usd: 100.0,
+            strength: polyalpha_core::SignalStrength::Weak,
+            z_score: Some(-2.0),
+            timestamp_ms: row.ts_ms,
+        };
+        let config = sample_replay_config(1.0, 100.0, 100.0, 100.0, 100.0);
+        let planner = replay_execution_planner(&config);
+        let mut positions = HashMap::new();
+        let mut cash = config.initial_capital;
+        let mut stats = ReplayStats::default();
+        let mut trade_log = Vec::new();
+
+        handle_candidate(
+            candidate,
+            &spec,
+            &row,
+            100_000.0,
+            &config,
+            &planner,
+            &mut positions,
+            &mut cash,
+            &mut stats,
+            &mut trade_log,
+        )
+        .expect("candidate handling should not error");
+
+        assert!(
+            positions.is_empty(),
+            "planner-rejected candidate must not open"
+        );
+        assert_eq!(stats.entry_count, 0);
+        assert_eq!(stats.signals_rejected_planner, 1);
+        assert_eq!(cash, config.initial_capital);
+    }
+
+    #[test]
+    fn handle_candidate_uses_executable_notional_without_double_counting_friction() {
+        let spec = sample_replay_spec();
+        let row = sample_replay_row(&spec);
+        let candidate = sample_open_candidate(&spec, &row);
+        let config = sample_replay_config(1.0, 20.0, 50.0, 5.0, 2.0);
+        let planner = replay_execution_planner(&config);
+        let plan = plan_replay_open_candidate(
+            &planner,
+            &candidate,
+            &row,
+            100_000.0,
+            spec.market_config.cex_qty_step,
+            &HashMap::new(),
+        )
+        .expect("plan should succeed");
+        let poly_exec_notional = (plan.poly_planned_shares.0 * plan.poly_executable_price.0)
+            .to_f64()
+            .expect("poly notional");
+        let total_fees = (plan.poly_fee_usd.0 + plan.cex_fee_usd.0)
+            .to_f64()
+            .expect("total fees");
+        let expected_cash = config.initial_capital - poly_exec_notional - total_fees;
+        let expected_round_trip_pnl = -total_fees;
+
+        let mut positions = HashMap::new();
+        let mut cash = config.initial_capital;
+        let mut stats = ReplayStats::default();
+        let mut trade_log = Vec::new();
+        handle_candidate(
+            candidate,
+            &spec,
+            &row,
+            100_000.0,
+            &config,
+            &planner,
+            &mut positions,
+            &mut cash,
+            &mut stats,
+            &mut trade_log,
+        )
+        .expect("candidate handling should not error");
+
+        let position = positions
+            .get(&spec.symbol)
+            .expect("entry should open a replay position");
+        assert_eq!(stats.entry_count, 1);
+        assert_f64_close(cash, expected_cash);
+        assert_f64_close(position.poly_entry_notional, poly_exec_notional);
+        assert_f64_close(position.round_trip_pnl, expected_round_trip_pnl);
+    }
+
+    #[test]
+    fn handle_candidate_scales_hedge_and_fees_with_entry_fill_ratio() {
+        let spec = sample_replay_spec();
+        let row = sample_replay_row(&spec);
+        let candidate = sample_open_candidate(&spec, &row);
+        let config = sample_replay_config(0.5, 20.0, 50.0, 5.0, 2.0);
+        let planner = replay_execution_planner(&config);
+        let plan = plan_replay_open_candidate(
+            &planner,
+            &candidate,
+            &row,
+            100_000.0,
+            spec.market_config.cex_qty_step,
+            &HashMap::new(),
+        )
+        .expect("plan should succeed");
+        let fill_ratio = Decimal::from_f64(config.stress.entry_fill_ratio).expect("fill ratio");
+        let actual_shares = (plan.poly_planned_shares.0 * fill_ratio)
+            .to_f64()
+            .expect("actual shares");
+        let actual_cex_qty = (plan.cex_planned_qty.0 * fill_ratio)
+            .to_f64()
+            .expect("actual cex qty");
+        let poly_exec_notional =
+            (plan.poly_planned_shares.0 * fill_ratio * plan.poly_executable_price.0)
+                .to_f64()
+                .expect("poly notional");
+        let cex_exec_notional = (plan.cex_planned_qty.0 * fill_ratio * plan.cex_executable_price.0)
+            .to_f64()
+            .expect("cex notional");
+        let expected_poly_fee = poly_exec_notional * config.stress.poly_fee_bps / 10_000.0;
+        let expected_cex_fee = cex_exec_notional * config.stress.cex_fee_bps / 10_000.0;
+        let expected_cash =
+            config.initial_capital - poly_exec_notional - expected_poly_fee - expected_cex_fee;
+
+        let mut positions = HashMap::new();
+        let mut cash = config.initial_capital;
+        let mut stats = ReplayStats::default();
+        let mut trade_log = Vec::new();
+        handle_candidate(
+            candidate,
+            &spec,
+            &row,
+            100_000.0,
+            &config,
+            &planner,
+            &mut positions,
+            &mut cash,
+            &mut stats,
+            &mut trade_log,
+        )
+        .expect("candidate handling should not error");
+
+        let position = positions
+            .get(&spec.symbol)
+            .expect("entry should open a replay position");
+        assert_eq!(stats.entry_count, 1);
+        assert_f64_close(position.shares, actual_shares);
+        assert_f64_close(position.cex_qty_btc, -actual_cex_qty);
+        assert_f64_close(
+            position.entry_fees_paid,
+            expected_poly_fee + expected_cex_fee,
+        );
+        assert_f64_close(cash, expected_cash);
+    }
+
+    #[test]
+    fn close_position_net_pnl_matches_cash_without_double_counting_slippage() {
+        let spec = sample_replay_spec();
+        let row = sample_replay_row(&spec);
+        let candidate = sample_open_candidate(&spec, &row);
+        let config = sample_replay_config(1.0, 20.0, 50.0, 5.0, 2.0);
+        let planner = replay_execution_planner(&config);
+        let open_plan = plan_replay_open_candidate(
+            &planner,
+            &candidate,
+            &row,
+            100_000.0,
+            spec.market_config.cex_qty_step,
+            &HashMap::new(),
+        )
+        .expect("open plan should succeed");
+        let open_poly_exec_notional = (open_plan.poly_planned_shares.0
+            * open_plan.poly_executable_price.0)
+            .to_f64()
+            .expect("poly notional");
+        let open_total_fees = (open_plan.poly_fee_usd.0 + open_plan.cex_fee_usd.0)
+            .to_f64()
+            .expect("open fees");
+        let open_total_slippage = (open_plan.poly_friction_cost_usd.0
+            + open_plan.cex_friction_cost_usd.0)
+            .to_f64()
+            .expect("open slippage");
+        let cex_qty_abs = open_plan.cex_planned_qty.0.to_f64().expect("cex qty");
+        let cex_qty_btc = if matches!(open_plan.cex_side, OrderSide::Buy) {
+            cex_qty_abs
+        } else {
+            -cex_qty_abs
+        };
+        let cex_entry_price = open_plan
+            .cex_executable_price
+            .0
+            .to_f64()
+            .expect("cex entry price");
+        let reserved_margin = cex_qty_abs * cex_entry_price * config.cex_margin_ratio;
+        let cash_after_entry = config.initial_capital - open_poly_exec_notional - open_total_fees;
+
+        let mut positions = HashMap::from([(
+            spec.symbol.clone(),
+            ReplayPosition {
+                market_id: spec.market_id.clone(),
+                token_side: candidate.token_side,
+                shares: open_plan
+                    .poly_planned_shares
+                    .0
+                    .to_f64()
+                    .expect("poly shares"),
+                poly_entry_notional: open_poly_exec_notional,
+                last_poly_price: open_plan
+                    .poly_executable_price
+                    .0
+                    .to_f64()
+                    .expect("poly entry price"),
+                cex_entry_price,
+                cex_qty_btc,
+                last_cex_price: cex_entry_price,
+                reserved_margin,
+                round_trip_pnl: -open_total_fees,
+                entry_ts_ms: row.ts_ms,
+                entry_poly_price: open_plan
+                    .poly_executable_price
+                    .0
+                    .to_f64()
+                    .expect("poly entry price"),
+                entry_fees_paid: open_total_fees,
+                entry_slippage_paid: open_total_slippage,
+                entry_z_score: candidate.z_score.unwrap_or_default(),
+                entry_basis_bps: candidate.raw_mispricing * 10_000.0,
+                entry_delta: candidate.delta_estimate,
+            },
+        )]);
+        let close_context = replay_planning_context(
+            &spec.symbol,
+            &row,
+            100_000.0,
+            spec.market_config.cex_qty_step,
+            &positions,
+        )
+        .unwrap();
+        let close_plan = planner
+            .plan(&sample_close_intent(&spec), &close_context)
+            .expect("close plan should succeed");
+        let close_poly_exec_notional = (close_plan.poly_planned_shares.0
+            * close_plan.poly_executable_price.0)
+            .to_f64()
+            .expect("close poly notional");
+        let close_total_fees = (close_plan.poly_fee_usd.0 + close_plan.cex_fee_usd.0)
+            .to_f64()
+            .expect("close fees");
+        let close_cex_price = close_plan
+            .cex_executable_price
+            .0
+            .to_f64()
+            .expect("close cex price");
+        let close_cex_gross = linear_cex_pnl(cex_entry_price, close_cex_price, cex_qty_btc);
+        let expected_final_cash =
+            cash_after_entry + close_poly_exec_notional + close_cex_gross - close_total_fees;
+        let expected_round_trip_net = expected_final_cash - config.initial_capital;
+
+        let mut cash = cash_after_entry;
+        let mut stats = ReplayStats::default();
+        let mut trade_log = Vec::new();
+        close_position(
+            &spec.symbol,
+            &spec,
+            row.current_price_for_position(positions.get(&spec.symbol)),
+            100_000.0,
+            false,
+            "basis_reverted",
+            &config,
+            &planner,
+            &mut positions,
+            &mut cash,
+            &mut stats,
+            &mut trade_log,
+            row.ts_ms + ONE_MINUTE_MS,
+        )
+        .expect("close should succeed");
+
+        let trade = trade_log
+            .first()
+            .expect("close should emit one trade log row");
+        assert!(
+            positions.is_empty(),
+            "close should remove the replay position"
+        );
+        assert_f64_close(cash, expected_final_cash);
+        assert_f64_close(trade.net_pnl, expected_round_trip_net);
     }
 }

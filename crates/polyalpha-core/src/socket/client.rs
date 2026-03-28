@@ -392,24 +392,28 @@ mod tests {
         state.timestamp_ms = 10;
         for idx in 0..20 {
             state.recent_events.push(MonitorEvent {
+                schema_version: crate::PLANNING_SCHEMA_VERSION,
                 timestamp_ms: idx,
                 kind: EventKind::System,
                 market: Some(format!("market-{idx}")),
                 correlation_id: None,
                 summary: format!("event-{idx}"),
                 details: None,
+                payload: None,
             });
         }
 
         apply_monitor_event_to_state(
             &mut state,
             MonitorEvent {
+                schema_version: crate::PLANNING_SCHEMA_VERSION,
                 timestamp_ms: 99,
                 kind: EventKind::Risk,
                 market: Some("target".to_owned()),
                 correlation_id: Some("corr-1".to_owned()),
                 summary: "latest".to_owned(),
                 details: Some(HashMap::from([("原因".to_owned(), "测试".to_owned())])),
+                payload: None,
             },
         );
 
@@ -423,12 +427,14 @@ mod tests {
     #[test]
     fn event_messages_are_ignored_before_initial_state() {
         let event = MonitorEvent {
+            schema_version: crate::PLANNING_SCHEMA_VERSION,
             timestamp_ms: 99,
             kind: EventKind::System,
             market: None,
             correlation_id: None,
             summary: "orphan".to_owned(),
             details: None,
+            payload: None,
         };
         assert!(apply_event_message(&mut None, event).is_none());
     }
@@ -480,12 +486,14 @@ mod tests {
         assert_eq!(first_state.timestamp_ms, 10);
 
         let event = MonitorEvent {
+            schema_version: crate::PLANNING_SCHEMA_VERSION,
             timestamp_ms: 99,
             kind: EventKind::Trade,
             market: Some("sol-dip-80-mar".to_owned()),
             correlation_id: Some("corr-1".to_owned()),
             summary: "latest event".to_owned(),
             details: Some(HashMap::from([("side".to_owned(), "buy".to_owned())])),
+            payload: None,
         };
         event_broadcaster.send(event.clone()).unwrap();
 
@@ -523,12 +531,14 @@ mod tests {
             let event = Message::Event {
                 timestamp_ms: 1,
                 event: MonitorEvent {
+                    schema_version: crate::PLANNING_SCHEMA_VERSION,
                     timestamp_ms: 1,
                     kind: EventKind::System,
                     market: Some("sol-dip-80-mar".to_owned()),
                     correlation_id: None,
                     summary: "event before snapshot".to_owned(),
                     details: None,
+                    payload: None,
                 },
             };
             stream.write_all(&event.to_bytes().unwrap()).await.unwrap();
