@@ -77,6 +77,22 @@
 
 - [`docs/superpowers/specs/2026-04-02-monitor-market-tier-retention-design.md`](superpowers/specs/2026-04-02-monitor-market-tier-retention-design.md)
 
+### 6. 市场池不再只是展示语义
+
+当前 open flow 已经增加真实门禁：
+
+- 市场处于 open cooldown 时，candidate 不再进入 planner
+- 有持仓 / close / rebalance / residual / force-exit 责任的市场，不再被当作可开新仓市场
+- `zero_cex_hedge_qty`、`residual_delta_too_large`、`non_positive_planned_edge`、订单簿漂移类 planner 拒绝，会把市场打入分层冷却
+- 结构性坏市场现在不是“一分钟后再试”，而是会被临时隔离更久，只有真正恢复可交易后才回池
+- `paper/live` 与 `sim` 共用同一套市场冷却语义
+
+意义：
+
+- `交易池 / 重点池 / 观察池` 不再只是 monitor 标签
+- 一部分“明知大概率做不了还反复送进 planner”的噪声已被前置挡掉
+- 市场池开始具备真正的“自动踢出坏市场”能力，而不是只在末端重复报错
+
 ## 最新验证证据
 
 ### 全量 Rust 验证
@@ -89,7 +105,7 @@ cargo test -p polyalpha-core -p polyalpha-data -p polyalpha-risk -p polyalpha-ex
 
 最新结果：
 
-- `polyalpha-cli`: `134 passed, 0 failed, 4 ignored`
+- `polyalpha-cli`: `141 passed, 0 failed, 4 ignored`
 - `polyalpha-core`: `39 passed, 0 failed`
 - `polyalpha-data`: `28 passed, 0 failed`
 - `polyalpha-executor`: `59 passed, 0 failed`
@@ -112,16 +128,30 @@ cargo test -p polyalpha-core -p polyalpha-data -p polyalpha-risk -p polyalpha-ex
 对应产物：
 
 - artifact: `data/live/multi-market-active.fresh-last-run.json`
-- audit summary: `data/audit/sessions/1302ed9d-d9e3-4d53-a067-5454fd85c961/summary.json`
+- audit summary: `data/audit/sessions/e69e0c60-7bd9-4133-bb38-889809252ec4/summary.json`
 
-这轮结果的高层结论：
+最新一轮结果：
 
 - `ticks_processed = 60`
-- `signals_seen = 242`
-- `signals_rejected = 419`
+- `signals_seen = 228`
+- `signals_rejected = 348`
+- `execution_rejected = 125`
 - `order_submitted = 4`
 - `fills = 4`
 - `status = completed`
+
+和紧邻上一轮同口径 60 tick 对比：
+
+- `zero_cex_hedge_qty`: `179 -> 69`
+- `execution_rejected`: `237 -> 125`
+- `signals_rejected`: `559 -> 348`
+- `order_submitted / fills`: 仍然保持 `4 / 4`
+
+这说明：
+
+- 结构性坏市场的重复 planner 命中已经明显下降
+- 新的市场池冷却没有把真实成交机会一起打掉
+- 当前主问题开始从“同一批坏市场反复撞 planner”转向“实时数据质量和剩余坏市场治理”
 
 意义：
 
@@ -131,7 +161,7 @@ cargo test -p polyalpha-core -p polyalpha-data -p polyalpha-risk -p polyalpha-ex
 
 ## 当前 live-ready 阻塞
 
-### 1. 交易池太脏
+### 1. 交易池治理已经起效，但还没过线
 
 大量市场虽然能产候选，但本质上不是真正可交易机会。
 
@@ -142,23 +172,24 @@ cargo test -p polyalpha-core -p polyalpha-data -p polyalpha-risk -p polyalpha-ex
 - `above_or_equal_max_poly_price`
 - `non_positive_planned_edge`
 
-这说明系统当前还在看太多“视觉上像机会、实际上不该做”的市场。
+相比紧邻上一轮，`zero_cex_hedge_qty` 已经显著下降，但还没有下降到“坏市场不再主导漏斗”的程度。
 
-### 2. Polymarket 实时可交易性质量仍然不够
+### 2. 实时可交易性质量仍然不够稳定
 
 最近一轮里：
 
-- `poly_quote_stale` 仍然占大头
-- `no_fresh_poly_sample` 仍然很多
+- `cex_stale` 已经抬头
+- 高价带市场仍然频繁卡在价格过滤
+- `poly_stale` 虽然下降，但还不能说明实时质量问题已经彻底解决
 
-这说明问题不是系统不看机会，而是很多时刻拿不到足够可信、足够新鲜的 Poly 报价。
+这说明问题不是系统不会交易，而是“进入漏斗的市场质量”和“实时双腿数据质量”还没有同时过线。
 
-### 3. 末端 revalidation 拒绝还偏多
+### 3. planner 末端拒绝仍然偏多
 
 `execution_planner` 侧的 revalidation 失败说明：
 
 - 有些候选直到最后一步才发现不成立
-- 这些问题应该更多地前置为“市场池准入 / 冷却 / 降级”逻辑，而不是只在最后一步拒绝
+- 这些问题已经开始前置为“市场池准入 / 冷却 / 降级”逻辑，但还需要继续扩展和调参，而不是只在最后一步拒绝
 
 ### 4. 还没做长时间 soak
 
@@ -183,22 +214,22 @@ cargo test -p polyalpha-core -p polyalpha-data -p polyalpha-risk -p polyalpha-ex
 
 结果判断标准：
 
-- `zero_cex_hedge_qty` 比例明显下降
+- `zero_cex_hedge_qty` 继续下降
 - 高价带 / 低质量市场更少进入开仓漏斗
 
 ### 2. 实时可交易性治理
 
 目标：
 
-- 把 `poly_quote_stale`
-- `zero_cex_hedge_qty`
-- `poly_price_move_exceeded`
+- 把 `cex_stale`
+- 高价带误入场
+- 剩余结构性 planner 拒绝
 
 这些问题变成自动准入 / 踢出 / 冷却规则
 
 结果判断标准：
 
-- planner 末端无效拒绝下降
+- planner 末端无效拒绝继续下降
 - 交易池里的市场更稳定
 
 ### 3. 长时间 live-mock soak

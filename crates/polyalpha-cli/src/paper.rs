@@ -62,6 +62,11 @@ use polyalpha_risk::{InMemoryRiskManager, RiskLimits};
 
 use crate::args::{LiveExecutorMode, PaperInspectFormat};
 use crate::commands::{open_plan_risk_rejection_reason, preview_open_plan, select_market};
+use crate::market_pool::{
+    active_open_cooldown_reason, active_open_cooldown_remaining_ms, clear_expired_open_cooldown,
+    cooldown_gate_reason, maybe_start_open_cooldown, note_focus_activity, note_tradeable_activity,
+    MarketPoolState,
+};
 #[cfg(test)]
 use crate::runtime::open_intent_from_candidate as runtime_open_intent_from_candidate;
 use crate::runtime::{
@@ -409,8 +414,7 @@ struct ObservedState {
     connection_reconnect_count: HashMap<String, u64>,
     connection_disconnect_count: HashMap<String, u64>,
     connection_last_disconnect_at_ms: HashMap<String, u64>,
-    last_focus_at_ms: Option<u64>,
-    last_tradeable_at_ms: Option<u64>,
+    market_pool: MarketPoolState,
 }
 
 impl ObservedState {
@@ -663,12 +667,11 @@ fn market_retention_reason(
 }
 
 fn note_focus_market_activity(observed: &mut ObservedState, now_ms: u64) {
-    observed.last_focus_at_ms = Some(now_ms);
+    note_focus_activity(&mut observed.market_pool, now_ms);
 }
 
 fn note_tradeable_market_activity(observed: &mut ObservedState, now_ms: u64) {
-    observed.last_focus_at_ms = Some(now_ms);
-    observed.last_tradeable_at_ms = Some(now_ms);
+    note_tradeable_activity(&mut observed.market_pool, now_ms);
 }
 
 fn market_recent_within(last_seen_at_ms: Option<u64>, now_ms: u64, grace_ms: u64) -> bool {
@@ -693,12 +696,88 @@ fn market_focus_grace_ms(settings: &Settings) -> u64 {
         .saturating_mul(MARKET_FOCUS_GRACE_MULTIPLIER)
 }
 
-fn async_snapshot_is_tradeable(snapshot: &AsyncMarketSnapshot) -> bool {
-    snapshot.evaluable_status == EvaluableStatus::Evaluable
+fn async_market_is_tradeable(
+    evaluable_status: EvaluableStatus,
+    async_classification: AsyncClassification,
+) -> bool {
+    evaluable_status == EvaluableStatus::Evaluable
         && matches!(
-            snapshot.async_classification,
+            async_classification,
             AsyncClassification::BalancedFresh | AsyncClassification::PolyLagAcceptable
         )
+}
+
+fn async_snapshot_is_tradeable(snapshot: &AsyncMarketSnapshot) -> bool {
+    async_market_is_tradeable(snapshot.evaluable_status, snapshot.async_classification)
+}
+
+fn audit_observed_is_tradeable(observed: &AuditObservedMarket) -> bool {
+    async_market_is_tradeable(observed.evaluable_status, observed.async_classification)
+}
+
+fn clear_market_pool_cooldown_if_needed(observed: &mut ObservedState, now_ms: u64) {
+    clear_expired_open_cooldown(&mut observed.market_pool, now_ms);
+}
+
+fn market_pool_cooldown_reason(observed: &ObservedState, now_ms: u64) -> Option<&str> {
+    active_open_cooldown_reason(&observed.market_pool, now_ms)
+}
+
+fn market_pool_cooldown_remaining_ms(observed: &ObservedState, now_ms: u64) -> Option<u64> {
+    active_open_cooldown_remaining_ms(&observed.market_pool, now_ms)
+}
+
+fn maybe_start_market_pool_cooldown(
+    observed: &mut ObservedState,
+    settings: &Settings,
+    now_ms: u64,
+    reason: &str,
+) -> bool {
+    maybe_start_open_cooldown(
+        &mut observed.market_pool,
+        settings.strategy.market_data.max_stale_ms,
+        reason,
+        now_ms,
+    )
+}
+
+fn maybe_start_market_pool_cooldown_from_message(
+    observed: &mut ObservedState,
+    settings: &Settings,
+    now_ms: u64,
+    message: &str,
+) -> Option<String> {
+    let reason = extract_plan_rejection_reason(message).unwrap_or_else(|| message.to_owned());
+    maybe_start_market_pool_cooldown(observed, settings, now_ms, &reason).then_some(reason)
+}
+
+fn maybe_start_market_pool_cooldown_from_rejections(
+    observed: &mut ObservedState,
+    settings: &Settings,
+    now_ms: u64,
+    rejection_reasons: &[String],
+) -> Option<String> {
+    rejection_reasons.iter().find_map(|reason| {
+        maybe_start_market_pool_cooldown_from_message(observed, settings, now_ms, reason)
+    })
+}
+
+fn market_pool_gate_reason(
+    observed: &ObservedState,
+    retention_reason: MarketRetentionReason,
+    tradeable_now: bool,
+    now_ms: u64,
+) -> String {
+    if let Some(reason) = market_pool_cooldown_reason(observed, now_ms) {
+        return cooldown_gate_reason(reason);
+    }
+    if retention_reason != MarketRetentionReason::None {
+        return format!("retained_{}", retention_reason.as_str());
+    }
+    if !tradeable_now {
+        return "not_tradeable_pool".to_owned();
+    }
+    "not_tradeable_pool".to_owned()
 }
 
 fn market_is_near_opportunity(
@@ -737,11 +816,12 @@ fn market_is_near_opportunity(
 
 fn determine_market_tier(
     settings: &Settings,
-    async_snapshot: Option<&AsyncMarketSnapshot>,
+    tradeable_now: bool,
     retention_reason: MarketRetentionReason,
     near_opportunity: bool,
     last_focus_at_ms: Option<u64>,
     last_tradeable_at_ms: Option<u64>,
+    open_cooldown_active: bool,
     now_ms: u64,
 ) -> MarketTier {
     if retention_reason != MarketRetentionReason::None {
@@ -756,11 +836,14 @@ fn determine_market_tier(
         market_tradeable_grace_ms(settings),
     );
 
-    if async_snapshot.is_some_and(async_snapshot_is_tradeable) && tradeable_recent {
+    if tradeable_now
+        && (near_opportunity || focus_recent || tradeable_recent)
+        && !open_cooldown_active
+    {
         return MarketTier::Tradeable;
     }
 
-    if near_opportunity || focus_recent {
+    if near_opportunity || focus_recent || open_cooldown_active {
         return MarketTier::Focus;
     }
 
@@ -6212,6 +6295,70 @@ fn ws_signal_gate_reason(observed: &AuditObservedMarket) -> Option<&'static str>
     }
 }
 
+fn open_market_pool_gate_decision(
+    settings: &Settings,
+    observed: &mut ObservedState,
+    observed_snapshot: Option<&AuditObservedMarket>,
+    retention_reason: MarketRetentionReason,
+    tradeable_gate_enabled: bool,
+    now_ms: u64,
+) -> Option<(String, Option<u64>)> {
+    clear_market_pool_cooldown_if_needed(observed, now_ms);
+
+    if let Some(reason) = market_pool_cooldown_reason(observed, now_ms) {
+        return Some((
+            cooldown_gate_reason(reason),
+            market_pool_cooldown_remaining_ms(observed, now_ms),
+        ));
+    }
+
+    if retention_reason != MarketRetentionReason::None {
+        return Some((format!("retained_{}", retention_reason.as_str()), None));
+    }
+
+    if !tradeable_gate_enabled {
+        return None;
+    }
+
+    let tradeable_now = observed_snapshot.is_some_and(audit_observed_is_tradeable);
+    let market_tier = determine_market_tier(
+        settings,
+        tradeable_now,
+        retention_reason,
+        true,
+        observed.market_pool.last_focus_at_ms,
+        observed.market_pool.last_tradeable_at_ms,
+        false,
+        now_ms,
+    );
+    (market_tier != MarketTier::Tradeable).then(|| {
+        (
+            market_pool_gate_reason(observed, retention_reason, tradeable_now, now_ms),
+            None,
+        )
+    })
+}
+
+fn market_pool_rejection_summary(
+    candidate: &OpenCandidate,
+    reason: &str,
+    cooldown_remaining_ms: Option<u64>,
+) -> String {
+    match cooldown_remaining_ms {
+        Some(remaining_ms) => format!(
+            "候选被拒绝：{} {}（剩余冷却 {}）",
+            gate_reason_label_zh("market_pool", reason),
+            candidate.candidate_id,
+            format_detail_ms(remaining_ms)
+        ),
+        None => format!(
+            "候选被拒绝：{} {}",
+            gate_reason_label_zh("market_pool", reason),
+            candidate.candidate_id
+        ),
+    }
+}
+
 async fn process_signal_single(
     candidate: OpenCandidate,
     settings: &Settings,
@@ -6433,6 +6580,58 @@ async fn process_signal_single(
         }
     }
 
+    let retention_reason = market_retention_reason(
+        risk.position_tracker()
+            .symbol_has_open_position(&candidate.symbol),
+        execution.active_plan_priority(&candidate.symbol),
+    );
+    if let Some((reason_code, cooldown_remaining_ms)) = open_market_pool_gate_decision(
+        settings,
+        observed,
+        observed_snapshot.as_ref(),
+        retention_reason,
+        ws_mode,
+        candidate.timestamp_ms,
+    ) {
+        let summary =
+            market_pool_rejection_summary(&candidate, &reason_code, cooldown_remaining_ms);
+        if let Some(audit) = audit.as_mut() {
+            audit.record_gate_decision(
+                &candidate,
+                "market_pool",
+                AuditGateResult::Rejected,
+                &reason_code,
+                summary.clone(),
+                observed_snapshot.clone(),
+            )?;
+        }
+        reject_signal(
+            stats,
+            recent_events,
+            &candidate,
+            "risk",
+            &reason_code,
+            summary,
+            build_gate_event_details(
+                &candidate,
+                observed_snapshot.as_ref(),
+                settings,
+                "market_pool",
+                AuditGateResult::Rejected,
+                &reason_code,
+                None,
+            ),
+        );
+        sync_engine_position_state_from_runtime(
+            engine,
+            risk,
+            trade_book,
+            &candidate.symbol,
+            fallback_token_side,
+        );
+        return Ok(());
+    }
+
     let plan = match preview_open_plan(execution, &candidate) {
         Ok(plan) => plan,
         Err(err) => {
@@ -6441,6 +6640,12 @@ async fn process_signal_single(
             record_signal_rejection(stats, "execution_planner");
             let reason_code = extract_plan_rejection_reason(&err.to_string())
                 .unwrap_or_else(|| "trade_plan_rejected".to_owned());
+            let _ = maybe_start_market_pool_cooldown(
+                observed,
+                settings,
+                candidate.timestamp_ms,
+                &reason_code,
+            );
             let summary = format!(
                 "候选被拒绝：未通过交易规划 {}（{}）",
                 candidate.candidate_id,
@@ -6643,6 +6848,12 @@ async fn process_signal_single(
             record_signal_rejection(stats, "execution_planner");
             trade_book.discard_open_trade(&candidate.symbol);
             let rejection_reasons = vec![err.to_string()];
+            let _ = maybe_start_market_pool_cooldown_from_rejections(
+                observed,
+                settings,
+                candidate.timestamp_ms,
+                &rejection_reasons,
+            );
             push_event_with_context_and_payload(
                 recent_events,
                 "risk",
@@ -6675,6 +6886,15 @@ async fn process_signal_single(
     };
     if execution_events_include_trade_plan_created(&events) {
         note_tradeable_market_activity(observed, candidate.timestamp_ms);
+    }
+    let rejection_reasons = opening_signal_rejection_reasons(&events);
+    if !rejection_reasons.is_empty() {
+        let _ = maybe_start_market_pool_cooldown_from_rejections(
+            observed,
+            settings,
+            candidate.timestamp_ms,
+            &rejection_reasons,
+        );
     }
     track_open_signal_execution_outcome(
         stats,
@@ -6929,6 +7149,63 @@ async fn process_signal_multi(
         }
     }
 
+    let retention_reason = market_retention_reason(
+        risk.position_tracker()
+            .symbol_has_open_position(&candidate.symbol),
+        execution.active_plan_priority(&candidate.symbol),
+    );
+    if let Some((reason_code, cooldown_remaining_ms)) = observed_map
+        .get_mut(&candidate.symbol)
+        .and_then(|observed| {
+            open_market_pool_gate_decision(
+                settings,
+                observed,
+                observed_snapshot.as_ref(),
+                retention_reason,
+                ws_mode,
+                candidate.timestamp_ms,
+            )
+        })
+    {
+        let summary =
+            market_pool_rejection_summary(&candidate, &reason_code, cooldown_remaining_ms);
+        if let Some(audit) = audit.as_mut() {
+            audit.record_gate_decision(
+                &candidate,
+                "market_pool",
+                AuditGateResult::Rejected,
+                &reason_code,
+                summary.clone(),
+                observed_snapshot.clone(),
+            )?;
+        }
+        reject_signal(
+            stats,
+            recent_events,
+            &candidate,
+            "risk",
+            &reason_code,
+            summary,
+            build_gate_event_details(
+                &candidate,
+                observed_snapshot.as_ref(),
+                settings,
+                "market_pool",
+                AuditGateResult::Rejected,
+                &reason_code,
+                None,
+            ),
+        );
+        sync_engine_position_state_from_runtime(
+            engine,
+            risk,
+            trade_book,
+            &candidate.symbol,
+            fallback_token_side,
+        );
+        return Ok(());
+    }
+
     let plan = match preview_open_plan(execution, &candidate) {
         Ok(plan) => plan,
         Err(err) => {
@@ -6937,6 +7214,14 @@ async fn process_signal_multi(
             record_signal_rejection(stats, "execution_planner");
             let reason_code = extract_plan_rejection_reason(&err.to_string())
                 .unwrap_or_else(|| "trade_plan_rejected".to_owned());
+            if let Some(observed) = observed_map.get_mut(&candidate.symbol) {
+                let _ = maybe_start_market_pool_cooldown(
+                    observed,
+                    settings,
+                    candidate.timestamp_ms,
+                    &reason_code,
+                );
+            }
             let summary = format!(
                 "候选被拒绝：未通过交易规划 {}（{}）",
                 candidate.candidate_id,
@@ -7139,6 +7424,14 @@ async fn process_signal_multi(
             record_signal_rejection(stats, "execution_planner");
             trade_book.discard_open_trade(&candidate.symbol);
             let rejection_reasons = vec![err.to_string()];
+            if let Some(observed) = observed_map.get_mut(&candidate.symbol) {
+                let _ = maybe_start_market_pool_cooldown_from_rejections(
+                    observed,
+                    settings,
+                    candidate.timestamp_ms,
+                    &rejection_reasons,
+                );
+            }
             push_event_with_context_and_payload(
                 recent_events,
                 "risk",
@@ -7172,6 +7465,17 @@ async fn process_signal_multi(
     if execution_events_include_trade_plan_created(&events) {
         if let Some(observed) = observed_map.get_mut(&candidate.symbol) {
             note_tradeable_market_activity(observed, candidate.timestamp_ms);
+        }
+    }
+    let rejection_reasons = opening_signal_rejection_reasons(&events);
+    if !rejection_reasons.is_empty() {
+        if let Some(observed) = observed_map.get_mut(&candidate.symbol) {
+            let _ = maybe_start_market_pool_cooldown_from_rejections(
+                observed,
+                settings,
+                candidate.timestamp_ms,
+                &rejection_reasons,
+            );
         }
     }
     track_open_signal_execution_outcome(
@@ -9474,6 +9778,7 @@ fn signal_strength_label_zh(strength: SignalStrength) -> &'static str {
 fn gate_label_zh(gate: &str) -> &str {
     match gate {
         "ws_freshness" => "WS 行情新鲜度",
+        "market_pool" => "市场池准入",
         "trade_plan" => "交易规划",
         "risk_guard" => "风控",
         "hedge_qty_guard" => "CEX 对冲量",
@@ -9487,6 +9792,28 @@ fn gate_label_zh(gate: &str) -> &str {
 fn gate_reason_label_zh(gate: &str, reason: &str) -> String {
     match gate {
         "ws_freshness" => format_ws_freshness_reason(reason).to_owned(),
+        "market_pool" => {
+            if let Some(reason) = crate::market_pool::cooldown_reason_from_gate(reason) {
+                return format!(
+                    "市场处于冷却期（{}）",
+                    translate_trade_plan_rejection(reason)
+                );
+            }
+            if let Some(reason) = reason.strip_prefix("retained_") {
+                return match reason {
+                    "force_exit" => "市场当前处于强退流程".to_owned(),
+                    "residual_recovery" => "市场当前处于残腿恢复流程".to_owned(),
+                    "close_in_progress" => "市场当前处于平仓流程".to_owned(),
+                    "delta_rebalance" => "市场当前处于再平衡流程".to_owned(),
+                    "has_position" => "市场已有持仓，禁止重复开仓".to_owned(),
+                    _ => "市场当前不允许新开仓".to_owned(),
+                };
+            }
+            match reason {
+                "not_tradeable_pool" => "市场当前不在交易池".to_owned(),
+                _ => "市场当前不允许新开仓".to_owned(),
+            }
+        }
         "price_filter" => match reason {
             "ok" => "价格在允许区间".to_owned(),
             "close_position" => "平仓信号绕过价格过滤".to_owned(),
@@ -11614,11 +11941,16 @@ fn build_market_views(
             let near_opportunity = market_is_near_opportunity(settings, snapshot.as_ref());
             let market_tier = determine_market_tier(
                 settings,
-                async_snapshot.as_ref(),
+                async_snapshot
+                    .as_ref()
+                    .is_some_and(async_snapshot_is_tradeable),
                 retention_reason,
                 near_opportunity,
-                observed.and_then(|item| item.last_focus_at_ms),
-                observed.and_then(|item| item.last_tradeable_at_ms),
+                observed.and_then(|item| item.market_pool.last_focus_at_ms),
+                observed.and_then(|item| item.market_pool.last_tradeable_at_ms),
+                observed
+                    .and_then(|item| market_pool_cooldown_reason(item, now_ms))
+                    .is_some(),
                 now_ms,
             );
             MarketView {
@@ -11658,8 +11990,9 @@ fn build_market_views(
                     .unwrap_or_default(),
                 market_tier,
                 retention_reason,
-                last_focus_at_ms: observed.and_then(|item| item.last_focus_at_ms),
-                last_tradeable_at_ms: observed.and_then(|item| item.last_tradeable_at_ms),
+                last_focus_at_ms: observed.and_then(|item| item.market_pool.last_focus_at_ms),
+                last_tradeable_at_ms: observed
+                    .and_then(|item| item.market_pool.last_tradeable_at_ms),
             }
         })
         .collect()
@@ -13055,41 +13388,28 @@ mod tests {
     fn record_market_tier_activity_updates_focus_and_tradeable_timestamps() {
         let mut observed = ObservedState::default();
         note_focus_market_activity(&mut observed, 1_000);
-        assert_eq!(observed.last_focus_at_ms, Some(1_000));
-        assert_eq!(observed.last_tradeable_at_ms, None);
+        assert_eq!(observed.market_pool.last_focus_at_ms, Some(1_000));
+        assert_eq!(observed.market_pool.last_tradeable_at_ms, None);
 
         note_tradeable_market_activity(&mut observed, 1_500);
-        assert_eq!(observed.last_focus_at_ms, Some(1_500));
-        assert_eq!(observed.last_tradeable_at_ms, Some(1_500));
+        assert_eq!(observed.market_pool.last_focus_at_ms, Some(1_500));
+        assert_eq!(observed.market_pool.last_tradeable_at_ms, Some(1_500));
+        assert_eq!(observed.market_pool.open_cooldown_reason, None);
+        assert_eq!(observed.market_pool.open_cooldown_until_ms, None);
     }
 
     #[test]
     fn determine_market_tier_distinguishes_tradeable_focus_and_observation() {
         let settings = test_settings_with_price_filter(None, None);
-        let healthy = AsyncMarketSnapshot {
-            poly_updated_at_ms: Some(1_900),
-            cex_updated_at_ms: Some(1_950),
-            poly_quote_age_ms: Some(100),
-            cex_quote_age_ms: Some(50),
-            cross_leg_skew_ms: Some(50),
-            transport_idle_ms_by_connection: HashMap::new(),
-            evaluable_status: EvaluableStatus::Evaluable,
-            async_classification: AsyncClassification::BalancedFresh,
-        };
-        let unhealthy = AsyncMarketSnapshot {
-            evaluable_status: EvaluableStatus::PolyQuoteStale,
-            async_classification: AsyncClassification::PolyQuoteStale,
-            ..healthy.clone()
-        };
-
         assert_eq!(
             determine_market_tier(
                 &settings,
-                Some(&healthy),
+                true,
                 polyalpha_core::MarketRetentionReason::None,
                 false,
                 Some(1_990),
                 Some(1_995),
+                false,
                 2_000,
             ),
             polyalpha_core::MarketTier::Tradeable
@@ -13097,23 +13417,25 @@ mod tests {
         assert_eq!(
             determine_market_tier(
                 &settings,
-                Some(&healthy),
+                true,
                 polyalpha_core::MarketRetentionReason::None,
                 true,
                 Some(1_990),
                 None,
+                false,
                 2_000,
             ),
-            polyalpha_core::MarketTier::Focus
+            polyalpha_core::MarketTier::Tradeable
         );
         assert_eq!(
             determine_market_tier(
                 &settings,
-                Some(&unhealthy),
+                false,
                 polyalpha_core::MarketRetentionReason::HasPosition,
                 false,
                 None,
                 Some(1_995),
+                false,
                 2_000,
             ),
             polyalpha_core::MarketTier::Focus
@@ -13121,15 +13443,147 @@ mod tests {
         assert_eq!(
             determine_market_tier(
                 &settings,
-                Some(&unhealthy),
+                false,
                 polyalpha_core::MarketRetentionReason::None,
                 false,
                 None,
                 Some(1_995),
+                false,
                 2_000,
             ),
             polyalpha_core::MarketTier::Observation
         );
+        assert_eq!(
+            determine_market_tier(
+                &settings,
+                true,
+                polyalpha_core::MarketRetentionReason::None,
+                true,
+                Some(1_990),
+                Some(1_995),
+                true,
+                2_000,
+            ),
+            polyalpha_core::MarketTier::Focus
+        );
+    }
+
+    #[tokio::test]
+    async fn process_signal_single_rejects_candidate_while_market_pool_cooldown_active() {
+        let settings = test_settings_with_price_filter(None, None);
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let (_provider, _executor, mut execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
+        let mut observed = ObservedState::default();
+        crate::market_pool::maybe_start_open_cooldown(
+            &mut observed.market_pool,
+            settings.strategy.market_data.max_stale_ms,
+            "zero_cex_hedge_qty",
+            1,
+        );
+
+        let mut stats = PaperStats::default();
+        let mut recent_events = VecDeque::new();
+        let mut engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
+        let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        let mut trade_book = TradeBook::default();
+        let paused = Arc::new(AtomicBool::new(false));
+        let emergency = Arc::new(AtomicBool::new(false));
+        let mut no_audit = None;
+
+        process_signal_single(
+            open_candidate(TokenSide::Yes),
+            &settings,
+            &registry,
+            &mut observed,
+            &mut stats,
+            &mut recent_events,
+            &mut engine,
+            &mut execution,
+            &mut risk,
+            &mut trade_book,
+            &paused,
+            &emergency,
+            false,
+            &mut no_audit,
+        )
+        .await
+        .expect("signal should be rejected by market pool gate");
+
+        assert_eq!(stats.signals_rejected, 1);
+        assert!(recent_events.iter().any(|event| {
+            event.summary.contains("市场处于冷却期") && event.summary.contains("CEX 对冲量为 0")
+        }));
+    }
+
+    #[tokio::test]
+    async fn process_signal_single_cools_market_after_zero_hedge_trade_plan_rejection() {
+        let settings = test_settings_with_price_filter(None, None);
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let (provider, _executor, mut execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
+        seed_runtime_books(&provider, &registry, 1);
+
+        let mut observed = ObservedState::default();
+        let mut candidate = open_candidate(TokenSide::Yes);
+        candidate.delta_estimate = 0.0;
+
+        let mut stats = PaperStats::default();
+        let mut recent_events = VecDeque::new();
+        let mut engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
+        let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        let mut trade_book = TradeBook::default();
+        let paused = Arc::new(AtomicBool::new(false));
+        let emergency = Arc::new(AtomicBool::new(false));
+        let mut no_audit = None;
+
+        process_signal_single(
+            candidate,
+            &settings,
+            &registry,
+            &mut observed,
+            &mut stats,
+            &mut recent_events,
+            &mut engine,
+            &mut execution,
+            &mut risk,
+            &mut trade_book,
+            &paused,
+            &emergency,
+            false,
+            &mut no_audit,
+        )
+        .await
+        .expect("signal should reject cleanly");
+
+        assert_eq!(
+            observed.market_pool.open_cooldown_reason.as_deref(),
+            Some("zero_cex_hedge_qty")
+        );
+        assert!(observed
+            .market_pool
+            .open_cooldown_until_ms
+            .is_some_and(|until_ms| until_ms > 1));
     }
 
     #[test]

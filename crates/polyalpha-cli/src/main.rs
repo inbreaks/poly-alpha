@@ -3,6 +3,7 @@ mod audit;
 mod backtest;
 mod backtest_rust;
 mod commands;
+mod market_pool;
 mod markets;
 mod monitor;
 mod paper;

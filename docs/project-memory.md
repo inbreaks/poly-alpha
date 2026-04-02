@@ -79,6 +79,7 @@
 
 - 降级市场池
 - 限制其进入交易池
+- 对结构性坏市场施加更长的临时隔离，而不是分钟级反复重试
 
 而不是删掉这个检查。
 
@@ -141,7 +142,19 @@
 
 以及 focus retention reason。
 
-这个语义不是为了 monitor 好看，而是为了后续 market pool governance。
+这个语义不是为了 monitor 好看，而是为了真实 market pool governance。
+
+当前默认口径已经是：
+
+- `paper/live` 的 open candidate 不能跳过市场池门禁
+- 市场进入 open cooldown 时，candidate 不得继续进入 planner
+- `sim` 也必须沿用同一套冷却语义，不能自己放宽
+
+当前进一步明确的执行口径是：
+
+- 结构性 planner 拒绝要用更长冷却做“临时隔离”
+- 边际恶化类拒绝用中等冷却
+- 订单簿漂移 / 单边 / 缺簿这类更偏实时波动的问题才适合短冷却
 
 后续治理都应该围绕：
 

@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use tokio::sync::broadcast::error::TryRecvError;
@@ -23,6 +23,11 @@ use polyalpha_risk::{InMemoryRiskManager, RiskLimits};
 
 use crate::args::{SimInspectFormat, SimScenario};
 use crate::commands::{open_plan_risk_rejection_reason, preview_open_plan, select_market};
+use crate::market_pool::{
+    active_open_cooldown_reason, active_open_cooldown_remaining_ms, clear_expired_open_cooldown,
+    extract_plan_rejection_reason_code, maybe_start_open_cooldown, note_tradeable_activity,
+    MarketPoolState,
+};
 use crate::runtime::{
     apply_orderbook_snapshot, build_data_manager, build_execution_stack,
     close_intent_for_symbol as runtime_close_intent_for_symbol, RuntimeExecutionMode,
@@ -238,6 +243,7 @@ struct ObservedState {
     cex_mid: Option<Decimal>,
     market_phase: Option<MarketPhase>,
     connections: HashMap<String, String>,
+    market_pool: MarketPoolState,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -505,10 +511,44 @@ async fn run_sim_with_mock_ticks(
                             summarize_candidate(&candidate),
                         );
 
+                        clear_expired_open_cooldown(
+                            &mut observed.market_pool,
+                            candidate.timestamp_ms,
+                        );
+                        if let Some(reason) = active_open_cooldown_reason(
+                            &observed.market_pool,
+                            candidate.timestamp_ms,
+                        ) {
+                            stats.signals_rejected += 1;
+                            let remaining_ms = active_open_cooldown_remaining_ms(
+                                &observed.market_pool,
+                                candidate.timestamp_ms,
+                            )
+                            .unwrap_or_default();
+                            push_event(
+                                &mut recent_events,
+                                "risk",
+                                format!(
+                                    "候选被拒绝：市场处于冷却期 {}（{}，剩余冷却 {}ms）",
+                                    candidate.candidate_id, reason, remaining_ms
+                                ),
+                            );
+                            continue;
+                        }
+
                         let plan = match preview_open_plan(&mut execution, &candidate) {
                             Ok(plan) => plan,
                             Err(err) => {
                                 stats.signals_rejected += 1;
+                                let reason_code =
+                                    extract_plan_rejection_reason_code(&err.to_string())
+                                        .unwrap_or_else(|| "trade_plan_rejected".to_owned());
+                                let _ = maybe_start_market_pool_cooldown(
+                                    settings,
+                                    &mut observed,
+                                    candidate.timestamp_ms,
+                                    &reason_code,
+                                );
                                 push_event(
                                     &mut recent_events,
                                     "risk",
@@ -537,6 +577,21 @@ async fn run_sim_with_mock_ticks(
 
                         match execution.process_plan(plan).await {
                             Ok(events) => {
+                                if execution_events_include_trade_plan_created(&events) {
+                                    note_tradeable_activity(
+                                        &mut observed.market_pool,
+                                        candidate.timestamp_ms,
+                                    );
+                                }
+                                let rejection_reasons = opening_signal_rejection_reasons(&events);
+                                if !rejection_reasons.is_empty() {
+                                    let _ = maybe_start_market_pool_cooldown_from_rejections(
+                                        settings,
+                                        &mut observed,
+                                        candidate.timestamp_ms,
+                                        &rejection_reasons,
+                                    );
+                                }
                                 apply_execution_events(
                                     &mut risk,
                                     &mut stats,
@@ -548,6 +603,13 @@ async fn run_sim_with_mock_ticks(
                             }
                             Err(err) => {
                                 stats.signals_rejected += 1;
+                                let rejection_reasons = vec![err.to_string()];
+                                let _ = maybe_start_market_pool_cooldown_from_rejections(
+                                    settings,
+                                    &mut observed,
+                                    candidate.timestamp_ms,
+                                    &rejection_reasons,
+                                );
                                 push_event(
                                     &mut recent_events,
                                     "risk",
@@ -886,6 +948,59 @@ fn mid_from_book(snapshot: &polyalpha_core::OrderBookSnapshot) -> Option<Decimal
     let best_bid = snapshot.bids.first()?.price.0;
     let best_ask = snapshot.asks.first()?.price.0;
     Some((best_bid + best_ask) / Decimal::new(2, 0))
+}
+
+fn maybe_start_market_pool_cooldown(
+    settings: &Settings,
+    observed: &mut ObservedState,
+    now_ms: u64,
+    reason: &str,
+) -> bool {
+    maybe_start_open_cooldown(
+        &mut observed.market_pool,
+        settings.strategy.market_data.max_stale_ms,
+        reason,
+        now_ms,
+    )
+}
+
+fn maybe_start_market_pool_cooldown_from_rejections(
+    settings: &Settings,
+    observed: &mut ObservedState,
+    now_ms: u64,
+    rejection_reasons: &[String],
+) -> Option<String> {
+    rejection_reasons.iter().find_map(|reason| {
+        let code = extract_plan_rejection_reason_code(reason).unwrap_or_else(|| reason.clone());
+        maybe_start_market_pool_cooldown(settings, observed, now_ms, &code).then_some(code)
+    })
+}
+
+fn opening_signal_rejection_reasons(events: &[ExecutionEvent]) -> Vec<String> {
+    let mut reasons = Vec::new();
+    let mut seen = HashSet::new();
+
+    for event in events {
+        if let ExecutionEvent::OrderSubmitted { response, .. } = event {
+            if matches!(response.status, OrderStatus::Rejected) {
+                let reason = response
+                    .rejection_reason
+                    .clone()
+                    .unwrap_or_else(|| "order_rejected".to_owned());
+                if seen.insert(reason.clone()) {
+                    reasons.push(reason);
+                }
+            }
+        }
+    }
+
+    reasons
+}
+
+fn execution_events_include_trade_plan_created(events: &[ExecutionEvent]) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, ExecutionEvent::TradePlanCreated { .. }))
 }
 
 fn build_snapshot(
@@ -1880,6 +1995,28 @@ mod tests {
                 .iter()
                 .all(|event| event.kind != "trade_closed"),
             "no position should mean no TradeClosed event"
+        );
+    }
+
+    #[test]
+    fn sim_market_pool_cooldown_starts_from_zero_hedge_rejection_reason() {
+        let market = test_market(Decimal::ONE);
+        let settings = test_settings(market, Decimal::ONE);
+        let mut observed = ObservedState::default();
+
+        let reason = maybe_start_market_pool_cooldown_from_rejections(
+            &settings,
+            &mut observed,
+            1_000,
+            &[String::from(
+                "plan rejected [zero_cex_hedge_qty]: open plan cannot produce a non-zero cex hedge after step rounding",
+            )],
+        );
+
+        assert_eq!(reason.as_deref(), Some("zero_cex_hedge_qty"));
+        assert_eq!(
+            active_open_cooldown_reason(&observed.market_pool, 1_001),
+            Some("zero_cex_hedge_qty")
         );
     }
 }
