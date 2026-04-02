@@ -35,6 +35,7 @@ def load_legacy_module() -> Any:
 
 
 LEGACY = load_legacy_module()
+RUNTIME_DEFAULTS = LEGACY.load_runtime_backtest_defaults()
 
 
 @dataclass
@@ -517,17 +518,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--token-id", default=None, help="只看单个 token_id")
     parser.add_argument("--start", default=None, help="开始时间，支持 YYYY-MM-DD 或毫秒时间戳")
     parser.add_argument("--end", default=None, help="结束时间，支持 YYYY-MM-DD 或毫秒时间戳")
-    parser.add_argument("--initial-capital", type=float, default=100_000.0)
-    parser.add_argument("--rolling-window", type=int, default=360)
-    parser.add_argument("--entry-z", type=float, default=2.0)
-    parser.add_argument("--exit-z", type=float, default=0.5)
+    parser.add_argument("--initial-capital", type=float, default=RUNTIME_DEFAULTS.initial_capital)
+    parser.add_argument("--rolling-window", type=int, default=RUNTIME_DEFAULTS.rolling_window)
+    parser.add_argument("--entry-z", type=float, default=RUNTIME_DEFAULTS.entry_z)
+    parser.add_argument("--exit-z", type=float, default=RUNTIME_DEFAULTS.exit_z)
     parser.add_argument("--position-units", type=float, default=None)
-    parser.add_argument("--position-notional-usd", type=float, default=1_000.0)
-    parser.add_argument("--max-capital-usage", type=float, default=0.25)
+    parser.add_argument(
+        "--position-notional-usd",
+        type=float,
+        default=RUNTIME_DEFAULTS.position_notional_usd,
+    )
+    parser.add_argument("--max-capital-usage", type=float, default=RUNTIME_DEFAULTS.max_capital_usage)
     parser.add_argument("--cex-hedge-ratio", type=float, default=1.0)
     parser.add_argument("--cex-margin-ratio", type=float, default=0.10)
     parser.add_argument("--fee-bps", type=float, default=2.0)
-    parser.add_argument("--slippage-bps", type=float, default=10.0)
+    parser.add_argument("--slippage-bps", type=float, default=RUNTIME_DEFAULTS.poly_slippage_bps)
     parser.add_argument(
         "--rust-report-json",
         default=DEFAULT_RUST_REPORT_PATH,
@@ -558,6 +563,10 @@ def build_run_config(args: argparse.Namespace) -> Any:
         cex_margin_ratio=float(args.cex_margin_ratio),
         fee_bps=float(args.fee_bps),
         slippage_bps=float(args.slippage_bps),
+        poly_slippage_bps=float(args.slippage_bps),
+        cex_slippage_bps=RUNTIME_DEFAULTS.cex_slippage_bps,
+        min_poly_price=RUNTIME_DEFAULTS.min_poly_price,
+        max_poly_price=RUNTIME_DEFAULTS.max_poly_price,
         report_json=None,
         equity_csv=None,
     )

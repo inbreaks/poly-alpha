@@ -10,7 +10,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use polyalpha_core::{
     AsyncClassification, CommandKind, CommandStatus, ConnectionStatus, EvaluableStatus, EventKind,
-    MarketView, TradeView,
+    MarketRetentionReason, MarketTier, MarketView, TradeView,
 };
 
 use super::state::{BannerLevel, Dialog, LogPane, Page, TuiState};
@@ -152,8 +152,10 @@ pub fn render_performance(state: &TuiState) -> Paragraph<'static> {
             Span::raw("  "),
             Span::styled("价格过滤 ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!(
-                "{:.2}-{:.2}",
-                state.monitor.config.min_poly_price, state.monitor.config.max_poly_price,
+                "{} {:.2}-{:.2}",
+                state.monitor.config.band_policy,
+                state.monitor.config.min_poly_price,
+                state.monitor.config.max_poly_price,
             )),
         ]),
         Line::from(vec![
@@ -1717,8 +1719,9 @@ fn format_option_price(price: Option<f64>) -> String {
 fn sorted_markets(markets: &[MarketView]) -> Vec<&MarketView> {
     let mut items = markets.iter().collect::<Vec<_>>();
     items.sort_by(|left, right| {
-        market_availability_rank(right)
-            .cmp(&market_availability_rank(left))
+        market_tier_priority(right)
+            .cmp(&market_tier_priority(left))
+            .then_with(|| market_availability_rank(right).cmp(&market_availability_rank(left)))
             .then_with(|| {
                 market_rank(right)
                     .partial_cmp(&market_rank(left))
@@ -1731,28 +1734,27 @@ fn sorted_markets(markets: &[MarketView]) -> Vec<&MarketView> {
     items
 }
 
-fn market_availability_rank(market: &MarketView) -> i32 {
-    match market.evaluable_status {
-        EvaluableStatus::Evaluable => match market.async_classification {
-            AsyncClassification::BalancedFresh => 6,
-            AsyncClassification::PolyLagAcceptable => 5,
-            AsyncClassification::PolyLagBorderline => 4,
-            _ => 3,
-        },
-        EvaluableStatus::Unknown => {
-            if newest_market_sample_ms(market) > 0 {
-                2
-            } else {
-                1
-            }
-        }
-        EvaluableStatus::ConnectionImpaired => 0,
-        EvaluableStatus::NotEvaluableNoPoly
-        | EvaluableStatus::NotEvaluableNoCex
-        | EvaluableStatus::NotEvaluableMisaligned
-        | EvaluableStatus::PolyQuoteStale
-        | EvaluableStatus::CexQuoteStale => -1,
+fn market_tier_priority(market: &MarketView) -> i32 {
+    match market.market_tier {
+        MarketTier::Tradeable => 400,
+        MarketTier::Focus => 200 + retention_reason_priority(market.retention_reason),
+        MarketTier::Observation => 100,
     }
+}
+
+fn retention_reason_priority(reason: MarketRetentionReason) -> i32 {
+    match reason {
+        MarketRetentionReason::None => 0,
+        MarketRetentionReason::HasPosition => 2,
+        MarketRetentionReason::CloseInProgress => 3,
+        MarketRetentionReason::DeltaRebalance => 3,
+        MarketRetentionReason::ResidualRecovery => 4,
+        MarketRetentionReason::ForceExit => 5,
+    }
+}
+
+fn market_availability_rank(market: &MarketView) -> i32 {
+    market_health_rank(market)
 }
 
 fn newest_market_sample_ms(market: &MarketView) -> u64 {
@@ -2143,12 +2145,12 @@ fn compact_evaluable_status_label(status: EvaluableStatus) -> &'static str {
     match status {
         EvaluableStatus::Unknown => "未知",
         EvaluableStatus::Evaluable => "可评估",
-        EvaluableStatus::NotEvaluableNoPoly => "Poly 无新样本",
-        EvaluableStatus::NotEvaluableNoCex => "交易所无参考价",
+        EvaluableStatus::NotEvaluableNoPoly => "Poly无样本",
+        EvaluableStatus::NotEvaluableNoCex => "交易所无价",
         EvaluableStatus::NotEvaluableMisaligned => "双腿未对齐",
         EvaluableStatus::ConnectionImpaired => "连接异常",
-        EvaluableStatus::PolyQuoteStale => "Poly 报价超时",
-        EvaluableStatus::CexQuoteStale => "交易所报价超时",
+        EvaluableStatus::PolyQuoteStale => "Poly超时",
+        EvaluableStatus::CexQuoteStale => "交易所超时",
     }
 }
 
@@ -2167,37 +2169,68 @@ fn compact_async_classification_label(classification: AsyncClassification) -> &'
     }
 }
 
-fn format_market_status_compact(market: &MarketView) -> String {
+fn market_health_rank(market: &MarketView) -> i32 {
     match market.evaluable_status {
         EvaluableStatus::Evaluable => match market.async_classification {
-            AsyncClassification::Unknown => {
-                compact_evaluable_status_label(market.evaluable_status).to_owned()
+            AsyncClassification::BalancedFresh => 6,
+            AsyncClassification::PolyLagAcceptable => 5,
+            AsyncClassification::PolyLagBorderline => 4,
+            _ => 3,
+        },
+        EvaluableStatus::Unknown => {
+            if newest_market_sample_ms(market) > 0 {
+                2
+            } else {
+                1
             }
-            classification => format!(
-                "{}/{}",
-                compact_evaluable_status_label(market.evaluable_status),
-                compact_async_classification_label(classification)
-            ),
-        },
-        status => compact_evaluable_status_label(status).to_owned(),
-    }
-}
-
-fn market_status_color(market: &MarketView) -> Color {
-    match market.evaluable_status {
-        EvaluableStatus::Evaluable => match market.async_classification {
-            AsyncClassification::BalancedFresh => Color::Green,
-            AsyncClassification::PolyLagAcceptable => Color::Cyan,
-            AsyncClassification::PolyLagBorderline => Color::Yellow,
-            _ => Color::Gray,
-        },
-        EvaluableStatus::ConnectionImpaired => Color::Red,
+        }
+        EvaluableStatus::ConnectionImpaired => 0,
         EvaluableStatus::NotEvaluableNoPoly
         | EvaluableStatus::NotEvaluableNoCex
         | EvaluableStatus::NotEvaluableMisaligned
         | EvaluableStatus::PolyQuoteStale
-        | EvaluableStatus::CexQuoteStale => Color::Yellow,
-        EvaluableStatus::Unknown => Color::DarkGray,
+        | EvaluableStatus::CexQuoteStale => -1,
+    }
+}
+
+fn compact_market_condition_label(market: &MarketView) -> &'static str {
+    match market.evaluable_status {
+        EvaluableStatus::Evaluable => match market.async_classification {
+            AsyncClassification::Unknown => compact_evaluable_status_label(market.evaluable_status),
+            classification => compact_async_classification_label(classification),
+        },
+        status => compact_evaluable_status_label(status),
+    }
+}
+
+fn format_market_status_compact(market: &MarketView) -> String {
+    let tier = market.market_tier.label_zh();
+    if market.retention_reason != MarketRetentionReason::None {
+        format!("{}/{}", tier, market.retention_reason.compact_label_zh())
+    } else {
+        format!("{}/{}", tier, compact_market_condition_label(market))
+    }
+}
+
+fn market_status_color(market: &MarketView) -> Color {
+    match market.market_tier {
+        MarketTier::Tradeable => match market.async_classification {
+            AsyncClassification::BalancedFresh => Color::Green,
+            AsyncClassification::PolyLagAcceptable => Color::Cyan,
+            _ => Color::Green,
+        },
+        MarketTier::Focus => match market.retention_reason {
+            MarketRetentionReason::ForceExit => Color::Red,
+            MarketRetentionReason::ResidualRecovery
+            | MarketRetentionReason::CloseInProgress
+            | MarketRetentionReason::DeltaRebalance => Color::Yellow,
+            MarketRetentionReason::HasPosition | MarketRetentionReason::None => Color::Cyan,
+        },
+        MarketTier::Observation => match market.evaluable_status {
+            EvaluableStatus::ConnectionImpaired => Color::Yellow,
+            EvaluableStatus::Unknown => Color::DarkGray,
+            _ => Color::Gray,
+        },
     }
 }
 
@@ -2253,6 +2286,8 @@ fn format_config_update_summary(config: &polyalpha_core::ConfigUpdate) -> String
         format!("单次仓位=${value:.0}")
     } else if let Some(value) = config.rolling_window {
         format!("滚动窗口={}s", value)
+    } else if let Some(value) = config.band_policy.as_deref() {
+        format!("价格带策略={value}")
     } else if let Some(value) = config.min_poly_price {
         format!("最小Polymarket价格={value:.3}")
     } else if let Some(value) = config.max_poly_price {
@@ -2555,54 +2590,83 @@ mod tests {
     fn market_table_uses_compact_status_labels() {
         let cases = [
             (
+                MarketTier::Tradeable,
+                MarketRetentionReason::None,
                 EvaluableStatus::Evaluable,
                 AsyncClassification::BalancedFresh,
-                "可评估/双腿新鲜",
+                "交易池/双腿新鲜",
             ),
             (
+                MarketTier::Tradeable,
+                MarketRetentionReason::None,
                 EvaluableStatus::Evaluable,
                 AsyncClassification::PolyLagAcceptable,
-                "可评估/慢腿可交",
+                "交易池/慢腿可交",
             ),
             (
+                MarketTier::Focus,
+                MarketRetentionReason::None,
                 EvaluableStatus::Evaluable,
                 AsyncClassification::PolyLagBorderline,
-                "可评估/慢腿临界",
+                "重点池/慢腿临界",
             ),
             (
+                MarketTier::Observation,
+                MarketRetentionReason::None,
                 EvaluableStatus::NotEvaluableNoPoly,
                 AsyncClassification::NoPolySample,
-                "Poly 无新样本",
+                "观察池/Poly无样本",
             ),
             (
+                MarketTier::Observation,
+                MarketRetentionReason::None,
                 EvaluableStatus::NotEvaluableNoCex,
                 AsyncClassification::NoCexReference,
-                "交易所无参考价",
+                "观察池/交易所无价",
             ),
             (
+                MarketTier::Observation,
+                MarketRetentionReason::None,
                 EvaluableStatus::NotEvaluableMisaligned,
                 AsyncClassification::Misaligned,
-                "双腿未对齐",
+                "观察池/双腿未对齐",
             ),
             (
+                MarketTier::Observation,
+                MarketRetentionReason::None,
                 EvaluableStatus::ConnectionImpaired,
                 AsyncClassification::ConnectionImpaired,
-                "连接异常",
+                "观察池/连接异常",
             ),
             (
+                MarketTier::Observation,
+                MarketRetentionReason::None,
                 EvaluableStatus::PolyQuoteStale,
                 AsyncClassification::PolyQuoteStale,
-                "Poly 报价超时",
+                "观察池/Poly超时",
             ),
             (
+                MarketTier::Observation,
+                MarketRetentionReason::None,
                 EvaluableStatus::CexQuoteStale,
                 AsyncClassification::CexQuoteStale,
-                "交易所报价超时",
+                "观察池/交易所超时",
+            ),
+            (
+                MarketTier::Focus,
+                MarketRetentionReason::HasPosition,
+                EvaluableStatus::Evaluable,
+                AsyncClassification::BalancedFresh,
+                "重点池/持仓",
             ),
         ];
 
-        for (evaluable_status, async_classification, expected) in cases {
+        for (market_tier, retention_reason, evaluable_status, async_classification, expected) in
+            cases
+        {
             let mut market = sample_market("xrp-dip-120-mar", Some(-1.22));
+            market.market_tier = market_tier;
+            market.retention_reason = retention_reason;
             market.evaluable_status = evaluable_status;
             market.async_classification = async_classification;
 
@@ -2610,6 +2674,37 @@ mod tests {
             assert_eq!(actual, expected);
             assert!(display_width(&actual) <= 18, "{actual}");
         }
+    }
+
+    #[test]
+    fn sorted_markets_prioritize_tradeable_then_retained_focus_then_observation() {
+        let mut tradeable = sample_market("tradeable-market", Some(1.0));
+        tradeable.market_tier = MarketTier::Tradeable;
+        tradeable.retention_reason = MarketRetentionReason::None;
+
+        let mut focus = sample_market("focus-market", Some(9.0));
+        focus.market_tier = MarketTier::Focus;
+        focus.retention_reason = MarketRetentionReason::HasPosition;
+
+        let mut observation = sample_market("observation-market", Some(20.0));
+        observation.market_tier = MarketTier::Observation;
+        observation.retention_reason = MarketRetentionReason::None;
+
+        let markets = vec![observation, focus, tradeable];
+        let sorted = sorted_markets(&markets);
+        let symbols = sorted
+            .into_iter()
+            .map(|market| market.symbol.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            symbols,
+            vec![
+                "tradeable-market".to_owned(),
+                "focus-market".to_owned(),
+                "observation-market".to_owned(),
+            ]
+        );
     }
 
     #[test]
@@ -2743,6 +2838,15 @@ mod tests {
             "调整参数(入场Z=2.50)"
         );
         assert_eq!(
+            format_command_kind(&CommandKind::UpdateConfig {
+                config: polyalpha_core::ConfigUpdate {
+                    band_policy: Some("disabled".to_owned()),
+                    ..polyalpha_core::ConfigUpdate::default()
+                }
+            }),
+            "调整参数(价格带策略=disabled)"
+        );
+        assert_eq!(
             format_command_status(CommandStatus::PartialSuccess),
             "部分成功"
         );
@@ -2768,6 +2872,10 @@ mod tests {
             cross_leg_skew_ms: Some(400),
             evaluable_status: EvaluableStatus::Evaluable,
             async_classification: AsyncClassification::PolyLagAcceptable,
+            market_tier: MarketTier::Tradeable,
+            retention_reason: MarketRetentionReason::None,
+            last_focus_at_ms: Some(1_800),
+            last_tradeable_at_ms: Some(1_900),
         }
     }
 

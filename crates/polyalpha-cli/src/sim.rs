@@ -5,30 +5,29 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::{sleep, Duration};
 
 use polyalpha_core::{
-    cex_venue_symbol, create_channels, AlphaEngine, CexBaseQty, ConnectionStatus, EngineParams,
-    EngineWarning, Exchange, ExecutionEvent, HedgeState, InstrumentKind, MarketConfig,
-    MarketDataEvent, MarketDataSource, MarketPhase, OpenCandidate, OrderStatus, PlanningIntent,
-    Position, Price, RiskManager, Settings, SymbolRegistry, TokenSide, VenueQuantity,
-    PLANNING_SCHEMA_VERSION,
+    create_channels, AlphaEngine, CexBaseQty, ConnectionStatus, EngineParams, EngineWarning,
+    Exchange, ExecutionEvent, HedgeState, InstrumentKind, MarketConfig, MarketDataEvent,
+    MarketDataSource, MarketPhase, OpenCandidate, OrderStatus, PlanningIntent, Position, Price,
+    RiskManager, Settings, SymbolRegistry, TokenSide, UsdNotional, VenueQuantity,
 };
 use polyalpha_data::{
-    CexBookLevel, CexBookUpdate, DataManager, MarketDataNormalizer, MockMarketDataSource, MockTick,
-    PolyBookLevel, PolyBookUpdate,
+    CexBookLevel, CexBookUpdate, MockMarketDataSource, MockTick, PolyBookLevel, PolyBookUpdate,
 };
 use polyalpha_engine::{SimpleAlphaEngine, SimpleEngineConfig};
-use polyalpha_executor::{
-    dry_run::{DryRunOrderSnapshot, SlippageConfig},
-    DryRunExecutor, ExecutionManager, InMemoryOrderbookProvider,
-};
+use polyalpha_executor::dry_run::DryRunOrderSnapshot;
 use polyalpha_risk::{InMemoryRiskManager, RiskLimits};
 
 use crate::args::{SimInspectFormat, SimScenario};
-use crate::commands::{select_market, signal_allowed};
+use crate::commands::{open_plan_risk_rejection_reason, preview_open_plan, select_market};
+use crate::runtime::{
+    apply_orderbook_snapshot, build_data_manager, build_execution_stack,
+    close_intent_for_symbol as runtime_close_intent_for_symbol, RuntimeExecutionMode,
+    RuntimeExecutor,
+};
 
 const MAX_EVENT_LOGS: usize = 32;
 const REPORT_WIDTH: usize = 78;
@@ -363,63 +362,17 @@ fn build_sim_engine_config(settings: &Settings) -> SimpleEngineConfig {
     }
 }
 
-fn build_sim_slippage_config(settings: &Settings) -> SlippageConfig {
-    SlippageConfig {
-        poly_slippage_bps: settings.paper_slippage.poly_slippage_bps,
-        cex_slippage_bps: settings.paper_slippage.cex_slippage_bps,
-        min_liquidity: settings.paper_slippage.min_liquidity,
-        allow_partial_fill: settings.paper_slippage.allow_partial_fill,
-    }
-}
-
-fn update_sim_orderbook(
-    provider: &InMemoryOrderbookProvider,
-    registry: &SymbolRegistry,
-    snapshot: &polyalpha_core::OrderBookSnapshot,
-) {
-    match snapshot.instrument {
-        InstrumentKind::CexPerp => {
-            let venue_symbol = registry
-                .get_config(&snapshot.symbol)
-                .map(|config| cex_venue_symbol(config.hedge_exchange, &config.cex_symbol))
-                .unwrap_or_else(|| {
-                    cex_venue_symbol(
-                        snapshot.exchange,
-                        &snapshot.symbol.0.to_ascii_uppercase().replace('-', ""),
-                    )
-                });
-            provider.update_cex(snapshot.clone(), venue_symbol);
-        }
-        InstrumentKind::PolyYes | InstrumentKind::PolyNo => provider.update(snapshot.clone()),
-    }
-}
-
-fn open_intent_from_candidate(candidate: &OpenCandidate) -> PlanningIntent {
-    PlanningIntent::OpenPosition {
-        schema_version: candidate.schema_version,
-        intent_id: format!("intent-open-{}", candidate.candidate_id),
-        correlation_id: candidate.correlation_id.clone(),
-        symbol: candidate.symbol.clone(),
-        candidate: candidate.clone(),
-        max_budget_usd: candidate.risk_budget_usd,
-        max_residual_delta: 0.05,
-        max_shock_loss_usd: candidate.risk_budget_usd.max(25.0),
-    }
-}
-
 fn close_intent_for_symbol(
     symbol: &polyalpha_core::Symbol,
     reason: &str,
     now_ms: u64,
 ) -> PlanningIntent {
-    PlanningIntent::ClosePosition {
-        schema_version: PLANNING_SCHEMA_VERSION,
-        intent_id: format!("intent-close-{}-{now_ms}", symbol.0),
-        correlation_id: format!("corr-close-{}-{now_ms}", symbol.0),
-        symbol: symbol.clone(),
-        close_reason: reason.to_owned(),
-        target_close_ratio: 1.0,
-    }
+    runtime_close_intent_for_symbol(
+        symbol,
+        reason,
+        &format!("corr-close-{}-{now_ms}", symbol.0),
+        now_ms,
+    )
 }
 
 fn sync_engine_position_state(
@@ -472,10 +425,7 @@ async fn run_sim_with_mock_ticks(
     let market = select_market(settings, market_index)?;
     let registry = SymbolRegistry::new(settings.markets.clone());
     let channels = create_channels(std::slice::from_ref(&market.symbol));
-    let manager = DataManager::new(
-        MarketDataNormalizer::new(registry.clone()),
-        channels.market_data_tx.clone(),
-    );
+    let manager = build_data_manager(&registry, channels.market_data_tx.clone());
 
     let mut source = MockMarketDataSource::new(
         manager,
@@ -497,16 +447,14 @@ async fn run_sim_with_mock_ticks(
         max_position_usd: Some(settings.strategy.basis.max_position_usd),
     });
 
-    let orderbook_provider = Arc::new(InMemoryOrderbookProvider::new());
-    let executor = DryRunExecutor::with_orderbook(
-        orderbook_provider.clone(),
-        build_sim_slippage_config(settings),
-    );
-    let mut execution = ExecutionManager::with_symbol_registry_and_orderbook_provider(
-        executor.clone(),
-        registry.clone(),
-        orderbook_provider.clone(),
-    );
+    let (orderbook_provider, executor, mut execution) = build_execution_stack(
+        settings,
+        &registry,
+        RuntimeExecutionMode::Paper,
+        1_700_000_000_000,
+        None,
+    )
+    .await?;
     let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
     let mut observed = ObservedState::default();
     let mut stats = SimStats::default();
@@ -521,7 +469,7 @@ async fn run_sim_with_mock_ticks(
                 Ok(event) => {
                     stats.market_events += 1;
                     if let MarketDataEvent::OrderBookUpdate { snapshot } = &event {
-                        update_sim_orderbook(&orderbook_provider, &registry, snapshot);
+                        apply_orderbook_snapshot(&orderbook_provider, &registry, snapshot);
                     }
                     observe_market_event(&mut observed, &event);
                     push_event(
@@ -557,20 +505,37 @@ async fn run_sim_with_mock_ticks(
                             summarize_candidate(&candidate),
                         );
 
-                        if !signal_allowed(&risk, &registry, &candidate).await? {
+                        let plan = match preview_open_plan(&mut execution, &candidate) {
+                            Ok(plan) => plan,
+                            Err(err) => {
+                                stats.signals_rejected += 1;
+                                push_event(
+                                    &mut recent_events,
+                                    "risk",
+                                    format!(
+                                        "候选被交易规划拒绝 {}（{}）",
+                                        candidate.candidate_id, err
+                                    ),
+                                );
+                                continue;
+                            }
+                        };
+
+                        if let Some(risk_rejection) = open_plan_risk_rejection_reason(&risk, &plan)
+                        {
                             stats.signals_rejected += 1;
                             push_event(
                                 &mut recent_events,
                                 "risk",
-                                format!("候选被拒绝：未通过风控检查 {}", candidate.candidate_id),
+                                format!(
+                                    "候选被拒绝：未通过风控检查 {}（{}）",
+                                    candidate.candidate_id, risk_rejection
+                                ),
                             );
                             continue;
                         }
 
-                        match execution
-                            .process_intent(open_intent_from_candidate(&candidate))
-                            .await
-                        {
+                        match execution.process_plan(plan).await {
                             Ok(events) => {
                                 apply_execution_events(
                                     &mut risk,
@@ -931,8 +896,8 @@ fn build_snapshot(
     observed: &ObservedState,
     stats: &SimStats,
     risk: &InMemoryRiskManager,
-    execution: &ExecutionManager<DryRunExecutor>,
-    executor: &DryRunExecutor,
+    execution: &polyalpha_executor::ExecutionManager<RuntimeExecutor>,
+    executor: &RuntimeExecutor,
 ) -> Result<SimSnapshot> {
     let snapshot = risk.build_snapshot(tick_index as u64);
     let positions = snapshot
@@ -1004,7 +969,14 @@ async fn apply_execution_events(
             ExecutionEvent::RecoveryPlanCreated { .. } => {
                 push_event(recent_events, "recovery", summarize_execution_event(&event));
             }
-            ExecutionEvent::ExecutionResultRecorded { .. } => {
+            ExecutionEvent::ExecutionResultRecorded { result } => {
+                if !result.actual_funding_cost_usd.0.is_zero() {
+                    let funding_adjustment =
+                        UsdNotional(Decimal::ZERO - result.actual_funding_cost_usd.0);
+                    risk.apply_realized_pnl_adjustment(UsdNotional(funding_adjustment.0))
+                        .await?;
+                    stats.total_pnl_usd += funding_adjustment.0.to_f64().unwrap_or_default();
+                }
                 push_event(recent_events, "result", summarize_execution_event(&event));
             }
             ExecutionEvent::OrderSubmitted { .. } => {
@@ -1043,9 +1015,8 @@ async fn apply_execution_events(
                     summarize_execution_event(&event),
                 );
             }
-            ExecutionEvent::TradeClosed { realized_pnl, .. } => {
+            ExecutionEvent::TradeClosed { .. } => {
                 stats.trades_closed += 1;
-                stats.total_pnl_usd += realized_pnl.0.to_f64().unwrap_or(0.0);
                 push_event(
                     recent_events,
                     "trade_closed",
@@ -1576,10 +1547,11 @@ mod tests {
     use super::*;
 
     use polyalpha_core::{
-        AuditConfig, BasisStrategyConfig, BinanceConfig, DmmStrategyConfig, GeneralConfig,
-        MarketDataConfig, MarketRule, NegRiskStrategyConfig, OkxConfig, PaperSlippageConfig,
-        PaperTradingConfig, PolymarketConfig, PolymarketIds, RiskConfig, SettlementRules,
-        StrategyConfig, Symbol, UsdNotional,
+        AuditConfig, BasisStrategyConfig, BinanceConfig, ClientOrderId, DmmStrategyConfig,
+        Exchange, ExecutionEvent, GeneralConfig, MarketDataConfig, MarketRule,
+        NegRiskStrategyConfig, OkxConfig, OrderId, OrderResponse, OrderStatus, PaperSlippageConfig,
+        PaperTradingConfig, PolyShares, PolymarketConfig, PolymarketIds, RiskConfig,
+        SettlementRules, StrategyConfig, Symbol, UsdNotional, VenueQuantity,
     };
 
     fn test_market(cex_qty_step: Decimal) -> MarketConfig {
@@ -1615,6 +1587,11 @@ mod tests {
                 clob_api_url: "https://example.com".to_owned(),
                 ws_url: "wss://example.com/ws".to_owned(),
                 chain_id: 137,
+                private_key: None,
+                signature_type: None,
+                funder: None,
+                api_key_nonce: None,
+                use_server_time: true,
             },
             binance: BinanceConfig {
                 rest_url: "https://example.com".to_owned(),
@@ -1636,6 +1613,7 @@ mod tests {
                     max_position_usd: UsdNotional(max_position_usd),
                     delta_rebalance_threshold: Decimal::new(5, 2),
                     delta_rebalance_interval_secs: 60,
+                    band_policy: polyalpha_core::BandPolicyMode::ConfiguredBand,
                     min_poly_price: Some(Decimal::ZERO),
                     max_poly_price: Some(Decimal::ONE),
                     max_data_age_minutes: 1,
@@ -1678,6 +1656,7 @@ mod tests {
                 min_liquidity: Decimal::new(1, 0),
                 allow_partial_fill: false,
             },
+            execution_costs: polyalpha_core::ExecutionCostConfig::default(),
             audit: AuditConfig::default(),
         }
     }
@@ -1800,6 +1779,25 @@ mod tests {
         })
     }
 
+    #[test]
+    fn summarize_execution_event_keeps_band_policy_rejection_code_visible() {
+        let text = summarize_execution_event(&ExecutionEvent::OrderSubmitted {
+            symbol: Symbol::new("btc-test"),
+            exchange: Exchange::Binance,
+            response: OrderResponse {
+                client_order_id: ClientOrderId("client-1".to_owned()),
+                exchange_order_id: OrderId("ord-1".to_owned()),
+                status: OrderStatus::Rejected,
+                filled_quantity: VenueQuantity::PolyShares(PolyShares(Decimal::ZERO)),
+                average_price: None,
+                rejection_reason: Some("below_min_poly_price".to_owned()),
+                timestamp_ms: 1,
+            },
+            correlation_id: "corr-1".to_owned(),
+        });
+        assert!(text.contains("below_min_poly_price"));
+    }
+
     #[tokio::test]
     async fn sim_rejects_non_executable_candidate_without_aborting() {
         let market = test_market(Decimal::new(1, 3));
@@ -1837,7 +1835,7 @@ mod tests {
             artifact
                 .recent_events
                 .iter()
-                .any(|event| event.summary.contains("候选被执行规划拒绝")),
+                .any(|event| event.summary.contains("候选被交易规划拒绝")),
             "planner rejection should be visible in sim event log"
         );
     }

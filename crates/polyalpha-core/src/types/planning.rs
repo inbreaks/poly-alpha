@@ -53,6 +53,7 @@ pub enum PlanRejectionReason {
     InsufficientCexDepth,
     PolyMaxPriceExceeded,
     PolyMinProceedsNotMet,
+    ZeroCexHedgeQty,
     ResidualDeltaTooLarge,
     ShockLossTooLarge,
     MarketPhaseDisallowsIntent,
@@ -74,6 +75,7 @@ impl PlanRejectionReason {
             Self::InsufficientCexDepth => "insufficient_cex_depth",
             Self::PolyMaxPriceExceeded => "poly_max_price_exceeded",
             Self::PolyMinProceedsNotMet => "poly_min_proceeds_not_met",
+            Self::ZeroCexHedgeQty => "zero_cex_hedge_qty",
             Self::ResidualDeltaTooLarge => "residual_delta_too_large",
             Self::ShockLossTooLarge => "shock_loss_too_large",
             Self::MarketPhaseDisallowsIntent => "market_phase_disallows_intent",
@@ -286,6 +288,8 @@ pub struct TradePlan {
     pub symbol: Symbol,
     pub intent_type: String,
     pub priority: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_decision_reason: Option<RecoveryDecisionReason>,
     pub created_at_ms: u64,
     pub poly_exchange_timestamp_ms: u64,
     pub poly_received_at_ms: u64,
@@ -433,6 +437,10 @@ mod tests {
         assert_eq!(
             PlanRejectionReason::MissingPolyBook.code(),
             "missing_poly_book"
+        );
+        assert_eq!(
+            PlanRejectionReason::ZeroCexHedgeQty.code(),
+            "zero_cex_hedge_qty"
         );
     }
 

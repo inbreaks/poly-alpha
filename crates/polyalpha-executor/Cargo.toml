@@ -5,10 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+alloy-signer-local = "1.8.3"
 async-trait.workspace = true
 base64 = "0.22"
 hmac = "0.12"
 polyalpha-core = { path = "../polyalpha-core" }
+polymarket-client-sdk = { version = "0.4.4", default-features = false, features = ["clob"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rust_decimal.workspace = true
 serde = { version = "1", features = ["derive"] }

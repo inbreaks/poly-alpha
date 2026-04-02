@@ -10,8 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use polyalpha_core::{
-    CexBaseQty, ConnectionStatus, CoreError, Exchange, MarketDataEvent, MarketDataSource,
-    OrderSide, Symbol,
+    CexBaseQty, ConnectionStatus, CoreError, Exchange, MarketDataSource, OrderSide, Symbol,
 };
 
 use crate::error::{DataError, Result};
@@ -37,21 +36,12 @@ pub struct BinanceFuturesDataSource {
 }
 
 impl BinanceFuturesDataSource {
-    fn publish_connection_event(&self, status: ConnectionStatus) {
-        let _ = self.manager.publish(MarketDataEvent::ConnectionEvent {
-            exchange: Exchange::Binance,
-            status,
-        });
-    }
-
     fn set_status_if_changed(&self, new_status: ConnectionStatus) {
         let mut guard = self.status.lock().expect("binance status lock poisoned");
         if *guard == new_status {
             return;
         }
         *guard = new_status;
-        drop(guard);
-        self.publish_connection_event(new_status);
     }
 
     fn mark_connected(&self) {
@@ -74,8 +64,6 @@ impl BinanceFuturesDataSource {
             return;
         }
         *guard = next;
-        drop(guard);
-        self.publish_connection_event(next);
     }
     pub fn new(manager: DataManager, rest_url: impl Into<String>) -> Self {
         Self {
@@ -316,7 +304,7 @@ impl BinanceFuturesDataSource {
 
     pub fn parse_partial_depth_ws_payload(
         payload: &str,
-        fallback_symbol: &str,
+        expected_symbol: &str,
     ) -> Result<Option<CexBookUpdate>> {
         let value: Value = serde_json::from_str(payload)?;
         let root = value.get("data").unwrap_or(&value);
@@ -336,16 +324,22 @@ impl BinanceFuturesDataSource {
             return Ok(None);
         };
 
-        let venue_symbol = root
+        let parsed_symbol = root
             .get("s")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
-            .unwrap_or(fallback_symbol)
-            .to_owned();
-        if venue_symbol.is_empty() {
+            .map(|value| value.to_ascii_uppercase())
+            .or_else(|| parse_binance_stream_symbol(&value));
+        let Some(venue_symbol) = parsed_symbol else {
             return Err(DataError::InvalidResponse(
                 "binance depth payload missing symbol".to_owned(),
             ));
+        };
+        if !expected_symbol.is_empty() && venue_symbol != expected_symbol.to_ascii_uppercase() {
+            return Err(DataError::InvalidResponse(format!(
+                "binance depth payload symbol mismatch: expected {}, got {}",
+                expected_symbol, venue_symbol
+            )));
         }
 
         Ok(Some(CexBookUpdate {
@@ -476,6 +470,15 @@ struct BinancePremiumIndexResponse {
     time: Option<u64>,
 }
 
+fn parse_binance_stream_symbol(value: &Value) -> Option<String> {
+    value
+        .get("stream")
+        .and_then(Value::as_str)
+        .and_then(|stream| stream.split('@').next())
+        .filter(|symbol| !symbol.is_empty())
+        .map(|symbol| symbol.to_ascii_uppercase())
+}
+
 fn parse_decimal(raw: &str) -> Result<Decimal> {
     Decimal::from_str(raw).map_err(|err| DataError::Decimal(err.to_string()))
 }
@@ -489,7 +492,37 @@ fn now_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    use polyalpha_core::{
+        create_channels, ConnectionStatus, Exchange, MarketConfig, PolymarketIds, Price, Symbol,
+        SymbolRegistry,
+    };
+
     use super::*;
+    use crate::{DataManager, MarketDataNormalizer};
+
+    fn sample_registry() -> SymbolRegistry {
+        SymbolRegistry::new(vec![MarketConfig {
+            symbol: Symbol::new("btc-100k-mar-2026"),
+            poly_ids: PolymarketIds {
+                condition_id: "condition-1".to_owned(),
+                yes_token_id: "yes-1".to_owned(),
+                no_token_id: "no-1".to_owned(),
+            },
+            market_question: None,
+            market_rule: None,
+            cex_symbol: "BTCUSDT".to_owned(),
+            hedge_exchange: Exchange::Binance,
+            strike_price: Some(Price(Decimal::new(100_000, 0))),
+            settlement_timestamp: 1_775_001_600,
+            min_tick_size: Price(Decimal::new(1, 2)),
+            neg_risk: false,
+            cex_price_tick: Decimal::new(1, 1),
+            cex_qty_step: Decimal::new(1, 3),
+            cex_contract_multiplier: Decimal::ONE,
+        }])
+    }
 
     #[test]
     fn parse_binance_depth_payload() {
@@ -553,5 +586,62 @@ mod tests {
         assert_eq!(update.sequence, 201);
         assert_eq!(update.bids.len(), 1);
         assert_eq!(update.asks.len(), 1);
+    }
+
+    #[test]
+    fn parse_binance_partial_depth_ws_payload_rejects_missing_symbol_metadata() {
+        let payload = r#"{
+            "data":{
+                "lastUpdateId": 201,
+                "E": 1715000002000,
+                "bids":[["100000.1","0.8"]],
+                "asks":[["100000.3","0.6"]]
+            }
+        }"#;
+
+        let err = BinanceFuturesDataSource::parse_partial_depth_ws_payload(payload, "BTCUSDT")
+            .expect_err("payload without stream or symbol must be rejected");
+        assert!(
+            matches!(err, DataError::InvalidResponse(message) if message.contains("missing symbol"))
+        );
+    }
+
+    #[test]
+    fn parse_binance_partial_depth_ws_payload_rejects_mismatched_symbol() {
+        let payload = r#"{
+            "stream":"ethusdt@depth20@100ms",
+            "data":{
+                "lastUpdateId": 201,
+                "E": 1715000002000,
+                "bids":[["100000.1","0.8"]],
+                "asks":[["100000.3","0.6"]]
+            }
+        }"#;
+
+        let err = BinanceFuturesDataSource::parse_partial_depth_ws_payload(payload, "BTCUSDT")
+            .expect_err("payload with mismatched stream symbol must be rejected");
+        assert!(
+            matches!(err, DataError::InvalidResponse(message) if message.contains("symbol mismatch"))
+        );
+    }
+
+    #[test]
+    fn rest_status_changes_do_not_publish_connection_events() {
+        let symbol = Symbol::new("btc-100k-mar-2026");
+        let channels = create_channels(std::slice::from_ref(&symbol));
+        let manager = DataManager::new(
+            MarketDataNormalizer::new(sample_registry()),
+            channels.market_data_tx.clone(),
+        );
+        let source = BinanceFuturesDataSource::new(manager, "https://fapi.binance.com");
+        let mut rx = channels.market_data_tx.subscribe();
+
+        source.mark_connected();
+        assert_eq!(source.connection_status(), ConnectionStatus::Connected);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        source.mark_failure();
+        assert_eq!(source.connection_status(), ConnectionStatus::Reconnecting);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 }

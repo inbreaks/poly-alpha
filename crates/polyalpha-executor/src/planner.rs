@@ -6,11 +6,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use polyalpha_core::{
-    CexBaseQty, ExecutionResult, Fill, InstrumentKind, OpenCandidate, OrderBookSnapshot,
-    OrderRequest, OrderSide, PlanRejectionReason, PlanningIntent, PolyOrderRequest, PolyShares,
-    PolySizingInstruction, Price, RecoveryDecisionReason, ResidualSnapshot,
-    RevalidationFailureReason, Symbol, TokenSide, TradePlan, UsdNotional, VenueQuantity,
-    PLANNING_SCHEMA_VERSION,
+    CexBaseQty, ExecutionCostConfig, ExecutionResult, Fill, FundingCostMode, InstrumentKind,
+    OpenCandidate, OrderBookSnapshot, OrderRequest, OrderSide, PlanRejectionReason, PlanningIntent,
+    PolyOrderRequest, PolyShares, PolySizingInstruction, Price, RecoveryDecisionReason,
+    ResidualSnapshot, RevalidationFailureReason, Symbol, TokenSide, TradePlan, UsdNotional,
+    VenueQuantity, PLANNING_SCHEMA_VERSION,
 };
 
 use crate::{
@@ -59,8 +59,10 @@ impl CanonicalPlanningContext {
 #[derive(Clone, Debug)]
 pub struct ExecutionPlanner {
     pub poly_fee_bps: u32,
-    pub cex_fee_bps: u32,
-    pub funding_bps_per_day: u32,
+    pub cex_taker_fee_bps: u32,
+    pub cex_maker_fee_bps: u32,
+    pub funding_mode: FundingCostMode,
+    pub fallback_funding_bps_per_day: u32,
     pub poly_slippage_bps: u32,
     pub cex_slippage_bps: u32,
 }
@@ -69,15 +71,53 @@ impl Default for ExecutionPlanner {
     fn default() -> Self {
         Self {
             poly_fee_bps: 20,
-            cex_fee_bps: 5,
-            funding_bps_per_day: 1,
+            cex_taker_fee_bps: 5,
+            cex_maker_fee_bps: 5,
+            funding_mode: FundingCostMode::FallbackBps,
+            fallback_funding_bps_per_day: 1,
             poly_slippage_bps: DEFAULT_POLY_SLIPPAGE_BPS as u32,
             cex_slippage_bps: DEFAULT_CEX_SLIPPAGE_BPS as u32,
         }
     }
 }
 
+fn recovery_reason_from_intent(intent: &PlanningIntent) -> Option<RecoveryDecisionReason> {
+    match intent {
+        PlanningIntent::ResidualRecovery {
+            recovery_reason, ..
+        } => Some(recovery_reason.clone()),
+        _ => None,
+    }
+}
+
 impl ExecutionPlanner {
+    pub fn from_execution_costs(config: &ExecutionCostConfig) -> Self {
+        Self {
+            poly_fee_bps: config.poly_fee_bps,
+            cex_taker_fee_bps: config.cex_taker_fee_bps,
+            cex_maker_fee_bps: config.cex_maker_fee_bps,
+            funding_mode: config.funding_mode,
+            fallback_funding_bps_per_day: config.fallback_funding_bps_per_day,
+            ..Self::default()
+        }
+    }
+
+    pub fn cex_fee_bps(&self, is_maker: bool) -> u32 {
+        if is_maker {
+            self.cex_maker_fee_bps
+        } else {
+            self.cex_taker_fee_bps
+        }
+    }
+
+    pub fn funding_bps_per_day(&self) -> u32 {
+        match self.funding_mode {
+            FundingCostMode::FallbackBps | FundingCostMode::ObservedRate => {
+                self.fallback_funding_bps_per_day
+            }
+        }
+    }
+
     pub fn plan(
         &self,
         intent: &PlanningIntent,
@@ -230,7 +270,7 @@ impl ExecutionPlanner {
             let estimate = self.estimate_cex_order(&context, plan.cex_side, normalized_qty);
             estimate.friction_cost_usd.unwrap_or(UsdNotional::ZERO).0
                 + estimate.fee_usd.unwrap_or(UsdNotional::ZERO).0
-                + bps_fee(estimate.executable_notional_usd, self.funding_bps_per_day).0
+                + bps_fee(estimate.executable_notional_usd, self.funding_bps_per_day()).0
         } else {
             Decimal::MAX
         };
@@ -347,6 +387,7 @@ impl ExecutionPlanner {
             plan_hash,
             intent_type: "delta_rebalance".to_owned(),
             priority: "delta_rebalance".to_owned(),
+            recovery_decision_reason: parent_plan.recovery_decision_reason.clone(),
             created_at_ms: actual_fills
                 .iter()
                 .map(|fill| fill.timestamp_ms)
@@ -453,6 +494,12 @@ impl ExecutionPlanner {
         let budget_cap_usd = Decimal::from_f64((*max_budget_usd).min(candidate.risk_budget_usd))
             .unwrap_or(Decimal::ZERO);
         let delta_abs = Decimal::from_f64(candidate.delta_estimate.abs()).unwrap_or(Decimal::ZERO);
+        if delta_abs <= Decimal::ZERO {
+            return Err(PlanRejection {
+                reason: PlanRejectionReason::ZeroCexHedgeQty,
+                detail: "open candidate cannot produce a non-zero cex hedge".to_owned(),
+            });
+        }
         let max_shares_by_budget = if poly_best_ask.0 > Decimal::ZERO {
             budget_cap_usd / poly_best_ask.0
         } else {
@@ -494,12 +541,19 @@ impl ExecutionPlanner {
             polyalpha_core::VenueQuantity::CexBaseQty(_) => PolyShares::ZERO,
         };
         let exact_cex_qty = poly_planned_shares.to_cex_base_qty(candidate.delta_estimate);
+        if exact_cex_qty.0 <= Decimal::ZERO {
+            return Err(PlanRejection {
+                reason: PlanRejectionReason::ZeroCexHedgeQty,
+                detail: "open plan cannot produce a non-zero cex hedge".to_owned(),
+            });
+        }
         let cex_planned_qty = exact_cex_qty.floor_to_step(context.cex_qty_step);
         let post_rounding_residual_qty = (exact_cex_qty.0 - cex_planned_qty.0).max(Decimal::ZERO);
-        if exact_cex_qty.0 > Decimal::ZERO && cex_planned_qty.0 <= Decimal::ZERO {
+        if cex_planned_qty.0 <= Decimal::ZERO {
             return Err(PlanRejection {
-                reason: PlanRejectionReason::ResidualDeltaTooLarge,
-                detail: "rounded hedge qty floors to zero".to_owned(),
+                reason: PlanRejectionReason::ZeroCexHedgeQty,
+                detail: "open plan cannot produce a non-zero cex hedge after step rounding"
+                    .to_owned(),
             });
         }
         if cex_planned_qty.0 > cex_depth {
@@ -527,9 +581,11 @@ impl ExecutionPlanner {
             .0
             .max(poly_estimate.executable_notional_usd.0 * delta_abs);
         let poly_fee_usd = bps_fee(poly_estimate.executable_notional_usd, self.poly_fee_bps);
-        let cex_fee_usd = bps_fee(UsdNotional(hedge_notional_proxy), self.cex_fee_bps);
-        let expected_funding_cost_usd =
-            bps_fee(UsdNotional(hedge_notional_proxy), self.funding_bps_per_day);
+        let cex_fee_usd = bps_fee(UsdNotional(hedge_notional_proxy), self.cex_fee_bps(false));
+        let expected_funding_cost_usd = bps_fee(
+            UsdNotional(hedge_notional_proxy),
+            self.funding_bps_per_day(),
+        );
         let residual_risk_penalty_usd = UsdNotional::ZERO;
         let planned_edge_usd = UsdNotional(
             UsdNotional(raw_edge_usd).0
@@ -588,6 +644,7 @@ impl ExecutionPlanner {
             symbol: intent.symbol().clone(),
             intent_type: intent.intent_type_code().to_owned(),
             priority: "open_position".to_owned(),
+            recovery_decision_reason: recovery_reason_from_intent(intent),
             created_at_ms: context.now_ms,
             poly_exchange_timestamp_ms: poly_book.exchange_timestamp_ms,
             poly_received_at_ms: poly_book.received_at_ms,
@@ -602,7 +659,7 @@ impl ExecutionPlanner {
             poly_requested_shares: capped_max_shares,
             poly_planned_shares,
             poly_max_cost_usd: UsdNotional(budget_cap_usd),
-            poly_max_avg_price: Price::ONE,
+            poly_max_avg_price: poly_estimate.executable_price.unwrap_or(poly_best_ask),
             poly_max_shares: capped_max_shares,
             poly_min_avg_price: Price::ZERO,
             poly_min_proceeds_usd: UsdNotional::ZERO,
@@ -693,7 +750,10 @@ impl ExecutionPlanner {
             )
         };
         let poly_fee_usd = bps_fee(poly_estimate.executable_notional_usd, self.poly_fee_bps);
-        let cex_fee_usd = bps_fee(cex_estimate.executable_notional_usd, self.cex_fee_bps);
+        let cex_fee_usd = bps_fee(
+            cex_estimate.executable_notional_usd,
+            self.cex_fee_bps(false),
+        );
         let planned_edge_usd = UsdNotional(
             -poly_estimate
                 .friction_cost_usd
@@ -717,6 +777,7 @@ impl ExecutionPlanner {
             symbol: intent.symbol().clone(),
             intent_type: intent.intent_type_code().to_owned(),
             priority: priority.to_owned(),
+            recovery_decision_reason: recovery_reason_from_intent(intent),
             created_at_ms: context.now_ms,
             poly_exchange_timestamp_ms: context.poly_yes_book.exchange_timestamp_ms,
             poly_received_at_ms: context.poly_yes_book.received_at_ms,
@@ -832,10 +893,13 @@ impl ExecutionPlanner {
             .max(Decimal::ZERO)
             .to_f64()
             .unwrap_or_default();
-        let cex_fee_usd = bps_fee(cex_estimate.executable_notional_usd, self.cex_fee_bps);
+        let cex_fee_usd = bps_fee(
+            cex_estimate.executable_notional_usd,
+            self.cex_fee_bps(false),
+        );
         let funding_cost = bps_fee(
             cex_estimate.executable_notional_usd,
-            self.funding_bps_per_day,
+            self.funding_bps_per_day(),
         );
         let planned_edge_usd = UsdNotional(
             -cex_estimate
@@ -861,6 +925,7 @@ impl ExecutionPlanner {
             symbol: intent.symbol().clone(),
             intent_type: intent.intent_type_code().to_owned(),
             priority: "residual_recovery".to_owned(),
+            recovery_decision_reason: recovery_reason_from_intent(intent),
             created_at_ms: context.now_ms,
             poly_exchange_timestamp_ms: selected_poly_book(context, poly_token_side)
                 .exchange_timestamp_ms,
@@ -1088,7 +1153,7 @@ impl ExecutionPlanner {
             executable_price,
             executable_notional_usd,
             friction_cost_usd: Some(bps_fee(executable_notional_usd, self.cex_slippage_bps)),
-            fee_usd: Some(bps_fee(executable_notional_usd, self.cex_fee_bps)),
+            fee_usd: Some(bps_fee(executable_notional_usd, self.cex_fee_bps(false))),
             rejection_reason: if remaining <= Decimal::ZERO {
                 None
             } else {
@@ -1128,8 +1193,10 @@ impl ExecutionPlanner {
         let shock_reference_price = cex_estimate
             .executable_price
             .unwrap_or_else(|| best_level_price(&context.cex_book, plan.cex_side));
-        let shock_losses =
-            shock_losses_for_residual_delta(plan.post_rounding_residual_delta, shock_reference_price);
+        let shock_losses = shock_losses_for_residual_delta(
+            plan.post_rounding_residual_delta,
+            shock_reference_price,
+        );
         Some((economics.realized_edge_usd, shock_losses))
     }
 
@@ -1424,12 +1491,12 @@ fn scaled_economics_for_replan(
         UsdNotional::ZERO
     };
     let cex_fee_usd = if cex_notional.0 > Decimal::ZERO {
-        bps_fee(cex_notional, planner.cex_fee_bps)
+        bps_fee(cex_notional, planner.cex_fee_bps(false))
     } else {
         UsdNotional::ZERO
     };
     let funding_cost_usd = if cex_notional.0 > Decimal::ZERO {
-        bps_fee(cex_notional, planner.funding_bps_per_day)
+        bps_fee(cex_notional, planner.funding_bps_per_day())
     } else {
         UsdNotional::ZERO
     };
@@ -1536,8 +1603,7 @@ mod tests {
     use polyalpha_core::{
         CexBaseQty, Exchange, Fill, InstrumentKind, OpenCandidate, OrderBookSnapshot, OrderId,
         OrderSide, PlanRejectionReason, PlanningIntent, PolyShares, Price, PriceLevel,
-        RevalidationFailureReason, SignalStrength, Symbol, TokenSide, VenueQuantity,
-        UsdNotional,
+        RevalidationFailureReason, SignalStrength, Symbol, TokenSide, UsdNotional, VenueQuantity,
     };
 
     use super::{CanonicalPlanningContext, ExecutionPlanner};
@@ -1657,6 +1723,36 @@ mod tests {
     }
 
     #[test]
+    fn planner_rejects_open_when_candidate_has_zero_cex_hedge_qty() {
+        let planner = ExecutionPlanner::default();
+        let mut intent = sample_open_intent();
+        let PlanningIntent::OpenPosition { candidate, .. } = &mut intent else {
+            panic!("expected open intent");
+        };
+        candidate.delta_estimate = 0.0;
+
+        let rejection = planner.plan(&intent, &sample_context()).unwrap_err();
+
+        assert_eq!(rejection.reason, PlanRejectionReason::ZeroCexHedgeQty);
+        assert!(rejection.detail.contains("cannot produce"));
+    }
+
+    #[test]
+    fn planner_rejects_open_when_cex_hedge_rounds_to_zero() {
+        let planner = ExecutionPlanner::default();
+        let mut intent = sample_open_intent();
+        let PlanningIntent::OpenPosition { candidate, .. } = &mut intent else {
+            panic!("expected open intent");
+        };
+        candidate.delta_estimate = 0.000001;
+
+        let rejection = planner.plan(&intent, &sample_context()).unwrap_err();
+
+        assert_eq!(rejection.reason, PlanRejectionReason::ZeroCexHedgeQty);
+        assert!(rejection.detail.contains("step rounding"));
+    }
+
+    #[test]
     fn planner_planned_edge_includes_fees_and_funding() {
         let planner = ExecutionPlanner::default();
         let plan = planner
@@ -1667,6 +1763,16 @@ mod tests {
         assert!(plan.cex_fee_usd.0 > Decimal::ZERO);
         assert!(plan.expected_funding_cost_usd.0 >= Decimal::ZERO);
         assert!(plan.planned_edge_usd.0 < plan.raw_edge_usd.0);
+    }
+
+    #[test]
+    fn open_plan_uses_executable_price_as_buy_cap() {
+        let planner = ExecutionPlanner::default();
+        let plan = planner
+            .plan(&sample_open_intent(), &sample_context())
+            .unwrap();
+
+        assert_eq!(plan.poly_max_avg_price, plan.poly_executable_price);
     }
 
     #[test]

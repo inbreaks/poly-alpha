@@ -2,6 +2,8 @@ use ::config::{Config, Environment, File};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
+use std::str::FromStr;
 
 use crate::types::{Exchange, MarketConfig, SettlementRules, UsdNotional};
 use crate::Result;
@@ -30,6 +32,45 @@ fn default_monitor_socket_path() -> String {
     "/tmp/polyalpha.sock".to_owned()
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BandPolicyMode {
+    #[default]
+    ConfiguredBand,
+    Disabled,
+}
+
+impl BandPolicyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfiguredBand => "configured_band",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    pub fn uses_configured_band(self) -> bool {
+        matches!(self, Self::ConfiguredBand)
+    }
+}
+
+impl fmt::Display for BandPolicyMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for BandPolicyMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "configured_band" => Ok(Self::ConfiguredBand),
+            "disabled" => Ok(Self::Disabled),
+            other => Err(format!("unsupported band policy: {other}")),
+        }
+    }
+}
+
 fn default_market_data_mode() -> MarketDataMode {
     MarketDataMode::Poll
 }
@@ -46,8 +87,16 @@ fn default_snapshot_refresh_secs() -> u64 {
     300
 }
 
+fn default_planner_depth_levels() -> usize {
+    5
+}
+
 fn default_funding_poll_secs() -> u64 {
     60
+}
+
+fn default_use_server_time() -> bool {
+    true
 }
 
 fn default_audit_enabled() -> bool {
@@ -70,6 +119,22 @@ fn default_audit_raw_segment_max_bytes() -> u64 {
     64 * 1024 * 1024
 }
 
+fn default_execution_cost_poly_fee_bps() -> u32 {
+    20
+}
+
+fn default_execution_cost_cex_taker_fee_bps() -> u32 {
+    5
+}
+
+fn default_execution_cost_cex_maker_fee_bps() -> u32 {
+    5
+}
+
+fn default_execution_cost_fallback_funding_bps_per_day() -> u32 {
+    1
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GeneralConfig {
     pub log_level: String,
@@ -79,10 +144,28 @@ pub struct GeneralConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolymarketSignatureType {
+    Eoa,
+    Proxy,
+    GnosisSafe,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PolymarketConfig {
     pub clob_api_url: String,
     pub ws_url: String,
     pub chain_id: u64,
+    #[serde(default)]
+    pub private_key: Option<String>,
+    #[serde(default)]
+    pub signature_type: Option<PolymarketSignatureType>,
+    #[serde(default)]
+    pub funder: Option<String>,
+    #[serde(default)]
+    pub api_key_nonce: Option<u32>,
+    #[serde(default = "default_use_server_time")]
+    pub use_server_time: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -112,6 +195,8 @@ pub struct MarketDataConfig {
     pub mode: MarketDataMode,
     #[serde(default = "default_max_stale_ms")]
     pub max_stale_ms: u64,
+    #[serde(default = "default_planner_depth_levels")]
+    pub planner_depth_levels: usize,
     #[serde(default)]
     pub poly_open_max_quote_age_ms: Option<u64>,
     #[serde(default)]
@@ -135,6 +220,7 @@ impl Default for MarketDataConfig {
         Self {
             mode: default_market_data_mode(),
             max_stale_ms: default_max_stale_ms(),
+            planner_depth_levels: default_planner_depth_levels(),
             poly_open_max_quote_age_ms: None,
             cex_open_max_quote_age_ms: None,
             close_max_quote_age_ms: None,
@@ -223,6 +309,9 @@ pub struct BasisOverrideConfig {
     /// Override maximum Polymarket price for trading
     #[serde(default)]
     pub max_poly_price: Option<Decimal>,
+    /// Override band policy for specific asset
+    #[serde(default)]
+    pub band_policy: Option<BandPolicyMode>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -235,6 +324,8 @@ pub struct BasisStrategyConfig {
     pub max_position_usd: UsdNotional,
     pub delta_rebalance_threshold: Decimal,
     pub delta_rebalance_interval_secs: u64,
+    #[serde(default)]
+    pub band_policy: BandPolicyMode,
     #[serde(default)]
     pub min_poly_price: Option<Decimal>,
     #[serde(default)]
@@ -335,6 +426,46 @@ impl Default for PaperSlippageConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FundingCostMode {
+    #[serde(alias = "fallback")]
+    FallbackBps,
+    ObservedRate,
+}
+
+impl Default for FundingCostMode {
+    fn default() -> Self {
+        Self::FallbackBps
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionCostConfig {
+    #[serde(default = "default_execution_cost_poly_fee_bps")]
+    pub poly_fee_bps: u32,
+    #[serde(default = "default_execution_cost_cex_taker_fee_bps")]
+    pub cex_taker_fee_bps: u32,
+    #[serde(default = "default_execution_cost_cex_maker_fee_bps")]
+    pub cex_maker_fee_bps: u32,
+    #[serde(default)]
+    pub funding_mode: FundingCostMode,
+    #[serde(default = "default_execution_cost_fallback_funding_bps_per_day")]
+    pub fallback_funding_bps_per_day: u32,
+}
+
+impl Default for ExecutionCostConfig {
+    fn default() -> Self {
+        Self {
+            poly_fee_bps: default_execution_cost_poly_fee_bps(),
+            cex_taker_fee_bps: default_execution_cost_cex_taker_fee_bps(),
+            cex_maker_fee_bps: default_execution_cost_cex_maker_fee_bps(),
+            funding_mode: FundingCostMode::default(),
+            fallback_funding_bps_per_day: default_execution_cost_fallback_funding_bps_per_day(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
     pub general: GeneralConfig,
@@ -348,6 +479,8 @@ pub struct Settings {
     pub paper: PaperTradingConfig,
     #[serde(default)]
     pub paper_slippage: PaperSlippageConfig,
+    #[serde(default)]
+    pub execution_costs: ExecutionCostConfig,
     #[serde(default)]
     pub audit: AuditConfig,
 }
@@ -376,11 +509,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn polymarket_config_deserializes_optional_live_auth_fields() {
+        let config: PolymarketConfig = serde_json::from_str(
+            r#"{
+                "clob_api_url":"https://clob.polymarket.com",
+                "ws_url":"wss://ws-subscriptions-clob.polymarket.com/ws/market",
+                "chain_id":137,
+                "private_key":"0xabc",
+                "signature_type":"proxy",
+                "funder":"0x0000000000000000000000000000000000000001",
+                "api_key_nonce":7,
+                "use_server_time":false
+            }"#,
+        )
+        .expect("polymarket config with live auth");
+
+        assert_eq!(config.private_key.as_deref(), Some("0xabc"));
+        assert_eq!(config.signature_type, Some(PolymarketSignatureType::Proxy));
+        assert_eq!(
+            config.funder.as_deref(),
+            Some("0x0000000000000000000000000000000000000001")
+        );
+        assert_eq!(config.api_key_nonce, Some(7));
+        assert!(!config.use_server_time);
+    }
+
+    #[test]
     fn market_data_config_defaults_to_poll_mode() {
         let config: MarketDataConfig =
             serde_json::from_str("{}").expect("default market data config");
         assert_eq!(config.mode, MarketDataMode::Poll);
         assert_eq!(config.max_stale_ms, 5_000);
+        assert_eq!(config.planner_depth_levels, 5);
         assert_eq!(config.resolved_poly_open_max_quote_age_ms(), 5_000);
         assert_eq!(config.resolved_cex_open_max_quote_age_ms(), 5_000);
         assert_eq!(config.resolved_close_max_quote_age_ms(), 10_000);
@@ -410,6 +570,7 @@ mod tests {
         .expect("ws market data config");
         assert_eq!(config.mode, MarketDataMode::Ws);
         assert_eq!(config.max_stale_ms, 1_500);
+        assert_eq!(config.planner_depth_levels, 5);
         assert_eq!(config.resolved_poly_open_max_quote_age_ms(), 2_500);
         assert_eq!(config.resolved_cex_open_max_quote_age_ms(), 1_200);
         assert_eq!(config.resolved_close_max_quote_age_ms(), 3_000);
@@ -440,5 +601,35 @@ mod tests {
         assert_eq!(config.checkpoint_interval_secs, 60);
         assert_eq!(config.warehouse_sync_interval_secs, 300);
         assert_eq!(config.raw_segment_max_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn execution_cost_config_defaults_are_explicit() {
+        let config: ExecutionCostConfig =
+            serde_json::from_str("{}").expect("default execution cost config");
+        assert_eq!(config.poly_fee_bps, 20);
+        assert_eq!(config.cex_taker_fee_bps, 5);
+        assert_eq!(config.cex_maker_fee_bps, 5);
+        assert_eq!(config.funding_mode, FundingCostMode::FallbackBps);
+        assert_eq!(config.fallback_funding_bps_per_day, 1);
+    }
+
+    #[test]
+    fn execution_cost_config_deserializes_observed_rate_mode() {
+        let config: ExecutionCostConfig = serde_json::from_str(
+            r#"{
+                "poly_fee_bps": 17,
+                "cex_taker_fee_bps": 9,
+                "cex_maker_fee_bps": 2,
+                "funding_mode": "observed_rate",
+                "fallback_funding_bps_per_day": 4
+            }"#,
+        )
+        .expect("execution cost config");
+        assert_eq!(config.poly_fee_bps, 17);
+        assert_eq!(config.cex_taker_fee_bps, 9);
+        assert_eq!(config.cex_maker_fee_bps, 2);
+        assert_eq!(config.funding_mode, FundingCostMode::ObservedRate);
+        assert_eq!(config.fallback_funding_bps_per_day, 4);
     }
 }

@@ -254,6 +254,88 @@ impl AsyncClassification {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketTier {
+    #[default]
+    Observation,
+    Focus,
+    Tradeable,
+}
+
+impl MarketTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Observation => "observation",
+            Self::Focus => "focus",
+            Self::Tradeable => "tradeable",
+        }
+    }
+
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            Self::Observation => "观察池",
+            Self::Focus => "重点池",
+            Self::Tradeable => "交易池",
+        }
+    }
+
+    pub fn compact_label_zh(self) -> &'static str {
+        match self {
+            Self::Observation => "观",
+            Self::Focus => "重",
+            Self::Tradeable => "交",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketRetentionReason {
+    #[default]
+    None,
+    HasPosition,
+    CloseInProgress,
+    DeltaRebalance,
+    ResidualRecovery,
+    ForceExit,
+}
+
+impl MarketRetentionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::HasPosition => "has_position",
+            Self::CloseInProgress => "close_in_progress",
+            Self::DeltaRebalance => "delta_rebalance",
+            Self::ResidualRecovery => "residual_recovery",
+            Self::ForceExit => "force_exit",
+        }
+    }
+
+    pub fn label_zh(self) -> &'static str {
+        match self {
+            Self::None => "无",
+            Self::HasPosition => "已有持仓",
+            Self::CloseInProgress => "平仓处理中",
+            Self::DeltaRebalance => "再平衡处理中",
+            Self::ResidualRecovery => "残腿恢复中",
+            Self::ForceExit => "强制退出中",
+        }
+    }
+
+    pub fn compact_label_zh(self) -> &'static str {
+        match self {
+            Self::None => "--",
+            Self::HasPosition => "持仓",
+            Self::CloseInProgress => "平仓",
+            Self::DeltaRebalance => "再平衡",
+            Self::ResidualRecovery => "恢复",
+            Self::ForceExit => "强退",
+        }
+    }
+}
+
 /// 业绩指标
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PerformanceMetrics {
@@ -331,6 +413,14 @@ pub struct MarketView {
     pub evaluable_status: EvaluableStatus,
     #[serde(default)]
     pub async_classification: AsyncClassification,
+    #[serde(default)]
+    pub market_tier: MarketTier,
+    #[serde(default)]
+    pub retention_reason: MarketRetentionReason,
+    #[serde(default)]
+    pub last_focus_at_ms: Option<u64>,
+    #[serde(default)]
+    pub last_tradeable_at_ms: Option<u64>,
 }
 
 /// 信号统计
@@ -367,6 +457,8 @@ pub struct MonitorStrategyConfig {
     pub exit_z: f64,
     pub position_notional_usd: f64,
     pub rolling_window: u64,
+    #[serde(default)]
+    pub band_policy: String,
     #[serde(default)]
     pub market_data_mode: String,
     #[serde(default)]
@@ -412,6 +504,7 @@ impl Default for MonitorStrategyConfig {
             exit_z: 0.5,
             position_notional_usd: 10000.0,
             rolling_window: 600,
+            band_policy: "configured_band".to_owned(),
             market_data_mode: "poll".to_owned(),
             max_stale_ms: 0,
             poly_open_max_quote_age_ms: 0,
@@ -649,6 +742,7 @@ pub struct ConfigUpdate {
     pub exit_z: Option<f64>,
     pub position_notional_usd: Option<f64>,
     pub rolling_window: Option<u64>,
+    pub band_policy: Option<String>,
     pub min_poly_price: Option<f64>,
     pub max_poly_price: Option<f64>,
 }
@@ -724,6 +818,32 @@ mod tests {
     }
 
     #[test]
+    fn band_policy_roundtrips_through_config_update_json() {
+        let msg = Message::Command {
+            command_id: "cfg-1".to_owned(),
+            kind: CommandKind::UpdateConfig {
+                config: ConfigUpdate {
+                    band_policy: Some("disabled".to_owned()),
+                    min_poly_price: Some(0.0),
+                    max_poly_price: Some(1.0),
+                    ..ConfigUpdate::default()
+                },
+            },
+        };
+
+        let encoded = msg.to_bytes().unwrap();
+        let decoded = Message::from_bytes(&encoded[..encoded.len() - 1]).unwrap();
+
+        match decoded {
+            Message::Command {
+                kind: CommandKind::UpdateConfig { config },
+                ..
+            } => assert_eq!(config.band_policy.as_deref(), Some("disabled")),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
     fn monitor_event_roundtrips_structured_planning_payload() {
         let candidate = OpenCandidate {
             schema_version: PLANNING_SCHEMA_VERSION,
@@ -760,6 +880,7 @@ mod tests {
             symbol: Symbol::new("btc-price-only"),
             intent_type: "open_position".to_owned(),
             priority: "open_position".to_owned(),
+            recovery_decision_reason: None,
             created_at_ms: 1_716_000_000_001,
             poly_exchange_timestamp_ms: 1_716_000_000_001,
             poly_received_at_ms: 1_716_000_000_002,
@@ -1059,6 +1180,10 @@ mod tests {
                 cross_leg_skew_ms: Some(10),
                 evaluable_status: EvaluableStatus::Evaluable,
                 async_classification: AsyncClassification::BalancedFresh,
+                market_tier: MarketTier::Focus,
+                retention_reason: MarketRetentionReason::HasPosition,
+                last_focus_at_ms: Some(1),
+                last_tradeable_at_ms: None,
             },
             MarketView {
                 symbol: "eth-reach-2400-mar".to_owned(),
@@ -1079,6 +1204,10 @@ mod tests {
                 cross_leg_skew_ms: Some(10),
                 evaluable_status: EvaluableStatus::Evaluable,
                 async_classification: AsyncClassification::BalancedFresh,
+                market_tier: MarketTier::Observation,
+                retention_reason: MarketRetentionReason::None,
+                last_focus_at_ms: None,
+                last_tradeable_at_ms: None,
             },
         ];
         state.recent_events = vec![
@@ -1195,5 +1324,57 @@ mod tests {
 
         assert!(event.matches_market("sol-dip-80-mar"));
         assert!(!event.matches_market("eth-reach-2400-mar"));
+    }
+
+    #[test]
+    fn market_tier_and_retention_reason_labels_are_stable() {
+        assert_eq!(MarketTier::Observation.as_str(), "observation");
+        assert_eq!(MarketTier::Focus.label_zh(), "重点池");
+        assert_eq!(MarketTier::Tradeable.compact_label_zh(), "交");
+
+        assert_eq!(MarketRetentionReason::None.as_str(), "none");
+        assert_eq!(MarketRetentionReason::HasPosition.label_zh(), "已有持仓");
+        assert_eq!(
+            MarketRetentionReason::ResidualRecovery.compact_label_zh(),
+            "恢复"
+        );
+    }
+
+    #[test]
+    fn monitor_state_market_view_carries_tier_and_retention_fields() {
+        let state = MonitorState {
+            markets: vec![MarketView {
+                symbol: "btc-test".to_owned(),
+                z_score: Some(2.4),
+                basis_pct: Some(12.0),
+                poly_price: Some(0.41),
+                poly_yes_price: Some(0.41),
+                poly_no_price: Some(0.59),
+                cex_price: Some(101_000.0),
+                fair_value: Some(0.37),
+                has_position: true,
+                minutes_to_expiry: Some(60.0),
+                active_token_side: Some("YES".to_owned()),
+                poly_updated_at_ms: Some(1),
+                cex_updated_at_ms: Some(2),
+                poly_quote_age_ms: Some(50),
+                cex_quote_age_ms: Some(40),
+                cross_leg_skew_ms: Some(10),
+                evaluable_status: EvaluableStatus::Evaluable,
+                async_classification: AsyncClassification::BalancedFresh,
+                market_tier: MarketTier::Focus,
+                retention_reason: MarketRetentionReason::HasPosition,
+                last_focus_at_ms: Some(100),
+                last_tradeable_at_ms: Some(90),
+            }],
+            ..MonitorState::default()
+        };
+
+        assert_eq!(state.markets[0].market_tier, MarketTier::Focus);
+        assert_eq!(
+            state.markets[0].retention_reason,
+            MarketRetentionReason::HasPosition
+        );
+        assert_eq!(state.markets[0].last_focus_at_ms, Some(100));
     }
 }

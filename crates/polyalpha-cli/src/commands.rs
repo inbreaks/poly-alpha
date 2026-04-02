@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::str::FromStr;
 use tokio::sync::broadcast::error::TryRecvError;
@@ -7,23 +7,24 @@ use tokio::sync::broadcast::error::TryRecvError;
 use polyalpha_core::{
     cex_venue_symbol, create_channels, AlphaEngine, CexBaseQty, CexOrderRequest, ClientOrderId,
     ConnectionStatus, EngineParams, Exchange, ExecutionEvent, InstrumentKind, MarketConfig,
-    MarketDataEvent, MarketDataSource, OpenCandidate, OrderRequest, OrderType, PlanningIntent,
-    PolyOrderRequest, PolyShares, PolySizingInstruction, Price, RiskManager, Settings,
-    SymbolRegistry, TimeInForce, TokenSide,
+    MarketDataEvent, MarketDataSource, OpenCandidate, OrderType, PlanningIntent, Price,
+    RiskManager, Settings, SymbolRegistry, TimeInForce, TokenSide, TradePlan,
 };
 use polyalpha_data::{
-    BinanceFuturesDataSource, CexBookLevel, CexBookUpdate, DataManager, MarketDataNormalizer,
-    MockMarketDataSource, MockTick, OkxMarketDataSource, PolyBookLevel, PolyBookUpdate,
-    PolymarketLiveDataSource,
+    BinanceFuturesDataSource, CexBookLevel, CexBookUpdate, MockMarketDataSource, MockTick,
+    OkxMarketDataSource, PolyBookLevel, PolyBookUpdate, PolymarketLiveDataSource,
 };
 use polyalpha_engine::{SimpleAlphaEngine, SimpleEngineConfig};
-use polyalpha_executor::{
-    dry_run::SlippageConfig, BinanceFuturesExecutor, DryRunExecutor, ExecutionManager,
-    InMemoryOrderbookProvider, OkxExecutor,
-};
+use polyalpha_executor::{BinanceFuturesExecutor, ExecutionManager, OkxExecutor};
 use polyalpha_risk::{InMemoryRiskManager, RiskLimits};
 
 use crate::args::{PreviewExchange, PreviewOrderType, PreviewSide};
+use crate::runtime::{
+    apply_orderbook_snapshot, build_data_manager, build_execution_stack,
+    close_intent_for_symbol as runtime_close_intent_for_symbol,
+    open_intent_from_candidate as runtime_open_intent_from_candidate, RuntimeExecutionMode,
+    RuntimeExecutor,
+};
 
 #[derive(Default)]
 struct DemoStats {
@@ -61,10 +62,7 @@ pub async fn run_demo(env: &str) -> Result<()> {
 
     let registry = SymbolRegistry::new(settings.markets.clone());
     let channels = create_channels(std::slice::from_ref(&market.symbol));
-    let manager = DataManager::new(
-        MarketDataNormalizer::new(registry.clone()),
-        channels.market_data_tx.clone(),
-    );
+    let manager = build_data_manager(&registry, channels.market_data_tx.clone());
 
     let ticks = scripted_ticks(&market);
     let mut source = MockMarketDataSource::new(
@@ -99,14 +97,14 @@ pub async fn run_demo(env: &str) -> Result<()> {
     });
 
     let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
-    let orderbook_provider = std::sync::Arc::new(InMemoryOrderbookProvider::new());
-    let executor =
-        DryRunExecutor::with_orderbook(orderbook_provider.clone(), SlippageConfig::default());
-    let mut execution = ExecutionManager::with_symbol_registry_and_orderbook_provider(
-        executor,
-        registry.clone(),
-        orderbook_provider.clone(),
-    );
+    let (orderbook_provider, _executor, mut execution) = build_execution_stack(
+        &settings,
+        &registry,
+        RuntimeExecutionMode::Paper,
+        1_700_000_000_000,
+        None,
+    )
+    .await?;
     let mut stats = DemoStats::default();
 
     // 这里按 tick 顺序推进，保证 dry-run 的结果稳定可复现。
@@ -116,7 +114,7 @@ pub async fn run_demo(env: &str) -> Result<()> {
                 Ok(event) => {
                     stats.market_events += 1;
                     if let MarketDataEvent::OrderBookUpdate { snapshot } = &event {
-                        update_demo_orderbook(&orderbook_provider, &registry, snapshot);
+                        apply_orderbook_snapshot(&orderbook_provider, &registry, snapshot);
                     }
                     if let MarketDataEvent::MarketLifecycle { symbol, phase, .. } = &event {
                         risk.update_market_phase(symbol.clone(), phase.clone());
@@ -132,15 +130,21 @@ pub async fn run_demo(env: &str) -> Result<()> {
                     for signal in output.open_candidates {
                         stats.signals_seen += 1;
 
+                        let plan = match preview_open_plan(&mut execution, &signal) {
+                            Ok(plan) => plan,
+                            Err(_) => {
+                                stats.signals_rejected += 1;
+                                continue;
+                            }
+                        };
+
                         // 这里先在 CLI 做最小 pre-trade gate，避免 demo 把风控旁路掉。
-                        if !signal_allowed(&risk, &registry, &signal).await? {
+                        if open_plan_risk_rejection_reason(&risk, &plan).is_some() {
                             stats.signals_rejected += 1;
                             continue;
                         }
 
-                        let events = execution
-                            .process_intent(open_intent_from_candidate(&signal))
-                            .await?;
+                        let events = execution.process_plan(plan).await?;
                         apply_execution_events(&mut risk, &mut stats, events).await?;
                         sync_engine_position_state(&mut engine, &risk, &market.symbol);
                     }
@@ -190,10 +194,16 @@ pub async fn run_live_data_check(env: &str, market_index: usize, depth: u16) -> 
 
     let registry = SymbolRegistry::new(settings.markets.clone());
     let channels = create_channels(std::slice::from_ref(&market.symbol));
-    let manager = DataManager::new(
-        MarketDataNormalizer::new(registry),
-        channels.market_data_tx.clone(),
-    );
+    let mut market_data_rx = channels.market_data_tx.subscribe();
+    let manager = build_data_manager(&registry, channels.market_data_tx.clone());
+    let (orderbook_provider, _executor, mut execution) = build_execution_stack(
+        &settings,
+        &registry,
+        RuntimeExecutionMode::LiveMock,
+        1_700_000_000_000,
+        Some(&market),
+    )
+    .await?;
 
     let mut poly = PolymarketLiveDataSource::new(
         manager.clone(),
@@ -202,7 +212,7 @@ pub async fn run_live_data_check(env: &str, market_index: usize, depth: u16) -> 
     );
     let mut binance =
         BinanceFuturesDataSource::new(manager.clone(), settings.binance.rest_url.clone());
-    let mut okx = OkxMarketDataSource::new(manager, settings.okx.rest_url.clone());
+    let mut okx = OkxMarketDataSource::new(manager.clone(), settings.okx.rest_url.clone());
 
     poly.connect().await?;
     binance.connect().await?;
@@ -213,79 +223,143 @@ pub async fn run_live_data_check(env: &str, market_index: usize, depth: u16) -> 
 
     println!("market: {}", market.symbol.0);
     println!("hedge symbol: {}", market.cex_symbol);
+    println!(
+        "planner depth levels: {}",
+        settings.strategy.market_data.planner_depth_levels
+    );
 
-    // 默认配置里的 token_id 还是占位值时，直接跳过真实 Poly 请求，避免误报。
-    if looks_like_placeholder_id(&market.poly_ids.yes_token_id) {
-        println!("polymarket: skipped, yes_token_id is still a placeholder");
+    if looks_like_placeholder_id(&market.poly_ids.yes_token_id)
+        || looks_like_placeholder_id(&market.poly_ids.no_token_id)
+    {
+        println!("polymarket: skipped, token ids are still placeholders");
         println!(
             "hint: run `polyalpha-cli markets discover-btc --match-text 100k --pick 0 --output config/live.auto.toml` to generate a live market overlay"
         );
     } else {
-        match poly
-            .fetch_orderbook_by_symbol(&market.symbol, TokenSide::Yes)
-            .await
-        {
-            Ok(poly_book) => {
-                println!(
-                    "polymarket yes book: best_bid={} best_ask={} bids={} asks={}",
-                    best_poly_bid(&poly_book).unwrap_or_else(|| "n/a".to_owned()),
-                    best_poly_ask(&poly_book).unwrap_or_else(|| "n/a".to_owned()),
-                    poly_book.bids.len(),
-                    poly_book.asks.len(),
-                );
-            }
-            Err(err) => {
-                println!("polymarket: error={err}");
+        for token_side in [TokenSide::Yes, TokenSide::No] {
+            match poly
+                .fetch_orderbook_by_symbol(&market.symbol, token_side)
+                .await
+            {
+                Ok(poly_book) => {
+                    manager.normalize_and_publish_poly_orderbook(poly_book.clone())?;
+                    drain_orderbook_updates(&mut market_data_rx, &orderbook_provider, &registry);
+                    println!(
+                        "polymarket {} book: best_bid={} best_ask={} bids={} asks={} seq={}",
+                        match token_side {
+                            TokenSide::Yes => "yes",
+                            TokenSide::No => "no",
+                        },
+                        best_poly_bid(&poly_book).unwrap_or_else(|| "n/a".to_owned()),
+                        best_poly_ask(&poly_book).unwrap_or_else(|| "n/a".to_owned()),
+                        poly_book.bids.len(),
+                        poly_book.asks.len(),
+                        poly_book.sequence,
+                    );
+                }
+                Err(err) => {
+                    println!(
+                        "polymarket {} book: error={err}",
+                        match token_side {
+                            TokenSide::Yes => "yes",
+                            TokenSide::No => "no",
+                        }
+                    );
+                }
             }
         }
     }
 
-    match binance.fetch_orderbook(&market.cex_symbol, depth).await {
-        Ok(binance_book) => match binance.fetch_funding_and_mark(&market.cex_symbol).await {
-            Ok((binance_funding, binance_mark)) => {
-                println!(
-                    "binance: best_bid={} best_ask={} funding={} mark={}",
-                    best_cex_bid(&binance_book).unwrap_or_else(|| "n/a".to_owned()),
-                    best_cex_ask(&binance_book).unwrap_or_else(|| "n/a".to_owned()),
-                    binance_funding.rate,
-                    binance_mark.price.0,
-                );
+    match market.hedge_exchange {
+        Exchange::Binance => match binance.fetch_orderbook(&market.cex_symbol, depth).await {
+            Ok(binance_book) => {
+                manager.normalize_and_publish_cex_orderbook(binance_book.clone())?;
+                drain_orderbook_updates(&mut market_data_rx, &orderbook_provider, &registry);
+                match binance.fetch_funding_and_mark(&market.cex_symbol).await {
+                    Ok((binance_funding, binance_mark)) => {
+                        println!(
+                            "binance: best_bid={} best_ask={} funding={} mark={} seq={}",
+                            best_cex_bid(&binance_book).unwrap_or_else(|| "n/a".to_owned()),
+                            best_cex_ask(&binance_book).unwrap_or_else(|| "n/a".to_owned()),
+                            binance_funding.rate,
+                            binance_mark.price.0,
+                            binance_book.sequence,
+                        );
+                    }
+                    Err(err) => {
+                        println!("binance: funding/mark error={err}");
+                    }
+                }
             }
             Err(err) => {
-                println!("binance: funding/mark error={err}");
+                println!("binance: orderbook error={err}");
             }
         },
-        Err(err) => {
-            println!("binance: orderbook error={err}");
+        Exchange::Okx => match okx.fetch_orderbook(&market.cex_symbol, depth).await {
+            Ok(okx_book) => {
+                manager.normalize_and_publish_cex_orderbook(okx_book.clone())?;
+                drain_orderbook_updates(&mut market_data_rx, &orderbook_provider, &registry);
+                match okx.fetch_funding_and_mark(&market.cex_symbol).await {
+                    Ok((okx_funding, okx_mark)) => {
+                        println!(
+                            "okx: best_bid={} best_ask={} funding={} mark={} seq={}",
+                            best_cex_bid(&okx_book).unwrap_or_else(|| "n/a".to_owned()),
+                            best_cex_ask(&okx_book).unwrap_or_else(|| "n/a".to_owned()),
+                            okx_funding.rate,
+                            okx_mark.price.0,
+                            okx_book.sequence,
+                        );
+                    }
+                    Err(err) => {
+                        println!("okx: funding/mark error={err}");
+                    }
+                }
+            }
+            Err(err) => {
+                println!("okx: orderbook error={err}");
+            }
+        },
+        Exchange::Polymarket => {
+            println!("cex: unsupported hedge exchange polymarket");
         }
     }
 
-    match okx.fetch_orderbook(&market.cex_symbol, depth).await {
-        Ok(okx_book) => match okx.fetch_funding_and_mark(&market.cex_symbol).await {
-            Ok((okx_funding, okx_mark)) => {
-                println!(
-                    "okx: best_bid={} best_ask={} funding={} mark={}",
-                    best_cex_bid(&okx_book).unwrap_or_else(|| "n/a".to_owned()),
-                    best_cex_ask(&okx_book).unwrap_or_else(|| "n/a".to_owned()),
-                    okx_funding.rate,
-                    okx_mark.price.0,
-                );
-            }
-            Err(err) => {
-                println!("okx: funding/mark error={err}");
-            }
-        },
+    drain_orderbook_updates(&mut market_data_rx, &orderbook_provider, &registry);
+    match execution.planning_context_for_symbol(&market.symbol) {
+        Ok(context) => {
+            println!(
+                "planner poly yes: bid={} ask={} seq={} recv_at={}",
+                best_snapshot_bid(&context.poly_yes_book).unwrap_or_else(|| "n/a".to_owned()),
+                best_snapshot_ask(&context.poly_yes_book).unwrap_or_else(|| "n/a".to_owned()),
+                context.poly_yes_book.sequence,
+                context.poly_yes_book.received_at_ms,
+            );
+            println!(
+                "planner poly no: bid={} ask={} seq={} recv_at={}",
+                best_snapshot_bid(&context.poly_no_book).unwrap_or_else(|| "n/a".to_owned()),
+                best_snapshot_ask(&context.poly_no_book).unwrap_or_else(|| "n/a".to_owned()),
+                context.poly_no_book.sequence,
+                context.poly_no_book.received_at_ms,
+            );
+            println!(
+                "planner cex: bid={} ask={} seq={} recv_at={}",
+                best_snapshot_bid(&context.cex_book).unwrap_or_else(|| "n/a".to_owned()),
+                best_snapshot_ask(&context.cex_book).unwrap_or_else(|| "n/a".to_owned()),
+                context.cex_book.sequence,
+                context.cex_book.received_at_ms,
+            );
+        }
         Err(err) => {
-            println!("okx: orderbook error={err}");
+            println!("planner context: error={err}");
         }
     }
 
     println!(
         "ws subscribe samples: poly={} binance={} okx={}",
-        PolymarketLiveDataSource::build_orderbook_subscribe_message(&[market
-            .poly_ids
-            .yes_token_id
-            .clone(),]),
+        PolymarketLiveDataSource::build_orderbook_subscribe_message(&[
+            market.poly_ids.yes_token_id.clone(),
+            market.poly_ids.no_token_id.clone(),
+        ]),
         BinanceFuturesDataSource::build_depth_subscribe_message(&market.cex_symbol, 1),
         OkxMarketDataSource::build_books_subscribe_message(&cex_venue_symbol(
             Exchange::Okx,
@@ -369,28 +443,22 @@ pub(crate) fn select_market(settings: &Settings, market_index: usize) -> Result<
         .ok_or_else(|| anyhow!("config does not contain market index {}", market_index))
 }
 
-pub(crate) async fn signal_allowed(
-    risk: &InMemoryRiskManager,
-    registry: &SymbolRegistry,
+pub(crate) fn preview_open_plan(
+    execution: &mut ExecutionManager<RuntimeExecutor>,
     signal: &OpenCandidate,
-) -> Result<bool> {
-    Ok(signal_rejection_reason(risk, registry, signal)
-        .await?
-        .is_none())
+) -> Result<TradePlan> {
+    execution
+        .preview_intent(&open_intent_from_candidate(signal))
+        .map_err(Into::into)
 }
 
-pub(crate) async fn signal_rejection_reason(
-    risk: &InMemoryRiskManager,
-    registry: &SymbolRegistry,
-    signal: &OpenCandidate,
-) -> Result<Option<String>> {
-    for request in signal_requests(registry, signal)? {
-        if let Err(err) = risk.pre_trade_check(request).await {
-            return Ok(Some(err.to_string()));
-        }
-    }
-
-    Ok(None)
+pub(crate) fn open_plan_risk_rejection_reason(
+    risk: &impl RiskManager,
+    plan: &TradePlan,
+) -> Option<String> {
+    risk.pre_trade_check_open_plan(plan)
+        .err()
+        .map(|err| err.to_string())
 }
 
 async fn apply_execution_events(
@@ -402,8 +470,19 @@ async fn apply_execution_events(
         match event {
             ExecutionEvent::TradePlanCreated { .. }
             | ExecutionEvent::PlanSuperseded { .. }
-            | ExecutionEvent::RecoveryPlanCreated { .. }
-            | ExecutionEvent::ExecutionResultRecorded { .. } => {}
+            | ExecutionEvent::RecoveryPlanCreated { .. } => {}
+            ExecutionEvent::ExecutionResultRecorded { result } => {
+                if !result.actual_funding_cost_usd.0.is_zero() {
+                    let funding_adjustment = polyalpha_core::UsdNotional(
+                        Decimal::ZERO - result.actual_funding_cost_usd.0,
+                    );
+                    risk.apply_realized_pnl_adjustment(polyalpha_core::UsdNotional(
+                        funding_adjustment.0,
+                    ))
+                    .await?;
+                    stats.total_pnl_usd += funding_adjustment.0.to_f64().unwrap_or_default();
+                }
+            }
             ExecutionEvent::OrderSubmitted { .. } => {
                 stats.order_submitted += 1;
             }
@@ -418,9 +497,8 @@ async fn apply_execution_events(
                 stats.state_changes += 1;
             }
             ExecutionEvent::ReconcileRequired { .. } => {}
-            ExecutionEvent::TradeClosed { realized_pnl, .. } => {
+            ExecutionEvent::TradeClosed { .. } => {
                 stats.trades_closed += 1;
-                stats.total_pnl_usd += realized_pnl.0.to_f64().unwrap_or(0.0);
             }
         }
     }
@@ -428,41 +506,8 @@ async fn apply_execution_events(
     Ok(())
 }
 
-fn signal_requests(
-    _registry: &SymbolRegistry,
-    signal: &OpenCandidate,
-) -> Result<Vec<OrderRequest>> {
-    let budget = Decimal::from_f64(signal.risk_budget_usd).unwrap_or(Decimal::ZERO);
-    let max_shares = PolyShares(budget);
-    let requests = vec![OrderRequest::Poly(PolyOrderRequest {
-        client_order_id: ClientOrderId("risk-poly".to_owned()),
-        symbol: signal.symbol.clone(),
-        token_side: signal.token_side,
-        side: polyalpha_core::OrderSide::Buy,
-        order_type: OrderType::Market,
-        sizing: PolySizingInstruction::BuyBudgetCap {
-            max_cost_usd: polyalpha_core::UsdNotional(budget),
-            max_avg_price: Price::ONE,
-            max_shares,
-        },
-        time_in_force: TimeInForce::Fok,
-        post_only: false,
-    })];
-
-    Ok(requests)
-}
-
 fn open_intent_from_candidate(candidate: &OpenCandidate) -> PlanningIntent {
-    PlanningIntent::OpenPosition {
-        schema_version: candidate.schema_version,
-        intent_id: format!("intent-open-{}", candidate.candidate_id),
-        correlation_id: candidate.correlation_id.clone(),
-        symbol: candidate.symbol.clone(),
-        candidate: candidate.clone(),
-        max_budget_usd: candidate.risk_budget_usd,
-        max_residual_delta: 0.05,
-        max_shock_loss_usd: candidate.risk_budget_usd.max(25.0),
-    }
+    runtime_open_intent_from_candidate(candidate)
 }
 
 fn close_intent_for_symbol(
@@ -470,14 +515,12 @@ fn close_intent_for_symbol(
     reason: &str,
     now_ms: u64,
 ) -> PlanningIntent {
-    PlanningIntent::ClosePosition {
-        schema_version: polyalpha_core::PLANNING_SCHEMA_VERSION,
-        intent_id: format!("intent-close-{}-{now_ms}", symbol.0),
-        correlation_id: format!("corr-close-{}-{now_ms}", symbol.0),
-        symbol: symbol.clone(),
-        close_reason: reason.to_owned(),
-        target_close_ratio: 1.0,
-    }
+    runtime_close_intent_for_symbol(
+        symbol,
+        reason,
+        &format!("corr-close-{}-{now_ms}", symbol.0),
+        now_ms,
+    )
 }
 
 fn sync_engine_position_state(
@@ -503,25 +546,20 @@ fn sync_engine_position_state(
     engine.sync_position_state(symbol, active_token_side);
 }
 
-fn update_demo_orderbook(
-    provider: &InMemoryOrderbookProvider,
+fn drain_orderbook_updates(
+    market_data_rx: &mut tokio::sync::broadcast::Receiver<MarketDataEvent>,
+    provider: &polyalpha_executor::InMemoryOrderbookProvider,
     registry: &SymbolRegistry,
-    snapshot: &polyalpha_core::OrderBookSnapshot,
 ) {
-    match snapshot.instrument {
-        InstrumentKind::CexPerp => {
-            let venue_symbol = registry
-                .get_config(&snapshot.symbol)
-                .map(|config| cex_venue_symbol(config.hedge_exchange, &config.cex_symbol))
-                .unwrap_or_else(|| {
-                    cex_venue_symbol(
-                        snapshot.exchange,
-                        &snapshot.symbol.0.to_ascii_uppercase().replace('-', ""),
-                    )
-                });
-            provider.update_cex(snapshot.clone(), venue_symbol);
+    loop {
+        match market_data_rx.try_recv() {
+            Ok(MarketDataEvent::OrderBookUpdate { snapshot }) => {
+                apply_orderbook_snapshot(provider, registry, &snapshot);
+            }
+            Ok(_) => continue,
+            Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+            Err(TryRecvError::Lagged(_)) => continue,
         }
-        InstrumentKind::PolyYes | InstrumentKind::PolyNo => provider.update(snapshot.clone()),
     }
 }
 
@@ -618,6 +656,20 @@ fn best_cex_bid(update: &CexBookUpdate) -> Option<String> {
 
 fn best_cex_ask(update: &CexBookUpdate) -> Option<String> {
     update
+        .asks
+        .first()
+        .map(|level| level.price.0.normalize().to_string())
+}
+
+fn best_snapshot_bid(snapshot: &polyalpha_core::OrderBookSnapshot) -> Option<String> {
+    snapshot
+        .bids
+        .first()
+        .map(|level| level.price.0.normalize().to_string())
+}
+
+fn best_snapshot_ask(snapshot: &polyalpha_core::OrderBookSnapshot) -> Option<String> {
+    snapshot
         .asks
         .first()
         .map(|level| level.price.0.normalize().to_string())

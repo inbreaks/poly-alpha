@@ -13,9 +13,10 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 
 use polyalpha_core::{
-    AlphaEngine, CexBaseQty, Exchange, InstrumentKind, MarketConfig, MarketDataEvent, MarketRule,
-    MarketRuleKind, OpenCandidate, OrderBookSnapshot, OrderSide, PlanningIntent, PolyShares,
-    PolymarketIds, Price, PriceLevel, Symbol, TokenSide, TradePlan, UsdNotional, VenueQuantity,
+    AlphaEngine, BandPolicyMode, CexBaseQty, Exchange, InstrumentKind, MarketConfig,
+    MarketDataConfig, MarketDataEvent, MarketRule, MarketRuleKind, OpenCandidate,
+    OrderBookSnapshot, OrderSide, PlanningIntent, PolyShares, PolymarketIds, Price, PriceLevel,
+    Symbol, TokenSide, TradePlan, UsdNotional, VenueQuantity,
 };
 use polyalpha_engine::{SimpleAlphaEngine, SimpleEngineConfig};
 use polyalpha_executor::{CanonicalPlanningContext, ExecutionPlanner};
@@ -26,6 +27,23 @@ const DEFAULT_POSITION_NOTIONAL_PCT: f64 = 0.01;
 const RESOLUTION_EPSILON: f64 = 1e-4;
 const ONE_MINUTE_MS: u64 = 60_000;
 const MONEY_LITERAL_RE: &str = r"([0-9][0-9,]*(?:\.\d+)?(?:[kmb])?)\b";
+const REPLAY_ANOMALY_MIN_ABS_EQUITY_JUMP_USD: f64 = 10_000.0;
+const REPLAY_ANOMALY_MIN_MARK_SHARE: f64 = 0.80;
+const REPLAY_ANOMALY_TOP_LIMIT: usize = 10;
+const REPLAY_ANOMALY_TOP_MARKET_LIMIT: usize = 10;
+const REPLAY_SYNC_RESET_MIN_MARKETS: usize = 3;
+const REPLAY_SYNC_RESET_EXTREME_THRESHOLD: f64 = 0.20;
+const REPLAY_SYNC_RESET_NEUTRAL_TARGET: f64 = 0.50;
+const REPLAY_SYNC_RESET_NEUTRAL_TOLERANCE: f64 = 0.055;
+const REPLAY_SYNC_RESET_MIN_MOVE: f64 = 0.25;
+const REPLAY_SYNC_RESET_INTERIOR_MIN: f64 = 0.25;
+const REPLAY_SYNC_RESET_INTERIOR_MAX: f64 = 0.75;
+const REPLAY_SYNC_RESET_SNAPBACK_TOLERANCE: f64 = 0.05;
+const REPLAY_SYNC_RESET_INTERIOR_MIN_TRIGGER_MARKETS: usize = 2;
+const REPLAY_SYNC_RESET_INTERIOR_MIN_SANITIZED_MARKETS: usize = 4;
+const REPLAY_SYNC_RESET_PAIR_TEMPLATE_TOLERANCE: f64 = 0.05;
+const REPLAY_SYNC_RESET_PAIR_COMPLEMENT_TOLERANCE: f64 = 0.08;
+const REPLAY_SYNC_RESET_PAIR_SETTLEMENT_TOLERANCE_MS: u64 = 2 * 60 * 60 * 1000;
 
 #[derive(Clone, Debug)]
 pub struct RustReplayCommandArgs {
@@ -46,10 +64,14 @@ pub struct RustReplayCommandArgs {
     pub cex_fee_bps: f64,
     pub cex_slippage_bps: f64,
     pub entry_fill_ratio: f64,
+    pub planner_depth_levels: usize,
+    pub band_policy: BandPolicyMode,
     pub min_poly_price: Option<f64>,
     pub max_poly_price: Option<f64>,
     pub max_holding_bars: Option<usize>,
     pub report_json: Option<String>,
+    pub anomaly_report_json: Option<String>,
+    pub fail_on_anomaly: bool,
     pub equity_csv: Option<String>,
     pub trades_csv: Option<String>,
     pub snapshots_csv: Option<String>,
@@ -69,6 +91,7 @@ pub struct RustStressCommandArgs {
     pub max_capital_usage: f64,
     pub cex_hedge_ratio: f64,
     pub cex_margin_ratio: f64,
+    pub planner_depth_levels: usize,
     pub preset: Option<RustStressPreset>,
     pub report_json: Option<String>,
 }
@@ -101,6 +124,8 @@ struct ResolvedReplayConfig {
     max_capital_usage: f64,
     cex_hedge_ratio: f64,
     cex_margin_ratio: f64,
+    planner_depth_levels: usize,
+    band_policy: BandPolicyMode,
     min_poly_price: Option<f64>,
     max_poly_price: Option<f64>,
     max_holding_bars: Option<usize>,
@@ -128,6 +153,7 @@ struct ReplayDataset {
     cex_close_by_ts: HashMap<u64, f64>,
     unique_minutes: usize,
     poly_observation_count: usize,
+    sanitization: ReplaySanitizationDiagnostics,
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +174,28 @@ struct ReplayMinuteRow {
     market_id: String,
     yes_price: Option<f64>,
     no_price: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ReplaySanitizationOutcome {
+    rows: Vec<ReplayMinuteRow>,
+    diagnostics: ReplaySanitizationDiagnostics,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct ReplaySanitizationDiagnostics {
+    sanitized_market_minutes: usize,
+    sanitized_poly_observations: usize,
+    sync_reset_windows: Vec<ReplaySanitizedSyncResetWindow>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct ReplaySanitizedSyncResetWindow {
+    event_id: String,
+    start_ts_ms: u64,
+    end_ts_ms: u64,
+    trigger_market_count: usize,
+    sanitized_market_count: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -202,6 +250,8 @@ struct ReplayStats {
     signals_emitted: usize,
     signals_rejected_capital: usize,
     signals_rejected_missing_price: usize,
+    signals_rejected_below_min_poly_price: usize,
+    signals_rejected_above_or_equal_max_poly_price: usize,
     signals_rejected_planner: usize,
     signals_ignored_existing_position: usize,
     unsupported_signals: usize,
@@ -231,6 +281,12 @@ struct ReplayStats {
     #[serde(skip_serializing)]
     rejected_capital_by_market: HashMap<String, usize>,
     #[serde(skip_serializing)]
+    rejected_missing_price_by_market: HashMap<String, usize>,
+    #[serde(skip_serializing)]
+    rejected_below_min_price_by_market: HashMap<String, usize>,
+    #[serde(skip_serializing)]
+    rejected_above_or_equal_max_price_by_market: HashMap<String, usize>,
+    #[serde(skip_serializing)]
     entries_by_market: HashMap<String, usize>,
     #[serde(skip_serializing)]
     net_pnl_by_market: HashMap<String, f64>,
@@ -241,6 +297,9 @@ struct MarketSignalDebugRow {
     market_id: String,
     signal_count: usize,
     rejected_capital_count: usize,
+    rejected_missing_price_count: usize,
+    rejected_below_min_price_count: usize,
+    rejected_above_or_equal_max_price_count: usize,
     entry_count: usize,
     net_pnl: f64,
 }
@@ -249,6 +308,7 @@ struct MarketSignalDebugRow {
 struct RustReplaySummary {
     db_path: String,
     stress: ExecutionStressConfig,
+    band_policy: BandPolicyMode,
     initial_capital: f64,
     ending_equity: f64,
     total_pnl: f64,
@@ -264,6 +324,8 @@ struct RustReplaySummary {
     signal_count: usize,
     signal_rejected_capital: usize,
     signal_rejected_missing_price: usize,
+    signal_rejected_below_min_poly_price: usize,
+    signal_rejected_above_or_equal_max_poly_price: usize,
     signal_rejected_planner: usize,
     signal_ignored_existing_position: usize,
     entry_count: usize,
@@ -286,11 +348,17 @@ struct RustReplaySummary {
     minute_count: usize,
     grouped_row_count: usize,
     poly_observation_count: usize,
+    sanitized_market_minute_count: usize,
+    sanitized_poly_observation_count: usize,
+    sanitized_sync_reset_window_count: usize,
     replayed_grouped_rows: usize,
     replayed_poly_observations: usize,
     open_positions_end: usize,
     start_ts_ms: Option<u64>,
     end_ts_ms: Option<u64>,
+    anomaly_count: usize,
+    max_abs_anomaly_equity_jump_usd: f64,
+    max_anomaly_mark_share: f64,
     top_signal_markets: Vec<MarketSignalDebugRow>,
     top_entry_markets: Vec<MarketSignalDebugRow>,
     market_debug_rows: Vec<MarketSignalDebugRow>,
@@ -301,6 +369,14 @@ struct RustReplayReport {
     generated_at_utc: String,
     build_metadata: HashMap<String, String>,
     summary: RustReplaySummary,
+    anomaly_diagnostics: ReplayAnomalyDiagnostics,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ReplayAnomalyReport {
+    generated_at_utc: String,
+    build_metadata: HashMap<String, String>,
+    diagnostics: ReplayAnomalyDiagnostics,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -363,6 +439,56 @@ struct ReplaySnapshotRow {
     snapshot_minutes_to_expiry: Option<f64>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+struct ReplayAnomalyDiagnostics {
+    anomaly_count: usize,
+    max_abs_equity_jump_usd: f64,
+    max_mark_share: f64,
+    top_anomalies: Vec<ReplayAnomaly>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+struct ReplayAnomaly {
+    start_ts_ms: u64,
+    end_ts_ms: u64,
+    equity_change_usd: f64,
+    cash_change_usd: f64,
+    fill_cash_change_usd: f64,
+    mark_change_usd: f64,
+    mark_share: f64,
+    reason_codes: Vec<String>,
+    sync_reset_events: Vec<ReplayAnomalousEvent>,
+    top_markets: Vec<ReplayMinuteAttribution>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct ReplayAnomalousEvent {
+    event_id: String,
+    market_count: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+struct ReplayMinuteAttribution {
+    event_id: String,
+    market_id: String,
+    market_slug: String,
+    market_question: Option<String>,
+    total_contribution_usd: f64,
+    fill_cash_change_usd: f64,
+    poly_mark_change_usd: f64,
+    cex_mark_change_usd: f64,
+    open_positions_before: usize,
+    open_positions_after: usize,
+    entries_at_end_ts: usize,
+    exits_at_end_ts: usize,
+    yes_price_start: Option<f64>,
+    yes_price_end: Option<f64>,
+    no_price_start: Option<f64>,
+    no_price_end: Option<f64>,
+    cex_price_start: Option<f64>,
+    cex_price_end: Option<f64>,
+}
+
 #[derive(Clone, Debug)]
 struct ReplayRunResult {
     summary: RustReplaySummary,
@@ -388,6 +514,8 @@ pub async fn run_rust_replay_command(args: RustReplayCommandArgs) -> Result<()> 
         args.max_capital_usage,
         args.cex_hedge_ratio,
         args.cex_margin_ratio,
+        args.planner_depth_levels,
+        args.band_policy,
         args.min_poly_price,
         args.max_poly_price,
         args.max_holding_bars,
@@ -401,7 +529,14 @@ pub async fn run_rust_replay_command(args: RustReplayCommandArgs) -> Result<()> 
         },
     )?;
     let run = run_single_replay(&dataset, &config, args.snapshots_csv.is_some()).await?;
-    print_replay_summary(&run.summary);
+    let anomaly_diagnostics =
+        detect_replay_anomalies(&dataset, &config, &run.equity_curve, &run.trade_log);
+    let mut summary = run.summary.clone();
+    summary.anomaly_count = anomaly_diagnostics.anomaly_count;
+    summary.max_abs_anomaly_equity_jump_usd = anomaly_diagnostics.max_abs_equity_jump_usd;
+    summary.max_anomaly_mark_share = anomaly_diagnostics.max_mark_share;
+    print_replay_summary(&summary);
+    print_replay_anomaly_summary(&anomaly_diagnostics);
 
     if let Some(path) = args.report_json.as_deref() {
         write_json(
@@ -409,7 +544,18 @@ pub async fn run_rust_replay_command(args: RustReplayCommandArgs) -> Result<()> 
             &RustReplayReport {
                 generated_at_utc: Utc::now().to_rfc3339(),
                 build_metadata: dataset.metadata.clone(),
-                summary: run.summary.clone(),
+                summary: summary.clone(),
+                anomaly_diagnostics: anomaly_diagnostics.clone(),
+            },
+        )?;
+    }
+    if let Some(path) = args.anomaly_report_json.as_deref() {
+        write_json(
+            path,
+            &ReplayAnomalyReport {
+                generated_at_utc: Utc::now().to_rfc3339(),
+                build_metadata: dataset.metadata.clone(),
+                diagnostics: anomaly_diagnostics.clone(),
             },
         )?;
     }
@@ -421,6 +567,16 @@ pub async fn run_rust_replay_command(args: RustReplayCommandArgs) -> Result<()> 
     }
     if let Some(path) = args.snapshots_csv.as_deref() {
         write_snapshots_csv(path, &run.snapshot_log)?;
+    }
+    if args.fail_on_anomaly && anomaly_diagnostics.anomaly_count > 0 {
+        let top = anomaly_diagnostics.top_anomalies.first();
+        bail!(
+            "replay anomaly detected: count={} largest_jump={:+.4} start_ts_ms={} end_ts_ms={}",
+            anomaly_diagnostics.anomaly_count,
+            top.map(|item| item.equity_change_usd).unwrap_or_default(),
+            top.map(|item| item.start_ts_ms).unwrap_or_default(),
+            top.map(|item| item.end_ts_ms).unwrap_or_default(),
+        );
     }
     Ok(())
 }
@@ -446,6 +602,8 @@ pub async fn run_rust_stress_command(args: RustStressCommandArgs) -> Result<()> 
             args.max_capital_usage,
             args.cex_hedge_ratio,
             args.cex_margin_ratio,
+            args.planner_depth_levels,
+            BandPolicyMode::ConfiguredBand,
             None, // min_poly_price - not available in stress test
             None, // max_poly_price - not available in stress test
             None, // max_holding_bars - not available in stress test
@@ -491,6 +649,8 @@ fn resolve_replay_config(
     max_capital_usage: f64,
     cex_hedge_ratio: f64,
     cex_margin_ratio: f64,
+    planner_depth_levels: usize,
+    band_policy: BandPolicyMode,
     min_poly_price: Option<f64>,
     max_poly_price: Option<f64>,
     max_holding_bars: Option<usize>,
@@ -505,6 +665,11 @@ fn resolve_replay_config(
     let exit_z = exit_z.abs().min(entry_z.max(0.0));
     let position_notional_usd =
         position_notional_usd.unwrap_or(initial_capital * DEFAULT_POSITION_NOTIONAL_PCT);
+    let planner_depth_levels = if planner_depth_levels == 0 {
+        MarketDataConfig::default().planner_depth_levels
+    } else {
+        planner_depth_levels
+    };
 
     Ok(ResolvedReplayConfig {
         db_path: db_path.to_owned(),
@@ -516,6 +681,8 @@ fn resolve_replay_config(
         max_capital_usage: max_capital_usage.max(0.0),
         cex_hedge_ratio: cex_hedge_ratio.max(0.0),
         cex_margin_ratio: cex_margin_ratio.max(0.0),
+        planner_depth_levels: planner_depth_levels.max(1),
+        band_policy,
         min_poly_price,
         max_poly_price,
         max_holding_bars,
@@ -576,7 +743,9 @@ fn load_dataset(db_path: &str, filter: &ReplayFilter) -> Result<ReplayDataset> {
     let metadata = load_build_metadata(&conn)?;
     let market_resolutions = load_market_resolutions(&conn)?;
     let markets = load_market_specs(&conn, filter, &market_resolutions, &metadata)?;
-    let rows = load_price_rows(&conn, filter)?;
+    let raw_rows = load_price_rows(&conn, filter)?;
+    let sanitization = sanitize_sync_neutral_resets(&markets, raw_rows);
+    let rows = sanitization.rows;
     let cex_close_by_ts = load_cex_closes(&conn, &metadata)?;
 
     if markets.is_empty() {
@@ -608,6 +777,7 @@ fn load_dataset(db_path: &str, filter: &ReplayFilter) -> Result<ReplayDataset> {
         cex_close_by_ts,
         unique_minutes: minute_set.len(),
         poly_observation_count,
+        sanitization: sanitization.diagnostics,
     })
 }
 
@@ -1311,6 +1481,7 @@ async fn run_single_replay(
     let summary = RustReplaySummary {
         db_path: config.db_path.clone(),
         stress: config.stress.clone(),
+        band_policy: config.band_policy,
         initial_capital: config.initial_capital,
         ending_equity,
         total_pnl: ending_equity - config.initial_capital,
@@ -1326,6 +1497,9 @@ async fn run_single_replay(
         signal_count: stats.signals_emitted,
         signal_rejected_capital: stats.signals_rejected_capital,
         signal_rejected_missing_price: stats.signals_rejected_missing_price,
+        signal_rejected_below_min_poly_price: stats.signals_rejected_below_min_poly_price,
+        signal_rejected_above_or_equal_max_poly_price: stats
+            .signals_rejected_above_or_equal_max_poly_price,
         signal_rejected_planner: stats.signals_rejected_planner,
         signal_ignored_existing_position: stats.signals_ignored_existing_position,
         entry_count: stats.entry_count,
@@ -1348,11 +1522,17 @@ async fn run_single_replay(
         minute_count: dataset.unique_minutes,
         grouped_row_count: dataset.rows.len(),
         poly_observation_count: dataset.poly_observation_count,
+        sanitized_market_minute_count: dataset.sanitization.sanitized_market_minutes,
+        sanitized_poly_observation_count: dataset.sanitization.sanitized_poly_observations,
+        sanitized_sync_reset_window_count: dataset.sanitization.sync_reset_windows.len(),
         replayed_grouped_rows: stats.grouped_rows_replayed,
         replayed_poly_observations: stats.poly_observations_replayed,
         open_positions_end: positions.len(),
         start_ts_ms: dataset.rows.first().map(|row| row.ts_ms),
         end_ts_ms: dataset.rows.last().map(|row| row.ts_ms),
+        anomaly_count: 0,
+        max_abs_anomaly_equity_jump_usd: 0.0,
+        max_anomaly_mark_share: 0.0,
         top_signal_markets: top_signal_markets(&stats, 10),
         top_entry_markets: top_entry_markets(&stats, 10),
         market_debug_rows: all_market_debug_rows(&stats),
@@ -1432,8 +1612,10 @@ async fn advance_symbol_cex_state(
 fn replay_execution_planner(config: &ResolvedReplayConfig) -> ExecutionPlanner {
     ExecutionPlanner {
         poly_fee_bps: rounded_bps(config.stress.poly_fee_bps),
-        cex_fee_bps: rounded_bps(config.stress.cex_fee_bps),
-        funding_bps_per_day: 0,
+        cex_taker_fee_bps: rounded_bps(config.stress.cex_fee_bps),
+        cex_maker_fee_bps: rounded_bps(config.stress.cex_fee_bps),
+        funding_mode: polyalpha_core::FundingCostMode::FallbackBps,
+        fallback_funding_bps_per_day: 0,
         poly_slippage_bps: rounded_bps(config.stress.poly_slippage_bps),
         cex_slippage_bps: rounded_bps(config.stress.cex_slippage_bps),
     }
@@ -1526,6 +1708,7 @@ fn synthetic_cex_book(symbol: &Symbol, price: f64, ts_ms: u64) -> Result<OrderBo
 }
 
 fn replay_planning_context(
+    planner_depth_levels: usize,
     symbol: &Symbol,
     row: &ReplayMinuteRow,
     cex_reference_price: f64,
@@ -1565,7 +1748,7 @@ fn replay_planning_context(
         };
 
     Ok(CanonicalPlanningContext {
-        planner_depth_levels: 1,
+        planner_depth_levels: planner_depth_levels.max(1),
         poly_yes_book: synthetic_poly_book(symbol, TokenSide::Yes, yes_price, row.ts_ms)?,
         poly_no_book: synthetic_poly_book(symbol, TokenSide::No, no_price, row.ts_ms)?,
         cex_book: synthetic_cex_book(symbol, cex_reference_price, row.ts_ms)?,
@@ -1579,6 +1762,7 @@ fn replay_planning_context(
 
 fn plan_replay_open_candidate(
     planner: &ExecutionPlanner,
+    planner_depth_levels: usize,
     candidate: &OpenCandidate,
     row: &ReplayMinuteRow,
     cex_reference_price: f64,
@@ -1587,6 +1771,7 @@ fn plan_replay_open_candidate(
 ) -> Result<TradePlan> {
     let intent = replay_open_intent(candidate);
     let context = replay_planning_context(
+        planner_depth_levels,
         &candidate.symbol,
         row,
         cex_reference_price,
@@ -1604,6 +1789,7 @@ fn plan_replay_open_candidate(
 
 fn plan_replay_close_position(
     planner: &ExecutionPlanner,
+    planner_depth_levels: usize,
     symbol: &Symbol,
     close_reason: &str,
     row: &ReplayMinuteRow,
@@ -1612,8 +1798,14 @@ fn plan_replay_close_position(
     positions: &HashMap<Symbol, ReplayPosition>,
 ) -> Result<TradePlan> {
     let intent = replay_close_intent(symbol, close_reason, row.ts_ms);
-    let context =
-        replay_planning_context(symbol, row, cex_reference_price, cex_qty_step, positions)?;
+    let context = replay_planning_context(
+        planner_depth_levels,
+        symbol,
+        row,
+        cex_reference_price,
+        cex_qty_step,
+        positions,
+    )?;
     planner.plan(&intent, &context).map_err(|rejection| {
         anyhow!(
             "replay close planner rejected [{}]: {}",
@@ -1694,28 +1886,47 @@ fn handle_candidate(
     let token_side = candidate.token_side;
     let Some(poly_entry_price) = row.price_for(token_side) else {
         stats.signals_rejected_missing_price += 1;
+        *stats
+            .rejected_missing_price_by_market
+            .entry(spec.market_id.clone())
+            .or_insert(0) += 1;
         return Ok(());
     };
     if poly_entry_price <= 0.0 || cex_reference_price <= 0.0 {
         stats.signals_rejected_missing_price += 1;
+        *stats
+            .rejected_missing_price_by_market
+            .entry(spec.market_id.clone())
+            .or_insert(0) += 1;
         return Ok(());
     }
 
-    if let Some(min_price) = config.min_poly_price {
-        if poly_entry_price < min_price {
-            stats.signals_rejected_missing_price += 1;
-            return Ok(());
+    if config.band_policy.uses_configured_band() {
+        if let Some(min_price) = config.min_poly_price {
+            if poly_entry_price < min_price {
+                stats.signals_rejected_below_min_poly_price += 1;
+                *stats
+                    .rejected_below_min_price_by_market
+                    .entry(spec.market_id.clone())
+                    .or_insert(0) += 1;
+                return Ok(());
+            }
         }
-    }
-    if let Some(max_price) = config.max_poly_price {
-        if poly_entry_price >= max_price {
-            stats.signals_rejected_missing_price += 1;
-            return Ok(());
+        if let Some(max_price) = config.max_poly_price {
+            if poly_entry_price >= max_price {
+                stats.signals_rejected_above_or_equal_max_poly_price += 1;
+                *stats
+                    .rejected_above_or_equal_max_price_by_market
+                    .entry(spec.market_id.clone())
+                    .or_insert(0) += 1;
+                return Ok(());
+            }
         }
     }
 
     let plan = match plan_replay_open_candidate(
         planner,
+        config.planner_depth_levels,
         &candidate,
         row,
         cex_reference_price,
@@ -1893,6 +2104,21 @@ fn top_signal_markets(stats: &ReplayStats, limit: usize) -> Vec<MarketSignalDebu
                 .get(market_id)
                 .copied()
                 .unwrap_or_default(),
+            rejected_missing_price_count: stats
+                .rejected_missing_price_by_market
+                .get(market_id)
+                .copied()
+                .unwrap_or_default(),
+            rejected_below_min_price_count: stats
+                .rejected_below_min_price_by_market
+                .get(market_id)
+                .copied()
+                .unwrap_or_default(),
+            rejected_above_or_equal_max_price_count: stats
+                .rejected_above_or_equal_max_price_by_market
+                .get(market_id)
+                .copied()
+                .unwrap_or_default(),
             entry_count: stats
                 .entries_by_market
                 .get(market_id)
@@ -1937,6 +2163,21 @@ fn top_entry_markets(stats: &ReplayStats, limit: usize) -> Vec<MarketSignalDebug
                 .get(market_id)
                 .copied()
                 .unwrap_or_default(),
+            rejected_missing_price_count: stats
+                .rejected_missing_price_by_market
+                .get(market_id)
+                .copied()
+                .unwrap_or_default(),
+            rejected_below_min_price_count: stats
+                .rejected_below_min_price_by_market
+                .get(market_id)
+                .copied()
+                .unwrap_or_default(),
+            rejected_above_or_equal_max_price_count: stats
+                .rejected_above_or_equal_max_price_by_market
+                .get(market_id)
+                .copied()
+                .unwrap_or_default(),
             entry_count: *entry_count,
             net_pnl: stats
                 .net_pnl_by_market
@@ -1967,6 +2208,9 @@ fn all_market_debug_rows(stats: &ReplayStats) -> Vec<MarketSignalDebugRow> {
         .keys()
         .chain(stats.entries_by_market.keys())
         .chain(stats.rejected_capital_by_market.keys())
+        .chain(stats.rejected_missing_price_by_market.keys())
+        .chain(stats.rejected_below_min_price_by_market.keys())
+        .chain(stats.rejected_above_or_equal_max_price_by_market.keys())
         .cloned()
         .collect::<HashSet<_>>()
         .into_iter()
@@ -1976,6 +2220,7 @@ fn all_market_debug_rows(stats: &ReplayStats) -> Vec<MarketSignalDebugRow> {
     market_ids
         .into_iter()
         .map(|market_id| MarketSignalDebugRow {
+            market_id: market_id.clone(),
             signal_count: stats
                 .signals_by_market
                 .get(&market_id)
@@ -1983,6 +2228,21 @@ fn all_market_debug_rows(stats: &ReplayStats) -> Vec<MarketSignalDebugRow> {
                 .unwrap_or_default(),
             rejected_capital_count: stats
                 .rejected_capital_by_market
+                .get(&market_id)
+                .copied()
+                .unwrap_or_default(),
+            rejected_missing_price_count: stats
+                .rejected_missing_price_by_market
+                .get(&market_id)
+                .copied()
+                .unwrap_or_default(),
+            rejected_below_min_price_count: stats
+                .rejected_below_min_price_by_market
+                .get(&market_id)
+                .copied()
+                .unwrap_or_default(),
+            rejected_above_or_equal_max_price_count: stats
+                .rejected_above_or_equal_max_price_by_market
                 .get(&market_id)
                 .copied()
                 .unwrap_or_default(),
@@ -1996,7 +2256,6 @@ fn all_market_debug_rows(stats: &ReplayStats) -> Vec<MarketSignalDebugRow> {
                 .get(&market_id)
                 .copied()
                 .unwrap_or_default(),
-            market_id,
         })
         .collect()
 }
@@ -2025,6 +2284,7 @@ fn close_position(
         let close_row = replay_close_row(spec, &existing_position, market_exit_price, ts_ms);
         match plan_replay_close_position(
             planner,
+            config.planner_depth_levels,
             symbol,
             close_reason,
             &close_row,
@@ -2547,6 +2807,908 @@ fn ratio(numerator: usize, denominator: usize) -> f64 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ReplayPricePoint {
+    yes_price: Option<f64>,
+    no_price: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ReplayPositionComponent {
+    poly_value: f64,
+    cex_unrealized: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ReplayMinuteAttributionAccumulator {
+    fill_cash_change_usd: f64,
+    poly_mark_change_usd: f64,
+    cex_mark_change_usd: f64,
+    open_positions_before: usize,
+    open_positions_after: usize,
+    entries_at_end_ts: usize,
+    exits_at_end_ts: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplaySyncResetFlavor {
+    NeutralPlateau,
+    InteriorReset,
+}
+
+fn build_market_price_series(
+    dataset: &ReplayDataset,
+) -> HashMap<String, Vec<(u64, ReplayPricePoint)>> {
+    build_market_price_series_from_rows(&dataset.rows)
+}
+
+fn build_market_price_series_from_rows(
+    rows: &[ReplayMinuteRow],
+) -> HashMap<String, Vec<(u64, ReplayPricePoint)>> {
+    let mut by_market: HashMap<String, Vec<(u64, ReplayPricePoint)>> = HashMap::new();
+    for row in rows {
+        by_market.entry(row.market_id.clone()).or_default().push((
+            row.ts_ms,
+            ReplayPricePoint {
+                yes_price: row.yes_price,
+                no_price: row.no_price,
+            },
+        ));
+    }
+    by_market
+}
+
+fn sanitize_sync_neutral_resets(
+    markets: &HashMap<String, ReplayMarketSpec>,
+    rows: Vec<ReplayMinuteRow>,
+) -> ReplaySanitizationOutcome {
+    if rows.is_empty() || markets.is_empty() {
+        return ReplaySanitizationOutcome {
+            rows,
+            diagnostics: ReplaySanitizationDiagnostics::default(),
+        };
+    }
+
+    let price_series = build_market_price_series_from_rows(&rows);
+    let mut event_market_ids: HashMap<String, Vec<String>> = HashMap::new();
+    for (market_id, spec) in markets {
+        event_market_ids
+            .entry(spec.event_id.clone())
+            .or_default()
+            .push(market_id.clone());
+    }
+
+    let mut neutral_triggers: HashMap<(String, u64), HashSet<String>> = HashMap::new();
+    let mut interior_triggers: HashMap<(String, u64), HashSet<String>> = HashMap::new();
+    let mut pair_triggers: HashMap<u64, HashSet<String>> = HashMap::new();
+    for (market_id, points) in &price_series {
+        let Some(spec) = markets.get(market_id) else {
+            continue;
+        };
+        for window in points.windows(3) {
+            let before = window[0].1;
+            let after = window[1].1;
+            let next = window[2].1;
+            match sync_reset_flavor(before, after, next) {
+                Some(ReplaySyncResetFlavor::NeutralPlateau) => {
+                    neutral_triggers
+                        .entry((spec.event_id.clone(), window[1].0))
+                        .or_default()
+                        .insert(market_id.clone());
+                    pair_triggers
+                        .entry(window[1].0)
+                        .or_default()
+                        .insert(market_id.clone());
+                }
+                Some(ReplaySyncResetFlavor::InteriorReset) => {
+                    interior_triggers
+                        .entry((spec.event_id.clone(), window[1].0))
+                        .or_default()
+                        .insert(market_id.clone());
+                    pair_triggers
+                        .entry(window[1].0)
+                        .or_default()
+                        .insert(market_id.clone());
+                }
+                None => {}
+            }
+        }
+    }
+
+    let mut trigger_entries = neutral_triggers.into_iter().collect::<Vec<_>>();
+    trigger_entries.sort_by(|left, right| {
+        left.0
+             .0
+            .cmp(&right.0 .0)
+            .then_with(|| left.0 .1.cmp(&right.0 .1))
+    });
+
+    let mut sanitized_cells: HashSet<(String, u64)> = HashSet::new();
+    let mut sync_reset_windows = Vec::new();
+    for ((event_id, start_ts_ms), trigger_market_ids) in trigger_entries {
+        if trigger_market_ids.len() < REPLAY_SYNC_RESET_MIN_MARKETS {
+            continue;
+        }
+        let Some(event_markets) = event_market_ids.get(&event_id) else {
+            continue;
+        };
+        let mut ts_ms = start_ts_ms;
+        let mut end_ts_ms = None;
+        let mut sanitized_market_ids = HashSet::new();
+
+        loop {
+            let neutral_market_ids = event_markets
+                .iter()
+                .filter(|market_id| {
+                    price_point_at(&price_series, market_id, ts_ms).is_some_and(|point| {
+                        is_neutral_probability(point.yes_price)
+                            && is_neutral_probability(point.no_price)
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if neutral_market_ids.len() < REPLAY_SYNC_RESET_MIN_MARKETS {
+                break;
+            }
+            for market_id in neutral_market_ids {
+                sanitized_market_ids.insert(market_id.clone());
+                sanitized_cells.insert((market_id, ts_ms));
+            }
+            end_ts_ms = Some(ts_ms);
+            let Some(next_ts_ms) = ts_ms.checked_add(ONE_MINUTE_MS) else {
+                break;
+            };
+            ts_ms = next_ts_ms;
+        }
+
+        if let Some(end_ts_ms) = end_ts_ms {
+            sync_reset_windows.push(ReplaySanitizedSyncResetWindow {
+                event_id,
+                start_ts_ms,
+                end_ts_ms,
+                trigger_market_count: trigger_market_ids.len(),
+                sanitized_market_count: sanitized_market_ids.len(),
+            });
+        }
+    }
+
+    let mut interior_entries = interior_triggers.into_iter().collect::<Vec<_>>();
+    interior_entries.sort_by(|left, right| {
+        left.0
+             .0
+            .cmp(&right.0 .0)
+            .then_with(|| left.0 .1.cmp(&right.0 .1))
+    });
+    for ((event_id, start_ts_ms), trigger_market_ids) in interior_entries {
+        let Some(event_markets) = event_market_ids.get(&event_id) else {
+            continue;
+        };
+        let start_interior_market_count = event_markets
+            .iter()
+            .filter(|market_id| {
+                price_point_at(&price_series, market_id, start_ts_ms).is_some_and(|point| {
+                    is_interior_sync_reset_probability(point.yes_price)
+                        && is_interior_sync_reset_probability(point.no_price)
+                })
+            })
+            .count();
+        let meets_trigger_threshold = trigger_market_ids.len() >= REPLAY_SYNC_RESET_MIN_MARKETS;
+        let meets_adjacent_template_threshold = trigger_market_ids.len()
+            >= REPLAY_SYNC_RESET_INTERIOR_MIN_TRIGGER_MARKETS
+            && start_interior_market_count >= REPLAY_SYNC_RESET_INTERIOR_MIN_SANITIZED_MARKETS;
+        if !meets_trigger_threshold && !meets_adjacent_template_threshold {
+            continue;
+        }
+        let mut ts_ms = start_ts_ms;
+        let mut end_ts_ms = None;
+        let mut sanitized_market_ids = HashSet::new();
+
+        loop {
+            let interior_market_ids = event_markets
+                .iter()
+                .filter(|market_id| {
+                    price_point_at(&price_series, market_id, ts_ms).is_some_and(|point| {
+                        is_interior_sync_reset_probability(point.yes_price)
+                            && is_interior_sync_reset_probability(point.no_price)
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if interior_market_ids.len() < REPLAY_SYNC_RESET_MIN_MARKETS {
+                break;
+            }
+            for market_id in interior_market_ids {
+                sanitized_market_ids.insert(market_id.clone());
+                sanitized_cells.insert((market_id, ts_ms));
+            }
+            end_ts_ms = Some(ts_ms);
+            let Some(next_ts_ms) = ts_ms.checked_add(ONE_MINUTE_MS) else {
+                break;
+            };
+            ts_ms = next_ts_ms;
+        }
+
+        if let Some(end_ts_ms) = end_ts_ms {
+            sync_reset_windows.push(ReplaySanitizedSyncResetWindow {
+                event_id,
+                start_ts_ms,
+                end_ts_ms,
+                trigger_market_count: trigger_market_ids.len(),
+                sanitized_market_count: sanitized_market_ids.len(),
+            });
+        }
+    }
+
+    let mut pair_entries = pair_triggers.into_iter().collect::<Vec<_>>();
+    pair_entries.sort_by_key(|(start_ts_ms, _)| *start_ts_ms);
+    for (start_ts_ms, trigger_market_ids) in pair_entries {
+        let Some(next_ts_ms) = start_ts_ms.checked_add(ONE_MINUTE_MS) else {
+            continue;
+        };
+        let mut pair_market_ids = HashSet::new();
+        let candidates = trigger_market_ids.into_iter().collect::<Vec<_>>();
+        for (left_idx, left_market_id) in candidates.iter().enumerate() {
+            for right_market_id in candidates.iter().skip(left_idx + 1) {
+                let Some(left_spec) = markets.get(left_market_id) else {
+                    continue;
+                };
+                let Some(right_spec) = markets.get(right_market_id) else {
+                    continue;
+                };
+                let Some(left_before) =
+                    price_point_at(&price_series, left_market_id, start_ts_ms - ONE_MINUTE_MS)
+                else {
+                    continue;
+                };
+                let Some(left_after) = price_point_at(&price_series, left_market_id, start_ts_ms)
+                else {
+                    continue;
+                };
+                let Some(left_next) = price_point_at(&price_series, left_market_id, next_ts_ms)
+                else {
+                    continue;
+                };
+                let Some(right_before) =
+                    price_point_at(&price_series, right_market_id, start_ts_ms - ONE_MINUTE_MS)
+                else {
+                    continue;
+                };
+                let Some(right_after) = price_point_at(&price_series, right_market_id, start_ts_ms)
+                else {
+                    continue;
+                };
+                let Some(right_next) = price_point_at(&price_series, right_market_id, next_ts_ms)
+                else {
+                    continue;
+                };
+                if !is_pair_sync_reset_candidate(
+                    left_spec,
+                    right_spec,
+                    left_before,
+                    left_after,
+                    left_next,
+                    right_before,
+                    right_after,
+                    right_next,
+                ) {
+                    continue;
+                }
+                pair_market_ids.insert(left_market_id.clone());
+                pair_market_ids.insert(right_market_id.clone());
+            }
+        }
+
+        pair_market_ids
+            .retain(|market_id| !sanitized_cells.contains(&(market_id.clone(), start_ts_ms)));
+        if pair_market_ids.len() < 2 {
+            continue;
+        }
+        for market_id in &pair_market_ids {
+            sanitized_cells.insert((market_id.clone(), start_ts_ms));
+        }
+        sync_reset_windows.push(ReplaySanitizedSyncResetWindow {
+            event_id: pair_sync_reset_scope(markets, &pair_market_ids),
+            start_ts_ms,
+            end_ts_ms: start_ts_ms,
+            trigger_market_count: pair_market_ids.len(),
+            sanitized_market_count: pair_market_ids.len(),
+        });
+    }
+
+    let mut diagnostics = ReplaySanitizationDiagnostics {
+        sanitized_market_minutes: 0,
+        sanitized_poly_observations: 0,
+        sync_reset_windows,
+    };
+    let rows = rows
+        .into_iter()
+        .map(|mut row| {
+            if sanitized_cells.contains(&(row.market_id.clone(), row.ts_ms)) {
+                diagnostics.sanitized_market_minutes += 1;
+                diagnostics.sanitized_poly_observations += usize::from(row.yes_price.is_some());
+                diagnostics.sanitized_poly_observations += usize::from(row.no_price.is_some());
+                row.yes_price = None;
+                row.no_price = None;
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+
+    ReplaySanitizationOutcome { rows, diagnostics }
+}
+
+fn price_point_at(
+    price_series: &HashMap<String, Vec<(u64, ReplayPricePoint)>>,
+    market_id: &str,
+    ts_ms: u64,
+) -> Option<ReplayPricePoint> {
+    let points = price_series.get(market_id)?;
+    let idx = points
+        .binary_search_by_key(&ts_ms, |(point_ts_ms, _)| *point_ts_ms)
+        .ok()?;
+    Some(points[idx].1)
+}
+
+fn replay_reference_cex_price_at(dataset: &ReplayDataset, ts_ms: u64) -> Option<f64> {
+    ts_ms
+        .checked_sub(ONE_MINUTE_MS)
+        .and_then(|prior_ts_ms| dataset.cex_close_by_ts.get(&prior_ts_ms).copied())
+}
+
+fn trade_token_side(trade: &ReplayTradeRow) -> TokenSide {
+    if trade.direction.starts_with("yes_") {
+        TokenSide::Yes
+    } else {
+        TokenSide::No
+    }
+}
+
+fn signed_cex_qty_from_trade(trade: &ReplayTradeRow) -> f64 {
+    if trade.delta_at_entry >= 0.0 {
+        -trade.cex_qty
+    } else {
+        trade.cex_qty
+    }
+}
+
+fn replay_trade_component_at(
+    dataset: &ReplayDataset,
+    price_series: &HashMap<String, Vec<(u64, ReplayPricePoint)>>,
+    trade: &ReplayTradeRow,
+    ts_ms: u64,
+) -> Option<ReplayPositionComponent> {
+    let ts = ts_ms / 1000;
+    if !(trade.entry_time <= ts && trade.exit_time > ts) {
+        return None;
+    }
+    if trade.entry_time == ts {
+        return Some(ReplayPositionComponent {
+            poly_value: trade.poly_shares * trade.entry_poly_price,
+            cex_unrealized: 0.0,
+        });
+    }
+
+    let prices = price_point_at(price_series, &trade.market_id, ts_ms)?;
+    let poly_price = match trade_token_side(trade) {
+        TokenSide::Yes => prices.yes_price?,
+        TokenSide::No => prices.no_price?,
+    };
+    let cex_price = replay_reference_cex_price_at(dataset, ts_ms)?;
+    Some(ReplayPositionComponent {
+        poly_value: trade.poly_shares * poly_price,
+        cex_unrealized: linear_cex_pnl(
+            trade.entry_cex_price,
+            cex_price,
+            signed_cex_qty_from_trade(trade),
+        ),
+    })
+}
+
+fn replay_entry_fee_usd(trade: &ReplayTradeRow, config: &ResolvedReplayConfig) -> f64 {
+    trade.poly_shares * trade.entry_poly_price * config.stress.poly_fee_bps / 10_000.0
+        + trade.cex_qty * trade.entry_cex_price * config.stress.cex_fee_bps / 10_000.0
+}
+
+fn replay_exit_fee_usd(trade: &ReplayTradeRow, config: &ResolvedReplayConfig) -> f64 {
+    trade.poly_shares * trade.exit_poly_price * config.stress.poly_fee_bps / 10_000.0
+        + trade.cex_qty * trade.exit_cex_price * config.stress.cex_fee_bps / 10_000.0
+}
+
+fn build_minute_attributions(
+    dataset: &ReplayDataset,
+    config: &ResolvedReplayConfig,
+    price_series: &HashMap<String, Vec<(u64, ReplayPricePoint)>>,
+    trade_log: &[ReplayTradeRow],
+    start_ts_ms: u64,
+    end_ts_ms: u64,
+) -> Vec<ReplayMinuteAttribution> {
+    let start_ts = start_ts_ms / 1000;
+    let end_ts = end_ts_ms / 1000;
+    let mut by_market: HashMap<String, ReplayMinuteAttributionAccumulator> = HashMap::new();
+
+    for trade in trade_log
+        .iter()
+        .filter(|trade| trade.entry_time <= end_ts && trade.exit_time > start_ts)
+    {
+        let accumulator = by_market.entry(trade.market_id.clone()).or_default();
+        let open_before = trade.entry_time <= start_ts && trade.exit_time > start_ts;
+        let open_after = trade.entry_time <= end_ts && trade.exit_time > end_ts;
+        if open_before {
+            accumulator.open_positions_before += 1;
+        }
+        if open_after {
+            accumulator.open_positions_after += 1;
+        }
+
+        let before = replay_trade_component_at(dataset, price_series, trade, start_ts_ms);
+        let after = replay_trade_component_at(dataset, price_series, trade, end_ts_ms);
+        accumulator.poly_mark_change_usd += after.map(|item| item.poly_value).unwrap_or_default()
+            - before.map(|item| item.poly_value).unwrap_or_default();
+        accumulator.cex_mark_change_usd +=
+            after.map(|item| item.cex_unrealized).unwrap_or_default()
+                - before.map(|item| item.cex_unrealized).unwrap_or_default();
+
+        if trade.entry_time == end_ts {
+            accumulator.entries_at_end_ts += 1;
+            accumulator.fill_cash_change_usd -=
+                trade.poly_shares * trade.entry_poly_price + replay_entry_fee_usd(trade, config);
+        }
+        if trade.exit_time == end_ts {
+            accumulator.exits_at_end_ts += 1;
+            accumulator.fill_cash_change_usd += trade.poly_shares * trade.exit_poly_price
+                + linear_cex_pnl(
+                    trade.entry_cex_price,
+                    trade.exit_cex_price,
+                    signed_cex_qty_from_trade(trade),
+                )
+                - replay_exit_fee_usd(trade, config);
+        }
+    }
+
+    let mut rows = by_market
+        .into_iter()
+        .filter_map(|(market_id, accumulator)| {
+            let spec = dataset.markets.get(&market_id)?;
+            let start_prices = price_point_at(price_series, &market_id, start_ts_ms);
+            let end_prices = price_point_at(price_series, &market_id, end_ts_ms);
+            Some(ReplayMinuteAttribution {
+                event_id: spec.event_id.clone(),
+                market_id: market_id.clone(),
+                market_slug: spec.market_slug.clone(),
+                market_question: spec.market_config.market_question.clone(),
+                total_contribution_usd: accumulator.fill_cash_change_usd
+                    + accumulator.poly_mark_change_usd
+                    + accumulator.cex_mark_change_usd,
+                fill_cash_change_usd: accumulator.fill_cash_change_usd,
+                poly_mark_change_usd: accumulator.poly_mark_change_usd,
+                cex_mark_change_usd: accumulator.cex_mark_change_usd,
+                open_positions_before: accumulator.open_positions_before,
+                open_positions_after: accumulator.open_positions_after,
+                entries_at_end_ts: accumulator.entries_at_end_ts,
+                exits_at_end_ts: accumulator.exits_at_end_ts,
+                yes_price_start: start_prices.and_then(|item| item.yes_price),
+                yes_price_end: end_prices.and_then(|item| item.yes_price),
+                no_price_start: start_prices.and_then(|item| item.no_price),
+                no_price_end: end_prices.and_then(|item| item.no_price),
+                cex_price_start: replay_reference_cex_price_at(dataset, start_ts_ms),
+                cex_price_end: replay_reference_cex_price_at(dataset, end_ts_ms),
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .total_contribution_usd
+            .abs()
+            .partial_cmp(&left.total_contribution_usd.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.market_id.cmp(&right.market_id))
+    });
+    rows
+}
+
+fn is_extreme_probability(value: Option<f64>) -> bool {
+    value.is_some_and(|item| {
+        item <= REPLAY_SYNC_RESET_EXTREME_THRESHOLD
+            || item >= 1.0 - REPLAY_SYNC_RESET_EXTREME_THRESHOLD
+    })
+}
+
+fn is_neutral_probability(value: Option<f64>) -> bool {
+    value.is_some_and(|item| {
+        (item - REPLAY_SYNC_RESET_NEUTRAL_TARGET).abs() <= REPLAY_SYNC_RESET_NEUTRAL_TOLERANCE
+    })
+}
+
+fn is_interior_sync_reset_probability(value: Option<f64>) -> bool {
+    value.is_some_and(|item| {
+        (REPLAY_SYNC_RESET_INTERIOR_MIN..=REPLAY_SYNC_RESET_INTERIOR_MAX).contains(&item)
+    })
+}
+
+fn approx_same_probability(lhs: Option<f64>, rhs: Option<f64>) -> bool {
+    lhs.zip(rhs)
+        .map(|(lhs, rhs)| (lhs - rhs).abs() <= REPLAY_SYNC_RESET_SNAPBACK_TOLERANCE)
+        .unwrap_or(false)
+}
+
+fn approx_same_probability_with_tolerance(
+    lhs: Option<f64>,
+    rhs: Option<f64>,
+    tolerance: f64,
+) -> bool {
+    lhs.zip(rhs)
+        .map(|(lhs, rhs)| (lhs - rhs).abs() <= tolerance)
+        .unwrap_or(false)
+}
+
+fn approx_probability_sum(lhs: Option<f64>, rhs: Option<f64>, target: f64, tolerance: f64) -> bool {
+    lhs.zip(rhs)
+        .map(|(lhs, rhs)| ((lhs + rhs) - target).abs() <= tolerance)
+        .unwrap_or(false)
+}
+
+fn same_strike(lhs: Option<Price>, rhs: Option<Price>) -> bool {
+    match (lhs, rhs) {
+        (Some(lhs), Some(rhs)) => lhs == rhs,
+        _ => false,
+    }
+}
+
+fn is_adjacent_ladder_pair(lhs: &MarketRule, rhs: &MarketRule) -> bool {
+    match (&lhs.kind, &rhs.kind) {
+        (MarketRuleKind::Below, MarketRuleKind::Between) => {
+            same_strike(lhs.upper_strike, rhs.lower_strike)
+        }
+        (MarketRuleKind::Between, MarketRuleKind::Below) => {
+            same_strike(lhs.lower_strike, rhs.upper_strike)
+        }
+        (MarketRuleKind::Between, MarketRuleKind::Between) => {
+            same_strike(lhs.upper_strike, rhs.lower_strike)
+                || same_strike(lhs.lower_strike, rhs.upper_strike)
+        }
+        (MarketRuleKind::Between, MarketRuleKind::Above) => {
+            same_strike(lhs.upper_strike, rhs.lower_strike)
+        }
+        (MarketRuleKind::Above, MarketRuleKind::Between) => {
+            same_strike(lhs.lower_strike, rhs.upper_strike)
+        }
+        _ => false,
+    }
+}
+
+fn is_complementary_threshold_pair(lhs: &MarketRule, rhs: &MarketRule) -> bool {
+    match (&lhs.kind, &rhs.kind) {
+        (MarketRuleKind::Above, MarketRuleKind::Below) => {
+            same_strike(lhs.lower_strike, rhs.upper_strike)
+        }
+        (MarketRuleKind::Below, MarketRuleKind::Above) => {
+            same_strike(lhs.upper_strike, rhs.lower_strike)
+        }
+        _ => false,
+    }
+}
+
+fn pair_sync_reset_scope(
+    markets: &HashMap<String, ReplayMarketSpec>,
+    market_ids: &HashSet<String>,
+) -> String {
+    let mut event_ids = market_ids
+        .iter()
+        .filter_map(|market_id| markets.get(market_id).map(|spec| spec.event_id.clone()))
+        .collect::<Vec<_>>();
+    event_ids.sort();
+    event_ids.dedup();
+    if event_ids.is_empty() {
+        "pair-sync-reset".to_owned()
+    } else {
+        event_ids.join("|")
+    }
+}
+
+fn is_pair_sync_reset_candidate(
+    lhs_spec: &ReplayMarketSpec,
+    rhs_spec: &ReplayMarketSpec,
+    lhs_before: ReplayPricePoint,
+    lhs_after: ReplayPricePoint,
+    lhs_next: ReplayPricePoint,
+    rhs_before: ReplayPricePoint,
+    rhs_after: ReplayPricePoint,
+    rhs_next: ReplayPricePoint,
+) -> bool {
+    if lhs_spec
+        .settlement_ts_ms
+        .abs_diff(rhs_spec.settlement_ts_ms)
+        > REPLAY_SYNC_RESET_PAIR_SETTLEMENT_TOLERANCE_MS
+    {
+        return false;
+    }
+    let Some(lhs_rule) = lhs_spec.market_config.market_rule.as_ref() else {
+        return false;
+    };
+    let Some(rhs_rule) = rhs_spec.market_config.market_rule.as_ref() else {
+        return false;
+    };
+    let lhs_extreme =
+        is_extreme_probability(lhs_before.yes_price) || is_extreme_probability(lhs_before.no_price);
+    let rhs_extreme =
+        is_extreme_probability(rhs_before.yes_price) || is_extreme_probability(rhs_before.no_price);
+    let lhs_next_extreme =
+        is_extreme_probability(lhs_next.yes_price) || is_extreme_probability(lhs_next.no_price);
+    let rhs_next_extreme =
+        is_extreme_probability(rhs_next.yes_price) || is_extreme_probability(rhs_next.no_price);
+    if !lhs_extreme || !rhs_extreme || !lhs_next_extreme || !rhs_next_extreme {
+        return false;
+    }
+
+    if is_adjacent_ladder_pair(lhs_rule, rhs_rule) {
+        return approx_same_probability_with_tolerance(
+            lhs_before.yes_price,
+            rhs_before.yes_price,
+            REPLAY_SYNC_RESET_PAIR_TEMPLATE_TOLERANCE,
+        ) && approx_same_probability_with_tolerance(
+            lhs_after.yes_price,
+            rhs_after.yes_price,
+            REPLAY_SYNC_RESET_PAIR_TEMPLATE_TOLERANCE,
+        ) && approx_same_probability_with_tolerance(
+            lhs_next.yes_price,
+            rhs_next.yes_price,
+            REPLAY_SYNC_RESET_PAIR_TEMPLATE_TOLERANCE,
+        );
+    }
+
+    if is_complementary_threshold_pair(lhs_rule, rhs_rule) {
+        return approx_probability_sum(
+            lhs_before.yes_price,
+            rhs_before.yes_price,
+            1.0,
+            REPLAY_SYNC_RESET_PAIR_COMPLEMENT_TOLERANCE,
+        ) && approx_probability_sum(
+            lhs_after.yes_price,
+            rhs_after.yes_price,
+            1.0,
+            REPLAY_SYNC_RESET_PAIR_COMPLEMENT_TOLERANCE,
+        ) && approx_probability_sum(
+            lhs_next.yes_price,
+            rhs_next.yes_price,
+            1.0,
+            REPLAY_SYNC_RESET_PAIR_COMPLEMENT_TOLERANCE,
+        );
+    }
+
+    false
+}
+
+fn sync_reset_flavor(
+    before: ReplayPricePoint,
+    after: ReplayPricePoint,
+    next: ReplayPricePoint,
+) -> Option<ReplaySyncResetFlavor> {
+    let moved_into_neutral = before
+        .yes_price
+        .zip(after.yes_price)
+        .map(|(lhs, rhs)| (lhs - rhs).abs() >= REPLAY_SYNC_RESET_MIN_MOVE)
+        .unwrap_or(false)
+        || before
+            .no_price
+            .zip(after.no_price)
+            .map(|(lhs, rhs)| (lhs - rhs).abs() >= REPLAY_SYNC_RESET_MIN_MOVE)
+            .unwrap_or(false);
+    let moved_out_of_neutral = after
+        .yes_price
+        .zip(next.yes_price)
+        .map(|(lhs, rhs)| (lhs - rhs).abs() >= REPLAY_SYNC_RESET_MIN_MOVE)
+        .unwrap_or(false)
+        || after
+            .no_price
+            .zip(next.no_price)
+            .map(|(lhs, rhs)| (lhs - rhs).abs() >= REPLAY_SYNC_RESET_MIN_MOVE)
+            .unwrap_or(false);
+    let next_is_neutral =
+        is_neutral_probability(next.yes_price) && is_neutral_probability(next.no_price);
+    let next_snaps_back_to_extreme = moved_out_of_neutral
+        && (is_extreme_probability(next.yes_price) || is_extreme_probability(next.no_price));
+    if moved_into_neutral
+        && (is_extreme_probability(before.yes_price) || is_extreme_probability(before.no_price))
+        && is_neutral_probability(after.yes_price)
+        && is_neutral_probability(after.no_price)
+        && (next_is_neutral || next_snaps_back_to_extreme)
+    {
+        return Some(ReplaySyncResetFlavor::NeutralPlateau);
+    }
+
+    let moved_into_interior = before
+        .yes_price
+        .zip(after.yes_price)
+        .map(|(lhs, rhs)| (lhs - rhs).abs() >= REPLAY_SYNC_RESET_MIN_MOVE)
+        .unwrap_or(false)
+        || before
+            .no_price
+            .zip(after.no_price)
+            .map(|(lhs, rhs)| (lhs - rhs).abs() >= REPLAY_SYNC_RESET_MIN_MOVE)
+            .unwrap_or(false);
+    let snapped_back_to_before = (approx_same_probability(before.yes_price, next.yes_price)
+        && approx_same_probability(before.no_price, next.no_price))
+        || approx_same_probability(before.yes_price, next.yes_price)
+        || approx_same_probability(before.no_price, next.no_price);
+    let next_is_interior = is_interior_sync_reset_probability(next.yes_price)
+        && is_interior_sync_reset_probability(next.no_price);
+    if moved_into_interior
+        && is_interior_sync_reset_probability(after.yes_price)
+        && is_interior_sync_reset_probability(after.no_price)
+        && (next_is_interior || snapped_back_to_before)
+    {
+        return Some(ReplaySyncResetFlavor::InteriorReset);
+    }
+
+    None
+}
+
+fn is_sync_probability_reset(
+    before: ReplayPricePoint,
+    after: ReplayPricePoint,
+    next: ReplayPricePoint,
+) -> bool {
+    sync_reset_flavor(before, after, next).is_some()
+}
+
+fn detect_sync_reset_events(
+    dataset: &ReplayDataset,
+    price_series: &HashMap<String, Vec<(u64, ReplayPricePoint)>>,
+    attributions: &[ReplayMinuteAttribution],
+    start_ts_ms: u64,
+    end_ts_ms: u64,
+) -> Vec<ReplayAnomalousEvent> {
+    let Some(next_ts_ms) = end_ts_ms.checked_add(ONE_MINUTE_MS) else {
+        return Vec::new();
+    };
+    let impacted_market_ids = attributions
+        .iter()
+        .filter(|item| item.total_contribution_usd.abs() > 1.0)
+        .map(|item| item.market_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+
+    for market_id in impacted_market_ids {
+        let Some(before) = price_point_at(price_series, market_id, start_ts_ms) else {
+            continue;
+        };
+        let Some(after) = price_point_at(price_series, market_id, end_ts_ms) else {
+            continue;
+        };
+        let Some(next) = price_point_at(price_series, market_id, next_ts_ms) else {
+            continue;
+        };
+        if !is_sync_probability_reset(before, after, next) {
+            continue;
+        }
+        let Some(spec) = dataset.markets.get(market_id) else {
+            continue;
+        };
+        *counts.entry(spec.event_id.clone()).or_insert(0) += 1;
+    }
+
+    let mut events = counts
+        .into_iter()
+        .filter(|(_, market_count)| *market_count >= REPLAY_SYNC_RESET_MIN_MARKETS)
+        .map(|(event_id, market_count)| ReplayAnomalousEvent {
+            event_id,
+            market_count,
+        })
+        .collect::<Vec<_>>();
+    events.sort_by(|left, right| {
+        right
+            .market_count
+            .cmp(&left.market_count)
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    });
+    events
+}
+
+fn detect_replay_anomalies(
+    dataset: &ReplayDataset,
+    config: &ResolvedReplayConfig,
+    equity_curve: &[EquityPoint],
+    trade_log: &[ReplayTradeRow],
+) -> ReplayAnomalyDiagnostics {
+    if equity_curve.len() < 2 {
+        return ReplayAnomalyDiagnostics::default();
+    }
+
+    let price_series = build_market_price_series(dataset);
+    let mut anomalies = Vec::new();
+
+    for window in equity_curve.windows(2) {
+        let start = &window[0];
+        let end = &window[1];
+        let equity_change_usd = end.equity - start.equity;
+        if equity_change_usd.abs() < REPLAY_ANOMALY_MIN_ABS_EQUITY_JUMP_USD {
+            continue;
+        }
+        let cash_change_usd = end.cash - start.cash;
+        let formula_mark_change_usd = equity_change_usd - cash_change_usd;
+        let mark_share = if equity_change_usd.abs() <= f64::EPSILON {
+            0.0
+        } else {
+            formula_mark_change_usd.abs() / equity_change_usd.abs()
+        };
+        if mark_share < REPLAY_ANOMALY_MIN_MARK_SHARE {
+            continue;
+        }
+
+        let attributions = build_minute_attributions(
+            dataset,
+            config,
+            &price_series,
+            trade_log,
+            start.ts_ms,
+            end.ts_ms,
+        );
+        let fill_cash_change_usd = attributions
+            .iter()
+            .map(|item| item.fill_cash_change_usd)
+            .sum::<f64>();
+        let detailed_mark_change_usd = attributions
+            .iter()
+            .map(|item| item.poly_mark_change_usd + item.cex_mark_change_usd)
+            .sum::<f64>();
+        let sync_reset_events = detect_sync_reset_events(
+            dataset,
+            &price_series,
+            &attributions,
+            start.ts_ms,
+            end.ts_ms,
+        );
+        let mut reason_codes = vec!["mark_dominated_jump".to_owned()];
+        if !sync_reset_events.is_empty() {
+            reason_codes.push("sync_probability_reset".to_owned());
+        }
+        anomalies.push(ReplayAnomaly {
+            start_ts_ms: start.ts_ms,
+            end_ts_ms: end.ts_ms,
+            equity_change_usd,
+            cash_change_usd,
+            fill_cash_change_usd,
+            mark_change_usd: if attributions.is_empty() {
+                formula_mark_change_usd
+            } else {
+                detailed_mark_change_usd
+            },
+            mark_share,
+            reason_codes,
+            sync_reset_events,
+            top_markets: attributions
+                .into_iter()
+                .take(REPLAY_ANOMALY_TOP_MARKET_LIMIT)
+                .collect(),
+        });
+    }
+
+    anomalies.sort_by(|left, right| {
+        right
+            .equity_change_usd
+            .abs()
+            .partial_cmp(&left.equity_change_usd.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.end_ts_ms.cmp(&right.end_ts_ms))
+    });
+
+    ReplayAnomalyDiagnostics {
+        anomaly_count: anomalies.len(),
+        max_abs_equity_jump_usd: anomalies
+            .iter()
+            .map(|item| item.equity_change_usd.abs())
+            .fold(0.0, f64::max),
+        max_mark_share: anomalies
+            .iter()
+            .map(|item| item.mark_share)
+            .fold(0.0, f64::max),
+        top_anomalies: anomalies
+            .into_iter()
+            .take(REPLAY_ANOMALY_TOP_LIMIT)
+            .collect(),
+    }
+}
+
 fn print_replay_summary(summary: &RustReplaySummary) {
     println!("==============================================================================");
     println!("Rust 历史回放");
@@ -2579,6 +3741,44 @@ fn print_replay_summary(summary: &RustReplaySummary) {
         summary.replayed_poly_observations,
         summary.replayed_grouped_rows
     );
+    if summary.sanitized_market_minute_count > 0 || summary.sanitized_poly_observation_count > 0 {
+        println!(
+            "净化: sync windows {} | sanitized market-minutes {} | sanitized poly obs {}",
+            summary.sanitized_sync_reset_window_count,
+            summary.sanitized_market_minute_count,
+            summary.sanitized_poly_observation_count,
+        );
+    }
+    println!(
+        "异常: {} | 最大异常跳变 {:.4} | 最大 mark 占比 {:.2}%",
+        summary.anomaly_count,
+        summary.max_abs_anomaly_equity_jump_usd,
+        summary.max_anomaly_mark_share * 100.0,
+    );
+}
+
+fn print_replay_anomaly_summary(diagnostics: &ReplayAnomalyDiagnostics) {
+    if diagnostics.anomaly_count == 0 {
+        return;
+    }
+    println!("------------------------------------------------------------------------------");
+    println!(
+        "Anomaly: {} 个 | 最大跳变 {:.4} | 最大 mark 占比 {:.2}%",
+        diagnostics.anomaly_count,
+        diagnostics.max_abs_equity_jump_usd,
+        diagnostics.max_mark_share * 100.0,
+    );
+    if let Some(top) = diagnostics.top_anomalies.first() {
+        println!(
+            "Top anomaly: {} -> {} | equity {:+.4} | fill {:+.4} | mark {:+.4} | reasons {}",
+            top.start_ts_ms,
+            top.end_ts_ms,
+            top.equity_change_usd,
+            top.fill_cash_change_usd,
+            top.mark_change_usd,
+            top.reason_codes.join(","),
+        );
+    }
 }
 
 fn print_stress_summary(results: &[RustReplaySummary]) {
@@ -2824,6 +4024,41 @@ mod tests {
         }
     }
 
+    fn replay_spec_for_question(
+        event_id: &str,
+        market_id: &str,
+        question: &str,
+    ) -> ReplayMarketSpec {
+        ReplayMarketSpec {
+            event_id: event_id.to_owned(),
+            market_id: market_id.to_owned(),
+            market_slug: format!("mkt-{market_id}"),
+            symbol: Symbol::new(format!("mkt-{market_id}")),
+            market_config: MarketConfig {
+                symbol: Symbol::new(format!("mkt-{market_id}")),
+                poly_ids: PolymarketIds {
+                    condition_id: format!("condition-{market_id}"),
+                    yes_token_id: format!("yes-{market_id}"),
+                    no_token_id: format!("no-{market_id}"),
+                },
+                market_question: Some(question.to_owned()),
+                market_rule: Some(parse_market_rule(question).expect("market rule")),
+                cex_symbol: "BTCUSDT".to_owned(),
+                hedge_exchange: Exchange::Binance,
+                strike_price: None,
+                settlement_timestamp: 10_000,
+                min_tick_size: Price(Decimal::new(1, 2)),
+                neg_risk: false,
+                cex_price_tick: Decimal::new(1, 1),
+                cex_qty_step: Decimal::new(1, 3),
+                cex_contract_multiplier: Decimal::ONE,
+            },
+            settlement_ts_ms: 10_000 * 1000,
+            yes_payout: None,
+            no_payout: None,
+        }
+    }
+
     fn sample_replay_row(spec: &ReplayMarketSpec) -> ReplayMinuteRow {
         ReplayMinuteRow {
             ts_ms: 1_749_999_940_000,
@@ -2868,6 +4103,8 @@ mod tests {
             max_capital_usage: 1.0,
             cex_hedge_ratio: 1.0,
             cex_margin_ratio: 0.1,
+            planner_depth_levels: MarketDataConfig::default().planner_depth_levels,
+            band_policy: BandPolicyMode::ConfiguredBand,
             min_poly_price: None,
             max_poly_price: None,
             max_holding_bars: None,
@@ -2970,6 +4207,8 @@ mod tests {
             0.25,
             1.0,
             0.1,
+            5,
+            BandPolicyMode::ConfiguredBand,
             None,
             None,
             None,
@@ -3170,6 +4409,7 @@ mod tests {
             for pending in pending_entry_signals {
                 if !positions.contains_key(&pending.spec.symbol) {
                     let context = replay_planning_context(
+                        config.planner_depth_levels,
                         &pending.candidate.symbol,
                         &pending.row,
                         pending.cex_reference_price,
@@ -3493,6 +4733,99 @@ mod tests {
     }
 
     #[test]
+    fn separates_price_band_rejections_from_true_missing_quotes() {
+        let spec = sample_replay_spec();
+        let mut row = sample_replay_row(&spec);
+        row.yes_price = Some(0.05);
+        row.no_price = Some(0.95);
+        let mut candidate = sample_open_candidate(&spec, &row);
+        candidate.token_side = TokenSide::Yes;
+
+        let mut config = sample_replay_config(1.0, 20.0, 50.0, 5.0, 2.0);
+        config.min_poly_price = Some(0.2);
+        config.max_poly_price = Some(0.5);
+
+        let planner = replay_execution_planner(&config);
+        let mut positions = HashMap::new();
+        let mut cash = config.initial_capital;
+        let mut stats = ReplayStats::default();
+        let mut trade_log = Vec::new();
+
+        handle_candidate(
+            candidate,
+            &spec,
+            &row,
+            100_000.0,
+            &config,
+            &planner,
+            &mut positions,
+            &mut cash,
+            &mut stats,
+            &mut trade_log,
+        )
+        .expect("candidate handling should not error");
+
+        assert_eq!(stats.signals_rejected_missing_price, 0);
+        assert_eq!(stats.signals_rejected_below_min_poly_price, 1);
+        assert_eq!(stats.signals_rejected_above_or_equal_max_poly_price, 0);
+    }
+
+    #[test]
+    fn market_debug_rows_include_reason_breakdown() {
+        let mut stats = ReplayStats::default();
+        stats.signals_by_market.insert("mkt-1".to_owned(), 3);
+        stats
+            .rejected_below_min_price_by_market
+            .insert("mkt-1".to_owned(), 2);
+
+        let rows = all_market_debug_rows(&stats);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].signal_count, 3);
+        assert_eq!(rows[0].rejected_below_min_price_count, 2);
+        assert_eq!(rows[0].rejected_missing_price_count, 0);
+        assert_eq!(rows[0].rejected_above_or_equal_max_price_count, 0);
+    }
+
+    #[test]
+    fn disabled_band_policy_keeps_candidate_tradable_inside_old_price_filter() {
+        let spec = sample_replay_spec();
+        let mut row = sample_replay_row(&spec);
+        row.yes_price = Some(0.05);
+        row.no_price = Some(0.95);
+        let mut candidate = sample_open_candidate(&spec, &row);
+        candidate.token_side = TokenSide::Yes;
+
+        let mut config = sample_replay_config(1.0, 20.0, 50.0, 5.0, 2.0);
+        config.band_policy = BandPolicyMode::Disabled;
+        config.min_poly_price = Some(0.2);
+        config.max_poly_price = Some(0.5);
+
+        let planner = replay_execution_planner(&config);
+        let mut positions = HashMap::new();
+        let mut cash = config.initial_capital;
+        let mut stats = ReplayStats::default();
+        let mut trade_log = Vec::new();
+
+        handle_candidate(
+            candidate,
+            &spec,
+            &row,
+            100_000.0,
+            &config,
+            &planner,
+            &mut positions,
+            &mut cash,
+            &mut stats,
+            &mut trade_log,
+        )
+        .expect("candidate handling should not error");
+
+        assert_eq!(stats.entry_count, 1);
+        assert_eq!(stats.signals_rejected_below_min_poly_price, 0);
+        assert!(positions.contains_key(&spec.symbol));
+    }
+
+    #[test]
     fn handle_candidate_uses_executable_notional_without_double_counting_friction() {
         let spec = sample_replay_spec();
         let row = sample_replay_row(&spec);
@@ -3501,6 +4834,7 @@ mod tests {
         let planner = replay_execution_planner(&config);
         let plan = plan_replay_open_candidate(
             &planner,
+            config.planner_depth_levels,
             &candidate,
             &row,
             100_000.0,
@@ -3553,6 +4887,7 @@ mod tests {
         let planner = replay_execution_planner(&config);
         let plan = plan_replay_open_candidate(
             &planner,
+            config.planner_depth_levels,
             &candidate,
             &row,
             100_000.0,
@@ -3619,6 +4954,7 @@ mod tests {
         let planner = replay_execution_planner(&config);
         let open_plan = plan_replay_open_candidate(
             &planner,
+            config.planner_depth_levels,
             &candidate,
             &row,
             100_000.0,
@@ -3686,6 +5022,7 @@ mod tests {
             },
         )]);
         let close_context = replay_planning_context(
+            config.planner_depth_levels,
             &spec.symbol,
             &row,
             100_000.0,
@@ -3742,6 +5079,1199 @@ mod tests {
         );
         assert_f64_close(cash, expected_final_cash);
         assert_f64_close(trade.net_pnl, expected_round_trip_net);
+    }
+
+    #[test]
+    fn detects_sync_probability_reset_anomaly_from_mark_dominated_jump() {
+        let event_id = "evt-reset".to_owned();
+        let event_markets = [
+            (
+                "1559492",
+                "Will the price of Bitcoin be above $80,000 on March 18?",
+                0.045,
+                0.500,
+                22_200.0222,
+                0.538,
+            ),
+            (
+                "1559402",
+                "Will the price of Bitcoin be between $62,000 and $64,000 on March 18?",
+                0.050,
+                0.495,
+                19_980.0200,
+                0.174,
+            ),
+            (
+                "1559400",
+                "Will the price of Bitcoin be less than $62,000 on March 18?",
+                0.065,
+                0.495,
+                15_369.2461,
+                0.441,
+            ),
+        ];
+        let mut markets = HashMap::new();
+        let mut rows = Vec::new();
+        let ts0 = 0_u64;
+        let ts1 = ONE_MINUTE_MS;
+        let ts2 = ONE_MINUTE_MS * 2;
+        for (market_id, question, yes_t0, yes_t1, _, _) in event_markets {
+            let spec = ReplayMarketSpec {
+                event_id: event_id.clone(),
+                market_id: market_id.to_owned(),
+                market_slug: format!("mkt-{market_id}"),
+                symbol: Symbol::new(format!("mkt-{market_id}")),
+                market_config: MarketConfig {
+                    symbol: Symbol::new(format!("mkt-{market_id}")),
+                    poly_ids: PolymarketIds {
+                        condition_id: format!("condition-{market_id}"),
+                        yes_token_id: format!("yes-{market_id}"),
+                        no_token_id: format!("no-{market_id}"),
+                    },
+                    market_question: Some(question.to_owned()),
+                    market_rule: Some(parse_market_rule(question).expect("market rule")),
+                    cex_symbol: "BTCUSDT".to_owned(),
+                    hedge_exchange: Exchange::Binance,
+                    strike_price: None,
+                    settlement_timestamp: 10_000,
+                    min_tick_size: Price(Decimal::new(1, 2)),
+                    neg_risk: false,
+                    cex_price_tick: Decimal::new(1, 1),
+                    cex_qty_step: Decimal::new(1, 3),
+                    cex_contract_multiplier: Decimal::ONE,
+                },
+                settlement_ts_ms: 10_000 * 1000,
+                yes_payout: None,
+                no_payout: None,
+            };
+            markets.insert(market_id.to_owned(), spec);
+            rows.push(ReplayMinuteRow {
+                ts_ms: ts0,
+                market_id: market_id.to_owned(),
+                yes_price: Some(yes_t0),
+                no_price: Some(1.0 - yes_t0),
+            });
+            rows.push(ReplayMinuteRow {
+                ts_ms: ts1,
+                market_id: market_id.to_owned(),
+                yes_price: Some(yes_t1),
+                no_price: Some(1.0 - yes_t1),
+            });
+            rows.push(ReplayMinuteRow {
+                ts_ms: ts2,
+                market_id: market_id.to_owned(),
+                yes_price: Some(yes_t1),
+                no_price: Some(1.0 - yes_t1),
+            });
+        }
+
+        let dataset = ReplayDataset {
+            metadata: HashMap::new(),
+            markets,
+            rows,
+            cex_close_by_ts: HashMap::from([(ts0, 70_250.0), (ts1, 70_300.0), (ts2, 70_320.0)]),
+            unique_minutes: 3,
+            poly_observation_count: 18,
+            sanitization: ReplaySanitizationDiagnostics::default(),
+        };
+        let config = sample_replay_config(1.0, 2.0, 10.0, 2.0, 10.0);
+        let trade_log = event_markets
+            .into_iter()
+            .enumerate()
+            .map(
+                |(idx, (market_id, _, yes_t0, yes_t1, shares, cex_qty))| ReplayTradeRow {
+                    trade_id: idx + 1,
+                    strategy: "arb".to_owned(),
+                    entry_time: ts0 / 1000,
+                    event_id: event_id.clone(),
+                    market_id: market_id.to_owned(),
+                    market_slug: format!("mkt-{market_id}"),
+                    exit_time: (ONE_MINUTE_MS * 3) / 1000,
+                    direction: "yes_signal basis reverted inside exit band".to_owned(),
+                    entry_poly_price: yes_t0,
+                    exit_poly_price: yes_t1,
+                    entry_cex_price: 70_250.0,
+                    exit_cex_price: 70_300.0,
+                    poly_shares: shares,
+                    cex_qty,
+                    gross_pnl: 0.0,
+                    fees: 0.0,
+                    slippage: 0.0,
+                    gas: 0.0,
+                    funding_cost: 0.0,
+                    net_pnl: 0.0,
+                    holding_bars: 3,
+                    z_score_at_entry: -2.0,
+                    basis_bps_at_entry: 400.0,
+                    delta_at_entry: 0.001,
+                },
+            )
+            .collect::<Vec<_>>();
+        let equity_curve = vec![
+            EquityPoint {
+                ts_ms: ts0,
+                equity: 100_000.0,
+                cash: 90_000.0,
+                available_cash: 90_000.0,
+                unrealized_pnl: 0.0,
+                gross_exposure: 0.0,
+                reserved_margin: 0.0,
+                capital_in_use: 0.0,
+                open_positions: 3,
+            },
+            EquityPoint {
+                ts_ms: ts1,
+                equity: 125_000.0,
+                cash: 90_500.0,
+                available_cash: 90_500.0,
+                unrealized_pnl: 24_500.0,
+                gross_exposure: 0.0,
+                reserved_margin: 0.0,
+                capital_in_use: 0.0,
+                open_positions: 3,
+            },
+            EquityPoint {
+                ts_ms: ts2,
+                equity: 125_100.0,
+                cash: 90_550.0,
+                available_cash: 90_550.0,
+                unrealized_pnl: 24_550.0,
+                gross_exposure: 0.0,
+                reserved_margin: 0.0,
+                capital_in_use: 0.0,
+                open_positions: 3,
+            },
+        ];
+
+        let diagnostics = detect_replay_anomalies(&dataset, &config, &equity_curve, &trade_log);
+
+        assert_eq!(diagnostics.anomaly_count, 1);
+        let anomaly = diagnostics
+            .top_anomalies
+            .first()
+            .expect("expected one anomaly");
+        assert_eq!(anomaly.start_ts_ms, ts0);
+        assert_eq!(anomaly.end_ts_ms, ts1);
+        assert!(anomaly
+            .reason_codes
+            .iter()
+            .any(|code| code == "mark_dominated_jump"));
+        assert!(anomaly
+            .reason_codes
+            .iter()
+            .any(|code| code == "sync_probability_reset"));
+        assert!(
+            anomaly.mark_change_usd > anomaly.fill_cash_change_usd.abs(),
+            "expected mark contribution to dominate fill cash"
+        );
+        assert_eq!(
+            anomaly.sync_reset_events,
+            vec![ReplayAnomalousEvent {
+                event_id,
+                market_count: 3,
+            }]
+        );
+        assert_eq!(anomaly.top_markets.len(), 3);
+        assert_eq!(anomaly.top_markets[0].market_id, "1559492");
+        assert!(anomaly.top_markets[0].total_contribution_usd > 9_000.0);
+        assert_eq!(
+            anomaly.top_markets[0].market_question.as_deref(),
+            Some("Will the price of Bitcoin be above $80,000 on March 18?")
+        );
+    }
+
+    #[test]
+    fn sanitize_sync_reset_plateau_nulls_event_wide_neutral_rows() {
+        let reset_event_id = "evt-reset".to_owned();
+        let stable_event_id = "evt-stable".to_owned();
+        let ts0 = 0_u64;
+        let ts1 = ONE_MINUTE_MS;
+        let ts2 = ONE_MINUTE_MS * 2;
+        let ts3 = ONE_MINUTE_MS * 3;
+        let impacted = [
+            (
+                "1559492",
+                "Will the price of Bitcoin be above $80,000 on March 18?",
+                0.045,
+                0.500,
+                0.047,
+            ),
+            (
+                "1559402",
+                "Will the price of Bitcoin be between $62,000 and $64,000 on March 18?",
+                0.050,
+                0.495,
+                0.052,
+            ),
+            (
+                "1559400",
+                "Will the price of Bitcoin be less than $62,000 on March 18?",
+                0.065,
+                0.495,
+                0.068,
+            ),
+        ];
+        let stable_market = (
+            "2559400",
+            "Will the price of Bitcoin be above $90,000 on March 18?",
+        );
+
+        let mut markets = HashMap::new();
+        let mut rows = Vec::new();
+        for (market_id, question, yes_t0, yes_neutral, yes_t3) in impacted {
+            markets.insert(
+                market_id.to_owned(),
+                replay_spec_for_question(&reset_event_id, market_id, question),
+            );
+            rows.push(ReplayMinuteRow {
+                ts_ms: ts0,
+                market_id: market_id.to_owned(),
+                yes_price: Some(yes_t0),
+                no_price: Some(1.0 - yes_t0),
+            });
+            rows.push(ReplayMinuteRow {
+                ts_ms: ts1,
+                market_id: market_id.to_owned(),
+                yes_price: Some(yes_neutral),
+                no_price: Some(1.0 - yes_neutral),
+            });
+            rows.push(ReplayMinuteRow {
+                ts_ms: ts2,
+                market_id: market_id.to_owned(),
+                yes_price: Some(yes_neutral),
+                no_price: Some(1.0 - yes_neutral),
+            });
+            rows.push(ReplayMinuteRow {
+                ts_ms: ts3,
+                market_id: market_id.to_owned(),
+                yes_price: Some(yes_t3),
+                no_price: Some(1.0 - yes_t3),
+            });
+        }
+
+        markets.insert(
+            stable_market.0.to_owned(),
+            replay_spec_for_question(&stable_event_id, stable_market.0, stable_market.1),
+        );
+        rows.push(ReplayMinuteRow {
+            ts_ms: ts0,
+            market_id: stable_market.0.to_owned(),
+            yes_price: Some(0.48),
+            no_price: Some(0.52),
+        });
+        rows.push(ReplayMinuteRow {
+            ts_ms: ts1,
+            market_id: stable_market.0.to_owned(),
+            yes_price: Some(0.50),
+            no_price: Some(0.50),
+        });
+        rows.push(ReplayMinuteRow {
+            ts_ms: ts2,
+            market_id: stable_market.0.to_owned(),
+            yes_price: Some(0.50),
+            no_price: Some(0.50),
+        });
+        rows.push(ReplayMinuteRow {
+            ts_ms: ts3,
+            market_id: stable_market.0.to_owned(),
+            yes_price: Some(0.51),
+            no_price: Some(0.49),
+        });
+
+        let outcome = sanitize_sync_neutral_resets(&markets, rows);
+
+        assert_eq!(outcome.diagnostics.sync_reset_windows.len(), 1);
+        assert_eq!(
+            outcome.diagnostics.sync_reset_windows[0],
+            ReplaySanitizedSyncResetWindow {
+                event_id: reset_event_id,
+                start_ts_ms: ts1,
+                end_ts_ms: ts2,
+                trigger_market_count: 3,
+                sanitized_market_count: 3,
+            }
+        );
+        assert_eq!(outcome.diagnostics.sanitized_market_minutes, 6);
+        assert_eq!(outcome.diagnostics.sanitized_poly_observations, 12);
+
+        for row in outcome
+            .rows
+            .iter()
+            .filter(|row| row.ts_ms == ts1 || row.ts_ms == ts2)
+        {
+            if row.market_id == stable_market.0 {
+                assert_eq!(row.yes_price, Some(0.50));
+                assert_eq!(row.no_price, Some(0.50));
+            } else {
+                assert_eq!(row.yes_price, None);
+                assert_eq!(row.no_price, None);
+            }
+        }
+        for row in outcome
+            .rows
+            .iter()
+            .filter(|row| row.ts_ms == ts0 || row.ts_ms == ts3)
+        {
+            assert!(row.yes_price.is_some());
+            assert!(row.no_price.is_some());
+        }
+    }
+
+    #[test]
+    fn sanitize_sync_reset_single_minute_spike_nulls_event_wide_neutral_rows() {
+        let reset_event_id = "evt-reset".to_owned();
+        let ts0 = 0_u64;
+        let ts1 = ONE_MINUTE_MS;
+        let ts2 = ONE_MINUTE_MS * 2;
+        let impacted = [
+            (
+                "1559492",
+                "Will the price of Bitcoin be above $80,000 on March 18?",
+                0.045,
+                0.500,
+                0.047,
+            ),
+            (
+                "1559402",
+                "Will the price of Bitcoin be between $62,000 and $64,000 on March 18?",
+                0.050,
+                0.495,
+                0.052,
+            ),
+            (
+                "1559400",
+                "Will the price of Bitcoin be less than $62,000 on March 18?",
+                0.065,
+                0.495,
+                0.068,
+            ),
+        ];
+
+        let mut markets = HashMap::new();
+        let mut rows = Vec::new();
+        for (market_id, question, yes_t0, yes_t1, yes_t2) in impacted {
+            markets.insert(
+                market_id.to_owned(),
+                replay_spec_for_question(&reset_event_id, market_id, question),
+            );
+            rows.push(ReplayMinuteRow {
+                ts_ms: ts0,
+                market_id: market_id.to_owned(),
+                yes_price: Some(yes_t0),
+                no_price: Some(1.0 - yes_t0),
+            });
+            rows.push(ReplayMinuteRow {
+                ts_ms: ts1,
+                market_id: market_id.to_owned(),
+                yes_price: Some(yes_t1),
+                no_price: Some(1.0 - yes_t1),
+            });
+            rows.push(ReplayMinuteRow {
+                ts_ms: ts2,
+                market_id: market_id.to_owned(),
+                yes_price: Some(yes_t2),
+                no_price: Some(1.0 - yes_t2),
+            });
+        }
+
+        let outcome = sanitize_sync_neutral_resets(&markets, rows);
+
+        assert_eq!(outcome.diagnostics.sync_reset_windows.len(), 1);
+        assert_eq!(
+            outcome.diagnostics.sync_reset_windows[0],
+            ReplaySanitizedSyncResetWindow {
+                event_id: reset_event_id,
+                start_ts_ms: ts1,
+                end_ts_ms: ts1,
+                trigger_market_count: 3,
+                sanitized_market_count: 3,
+            }
+        );
+        assert_eq!(outcome.diagnostics.sanitized_market_minutes, 3);
+        assert_eq!(outcome.diagnostics.sanitized_poly_observations, 6);
+
+        for row in &outcome.rows {
+            if row.ts_ms == ts1 {
+                assert_eq!(row.yes_price, None);
+                assert_eq!(row.no_price, None);
+            } else {
+                assert!(row.yes_price.is_some());
+                assert!(row.no_price.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn sanitize_sync_reset_single_minute_template_spike_nulls_event_wide_rows() {
+        let reset_event_id = "evt-reset-template".to_owned();
+        let ts0 = 0_u64;
+        let ts1 = ONE_MINUTE_MS;
+        let ts2 = ONE_MINUTE_MS * 2;
+        let impacted = [
+            (
+                "1414993",
+                "Will the price of Solana be less than $40 on March 1?",
+                0.016,
+                0.3445,
+                0.016,
+            ),
+            (
+                "1415025",
+                "Will the price of Solana be between $120 and $130 on March 1?",
+                0.0155,
+                0.3445,
+                0.0155,
+            ),
+            (
+                "1415016",
+                "Will the price of Solana be between $110 and $120 on March 1?",
+                0.0205,
+                0.3395,
+                0.0205,
+            ),
+        ];
+
+        let mut markets = HashMap::new();
+        let mut rows = Vec::new();
+        for (market_id, question, yes_t0, yes_t1, yes_t2) in impacted {
+            markets.insert(
+                market_id.to_owned(),
+                replay_spec_for_question(&reset_event_id, market_id, question),
+            );
+            rows.push(ReplayMinuteRow {
+                ts_ms: ts0,
+                market_id: market_id.to_owned(),
+                yes_price: Some(yes_t0),
+                no_price: Some(1.0 - yes_t0),
+            });
+            rows.push(ReplayMinuteRow {
+                ts_ms: ts1,
+                market_id: market_id.to_owned(),
+                yes_price: Some(yes_t1),
+                no_price: Some(1.0 - yes_t1),
+            });
+            rows.push(ReplayMinuteRow {
+                ts_ms: ts2,
+                market_id: market_id.to_owned(),
+                yes_price: Some(yes_t2),
+                no_price: Some(1.0 - yes_t2),
+            });
+        }
+
+        let outcome = sanitize_sync_neutral_resets(&markets, rows);
+
+        assert_eq!(outcome.diagnostics.sync_reset_windows.len(), 1);
+        assert_eq!(
+            outcome.diagnostics.sync_reset_windows[0],
+            ReplaySanitizedSyncResetWindow {
+                event_id: reset_event_id,
+                start_ts_ms: ts1,
+                end_ts_ms: ts1,
+                trigger_market_count: 3,
+                sanitized_market_count: 3,
+            }
+        );
+        assert_eq!(outcome.diagnostics.sanitized_market_minutes, 3);
+        assert_eq!(outcome.diagnostics.sanitized_poly_observations, 6);
+
+        for row in &outcome.rows {
+            if row.ts_ms == ts1 {
+                assert_eq!(row.yes_price, None);
+                assert_eq!(row.no_price, None);
+            } else {
+                assert!(row.yes_price.is_some());
+                assert!(row.no_price.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn sanitize_sync_reset_template_plateau_nulls_event_wide_rows_until_exit() {
+        let reset_event_id = "evt-reset-template-plateau".to_owned();
+        let ts0 = 0_u64;
+        let ts1 = ONE_MINUTE_MS;
+        let ts2 = ONE_MINUTE_MS * 2;
+        let ts3 = ONE_MINUTE_MS * 3;
+        let impacted = [
+            (
+                "1415039",
+                "Will the price of XRP be less than $0.90 on March 1?",
+                0.0160,
+                0.3445,
+                0.4695,
+                0.0160,
+            ),
+            (
+                "1415041",
+                "Will the price of XRP be between $0.90 and $1.00 on March 1?",
+                0.0165,
+                0.3445,
+                0.4645,
+                0.0165,
+            ),
+            (
+                "1408395",
+                "Will the price of XRP be between $1.00 and $1.10 on February 28?",
+                0.0295,
+                0.3475,
+                0.4650,
+                0.0290,
+            ),
+        ];
+
+        let mut markets = HashMap::new();
+        let mut rows = Vec::new();
+        for (market_id, question, yes_t0, yes_t1, yes_t2, yes_t3) in impacted {
+            markets.insert(
+                market_id.to_owned(),
+                replay_spec_for_question(&reset_event_id, market_id, question),
+            );
+            for (ts_ms, yes_price) in [(ts0, yes_t0), (ts1, yes_t1), (ts2, yes_t2), (ts3, yes_t3)] {
+                rows.push(ReplayMinuteRow {
+                    ts_ms,
+                    market_id: market_id.to_owned(),
+                    yes_price: Some(yes_price),
+                    no_price: Some(1.0 - yes_price),
+                });
+            }
+        }
+
+        let outcome = sanitize_sync_neutral_resets(&markets, rows);
+
+        assert_eq!(outcome.diagnostics.sync_reset_windows.len(), 1);
+        assert_eq!(
+            outcome.diagnostics.sync_reset_windows[0],
+            ReplaySanitizedSyncResetWindow {
+                event_id: reset_event_id,
+                start_ts_ms: ts1,
+                end_ts_ms: ts2,
+                trigger_market_count: 3,
+                sanitized_market_count: 3,
+            }
+        );
+        assert_eq!(outcome.diagnostics.sanitized_market_minutes, 6);
+        assert_eq!(outcome.diagnostics.sanitized_poly_observations, 12);
+
+        for row in &outcome.rows {
+            if row.ts_ms == ts1 || row.ts_ms == ts2 {
+                assert_eq!(row.yes_price, None);
+                assert_eq!(row.no_price, None);
+            } else {
+                assert!(row.yes_price.is_some());
+                assert!(row.no_price.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn sanitize_sync_reset_two_trigger_markets_still_nulls_event_wide_interior_template_reset() {
+        let reset_event_id = "evt-reset-template-adjacent".to_owned();
+        let ts0 = 0_u64;
+        let ts1 = ONE_MINUTE_MS;
+        let ts2 = ONE_MINUTE_MS * 2;
+        let impacted = [
+            (
+                "1403023",
+                "Will the price of Solana be between $60 and $70 on February 27?",
+                0.0580,
+                0.3495,
+                0.0530,
+            ),
+            (
+                "1403024",
+                "Will the price of Solana be between $70 and $80 on February 27?",
+                0.4500,
+                0.4600,
+                0.4500,
+            ),
+            (
+                "1403025",
+                "Will the price of Solana be between $80 and $90 on February 27?",
+                0.4150,
+                0.4550,
+                0.4150,
+            ),
+            (
+                "1403026",
+                "Will the price of Solana be between $90 and $100 on February 27?",
+                0.0850,
+                0.3700,
+                0.0700,
+            ),
+        ];
+        let unaffected = (
+            "1403027",
+            "Will the price of Solana be between $100 and $110 on February 27?",
+            0.0135,
+            0.0135,
+            0.0135,
+        );
+
+        let mut markets = HashMap::new();
+        let mut rows = Vec::new();
+        for (market_id, question, yes_t0, yes_t1, yes_t2) in
+            impacted.into_iter().chain([unaffected])
+        {
+            markets.insert(
+                market_id.to_owned(),
+                replay_spec_for_question(&reset_event_id, market_id, question),
+            );
+            for (ts_ms, yes_price) in [(ts0, yes_t0), (ts1, yes_t1), (ts2, yes_t2)] {
+                rows.push(ReplayMinuteRow {
+                    ts_ms,
+                    market_id: market_id.to_owned(),
+                    yes_price: Some(yes_price),
+                    no_price: Some(1.0 - yes_price),
+                });
+            }
+        }
+        let outcome = sanitize_sync_neutral_resets(&markets, rows);
+
+        assert_eq!(outcome.diagnostics.sync_reset_windows.len(), 1);
+        assert_eq!(
+            outcome.diagnostics.sync_reset_windows[0],
+            ReplaySanitizedSyncResetWindow {
+                event_id: reset_event_id,
+                start_ts_ms: ts1,
+                end_ts_ms: ts1,
+                trigger_market_count: 2,
+                sanitized_market_count: 4,
+            }
+        );
+        assert_eq!(outcome.diagnostics.sanitized_market_minutes, 4);
+        assert_eq!(outcome.diagnostics.sanitized_poly_observations, 8);
+
+        for row in &outcome.rows {
+            if row.ts_ms == ts1 && row.market_id != unaffected.0 {
+                assert_eq!(row.yes_price, None);
+                assert_eq!(row.no_price, None);
+            } else {
+                assert!(row.yes_price.is_some());
+                assert!(row.no_price.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn sanitize_sync_reset_adjacent_pair_template_spike_nulls_two_market_pair() {
+        let reset_event_id = "evt-reset-pair".to_owned();
+        let ts0 = 0_u64;
+        let ts1 = ONE_MINUTE_MS;
+        let ts2 = ONE_MINUTE_MS * 2;
+        let impacted = [
+            (
+                "1415039",
+                "Will the price of XRP be less than $0.90 on March 1?",
+                0.0160,
+                0.3400,
+                0.0160,
+            ),
+            (
+                "1415041",
+                "Will the price of XRP be between $0.90 and $1.00 on March 1?",
+                0.0165,
+                0.3445,
+                0.0165,
+            ),
+        ];
+        let unaffected = (
+            "1415044",
+            "Will the price of XRP be between $1.00 and $1.10 on March 1?",
+            0.0300,
+            0.0300,
+            0.0300,
+        );
+
+        let mut markets = HashMap::new();
+        let mut rows = Vec::new();
+        for (market_id, question, yes_t0, yes_t1, yes_t2) in
+            impacted.into_iter().chain([unaffected])
+        {
+            markets.insert(
+                market_id.to_owned(),
+                replay_spec_for_question(&reset_event_id, market_id, question),
+            );
+            for (ts_ms, yes_price) in [(ts0, yes_t0), (ts1, yes_t1), (ts2, yes_t2)] {
+                rows.push(ReplayMinuteRow {
+                    ts_ms,
+                    market_id: market_id.to_owned(),
+                    yes_price: Some(yes_price),
+                    no_price: Some(1.0 - yes_price),
+                });
+            }
+        }
+        let pair_spec = markets
+            .get_mut("1415041")
+            .expect("pair market spec should exist");
+        pair_spec.settlement_ts_ms += 5_000;
+        pair_spec.market_config.settlement_timestamp += 5;
+
+        let outcome = sanitize_sync_neutral_resets(&markets, rows);
+
+        assert_eq!(outcome.diagnostics.sync_reset_windows.len(), 1);
+        assert_eq!(outcome.diagnostics.sanitized_market_minutes, 2);
+        assert_eq!(outcome.diagnostics.sanitized_poly_observations, 4);
+
+        for row in &outcome.rows {
+            if row.ts_ms == ts1 && row.market_id != unaffected.0 {
+                assert_eq!(row.yes_price, None);
+                assert_eq!(row.no_price, None);
+            } else {
+                assert!(row.yes_price.is_some());
+                assert!(row.no_price.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn sanitize_sync_reset_complementary_threshold_pair_nulls_cross_event_pair() {
+        let above_event_id = "evt-above-threshold".to_owned();
+        let below_event_id = "evt-below-threshold".to_owned();
+        let ts0 = 0_u64;
+        let ts1 = ONE_MINUTE_MS;
+        let ts2 = ONE_MINUTE_MS * 2;
+        let impacted = [
+            (
+                &above_event_id,
+                "1220909",
+                "Will the price of Ethereum be above $2,800 on January 26?",
+                0.9715,
+                0.5490,
+                0.9710,
+            ),
+            (
+                &below_event_id,
+                "1220942",
+                "Will the price of Ethereum be less than $2,800 on January 26?",
+                0.0285,
+                0.4570,
+                0.0290,
+            ),
+        ];
+        let unaffected = [
+            (
+                &above_event_id,
+                "1220911",
+                "Will the price of Ethereum be above $2,900 on January 26?",
+                0.9400,
+                0.9400,
+                0.9400,
+            ),
+            (
+                &below_event_id,
+                "1220944",
+                "Will the price of Ethereum be between $2,900 and $3,000 on January 26?",
+                0.0400,
+                0.0400,
+                0.0400,
+            ),
+        ];
+
+        let mut markets = HashMap::new();
+        let mut rows = Vec::new();
+        for (event_id, market_id, question, yes_t0, yes_t1, yes_t2) in
+            impacted.into_iter().chain(unaffected)
+        {
+            markets.insert(
+                market_id.to_owned(),
+                replay_spec_for_question(event_id, market_id, question),
+            );
+            for (ts_ms, yes_price) in [(ts0, yes_t0), (ts1, yes_t1), (ts2, yes_t2)] {
+                rows.push(ReplayMinuteRow {
+                    ts_ms,
+                    market_id: market_id.to_owned(),
+                    yes_price: Some(yes_price),
+                    no_price: Some(1.0 - yes_price),
+                });
+            }
+        }
+        let pair_spec = markets
+            .get_mut("1220942")
+            .expect("pair market spec should exist");
+        pair_spec.settlement_ts_ms += 90 * ONE_MINUTE_MS;
+        pair_spec.market_config.settlement_timestamp += 90 * 60;
+
+        let outcome = sanitize_sync_neutral_resets(&markets, rows);
+
+        assert_eq!(outcome.diagnostics.sync_reset_windows.len(), 1);
+        assert_eq!(outcome.diagnostics.sanitized_market_minutes, 2);
+        assert_eq!(outcome.diagnostics.sanitized_poly_observations, 4);
+
+        for row in &outcome.rows {
+            if row.ts_ms == ts1 && (row.market_id == "1220909" || row.market_id == "1220942") {
+                assert_eq!(row.yes_price, None);
+                assert_eq!(row.no_price, None);
+            } else {
+                assert!(row.yes_price.is_some());
+                assert!(row.no_price.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn detects_sync_probability_reset_anomaly_from_single_minute_mark_spike() {
+        let event_id = "evt-reset".to_owned();
+        let event_markets = [
+            (
+                "1559492",
+                "Will the price of Bitcoin be above $80,000 on March 18?",
+                0.045,
+                0.500,
+                0.047,
+                22_200.0222,
+                0.538,
+            ),
+            (
+                "1559402",
+                "Will the price of Bitcoin be between $62,000 and $64,000 on March 18?",
+                0.050,
+                0.495,
+                0.052,
+                19_980.0200,
+                0.174,
+            ),
+            (
+                "1559400",
+                "Will the price of Bitcoin be less than $62,000 on March 18?",
+                0.065,
+                0.495,
+                0.068,
+                15_369.2461,
+                0.441,
+            ),
+        ];
+        let mut markets = HashMap::new();
+        let mut rows = Vec::new();
+        let ts0 = 0_u64;
+        let ts1 = ONE_MINUTE_MS;
+        let ts2 = ONE_MINUTE_MS * 2;
+        for (market_id, question, yes_t0, yes_t1, yes_t2, _, _) in event_markets {
+            let spec = ReplayMarketSpec {
+                event_id: event_id.clone(),
+                market_id: market_id.to_owned(),
+                market_slug: format!("mkt-{market_id}"),
+                symbol: Symbol::new(format!("mkt-{market_id}")),
+                market_config: MarketConfig {
+                    symbol: Symbol::new(format!("mkt-{market_id}")),
+                    poly_ids: PolymarketIds {
+                        condition_id: format!("condition-{market_id}"),
+                        yes_token_id: format!("yes-{market_id}"),
+                        no_token_id: format!("no-{market_id}"),
+                    },
+                    market_question: Some(question.to_owned()),
+                    market_rule: Some(parse_market_rule(question).expect("market rule")),
+                    cex_symbol: "BTCUSDT".to_owned(),
+                    hedge_exchange: Exchange::Binance,
+                    strike_price: None,
+                    settlement_timestamp: 10_000,
+                    min_tick_size: Price(Decimal::new(1, 2)),
+                    neg_risk: false,
+                    cex_price_tick: Decimal::new(1, 1),
+                    cex_qty_step: Decimal::new(1, 3),
+                    cex_contract_multiplier: Decimal::ONE,
+                },
+                settlement_ts_ms: 10_000 * 1000,
+                yes_payout: None,
+                no_payout: None,
+            };
+            markets.insert(market_id.to_owned(), spec);
+            rows.push(ReplayMinuteRow {
+                ts_ms: ts0,
+                market_id: market_id.to_owned(),
+                yes_price: Some(yes_t0),
+                no_price: Some(1.0 - yes_t0),
+            });
+            rows.push(ReplayMinuteRow {
+                ts_ms: ts1,
+                market_id: market_id.to_owned(),
+                yes_price: Some(yes_t1),
+                no_price: Some(1.0 - yes_t1),
+            });
+            rows.push(ReplayMinuteRow {
+                ts_ms: ts2,
+                market_id: market_id.to_owned(),
+                yes_price: Some(yes_t2),
+                no_price: Some(1.0 - yes_t2),
+            });
+        }
+
+        let dataset = ReplayDataset {
+            metadata: HashMap::new(),
+            markets,
+            rows,
+            cex_close_by_ts: HashMap::from([(ts0, 70_250.0), (ts1, 70_300.0), (ts2, 70_320.0)]),
+            unique_minutes: 3,
+            poly_observation_count: 18,
+            sanitization: ReplaySanitizationDiagnostics::default(),
+        };
+        let config = sample_replay_config(1.0, 2.0, 10.0, 2.0, 10.0);
+        let trade_log = event_markets
+            .into_iter()
+            .enumerate()
+            .map(
+                |(idx, (market_id, _, yes_t0, yes_t1, _yes_t2, shares, cex_qty))| ReplayTradeRow {
+                    trade_id: idx + 1,
+                    strategy: "arb".to_owned(),
+                    entry_time: ts0 / 1000,
+                    event_id: event_id.clone(),
+                    market_id: market_id.to_owned(),
+                    market_slug: format!("mkt-{market_id}"),
+                    exit_time: (ONE_MINUTE_MS * 3) / 1000,
+                    direction: "yes_signal basis reverted inside exit band".to_owned(),
+                    entry_poly_price: yes_t0,
+                    exit_poly_price: yes_t1,
+                    entry_cex_price: 70_250.0,
+                    exit_cex_price: 70_300.0,
+                    poly_shares: shares,
+                    cex_qty,
+                    gross_pnl: 0.0,
+                    fees: 0.0,
+                    slippage: 0.0,
+                    gas: 0.0,
+                    funding_cost: 0.0,
+                    net_pnl: 0.0,
+                    holding_bars: 3,
+                    z_score_at_entry: -2.0,
+                    basis_bps_at_entry: 400.0,
+                    delta_at_entry: 0.001,
+                },
+            )
+            .collect::<Vec<_>>();
+        let equity_curve = vec![
+            EquityPoint {
+                ts_ms: ts0,
+                equity: 100_000.0,
+                cash: 90_000.0,
+                available_cash: 90_000.0,
+                unrealized_pnl: 0.0,
+                gross_exposure: 0.0,
+                reserved_margin: 0.0,
+                capital_in_use: 0.0,
+                open_positions: 3,
+            },
+            EquityPoint {
+                ts_ms: ts1,
+                equity: 125_000.0,
+                cash: 90_500.0,
+                available_cash: 90_500.0,
+                unrealized_pnl: 24_500.0,
+                gross_exposure: 0.0,
+                reserved_margin: 0.0,
+                capital_in_use: 0.0,
+                open_positions: 3,
+            },
+            EquityPoint {
+                ts_ms: ts2,
+                equity: 100_100.0,
+                cash: 90_550.0,
+                available_cash: 90_550.0,
+                unrealized_pnl: 24_550.0,
+                gross_exposure: 0.0,
+                reserved_margin: 0.0,
+                capital_in_use: 0.0,
+                open_positions: 3,
+            },
+        ];
+
+        let diagnostics = detect_replay_anomalies(&dataset, &config, &equity_curve, &trade_log);
+        let anomaly = diagnostics
+            .top_anomalies
+            .first()
+            .expect("expected one anomaly");
+        assert!(anomaly
+            .reason_codes
+            .iter()
+            .any(|code| code == "sync_probability_reset"));
+        assert_eq!(
+            anomaly.sync_reset_events,
+            vec![ReplayAnomalousEvent {
+                event_id,
+                market_count: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn detects_sync_probability_reset_anomaly_from_single_minute_template_spike() {
+        let event_id = "evt-reset-template".to_owned();
+        let event_markets = [
+            (
+                "1414993",
+                "Will the price of Solana be less than $40 on March 1?",
+                0.016,
+                0.3445,
+                0.016,
+                20_000.0,
+                0.250,
+            ),
+            (
+                "1415025",
+                "Will the price of Solana be between $120 and $130 on March 1?",
+                0.0155,
+                0.3445,
+                0.0155,
+                18_000.0,
+                0.220,
+            ),
+            (
+                "1415016",
+                "Will the price of Solana be between $110 and $120 on March 1?",
+                0.0205,
+                0.3395,
+                0.0205,
+                15_000.0,
+                0.180,
+            ),
+        ];
+        let mut markets = HashMap::new();
+        let mut rows = Vec::new();
+        let ts0 = 0_u64;
+        let ts1 = ONE_MINUTE_MS;
+        let ts2 = ONE_MINUTE_MS * 2;
+        for (market_id, question, yes_t0, yes_t1, yes_t2, _, _) in event_markets {
+            let spec = ReplayMarketSpec {
+                event_id: event_id.clone(),
+                market_id: market_id.to_owned(),
+                market_slug: format!("mkt-{market_id}"),
+                symbol: Symbol::new(format!("mkt-{market_id}")),
+                market_config: MarketConfig {
+                    symbol: Symbol::new(format!("mkt-{market_id}")),
+                    poly_ids: PolymarketIds {
+                        condition_id: format!("condition-{market_id}"),
+                        yes_token_id: format!("yes-{market_id}"),
+                        no_token_id: format!("no-{market_id}"),
+                    },
+                    market_question: Some(question.to_owned()),
+                    market_rule: Some(parse_market_rule(question).expect("market rule")),
+                    cex_symbol: "SOLUSDT".to_owned(),
+                    hedge_exchange: Exchange::Binance,
+                    strike_price: None,
+                    settlement_timestamp: 10_000,
+                    min_tick_size: Price(Decimal::new(1, 2)),
+                    neg_risk: false,
+                    cex_price_tick: Decimal::new(1, 1),
+                    cex_qty_step: Decimal::new(1, 3),
+                    cex_contract_multiplier: Decimal::ONE,
+                },
+                settlement_ts_ms: 10_000 * 1000,
+                yes_payout: None,
+                no_payout: None,
+            };
+            markets.insert(market_id.to_owned(), spec);
+            rows.push(ReplayMinuteRow {
+                ts_ms: ts0,
+                market_id: market_id.to_owned(),
+                yes_price: Some(yes_t0),
+                no_price: Some(1.0 - yes_t0),
+            });
+            rows.push(ReplayMinuteRow {
+                ts_ms: ts1,
+                market_id: market_id.to_owned(),
+                yes_price: Some(yes_t1),
+                no_price: Some(1.0 - yes_t1),
+            });
+            rows.push(ReplayMinuteRow {
+                ts_ms: ts2,
+                market_id: market_id.to_owned(),
+                yes_price: Some(yes_t2),
+                no_price: Some(1.0 - yes_t2),
+            });
+        }
+
+        let dataset = ReplayDataset {
+            metadata: HashMap::new(),
+            markets,
+            rows,
+            cex_close_by_ts: HashMap::from([(ts0, 80.15), (ts1, 80.09), (ts2, 79.81)]),
+            unique_minutes: 3,
+            poly_observation_count: 18,
+            sanitization: ReplaySanitizationDiagnostics::default(),
+        };
+        let config = sample_replay_config(1.0, 2.0, 10.0, 2.0, 10.0);
+        let trade_log = event_markets
+            .into_iter()
+            .enumerate()
+            .map(
+                |(idx, (market_id, _, yes_t0, yes_t1, _yes_t2, shares, cex_qty))| ReplayTradeRow {
+                    trade_id: idx + 1,
+                    strategy: "arb".to_owned(),
+                    entry_time: ts0 / 1000,
+                    event_id: event_id.clone(),
+                    market_id: market_id.to_owned(),
+                    market_slug: format!("mkt-{market_id}"),
+                    exit_time: (ONE_MINUTE_MS * 3) / 1000,
+                    direction: "yes_signal basis reverted inside exit band".to_owned(),
+                    entry_poly_price: yes_t0,
+                    exit_poly_price: yes_t1,
+                    entry_cex_price: 80.15,
+                    exit_cex_price: 80.09,
+                    poly_shares: shares,
+                    cex_qty,
+                    gross_pnl: 0.0,
+                    fees: 0.0,
+                    slippage: 0.0,
+                    gas: 0.0,
+                    funding_cost: 0.0,
+                    net_pnl: 0.0,
+                    holding_bars: 3,
+                    z_score_at_entry: -2.0,
+                    basis_bps_at_entry: 400.0,
+                    delta_at_entry: 0.001,
+                },
+            )
+            .collect::<Vec<_>>();
+        let equity_curve = vec![
+            EquityPoint {
+                ts_ms: ts0,
+                equity: 100_000.0,
+                cash: 90_000.0,
+                available_cash: 90_000.0,
+                unrealized_pnl: 0.0,
+                gross_exposure: 0.0,
+                reserved_margin: 0.0,
+                capital_in_use: 0.0,
+                open_positions: 3,
+            },
+            EquityPoint {
+                ts_ms: ts1,
+                equity: 124_000.0,
+                cash: 90_400.0,
+                available_cash: 90_400.0,
+                unrealized_pnl: 23_600.0,
+                gross_exposure: 0.0,
+                reserved_margin: 0.0,
+                capital_in_use: 0.0,
+                open_positions: 3,
+            },
+            EquityPoint {
+                ts_ms: ts2,
+                equity: 100_200.0,
+                cash: 90_450.0,
+                available_cash: 90_450.0,
+                unrealized_pnl: 23_650.0,
+                gross_exposure: 0.0,
+                reserved_margin: 0.0,
+                capital_in_use: 0.0,
+                open_positions: 3,
+            },
+        ];
+
+        let diagnostics = detect_replay_anomalies(&dataset, &config, &equity_curve, &trade_log);
+        let anomaly = diagnostics
+            .top_anomalies
+            .first()
+            .expect("expected one anomaly");
+        assert!(anomaly
+            .reason_codes
+            .iter()
+            .any(|code| code == "sync_probability_reset"));
+        assert_eq!(
+            anomaly.sync_reset_events,
+            vec![ReplayAnomalousEvent {
+                event_id,
+                market_count: 3,
+            }]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

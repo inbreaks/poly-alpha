@@ -9,8 +9,7 @@ use rust_decimal::Decimal;
 use serde_json::{json, Value};
 
 use polyalpha_core::{
-    ConnectionStatus, CoreError, Exchange, MarketDataEvent, MarketDataSource, SettlementRules,
-    Symbol, TokenSide,
+    ConnectionStatus, CoreError, Exchange, MarketDataSource, SettlementRules, Symbol, TokenSide,
 };
 
 use crate::error::{DataError, Result};
@@ -37,21 +36,12 @@ pub struct PolymarketLiveDataSource {
 }
 
 impl PolymarketLiveDataSource {
-    fn publish_connection_event(&self, status: ConnectionStatus) {
-        let _ = self.manager.publish(MarketDataEvent::ConnectionEvent {
-            exchange: Exchange::Polymarket,
-            status,
-        });
-    }
-
     fn set_status_if_changed(&self, new_status: ConnectionStatus) {
         let mut guard = self.status.lock().expect("polymarket status lock poisoned");
         if *guard == new_status {
             return;
         }
         *guard = new_status;
-        drop(guard);
-        self.publish_connection_event(new_status);
     }
 
     fn mark_connected(&self) {
@@ -74,8 +64,6 @@ impl PolymarketLiveDataSource {
             return;
         }
         *guard = next;
-        drop(guard);
-        self.publish_connection_event(next);
     }
     pub fn new(
         manager: DataManager,
@@ -259,16 +247,23 @@ impl PolymarketLiveDataSource {
     pub fn build_orderbook_subscribe_message(asset_ids: &[String]) -> Value {
         json!({
             "type": "market",
+            "operation": "subscribe",
             "assets_ids": asset_ids,
-            "custom_feature_enabled": true,
+            "initial_dump": true,
         })
     }
 
     pub fn parse_ws_orderbook_payload(
         payload: &str,
-        fallback_token_id: &str,
+        _fallback_token_id: &str,
     ) -> Result<PolyBookUpdate> {
-        Self::parse_orderbook_payload(payload, fallback_token_id)
+        let update = Self::parse_orderbook_payload(payload, "")?;
+        if update.asset_id.is_empty() {
+            return Err(DataError::InvalidResponse(
+                "polymarket ws payload missing asset_id".to_owned(),
+            ));
+        }
+        Ok(update)
     }
 
     pub fn parse_orderbook_payload(
@@ -426,7 +421,37 @@ fn now_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    use polyalpha_core::{
+        create_channels, ConnectionStatus, Exchange, MarketConfig, PolymarketIds, Price, Symbol,
+        SymbolRegistry,
+    };
+
     use super::*;
+    use crate::{DataManager, MarketDataNormalizer};
+
+    fn sample_registry() -> SymbolRegistry {
+        SymbolRegistry::new(vec![MarketConfig {
+            symbol: Symbol::new("btc-100k-mar-2026"),
+            poly_ids: PolymarketIds {
+                condition_id: "condition-1".to_owned(),
+                yes_token_id: "yes-1".to_owned(),
+                no_token_id: "no-1".to_owned(),
+            },
+            market_question: None,
+            market_rule: None,
+            cex_symbol: "BTCUSDT".to_owned(),
+            hedge_exchange: Exchange::Binance,
+            strike_price: Some(Price(Decimal::new(100_000, 0))),
+            settlement_timestamp: 1_775_001_600,
+            min_tick_size: Price(Decimal::new(1, 2)),
+            neg_risk: false,
+            cex_price_tick: Decimal::new(1, 1),
+            cex_qty_step: Decimal::new(1, 3),
+            cex_contract_multiplier: Decimal::ONE,
+        }])
+    }
 
     #[test]
     fn parse_polymarket_orderbook_object_levels() {
@@ -473,14 +498,72 @@ mod tests {
     }
 
     #[test]
+    fn parse_polymarket_rest_orderbook_uses_token_id_hint_when_payload_omits_asset_id() {
+        let payload = r#"
+        {
+          "timestamp": "1715000000000",
+          "sequence": "42",
+          "bids": [{"price":"0.49","size":"12"}],
+          "asks": [{"price":"0.51","size":"13"}]
+        }
+        "#;
+
+        let update = PolymarketLiveDataSource::parse_orderbook_payload(payload, "yes-1")
+            .expect("rest payload should use hinted token id");
+        assert_eq!(update.asset_id, "yes-1");
+    }
+
+    #[test]
+    fn parse_polymarket_ws_orderbook_rejects_missing_asset_id() {
+        let payload = r#"
+        {
+          "timestamp": "1715000000000",
+          "sequence": "42",
+          "bids": [{"price":"0.49","size":"12"}],
+          "asks": [{"price":"0.51","size":"13"}]
+        }
+        "#;
+
+        let err = PolymarketLiveDataSource::parse_ws_orderbook_payload(payload, "yes-1")
+            .expect_err("ws payload without asset id must be rejected");
+        assert!(matches!(err, DataError::InvalidResponse(message) if message.contains("asset_id")));
+    }
+
+    #[test]
     fn build_subscribe_message_contains_asset_ids() {
         let message = PolymarketLiveDataSource::build_orderbook_subscribe_message(&[
             "yes-1".to_owned(),
             "no-1".to_owned(),
         ]);
         assert_eq!(message["type"], "market");
+        assert_eq!(message["operation"], "subscribe");
         assert_eq!(message["assets_ids"][0], "yes-1");
         assert_eq!(message["assets_ids"][1], "no-1");
-        assert_eq!(message["custom_feature_enabled"], true);
+        assert_eq!(message["initial_dump"], true);
+        assert!(message.get("custom_feature_enabled").is_none());
+    }
+
+    #[test]
+    fn rest_status_changes_do_not_publish_connection_events() {
+        let symbol = Symbol::new("btc-100k-mar-2026");
+        let channels = create_channels(std::slice::from_ref(&symbol));
+        let manager = DataManager::new(
+            MarketDataNormalizer::new(sample_registry()),
+            channels.market_data_tx.clone(),
+        );
+        let source = PolymarketLiveDataSource::new(
+            manager,
+            "https://clob.polymarket.com",
+            SettlementRules::default(),
+        );
+        let mut rx = channels.market_data_tx.subscribe();
+
+        source.mark_connected();
+        assert_eq!(source.connection_status(), ConnectionStatus::Connected);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        source.mark_failure();
+        assert_eq!(source.connection_status(), ConnectionStatus::Reconnecting);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 }

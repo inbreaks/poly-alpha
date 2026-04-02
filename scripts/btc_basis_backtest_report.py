@@ -5,8 +5,9 @@ BTC 基差回测与报告脚本。
 子命令:
 1) inspect-db: 检查 DuckDB 元数据、时间范围和行数
 2) run: 调用 Rust replay 事实源，并输出中文报表
-3) run-legacy: 运行旧版 Python 回测，仅供历史对照
-4) walk-forward: 运行旧版 Python 样本外评估，仅供历史对照
+3) run-current-noband: 调用 Rust replay 并禁用价格带，便于对照分析
+4) run-legacy: 运行旧版 Python 回测，仅供历史对照
+5) walk-forward: 运行旧版 Python 样本外评估，仅供历史对照
 
 依赖:
     python3 -m pip install -r requirements/backtest-db.txt
@@ -23,8 +24,9 @@ import os
 import re
 import subprocess
 import tempfile
+import tomllib
 from collections import defaultdict, deque
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -38,18 +40,12 @@ except ModuleNotFoundError as exc:  # pragma: no cover
     ) from exc
 
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_CONFIG_PATH = os.path.join(REPO_ROOT, "config", "default.toml")
 DEFAULT_DB_PATH = "data/btc_basis_backtest_price_only_ready.duckdb"
-DEFAULT_INITIAL_CAPITAL = 100_000.0
-# 这里改回偏保守的基线参数，避免继续沿用样本内挑出来的“当前最优组合”。
-DEFAULT_WINDOW = 360
-DEFAULT_ENTRY_Z = 2.0
-DEFAULT_EXIT_Z = 0.5
-DEFAULT_POSITION_NOTIONAL_PCT = 0.01
-DEFAULT_MAX_CAPITAL_USAGE = 0.25
 DEFAULT_CEX_HEDGE_RATIO = 1.0
 DEFAULT_CEX_MARGIN_RATIO = 0.10
 DEFAULT_FEE_BPS = 2.0
-DEFAULT_SLIPPAGE_BPS = 10.0
 DEFAULT_TRAIN_DAYS = 30
 DEFAULT_TEST_DAYS = 7
 DEFAULT_STEP_DAYS = 7
@@ -61,12 +57,80 @@ SQRT_TWO = math.sqrt(2.0)
 MIN_WALK_FORWARD_SLICES = 1
 RESOLUTION_EPSILON = 1e-4
 MONEY_LITERAL_RE = r"([0-9][0-9,]*(?:\.\d+)?(?:[kmb])?)\b"
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUST_REPLAY_FACT_SOURCE = "rust_replay"
 LEGACY_REFERENCE_NOTE = (
     "旧版 Python 回测保留在 `run-legacy` / `walk-forward`，仅供历史对照，"
     "不再作为默认事实源。"
 )
+
+
+@dataclass(frozen=True)
+class RuntimeBacktestDefaults:
+    initial_capital: float
+    rolling_window: int
+    entry_z: float
+    exit_z: float
+    position_notional_usd: float
+    max_capital_usage: float
+    poly_slippage_bps: float
+    cex_slippage_bps: float
+    band_policy: str
+    min_poly_price: float | None
+    max_poly_price: float | None
+
+
+def _to_float(value: Any, default: float) -> float:
+    if value is None:
+        return default
+    return float(value)
+
+
+def _to_optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
+def load_runtime_backtest_defaults() -> RuntimeBacktestDefaults:
+    with open(DEFAULT_CONFIG_PATH, "rb") as f:
+        raw = tomllib.load(f)
+
+    strategy = raw.get("strategy", {})
+    basis = strategy.get("basis", {})
+    risk = raw.get("risk", {})
+    paper = raw.get("paper", {})
+    paper_slippage = raw.get("paper_slippage", {})
+
+    initial_capital = _to_float(paper.get("initial_capital"), 10_000.0)
+    max_total_exposure = _to_float(risk.get("max_total_exposure_usd"), initial_capital)
+    if abs(initial_capital) <= 1e-12:
+        max_capital_usage = 0.0
+    else:
+        max_capital_usage = max(max_total_exposure / initial_capital, 0.0)
+
+    return RuntimeBacktestDefaults(
+        initial_capital=initial_capital,
+        rolling_window=max(int(_to_float(basis.get("rolling_window_secs"), 36_000.0) / 60), 2),
+        entry_z=_to_float(basis.get("entry_z_score_threshold"), 4.0),
+        exit_z=_to_float(basis.get("exit_z_score_threshold"), 0.5),
+        position_notional_usd=_to_float(basis.get("max_position_usd"), 200.0),
+        max_capital_usage=max_capital_usage,
+        poly_slippage_bps=_to_float(paper_slippage.get("poly_slippage_bps"), 50.0),
+        cex_slippage_bps=_to_float(paper_slippage.get("cex_slippage_bps"), 2.0),
+        band_policy=str(basis.get("band_policy", "configured_band")),
+        min_poly_price=_to_optional_float(basis.get("min_poly_price")),
+        max_poly_price=_to_optional_float(basis.get("max_poly_price")),
+    )
+
+
+RUNTIME_BACKTEST_DEFAULTS = load_runtime_backtest_defaults()
+DEFAULT_INITIAL_CAPITAL = RUNTIME_BACKTEST_DEFAULTS.initial_capital
+DEFAULT_WINDOW = RUNTIME_BACKTEST_DEFAULTS.rolling_window
+DEFAULT_ENTRY_Z = RUNTIME_BACKTEST_DEFAULTS.entry_z
+DEFAULT_EXIT_Z = RUNTIME_BACKTEST_DEFAULTS.exit_z
+DEFAULT_POSITION_NOTIONAL_USD = RUNTIME_BACKTEST_DEFAULTS.position_notional_usd
+DEFAULT_MAX_CAPITAL_USAGE = RUNTIME_BACKTEST_DEFAULTS.max_capital_usage
+DEFAULT_SLIPPAGE_BPS = RUNTIME_BACKTEST_DEFAULTS.poly_slippage_bps
 
 
 @dataclass
@@ -120,6 +184,12 @@ class BacktestSummary:
     cex_slippage_paid: float
     annualized_sharpe: float
     strategy: dict[str, Any]
+    anomaly_count: int = 0
+    max_abs_anomaly_equity_jump_usd: float = 0.0
+    max_anomaly_mark_share: float = 0.0
+    top_anomaly_start_ts_ms: int | None = None
+    top_anomaly_end_ts_ms: int | None = None
+    top_anomaly_reason_codes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -244,6 +314,10 @@ class RunConfig:
     cex_margin_ratio: float
     fee_bps: float
     slippage_bps: float
+    poly_slippage_bps: float
+    cex_slippage_bps: float
+    min_poly_price: float | None
+    max_poly_price: float | None
     report_json: str | None
     equity_csv: str | None
 
@@ -346,9 +420,11 @@ def table_label(name: str) -> str:
         "polymarket_contracts": "Polymarket 合约表",
         "polymarket_price_history": "Polymarket 历史价格表",
         "polymarket_history_failures": "Polymarket 抓取失败表",
-        "binance_btc_1m": "Binance BTC 1m K线表",
         "basis_1m": "分钟级基差表",
     }
+    if re.fullmatch(r"binance_[a-z0-9]+_1m", name):
+        asset = name.removeprefix("binance_").removesuffix("_1m").upper()
+        return f"Binance {asset} 1m K线表"
     return labels.get(name, name)
 
 
@@ -358,6 +434,7 @@ def strategy_label(key: str) -> str:
         "rolling_window": "滚动窗口",
         "entry_z": "入场阈值",
         "exit_z": "出场阈值",
+        "band_policy": "价格带策略",
         "position_sizing_mode": "仓位模式",
         "position_units": "单次 Poly 份数",
         "position_notional_usd": "单次 Poly 名义",
@@ -366,6 +443,8 @@ def strategy_label(key: str) -> str:
         "cex_margin_ratio": "CEX 初始保证金率",
         "fee_bps": "单腿手续费",
         "slippage_bps": "单腿滑点",
+        "min_poly_price": "最小 Poly 价格",
+        "max_poly_price": "最大 Poly 价格",
         "signal_basis": "信号基差",
         "cex_probability_proxy": "CEX 概率代理",
         "trade_start_ts_ms": "交易起点",
@@ -386,6 +465,10 @@ def strategy_value_display(key: str, value: Any) -> str:
         return f"{value} 分钟"
     if key in {"entry_z", "exit_z"}:
         return fmt_ratio(float(value))
+    if key == "band_policy" and value == "configured_band":
+        return "使用配置价格带"
+    if key == "band_policy" and value == "disabled":
+        return "禁用价格带"
     if key == "position_sizing_mode" and value == "target_poly_notional_usd":
         return "按 Poly 名义金额下单"
     if key == "position_sizing_mode" and value == "legacy_poly_units":
@@ -400,6 +483,8 @@ def strategy_value_display(key: str, value: Any) -> str:
         return f"{float(value):.2f}x"
     if key in {"fee_bps", "slippage_bps"}:
         return f"{float(value):.2f} bps"
+    if key in {"min_poly_price", "max_poly_price"}:
+        return "-" if value is None else f"{float(value):.4f}"
     if key == "entry_fill_ratio":
         return fmt_pct(float(value))
     if key == "trade_start_ts_ms":
@@ -487,7 +572,7 @@ def add_backtest_run_arguments(parser: argparse.ArgumentParser) -> None:
         "--position-notional-usd",
         type=float,
         default=None,
-        help="每次信号买入的 Poly 名义金额；默认按初始资金的一定比例自动推导",
+        help=f"每次信号买入的 Poly 名义金额；默认取 config/default.toml，当前为 {DEFAULT_POSITION_NOTIONAL_USD:.2f} USD",
     )
     parser.add_argument(
         "--max-capital-usage",
@@ -512,7 +597,31 @@ def add_backtest_run_arguments(parser: argparse.ArgumentParser) -> None:
         "--slippage-bps",
         type=float,
         default=DEFAULT_SLIPPAGE_BPS,
-        help="单边滑点 bps",
+        help="共享回测口径的单边滑点 bps；默认与 Poly 腿一致",
+    )
+    parser.add_argument(
+        "--poly-slippage-bps",
+        type=float,
+        default=RUNTIME_BACKTEST_DEFAULTS.poly_slippage_bps,
+        help="Rust replay 默认事实源的 Poly 单边滑点 bps",
+    )
+    parser.add_argument(
+        "--cex-slippage-bps",
+        type=float,
+        default=RUNTIME_BACKTEST_DEFAULTS.cex_slippage_bps,
+        help="Rust replay 默认事实源的 CEX 单边滑点 bps",
+    )
+    parser.add_argument(
+        "--min-poly-price",
+        type=float,
+        default=RUNTIME_BACKTEST_DEFAULTS.min_poly_price,
+        help="Rust replay 默认事实源的最小 Poly 价格过滤",
+    )
+    parser.add_argument(
+        "--max-poly-price",
+        type=float,
+        default=RUNTIME_BACKTEST_DEFAULTS.max_poly_price,
+        help="Rust replay 默认事实源的最大 Poly 价格过滤",
     )
     parser.add_argument("--report-json", default=None, help="可选 JSON 报告输出路径")
     parser.add_argument("--equity-csv", default=None, help="可选权益曲线 CSV 输出路径")
@@ -529,6 +638,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = sub.add_parser("run", help="调用 Rust replay 并输出中文报表（默认事实源）")
     add_backtest_run_arguments(run_parser)
+
+    noband_run_parser = sub.add_parser(
+        "run-current-noband",
+        help="调用 Rust replay 并禁用价格带，用于 current/current-noband 对照",
+    )
+    add_backtest_run_arguments(noband_run_parser)
 
     legacy_run_parser = sub.add_parser("run-legacy", help="运行旧版 Python 回测，仅供历史对照")
     add_backtest_run_arguments(legacy_run_parser)
@@ -710,12 +825,13 @@ def inspect_db(db_path: str, show_failures: bool) -> None:
     conn = duckdb.connect(db_path, read_only=True)
     try:
         metadata = fetch_metadata(conn)
+        cex_table = detect_cex_table_name(conn)
         table_names = [
             "gamma_events",
             "polymarket_contracts",
             "polymarket_price_history",
             "polymarket_history_failures",
-            "binance_btc_1m",
+            cex_table,
             "basis_1m",
         ]
         counts = {
@@ -735,11 +851,11 @@ def inspect_db(db_path: str, show_failures: bool) -> None:
             from basis_1m
             """
         ).fetchone()
-
-        print_title("BTC 基差回测数据库检查")
+        print_title("基差回测数据库检查")
 
         print_section("数据库")
         print_kv("数据库路径", db_path)
+        print_kv("CEX 1m 表", cex_table)
         if metadata:
             print_section("构建元数据")
             for key in sorted(metadata.keys()):
@@ -890,13 +1006,27 @@ def load_poly_rows(conn: Any, cfg: RunConfig) -> list[tuple[int, str, str, str, 
     return conn.execute(sql, params).fetchall()
 
 
+def detect_cex_table_name(conn: Any) -> str:
+    tables = [
+        str(row[0])
+        for row in conn.execute("show tables").fetchall()
+        if re.fullmatch(r"binance_[a-z0-9]+_1m", str(row[0]))
+    ]
+    if not tables:
+        raise SystemExit("no binance_*_1m table found in database")
+    if len(tables) > 1:
+        raise SystemExit(f"multiple binance_*_1m tables found: {tables}")
+    return tables[0]
+
+
 def load_cex_rows(conn: Any) -> list[tuple[int, float]]:
+    cex_table = detect_cex_table_name(conn)
     return conn.execute(
         """
         select ts_ms, close
-        from binance_btc_1m
+        from {}
         order by ts_ms asc
-        """
+        """.format(cex_table)
     ).fetchall()
 
 
@@ -1148,7 +1278,7 @@ def resolve_position_size(cfg: RunConfig, poly_price: float) -> tuple[float, flo
 
     target_notional = cfg.position_notional_usd
     if target_notional is None:
-        target_notional = cfg.initial_capital * DEFAULT_POSITION_NOTIONAL_PCT
+        target_notional = DEFAULT_POSITION_NOTIONAL_USD
     target_notional = max(target_notional, 0.0)
     shares = target_notional / poly_price
     return shares, target_notional, "target_poly_notional_usd"
@@ -1206,7 +1336,7 @@ def run_backtest(cfg: RunConfig) -> tuple[BacktestSummary, list[EquityPoint], li
     resolved_position_mode = "legacy_poly_units" if cfg.position_units is not None else "target_poly_notional_usd"
     resolved_position_notional = cfg.position_notional_usd
     if resolved_position_mode == "target_poly_notional_usd" and resolved_position_notional is None:
-        resolved_position_notional = cfg.initial_capital * DEFAULT_POSITION_NOTIONAL_PCT
+        resolved_position_notional = DEFAULT_POSITION_NOTIONAL_USD
 
     def ensure_market_stat(market_id: str, event_id: str) -> MarketPerformance:
         row = market_stats.get(market_id)
@@ -1722,6 +1852,10 @@ def build_run_config_from_args(args: argparse.Namespace) -> RunConfig:
         cex_margin_ratio=float(args.cex_margin_ratio),
         fee_bps=float(args.fee_bps),
         slippage_bps=float(args.slippage_bps),
+        poly_slippage_bps=float(args.poly_slippage_bps),
+        cex_slippage_bps=float(args.cex_slippage_bps),
+        min_poly_price=float(args.min_poly_price) if args.min_poly_price is not None else None,
+        max_poly_price=float(args.max_poly_price) if args.max_poly_price is not None else None,
         report_json=args.report_json,
         equity_csv=args.equity_csv,
     )
@@ -1731,7 +1865,7 @@ def resolve_position_sizing_config(cfg: RunConfig) -> tuple[str, float | None]:
     resolved_position_mode = "legacy_poly_units" if cfg.position_units is not None else "target_poly_notional_usd"
     resolved_position_notional = cfg.position_notional_usd
     if resolved_position_mode == "target_poly_notional_usd" and resolved_position_notional is None:
-        resolved_position_notional = cfg.initial_capital * DEFAULT_POSITION_NOTIONAL_PCT
+        resolved_position_notional = DEFAULT_POSITION_NOTIONAL_USD
     return resolved_position_mode, resolved_position_notional
 
 
@@ -1804,6 +1938,9 @@ def build_rust_replay_command(
     cfg: RunConfig,
     rust_report_json_path: str,
     rust_equity_csv_path: str,
+    rust_anomaly_report_json_path: str,
+    *,
+    band_policy: str | None = None,
 ) -> list[str]:
     if cfg.token_id is not None:
         raise SystemExit(
@@ -1817,6 +1954,7 @@ def build_rust_replay_command(
         )
 
     _, resolved_position_notional = resolve_position_sizing_config(cfg)
+    resolved_band_policy = band_policy or RUNTIME_BACKTEST_DEFAULTS.band_policy
     args = [
         "cargo",
         "run",
@@ -1845,13 +1983,18 @@ def build_rust_replay_command(
         "--poly-fee-bps",
         str(cfg.fee_bps),
         "--poly-slippage-bps",
-        str(cfg.slippage_bps),
+        str(cfg.poly_slippage_bps),
         "--cex-fee-bps",
         str(cfg.fee_bps),
         "--cex-slippage-bps",
-        str(cfg.slippage_bps),
+        str(cfg.cex_slippage_bps),
+        "--band-policy",
+        resolved_band_policy,
         "--report-json",
         rust_report_json_path,
+        "--anomaly-report-json",
+        rust_anomaly_report_json_path,
+        "--fail-on-anomaly",
         "--equity-csv",
         rust_equity_csv_path,
     ]
@@ -1863,17 +2006,30 @@ def build_rust_replay_command(
         args.extend(["--end", str(cfg.end_ts_ms)])
     if resolved_position_notional is not None:
         args.extend(["--position-notional-usd", str(resolved_position_notional)])
+    if cfg.min_poly_price is not None:
+        args.extend(["--min-poly-price", str(cfg.min_poly_price)])
+    if cfg.max_poly_price is not None:
+        args.extend(["--max-poly-price", str(cfg.max_poly_price)])
     return args
 
 
 def run_rust_replay_fact_source(
     cfg: RunConfig,
+    *,
+    band_policy: str | None = None,
 ) -> tuple[BacktestSummary, list[EquityPoint], list[ReportMarketRow], dict[str, Any]]:
     market_labels, token_count = load_report_context(cfg)
     with tempfile.TemporaryDirectory(prefix="polyalpha-rust-replay-") as tempdir:
         rust_report_json_path = os.path.join(tempdir, "rust-report.json")
         rust_equity_csv_path = os.path.join(tempdir, "rust-equity.csv")
-        command = build_rust_replay_command(cfg, rust_report_json_path, rust_equity_csv_path)
+        rust_anomaly_report_json_path = os.path.join(tempdir, "rust-anomaly-report.json")
+        command = build_rust_replay_command(
+            cfg,
+            rust_report_json_path,
+            rust_equity_csv_path,
+            rust_anomaly_report_json_path,
+            band_policy=band_policy,
+        )
         completed = subprocess.run(
             command,
             cwd=REPO_ROOT,
@@ -1881,16 +2037,25 @@ def run_rust_replay_fact_source(
             capture_output=True,
             check=False,
         )
+        rust_report = load_json_if_exists(rust_report_json_path)
+        rust_anomaly_report = load_json_if_exists(rust_anomaly_report_json_path)
         if completed.returncode != 0:
-            error_text = (completed.stderr or completed.stdout or "").strip()
-            raise SystemExit(
-                "Rust replay 执行失败；请先检查 Rust 工程是否可编译。\n"
-                f"命令: {' '.join(command)}\n"
-                f"输出:\n{error_text}"
-            )
-
-        with open(rust_report_json_path, encoding="utf-8") as f:
-            rust_report = json.load(f)
+            if not is_rust_replay_anomaly_gate_exit(
+                completed=completed,
+                rust_report=rust_report,
+                rust_anomaly_report=rust_anomaly_report,
+                rust_equity_csv_path=rust_equity_csv_path,
+            ):
+                error_text = (completed.stderr or completed.stdout or "").strip()
+                raise SystemExit(
+                    "Rust replay 执行失败；请先检查 Rust 工程是否可编译。\n"
+                    f"命令: {' '.join(command)}\n"
+                    f"输出:\n{error_text}"
+                )
+        if rust_report is None:
+            raise SystemExit(f"Rust replay 未产出 report_json: {rust_report_json_path}")
+        if rust_anomaly_report is not None:
+            rust_report["anomaly_report"] = rust_anomaly_report
         equity_curve = load_equity_curve_csv(rust_equity_csv_path)
 
     summary = build_report_layer_summary(cfg, rust_report, equity_curve, token_count)
@@ -1906,6 +2071,8 @@ def build_report_layer_summary(
 ) -> BacktestSummary:
     raw_summary = rust_report["summary"]
     build_metadata = rust_report.get("build_metadata", {})
+    anomaly_surface = build_replay_anomaly_surface(rust_report)
+    top_anomaly = anomaly_surface.get("top_anomaly")
     _, resolved_position_notional = resolve_position_sizing_config(cfg)
     annualized_sharpe = compute_annualized_sharpe_from_equity_curve(equity_curve)
     poly_realized_pnl = (
@@ -1962,6 +2129,7 @@ def build_report_layer_summary(
             "rolling_window": cfg.rolling_window,
             "entry_z": cfg.entry_z,
             "exit_z": cfg.exit_z,
+            "band_policy": raw_summary.get("band_policy", RUNTIME_BACKTEST_DEFAULTS.band_policy),
             "position_sizing_mode": "target_poly_notional_usd",
             "position_notional_usd": resolved_position_notional,
             "max_capital_usage": cfg.max_capital_usage,
@@ -1969,6 +2137,8 @@ def build_report_layer_summary(
             "cex_margin_ratio": cfg.cex_margin_ratio,
             "fee_bps": cfg.fee_bps,
             "slippage_bps": cfg.slippage_bps,
+            "min_poly_price": cfg.min_poly_price,
+            "max_poly_price": cfg.max_poly_price,
             "entry_fill_ratio": float(raw_summary.get("stress", {}).get("entry_fill_ratio", 1.0)),
             "signal_basis": "poly_price - causal_terminal_probability",
             "cex_probability_proxy": "lognormal terminal probability from previous completed cex bar and trailing realized volatility",
@@ -1980,6 +2150,20 @@ def build_report_layer_summary(
                 "旧版 Python 回测保留在 `run-legacy` / `walk-forward`，仅供历史对照。"
             ),
         },
+        anomaly_count=int(anomaly_surface["anomaly_count"]),
+        max_abs_anomaly_equity_jump_usd=float(anomaly_surface["max_abs_anomaly_equity_jump_usd"]),
+        max_anomaly_mark_share=float(anomaly_surface["max_anomaly_mark_share"]),
+        top_anomaly_start_ts_ms=(
+            int(top_anomaly["start_ts_ms"]) if isinstance(top_anomaly, dict) else None
+        ),
+        top_anomaly_end_ts_ms=(
+            int(top_anomaly["end_ts_ms"]) if isinstance(top_anomaly, dict) else None
+        ),
+        top_anomaly_reason_codes=(
+            [str(item) for item in top_anomaly.get("reason_codes", [])]
+            if isinstance(top_anomaly, dict)
+            else []
+        ),
     )
 
 
@@ -2028,6 +2212,90 @@ def report_mode_metadata(report_mode: str, fact_source: str, note: str) -> dict[
         "fact_source": fact_source,
         "note": note,
     }
+
+
+def load_json_if_exists(path: str) -> dict[str, Any] | None:
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        loaded = json.load(f)
+    if isinstance(loaded, dict):
+        return loaded
+    return None
+
+
+def build_replay_anomaly_surface(rust_report: dict[str, Any]) -> dict[str, Any]:
+    raw_summary = rust_report.get("summary", {})
+    anomaly_report = rust_report.get("anomaly_report", {})
+    diagnostics = anomaly_report.get("diagnostics") if isinstance(anomaly_report, dict) else None
+    if not isinstance(diagnostics, dict):
+        diagnostics = rust_report.get("anomaly_diagnostics", {})
+    has_diagnostics = isinstance(diagnostics, dict)
+    if not has_diagnostics:
+        diagnostics = {}
+
+    def diagnostic_value(key: str, summary_key: str, default: Any) -> Any:
+        if key in diagnostics and diagnostics[key] is not None:
+            return diagnostics[key]
+        if summary_key in raw_summary and raw_summary[summary_key] is not None:
+            return raw_summary[summary_key]
+        return default
+
+    top_anomalies = diagnostics.get("top_anomalies")
+    top_anomaly = top_anomalies[0] if isinstance(top_anomalies, list) and top_anomalies else None
+    anomaly_count = int(
+        diagnostic_value("anomaly_count", "anomaly_count", 0)
+        if has_diagnostics
+        else raw_summary.get("anomaly_count", 0)
+        or 0
+    )
+    max_abs_jump = float(
+        diagnostic_value("max_abs_equity_jump_usd", "max_abs_anomaly_equity_jump_usd", 0.0)
+        if has_diagnostics
+        else raw_summary.get("max_abs_anomaly_equity_jump_usd", 0.0)
+        or 0.0
+    )
+    max_mark_share = float(
+        diagnostic_value("max_mark_share", "max_anomaly_mark_share", 0.0)
+        if has_diagnostics
+        else raw_summary.get("max_anomaly_mark_share", 0.0)
+        or 0.0
+    )
+
+    return {
+        "anomaly_count": anomaly_count,
+        "max_abs_anomaly_equity_jump_usd": max_abs_jump,
+        "max_anomaly_mark_share": max_mark_share,
+        "top_anomaly": {
+            "start_ts_ms": int(top_anomaly.get("start_ts_ms", 0)),
+            "end_ts_ms": int(top_anomaly.get("end_ts_ms", 0)),
+            "reason_codes": [str(item) for item in top_anomaly.get("reason_codes", [])],
+        }
+        if isinstance(top_anomaly, dict)
+        else None,
+    }
+
+
+def is_rust_replay_anomaly_gate_exit(
+    *,
+    completed: subprocess.CompletedProcess[str],
+    rust_report: dict[str, Any] | None,
+    rust_anomaly_report: dict[str, Any] | None,
+    rust_equity_csv_path: str,
+) -> bool:
+    if completed.returncode != 1:
+        return False
+    if rust_report is None or rust_anomaly_report is None:
+        return False
+    if not os.path.exists(rust_equity_csv_path):
+        return False
+    error_text = f"{completed.stderr or ''}\n{completed.stdout or ''}".lower()
+    if "replay anomaly detected" not in error_text:
+        return False
+    anomaly_count = build_replay_anomaly_surface(
+        {"summary": rust_report.get("summary", {}), "anomaly_report": rust_anomaly_report}
+    ).get("anomaly_count", 0)
+    return int(anomaly_count) > 0
 
 
 def run_walk_forward(
@@ -2262,12 +2530,17 @@ def build_report_layer_payload(
     equity_curve: list[EquityPoint],
     rust_report: dict[str, Any],
 ) -> dict[str, Any]:
+    anomaly_surface = build_replay_anomaly_surface(rust_report)
     return {
         "report_metadata": report_mode_metadata(
             report_mode="rust_fact_source_report_layer",
             fact_source=RUST_REPLAY_FACT_SOURCE,
             note=LEGACY_REFERENCE_NOTE,
         ),
+        "acceptance": {
+            "status": "pass" if anomaly_surface["anomaly_count"] == 0 else "anomaly_detected",
+            "anomaly": anomaly_surface,
+        },
         "summary": asdict(summary),
         "market_rankings": [report_market_payload(row) for row in market_rows],
         "equity_points": [asdict(point) for point in equity_curve],
@@ -2411,6 +2684,8 @@ def print_report_layer_summary(
     rust_report: dict[str, Any],
 ) -> None:
     raw_summary = rust_report["summary"]
+    anomaly_surface = build_replay_anomaly_surface(rust_report)
+    top_anomaly = anomaly_surface.get("top_anomaly")
     total_return = 0.0
     if abs(summary.initial_capital) > 1e-12:
         total_return = summary.total_pnl / summary.initial_capital
@@ -2490,6 +2765,24 @@ def print_report_layer_summary(
     print_kv("主动平仓次数", fmt_int(int(raw_summary.get("close_count", 0))))
     print_kv("到期结算次数", fmt_int(int(raw_summary.get("settlement_count", 0))))
 
+    print_section("异常检测")
+    print_kv("验收状态", "通过" if anomaly_surface["anomaly_count"] == 0 else "触发异常门限")
+    print_kv("异常窗口数", fmt_int(int(anomaly_surface["anomaly_count"])))
+    print_kv(
+        "最大异常权益跳变",
+        fmt_money(float(anomaly_surface["max_abs_anomaly_equity_jump_usd"]), signed=True),
+    )
+    print_kv("最大异常 mark 占比", fmt_pct(float(anomaly_surface["max_anomaly_mark_share"])))
+    if isinstance(top_anomaly, dict):
+        print_kv(
+            "Top 异常窗口",
+            f"{fmt_ts_ms(int(top_anomaly['start_ts_ms']))} -> {fmt_ts_ms(int(top_anomaly['end_ts_ms']))}",
+        )
+        print_kv("Top 异常原因", ",".join(top_anomaly.get("reason_codes", [])) or "-")
+    else:
+        print_kv("Top 异常窗口", "-")
+        print_kv("Top 异常原因", "-")
+
     print_section("成本拆解")
     print_kv("Poly 手续费", fmt_money(summary.poly_fees_paid))
     print_kv("Poly 滑点", fmt_money(summary.poly_slippage_paid))
@@ -2519,9 +2812,13 @@ def main() -> None:
         inspect_db(args.db_path, args.show_failures)
         return
 
-    if args.command == "run":
+    if args.command in {"run", "run-current-noband"}:
         cfg = build_run_config_from_args(args)
-        summary, equity_curve, market_rows, rust_report = run_rust_replay_fact_source(cfg)
+        band_policy = "disabled" if args.command == "run-current-noband" else None
+        summary, equity_curve, market_rows, rust_report = run_rust_replay_fact_source(
+            cfg,
+            band_policy=band_policy,
+        )
         print_report_layer_summary(summary, cfg, market_rows, rust_report)
 
         if cfg.report_json:
@@ -2532,6 +2829,8 @@ def main() -> None:
         if cfg.equity_csv:
             dump_equity_csv(cfg.equity_csv, equity_curve)
             print_kv("已写出 equity_csv", cfg.equity_csv)
+        if summary.anomaly_count > 0:
+            raise SystemExit(1)
         return
 
     if args.command == "run-legacy":

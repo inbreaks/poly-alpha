@@ -2944,6 +2944,11 @@ mod tests {
                 clob_api_url: "https://clob.polymarket.com".to_owned(),
                 ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_owned(),
                 chain_id: 137,
+                private_key: None,
+                signature_type: None,
+                funder: None,
+                api_key_nonce: None,
+                use_server_time: true,
             },
             binance: BinanceConfig {
                 rest_url: "https://fapi.binance.com".to_owned(),
@@ -2983,6 +2988,7 @@ mod tests {
                     max_position_usd: UsdNotional(Decimal::from(200u32)),
                     delta_rebalance_threshold: Decimal::new(5, 2),
                     delta_rebalance_interval_secs: 60,
+                    band_policy: polyalpha_core::BandPolicyMode::ConfiguredBand,
                     min_poly_price: Some(Decimal::new(20, 2)),
                     max_poly_price: Some(Decimal::new(50, 2)),
                     max_data_age_minutes: 1,
@@ -3009,6 +3015,7 @@ mod tests {
                 market_data: MarketDataConfig {
                     mode: polyalpha_core::MarketDataMode::Ws,
                     max_stale_ms: 5_000,
+                    planner_depth_levels: 5,
                     poly_open_max_quote_age_ms: Some(3_000),
                     cex_open_max_quote_age_ms: Some(1_000),
                     close_max_quote_age_ms: Some(5_000),
@@ -3031,6 +3038,7 @@ mod tests {
             },
             paper: PaperTradingConfig::default(),
             paper_slippage: PaperSlippageConfig::default(),
+            execution_costs: polyalpha_core::ExecutionCostConfig::default(),
             audit: AuditConfig::default(),
         };
         let payload = render_generated_settings(

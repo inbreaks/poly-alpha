@@ -1,21 +1,33 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{Local, TimeZone};
 use futures_util::{SinkExt, StreamExt};
-use rust_decimal::prelude::ToPrimitive;
+use reqwest::Url;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::env;
 use std::fs;
+use std::future::Future;
+use std::hash::{Hash, Hasher};
+use std::net::IpAddr;
 use std::path::PathBuf;
+use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{broadcast::error::TryRecvError, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep, Duration, MissedTickBehavior};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    client_async_tls_with_config,
+    tungstenite::{self, Message},
+    MaybeTlsStream, WebSocketStream,
+};
 use uuid::Uuid;
 
 use polyalpha_audit::{
@@ -30,25 +42,35 @@ use polyalpha_core::{
     CommandStatus, CommandView, ConnectionInfo, ConnectionStatus, EngineParams, EngineWarning,
     EvaluableStatus, EvaluationStats, EventKind, Exchange, ExecutionEvent, ExecutionPipelineView,
     ExecutionResult, Fill, HedgeState, InstrumentKind, MarketConfig, MarketDataEvent,
-    MarketDataMode, MarketDataSource, MarketPhase, MarketView, MonitorEvent, MonitorEventPayload,
-    MonitorRuntimeStats, MonitorSocketServer, MonitorState, MonitorStrategyConfig, OpenCandidate,
-    OrderStatus, PerformanceMetrics, PlanningIntent, PolyShares, Position, Price, RiskManager,
-    Settings, SignalStrength, Symbol, SymbolRegistry, TokenSide, TradePlan, TradeView, UsdNotional,
-    VenueQuantity, PLANNING_SCHEMA_VERSION,
+    MarketDataMode, MarketDataSource, MarketPhase, MarketRetentionReason, MarketTier, MarketView,
+    MonitorEvent, MonitorEventPayload, MonitorRuntimeStats, MonitorSocketServer, MonitorState,
+    MonitorStrategyConfig, OpenCandidate, OrderStatus, PerformanceMetrics, PlanningIntent,
+    PolyShares, Position, Price, RiskManager, Settings, SignalStrength, Symbol, SymbolRegistry,
+    TokenSide, TradePlan, TradeView, UsdNotional, VenueQuantity, PLANNING_SCHEMA_VERSION,
 };
 use polyalpha_data::{
-    BinanceFuturesDataSource, DataManager, MarketDataNormalizer, OkxMarketDataSource,
-    PolyBookLevel, PolyBookUpdate, PolymarketLiveDataSource,
+    BinanceFuturesDataSource, DataManager, OkxMarketDataSource, PolyBookLevel, PolyBookUpdate,
+    PolymarketLiveDataSource,
 };
 use polyalpha_engine::{MarketOverrideConfig, SimpleAlphaEngine, SimpleEngineConfig};
+#[cfg(test)]
+use polyalpha_executor::dry_run::DryRunExecutor;
 use polyalpha_executor::{
-    dry_run::{DryRunOrderSnapshot, SlippageConfig},
-    DryRunExecutor, ExecutionManager, InMemoryOrderbookProvider,
+    dry_run::DryRunOrderSnapshot, ExecutionManager, InMemoryOrderbookProvider,
 };
 use polyalpha_risk::{InMemoryRiskManager, RiskLimits};
 
-use crate::args::PaperInspectFormat;
-use crate::commands::{select_market, signal_rejection_reason};
+use crate::args::{LiveExecutorMode, PaperInspectFormat};
+use crate::commands::{open_plan_risk_rejection_reason, preview_open_plan, select_market};
+#[cfg(test)]
+use crate::runtime::open_intent_from_candidate as runtime_open_intent_from_candidate;
+use crate::runtime::{
+    apply_orderbook_snapshot, build_data_manager, build_execution_stack,
+    close_intent_for_symbol as runtime_close_intent_for_symbol,
+    delta_rebalance_intent_for_symbol as runtime_delta_rebalance_intent_for_symbol,
+    force_exit_intent_for_symbol as runtime_force_exit_intent_for_symbol, RuntimeExecutionMode,
+    RuntimeExecutor,
+};
 
 const MAX_EVENT_LOGS: usize = 128;
 const MAX_MONITOR_EVENTS: usize = 48;
@@ -64,9 +86,17 @@ const MULTI_MARKET_BOOTSTRAP_MAX_CONCURRENCY: usize = 12;
 const MULTI_MARKET_WARMUP_MAX_CONCURRENCY: usize = 8;
 const MULTI_MARKET_FUNDING_MAX_CONCURRENCY: usize = 8;
 const MULTI_MARKET_SYNC_WARMUP_THRESHOLD: usize = 16;
+const WS_CONNECT_TIMEOUT_MS: u64 = 10_000;
+const MARKET_TRADEABLE_GRACE_MULTIPLIER: u64 = 3;
+const MARKET_FOCUS_GRACE_MULTIPLIER: u64 = 12;
+const MARKET_NEAR_OPPORTUNITY_FRACTION: f64 = 0.75;
 
 type EventDetails = HashMap<String, String>;
 const PAPER_ARTIFACT_SCHEMA_VERSION: u32 = PLANNING_SCHEMA_VERSION;
+
+fn default_artifact_trading_mode() -> polyalpha_core::TradingMode {
+    polyalpha_core::TradingMode::Paper
+}
 
 fn deserialize_paper_schema_version<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
 where
@@ -200,6 +230,10 @@ impl ExchangeConnectionTracker {
         }
     }
 
+    fn mark_connecting(&self) {
+        self.set_status(ConnectionStatus::Connecting);
+    }
+
     fn mark_connected(&self, stream_key: &str) {
         if let Ok(mut guard) = self.active_streams.lock() {
             guard.insert(stream_key.to_owned());
@@ -230,6 +264,8 @@ impl ExchangeConnectionTracker {
         }
         *guard = new_status;
         drop(guard);
+        eprintln!("ws status {:?} -> {:?}", self.exchange, new_status);
+        tracing::info!("ws status {:?} -> {:?}", self.exchange, new_status);
         let _ = self.manager.publish(MarketDataEvent::ConnectionEvent {
             exchange: self.exchange,
             status: new_status,
@@ -242,10 +278,11 @@ struct LocalPolyBook {
     bids: BTreeMap<Decimal, Decimal>,
     asks: BTreeMap<Decimal, Decimal>,
     last_trade_price: Option<Price>,
+    sequence: u64,
 }
 
 impl LocalPolyBook {
-    fn from_update(update: &PolyBookUpdate) -> Self {
+    fn from_update_with_previous(update: &PolyBookUpdate, previous_sequence: u64) -> Self {
         let mut book = Self::default();
         for level in &update.bids {
             book.bids.insert(level.price.0, level.shares.0);
@@ -254,6 +291,7 @@ impl LocalPolyBook {
             book.asks.insert(level.price.0, level.shares.0);
         }
         book.last_trade_price = update.last_trade_price;
+        book.sequence = normalized_ws_poly_sequence(previous_sequence, update.sequence);
         book
     }
 
@@ -269,7 +307,16 @@ impl LocalPolyBook {
         }
     }
 
-    fn to_update(&self, asset_id: &str, exchange_timestamp_ms: u64) -> PolyBookUpdate {
+    fn next_sequence(&self) -> u64 {
+        normalized_ws_poly_sequence(self.sequence, 0)
+    }
+
+    fn to_update(
+        &self,
+        asset_id: &str,
+        exchange_timestamp_ms: u64,
+        sequence: u64,
+    ) -> PolyBookUpdate {
         PolyBookUpdate {
             asset_id: asset_id.to_owned(),
             bids: self
@@ -291,10 +338,16 @@ impl LocalPolyBook {
                 .collect(),
             exchange_timestamp_ms,
             received_at_ms: now_millis(),
-            sequence: 0,
+            sequence,
             last_trade_price: self.last_trade_price,
         }
     }
+}
+
+fn normalized_ws_poly_sequence(previous_sequence: u64, incoming_sequence: u64) -> u64 {
+    incoming_sequence
+        .max(previous_sequence.saturating_add(1))
+        .max(1)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -336,6 +389,7 @@ struct PaperStats {
     trades_closed: usize,
     total_pnl_usd: f64,
     last_skip_event_ms: HashMap<String, u64>,
+    last_delta_rebalance_at_ms: HashMap<Symbol, u64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -355,6 +409,8 @@ struct ObservedState {
     connection_reconnect_count: HashMap<String, u64>,
     connection_disconnect_count: HashMap<String, u64>,
     connection_last_disconnect_at_ms: HashMap<String, u64>,
+    last_focus_at_ms: Option<u64>,
+    last_tradeable_at_ms: Option<u64>,
 }
 
 impl ObservedState {
@@ -446,7 +502,7 @@ fn tracked_connection_status(
 fn connection_is_impaired(status: Option<ConnectionStatus>) -> bool {
     matches!(
         status,
-        Some(ConnectionStatus::Connecting)
+        None | Some(ConnectionStatus::Connecting)
             | Some(ConnectionStatus::Reconnecting)
             | Some(ConnectionStatus::Disconnected)
     )
@@ -592,6 +648,125 @@ fn require_connected_inputs(settings: &Settings) -> bool {
     settings.strategy.basis.enable_freshness_check && settings.strategy.basis.reject_on_disconnect
 }
 
+fn market_retention_reason(
+    has_position: bool,
+    active_plan_priority: Option<&str>,
+) -> MarketRetentionReason {
+    match active_plan_priority {
+        Some("force_exit") => MarketRetentionReason::ForceExit,
+        Some("residual_recovery") => MarketRetentionReason::ResidualRecovery,
+        Some("close_position") => MarketRetentionReason::CloseInProgress,
+        Some("delta_rebalance") => MarketRetentionReason::DeltaRebalance,
+        _ if has_position => MarketRetentionReason::HasPosition,
+        _ => MarketRetentionReason::None,
+    }
+}
+
+fn note_focus_market_activity(observed: &mut ObservedState, now_ms: u64) {
+    observed.last_focus_at_ms = Some(now_ms);
+}
+
+fn note_tradeable_market_activity(observed: &mut ObservedState, now_ms: u64) {
+    observed.last_focus_at_ms = Some(now_ms);
+    observed.last_tradeable_at_ms = Some(now_ms);
+}
+
+fn market_recent_within(last_seen_at_ms: Option<u64>, now_ms: u64, grace_ms: u64) -> bool {
+    last_seen_at_ms.is_some_and(|seen_at_ms| now_ms.saturating_sub(seen_at_ms) <= grace_ms)
+}
+
+fn market_tradeable_grace_ms(settings: &Settings) -> u64 {
+    settings
+        .strategy
+        .market_data
+        .max_stale_ms
+        .max(5_000)
+        .saturating_mul(MARKET_TRADEABLE_GRACE_MULTIPLIER)
+}
+
+fn market_focus_grace_ms(settings: &Settings) -> u64 {
+    settings
+        .strategy
+        .market_data
+        .max_stale_ms
+        .max(5_000)
+        .saturating_mul(MARKET_FOCUS_GRACE_MULTIPLIER)
+}
+
+fn async_snapshot_is_tradeable(snapshot: &AsyncMarketSnapshot) -> bool {
+    snapshot.evaluable_status == EvaluableStatus::Evaluable
+        && matches!(
+            snapshot.async_classification,
+            AsyncClassification::BalancedFresh | AsyncClassification::PolyLagAcceptable
+        )
+}
+
+fn market_is_near_opportunity(
+    settings: &Settings,
+    snapshot: Option<&polyalpha_engine::BasisStrategySnapshot>,
+) -> bool {
+    let Some(snapshot) = snapshot else {
+        return false;
+    };
+
+    let entry_z = settings
+        .strategy
+        .basis
+        .entry_z_score_threshold
+        .to_f64()
+        .unwrap_or_default()
+        .abs();
+    let min_basis_bps = settings
+        .strategy
+        .basis
+        .min_basis_bps
+        .to_f64()
+        .unwrap_or_default()
+        .abs();
+
+    if entry_z > 0.0
+        && snapshot
+            .z_score
+            .is_some_and(|z_score| z_score.abs() >= entry_z * MARKET_NEAR_OPPORTUNITY_FRACTION)
+    {
+        return true;
+    }
+
+    (snapshot.signal_basis.abs() * 10_000.0) >= min_basis_bps * MARKET_NEAR_OPPORTUNITY_FRACTION
+}
+
+fn determine_market_tier(
+    settings: &Settings,
+    async_snapshot: Option<&AsyncMarketSnapshot>,
+    retention_reason: MarketRetentionReason,
+    near_opportunity: bool,
+    last_focus_at_ms: Option<u64>,
+    last_tradeable_at_ms: Option<u64>,
+    now_ms: u64,
+) -> MarketTier {
+    if retention_reason != MarketRetentionReason::None {
+        return MarketTier::Focus;
+    }
+
+    let focus_recent =
+        market_recent_within(last_focus_at_ms, now_ms, market_focus_grace_ms(settings));
+    let tradeable_recent = market_recent_within(
+        last_tradeable_at_ms,
+        now_ms,
+        market_tradeable_grace_ms(settings),
+    );
+
+    if async_snapshot.is_some_and(async_snapshot_is_tradeable) && tradeable_recent {
+        return MarketTier::Tradeable;
+    }
+
+    if near_opportunity || focus_recent {
+        return MarketTier::Focus;
+    }
+
+    MarketTier::Observation
+}
+
 fn audit_snapshot_for_candidate(
     settings: &Settings,
     registry: &SymbolRegistry,
@@ -632,12 +807,13 @@ impl PaperAudit {
         env: &str,
         markets: &[MarketConfig],
         now_ms: u64,
+        trading_mode: polyalpha_core::TradingMode,
     ) -> Result<Self> {
         let manifest = AuditSessionManifest {
             version: 1,
             session_id: Uuid::new_v4().to_string(),
             env: env.to_owned(),
-            mode: polyalpha_core::TradingMode::Paper,
+            mode: trading_mode,
             started_at_ms: now_ms,
             market_count: markets.len(),
             markets: markets
@@ -1140,6 +1316,8 @@ struct PaperSnapshot {
 struct PaperArtifact {
     #[serde(deserialize_with = "deserialize_paper_schema_version")]
     schema_version: u32,
+    #[serde(default = "default_artifact_trading_mode")]
+    trading_mode: polyalpha_core::TradingMode,
     env: String,
     market_index: usize,
     market: String,
@@ -1416,6 +1594,8 @@ fn describe_config_update_zh(config: &polyalpha_core::ConfigUpdate) -> String {
         format!("单次仓位=${value:.0}")
     } else if let Some(value) = config.rolling_window {
         format!("滚动窗口={}s", value)
+    } else if let Some(value) = config.band_policy.as_deref() {
+        format!("价格带策略={value}")
     } else if let Some(value) = config.min_poly_price {
         format!("最小Polymarket价格={value:.3}")
     } else if let Some(value) = config.max_poly_price {
@@ -2627,17 +2807,9 @@ fn sync_engine_position_state_from_runtime(
     engine.sync_position_state(symbol, token_side);
 }
 
+#[cfg(test)]
 fn open_intent_from_candidate(candidate: &OpenCandidate) -> PlanningIntent {
-    PlanningIntent::OpenPosition {
-        schema_version: candidate.schema_version,
-        intent_id: format!("intent-open-{}", candidate.candidate_id),
-        correlation_id: candidate.correlation_id.clone(),
-        symbol: candidate.symbol.clone(),
-        candidate: candidate.clone(),
-        max_budget_usd: candidate.risk_budget_usd,
-        max_residual_delta: 0.05,
-        max_shock_loss_usd: candidate.risk_budget_usd.max(25.0),
-    }
+    runtime_open_intent_from_candidate(candidate)
 }
 
 fn close_intent_for_symbol(
@@ -2646,21 +2818,46 @@ fn close_intent_for_symbol(
     correlation_id: &str,
     now_ms: u64,
 ) -> PlanningIntent {
-    PlanningIntent::ClosePosition {
-        schema_version: PLANNING_SCHEMA_VERSION,
-        intent_id: format!("intent-close-{}-{now_ms}", symbol.0),
-        correlation_id: correlation_id.to_owned(),
-        symbol: symbol.clone(),
-        close_reason: reason.to_owned(),
-        target_close_ratio: 1.0,
-    }
+    runtime_close_intent_for_symbol(symbol, reason, correlation_id, now_ms)
+}
+
+fn delta_rebalance_intent_for_symbol(
+    symbol: &Symbol,
+    correlation_id: &str,
+    now_ms: u64,
+    target_residual_delta_max: f64,
+    target_shock_loss_max: f64,
+) -> PlanningIntent {
+    runtime_delta_rebalance_intent_for_symbol(
+        symbol,
+        correlation_id,
+        now_ms,
+        target_residual_delta_max,
+        target_shock_loss_max,
+    )
+}
+
+fn force_exit_intent_for_symbol(
+    symbol: &Symbol,
+    reason: &str,
+    correlation_id: &str,
+    now_ms: u64,
+    allow_negative_edge: bool,
+) -> PlanningIntent {
+    runtime_force_exit_intent_for_symbol(
+        symbol,
+        reason,
+        correlation_id,
+        now_ms,
+        allow_negative_edge,
+    )
 }
 
 async fn close_symbol_position(
     symbol: &Symbol,
     command_id: &str,
     engine: &mut SimpleAlphaEngine,
-    execution: &mut ExecutionManager<DryRunExecutor>,
+    execution: &mut ExecutionManager<RuntimeExecutor>,
     risk: &mut InMemoryRiskManager,
     stats: &mut PaperStats,
     recent_events: &mut VecDeque<PaperEventLog>,
@@ -2687,11 +2884,175 @@ async fn close_symbol_position(
     Ok(())
 }
 
+async fn force_exit_symbol_position(
+    symbol: &Symbol,
+    command_id: &str,
+    reason: &str,
+    engine: &mut SimpleAlphaEngine,
+    execution: &mut ExecutionManager<RuntimeExecutor>,
+    risk: &mut InMemoryRiskManager,
+    stats: &mut PaperStats,
+    recent_events: &mut VecDeque<PaperEventLog>,
+    trade_book: &mut TradeBook,
+    now_ms: u64,
+) -> Result<()> {
+    let intent = force_exit_intent_for_symbol(
+        symbol,
+        reason,
+        &format!("command-{command_id}"),
+        now_ms,
+        true,
+    );
+    execute_intent_trigger(
+        intent,
+        now_ms,
+        engine,
+        execution,
+        risk,
+        stats,
+        recent_events,
+        trade_book,
+    )
+    .await?;
+    Ok(())
+}
+
+fn rebalance_reference_delta(
+    trade_book: &TradeBook,
+    engine: &SimpleAlphaEngine,
+    symbol: &Symbol,
+) -> Option<f64> {
+    engine
+        .basis_snapshot(symbol)
+        .map(|snapshot| snapshot.delta)
+        .or_else(|| trade_book.open.get(symbol).map(|open| open.delta))
+}
+
+fn current_rebalance_residual_delta(
+    risk: &InMemoryRiskManager,
+    trade_book: &TradeBook,
+    engine: &SimpleAlphaEngine,
+    symbol: &Symbol,
+) -> Option<f64> {
+    let tracker = risk.position_tracker();
+    if !tracker.symbol_has_open_position(symbol) {
+        return None;
+    }
+
+    let poly_yes_qty = tracker
+        .net_symbol_qty(symbol, InstrumentKind::PolyYes)
+        .abs();
+    let poly_no_qty = tracker.net_symbol_qty(symbol, InstrumentKind::PolyNo).abs();
+    let poly_qty = match (poly_yes_qty.is_zero(), poly_no_qty.is_zero()) {
+        (false, true) => poly_yes_qty,
+        (true, false) => poly_no_qty,
+        (true, true) => Decimal::ZERO,
+        (false, false) => poly_yes_qty.max(poly_no_qty),
+    };
+    if poly_qty.is_zero() {
+        return None;
+    }
+
+    let hedge_ratio = trade_book
+        .open
+        .get(symbol)
+        .map(|open| open.hedge_ratio)
+        .unwrap_or(1.0);
+    let delta = rebalance_reference_delta(trade_book, engine, symbol)?;
+    let desired_cex_qty = PolyShares(poly_qty).to_cex_base_qty(delta).0
+        * Decimal::from_f64(hedge_ratio).unwrap_or(Decimal::ONE);
+    let actual_cex_qty = risk.cex_position_qty(symbol).abs();
+
+    (desired_cex_qty - actual_cex_qty)
+        .abs()
+        .to_f64()
+        .filter(|value| value.is_finite())
+}
+
+fn rebalance_shock_loss_max(
+    observed_map: &HashMap<Symbol, ObservedState>,
+    symbol: &Symbol,
+    residual_delta: f64,
+) -> f64 {
+    let reference_price = observed_map
+        .get(symbol)
+        .and_then(|observed| observed.cex_mid)
+        .and_then(|value| value.to_f64())
+        .unwrap_or_default();
+    if reference_price > 0.0 {
+        residual_delta * reference_price * 0.02
+    } else {
+        residual_delta
+    }
+}
+
+async fn maybe_execute_delta_rebalance(
+    settings: &Settings,
+    observed_map: &HashMap<Symbol, ObservedState>,
+    symbol: &Symbol,
+    engine: &mut SimpleAlphaEngine,
+    execution: &mut ExecutionManager<RuntimeExecutor>,
+    risk: &mut InMemoryRiskManager,
+    stats: &mut PaperStats,
+    recent_events: &mut VecDeque<PaperEventLog>,
+    trade_book: &mut TradeBook,
+    now_ms: u64,
+) -> Result<()> {
+    let threshold = settings
+        .strategy
+        .basis
+        .delta_rebalance_threshold
+        .to_f64()
+        .unwrap_or_default();
+    if threshold <= 0.0 {
+        return Ok(());
+    }
+
+    let residual_delta =
+        current_rebalance_residual_delta(risk, trade_book, engine, symbol).unwrap_or_default();
+    if residual_delta <= threshold {
+        return Ok(());
+    }
+
+    let throttle_ms = settings.strategy.basis.delta_rebalance_interval_secs.max(1) * 1_000;
+    if stats
+        .last_delta_rebalance_at_ms
+        .get(symbol)
+        .copied()
+        .is_some_and(|last| now_ms.saturating_sub(last) < throttle_ms)
+    {
+        return Ok(());
+    }
+
+    let intent = delta_rebalance_intent_for_symbol(
+        symbol,
+        &format!("corr-delta-rebalance-{}-{now_ms}", symbol.0),
+        now_ms,
+        threshold,
+        rebalance_shock_loss_max(observed_map, symbol, residual_delta),
+    );
+    execute_intent_trigger(
+        intent,
+        now_ms,
+        engine,
+        execution,
+        risk,
+        stats,
+        recent_events,
+        trade_book,
+    )
+    .await?;
+    stats
+        .last_delta_rebalance_at_ms
+        .insert(symbol.clone(), now_ms);
+    Ok(())
+}
+
 async fn execute_intent_trigger(
     intent: PlanningIntent,
     timestamp_ms: u64,
     engine: &mut SimpleAlphaEngine,
-    execution: &mut ExecutionManager<DryRunExecutor>,
+    execution: &mut ExecutionManager<RuntimeExecutor>,
     risk: &mut InMemoryRiskManager,
     stats: &mut PaperStats,
     recent_events: &mut VecDeque<PaperEventLog>,
@@ -2805,6 +3166,13 @@ fn apply_runtime_config_update(
         changed.push(format!("单次仓位=${position_notional_usd:.2}"));
     }
 
+    if let Some(band_policy_raw) = update.band_policy.as_deref() {
+        let band_policy = polyalpha_core::BandPolicyMode::from_str(band_policy_raw)
+            .map_err(|err| anyhow!("{err}"))?;
+        settings.strategy.basis.band_policy = band_policy;
+        changed.push(format!("价格带策略={band_policy_raw}"));
+    }
+
     if let Some(min_poly_price) = update.min_poly_price {
         if !(0.0..=1.0).contains(&min_poly_price) {
             anyhow::bail!("最小 Polymarket 价格必须位于 0 到 1 之间");
@@ -2851,7 +3219,7 @@ async fn process_pending_command_single(
     settings: &mut Settings,
     market: &MarketConfig,
     engine: &mut SimpleAlphaEngine,
-    execution: &mut ExecutionManager<DryRunExecutor>,
+    execution: &mut ExecutionManager<RuntimeExecutor>,
     risk: &mut InMemoryRiskManager,
     stats: &mut PaperStats,
     recent_events: &mut VecDeque<PaperEventLog>,
@@ -2891,7 +3259,32 @@ async fn process_pending_command_single(
                     pre_emergency_paused.store(paused.load(Ordering::SeqCst), Ordering::SeqCst);
                 }
                 paused.store(true, Ordering::SeqCst);
-                Ok((CommandStatus::Success, "紧急停止已激活".to_owned(), None))
+                let grouped_positions = group_positions_by_symbol(risk, now_ms);
+                if has_open_position_for_symbol(&grouped_positions, &market.symbol) {
+                    match force_exit_symbol_position(
+                        &market.symbol,
+                        &command.command_id,
+                        "emergency_stop",
+                        engine,
+                        execution,
+                        risk,
+                        stats,
+                        recent_events,
+                        trade_book,
+                        now_ms,
+                    )
+                    .await
+                    {
+                        Ok(()) => Ok((
+                            CommandStatus::Success,
+                            format!("紧急停止已激活，并已提交 {} 强制退出", market.symbol.0),
+                            None,
+                        )),
+                        Err(err) => Err((CommandStatus::Failed, err.to_string(), Some(2006))),
+                    }
+                } else {
+                    Ok((CommandStatus::Success, "紧急停止已激活".to_owned(), None))
+                }
             }
             CommandKind::ClearEmergency => {
                 emergency.store(false, Ordering::SeqCst);
@@ -3019,7 +3412,7 @@ async fn process_pending_command_multi(
     settings: &mut Settings,
     markets: &[MarketConfig],
     engine: &mut SimpleAlphaEngine,
-    execution: &mut ExecutionManager<DryRunExecutor>,
+    execution: &mut ExecutionManager<RuntimeExecutor>,
     risk: &mut InMemoryRiskManager,
     stats: &mut PaperStats,
     recent_events: &mut VecDeque<PaperEventLog>,
@@ -3059,7 +3452,48 @@ async fn process_pending_command_multi(
                     pre_emergency_paused.store(paused.load(Ordering::SeqCst), Ordering::SeqCst);
                 }
                 paused.store(true, Ordering::SeqCst);
-                Ok((CommandStatus::Success, "紧急停止已激活".to_owned(), None))
+                let grouped_positions = group_positions_by_symbol(risk, now_ms);
+                let symbols_to_force_exit: Vec<Symbol> = markets
+                    .iter()
+                    .filter(|market| {
+                        has_open_position_for_symbol(&grouped_positions, &market.symbol)
+                    })
+                    .map(|market| market.symbol.clone())
+                    .collect();
+                let mut force_exit_error = None;
+                for symbol in &symbols_to_force_exit {
+                    if let Err(err) = force_exit_symbol_position(
+                        symbol,
+                        &command.command_id,
+                        "emergency_stop",
+                        engine,
+                        execution,
+                        risk,
+                        stats,
+                        recent_events,
+                        trade_book,
+                        now_ms,
+                    )
+                    .await
+                    {
+                        force_exit_error = Some(err);
+                        break;
+                    }
+                }
+                if let Some(err) = force_exit_error {
+                    Err((CommandStatus::Failed, err.to_string(), Some(2106)))
+                } else if symbols_to_force_exit.is_empty() {
+                    Ok((CommandStatus::Success, "紧急停止已激活".to_owned(), None))
+                } else {
+                    Ok((
+                        CommandStatus::Success,
+                        format!(
+                            "紧急停止已激活，并已提交 {} 个市场强制退出",
+                            symbols_to_force_exit.len()
+                        ),
+                        None,
+                    ))
+                }
             }
             CommandKind::ClearEmergency => {
                 emergency.store(false, Ordering::SeqCst);
@@ -3196,11 +3630,14 @@ fn candidate_price_for_filter(candidate: &OpenCandidate, observed: &ObservedStat
     }
 }
 
-fn candidate_passes_price_filter(
+fn candidate_price_filter_rejection_reason(
     candidate: &OpenCandidate,
     observed: &ObservedState,
     settings: &Settings,
-) -> bool {
+) -> Option<&'static str> {
+    if !settings.strategy.basis.band_policy.uses_configured_band() {
+        return None;
+    }
     let min_price = settings
         .strategy
         .basis
@@ -3212,25 +3649,64 @@ fn candidate_passes_price_filter(
         .max_poly_price
         .and_then(|value| value.to_f64());
     if min_price.is_none() && max_price.is_none() {
-        return true;
+        return None;
     }
 
     let Some(price) = candidate_price_for_filter(candidate, observed) else {
-        return false;
+        return Some("missing_poly_quote");
     };
-    min_price.map(|min| price >= min).unwrap_or(true)
-        && max_price.map(|max| price <= max).unwrap_or(true)
+    if min_price.is_some_and(|min| price < min) {
+        return Some("below_min_poly_price");
+    }
+    if max_price.is_some_and(|max| price >= max) {
+        return Some("above_or_equal_max_poly_price");
+    }
+    None
 }
 
+#[cfg(test)]
+fn candidate_passes_price_filter(
+    candidate: &OpenCandidate,
+    observed: &ObservedState,
+    settings: &Settings,
+) -> bool {
+    candidate_price_filter_rejection_reason(candidate, observed, settings).is_none()
+}
+
+fn candidate_price_filter_rejection_reason_multi(
+    candidate: &OpenCandidate,
+    observed_map: &HashMap<Symbol, ObservedState>,
+    settings: &Settings,
+) -> Option<&'static str> {
+    match observed_map.get(&candidate.symbol) {
+        Some(observed) => candidate_price_filter_rejection_reason(candidate, observed, settings),
+        None if settings.strategy.basis.band_policy.uses_configured_band() => {
+            Some("missing_poly_quote")
+        }
+        None => None,
+    }
+}
+
+#[cfg(test)]
 fn candidate_passes_price_filter_multi(
     candidate: &OpenCandidate,
     observed_map: &HashMap<Symbol, ObservedState>,
     settings: &Settings,
 ) -> bool {
-    observed_map
-        .get(&candidate.symbol)
-        .map(|observed| candidate_passes_price_filter(candidate, observed, settings))
-        .unwrap_or(false)
+    candidate_price_filter_rejection_reason_multi(candidate, observed_map, settings).is_none()
+}
+
+fn resolve_live_execution_mode(
+    executor_mode: LiveExecutorMode,
+    confirm_live: bool,
+) -> Result<RuntimeExecutionMode> {
+    match executor_mode {
+        LiveExecutorMode::Mock => Ok(RuntimeExecutionMode::LiveMock),
+        LiveExecutorMode::Live if !confirm_live => {
+            anyhow::bail!("armed live execution requires --confirm-live")
+        }
+        LiveExecutorMode::Live => Ok(RuntimeExecutionMode::Live),
+    }
 }
 
 pub async fn run_paper(
@@ -3244,7 +3720,69 @@ pub async fn run_paper(
     json: bool,
     warmup_klines: u16,
 ) -> Result<()> {
-    let mut settings = Settings::load(env).with_context(|| format!("加载配置环境 `{env}` 失败"))?;
+    let settings = Settings::load(env).with_context(|| format!("加载配置环境 `{env}` 失败"))?;
+    run_runtime_single(
+        env,
+        settings,
+        market_index,
+        poll_interval_ms,
+        print_every,
+        max_ticks,
+        depth,
+        include_funding,
+        json,
+        warmup_klines,
+        RuntimeExecutionMode::Paper,
+        polyalpha_core::TradingMode::Paper,
+    )
+    .await
+}
+
+pub async fn run_live(
+    env: &str,
+    market_index: usize,
+    poll_interval_ms: u64,
+    print_every: usize,
+    max_ticks: usize,
+    depth: u16,
+    include_funding: bool,
+    json: bool,
+    warmup_klines: u16,
+    executor_mode: LiveExecutorMode,
+    confirm_live: bool,
+) -> Result<()> {
+    let settings = Settings::load(env).with_context(|| format!("加载配置环境 `{env}` 失败"))?;
+    run_runtime_single(
+        env,
+        settings,
+        market_index,
+        poll_interval_ms,
+        print_every,
+        max_ticks,
+        depth,
+        include_funding,
+        json,
+        warmup_klines,
+        resolve_live_execution_mode(executor_mode, confirm_live)?,
+        polyalpha_core::TradingMode::Live,
+    )
+    .await
+}
+
+async fn run_runtime_single(
+    env: &str,
+    mut settings: Settings,
+    market_index: usize,
+    poll_interval_ms: u64,
+    print_every: usize,
+    max_ticks: usize,
+    depth: u16,
+    include_funding: bool,
+    json: bool,
+    warmup_klines: u16,
+    execution_mode: RuntimeExecutionMode,
+    trading_mode: polyalpha_core::TradingMode,
+) -> Result<()> {
     if matches!(settings.strategy.market_data.mode, MarketDataMode::Ws) {
         return run_paper_ws_mode(
             env,
@@ -3257,16 +3795,15 @@ pub async fn run_paper(
             include_funding,
             json,
             warmup_klines,
+            execution_mode,
+            trading_mode,
         )
         .await;
     }
     let market = select_market(&settings, market_index)?;
     let registry = SymbolRegistry::new(settings.markets.clone());
     let channels = create_channels(std::slice::from_ref(&market.symbol));
-    let manager = DataManager::new(
-        MarketDataNormalizer::new(registry.clone()),
-        channels.market_data_tx.clone(),
-    );
+    let manager = build_data_manager(&registry, channels.market_data_tx.clone());
 
     // Create socket server for monitor
     let socket_path = monitor_socket_path(&settings);
@@ -3341,8 +3878,14 @@ pub async fn run_paper(
     });
 
     let executor_start_ms = now_millis();
-    let (orderbook_provider, executor, mut execution) =
-        build_paper_execution_stack(&settings, &registry, executor_start_ms);
+    let (orderbook_provider, executor, mut execution) = build_paper_execution_stack(
+        &settings,
+        &registry,
+        executor_start_ms,
+        execution_mode,
+        Some(&market),
+    )
+    .await?;
     let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
     let mut observed = ObservedState::default();
     let mut stats = PaperStats::default();
@@ -3358,6 +3901,7 @@ pub async fn run_paper(
             env,
             std::slice::from_ref(&market),
             executor_start_ms,
+            trading_mode,
         )?;
         println!(
             "审计会话已启动：{} -> {}",
@@ -3551,7 +4095,7 @@ pub async fn run_paper(
                             candidate,
                             &settings,
                             &registry,
-                            &observed,
+                            &mut observed,
                             &mut stats,
                             &mut recent_events,
                             &mut engine,
@@ -3581,6 +4125,20 @@ pub async fn run_paper(
                             &mut stats,
                             &mut recent_events,
                             &mut trade_book,
+                        )
+                        .await?;
+                    } else {
+                        maybe_execute_delta_rebalance(
+                            &settings,
+                            &HashMap::from([(market.symbol.clone(), observed.clone())]),
+                            &market.symbol,
+                            &mut engine,
+                            &mut execution,
+                            &mut risk,
+                            &mut stats,
+                            &mut recent_events,
+                            &mut trade_book,
+                            now_millis(),
                         )
                         .await?;
                     }
@@ -3618,6 +4176,7 @@ pub async fn run_paper(
             &observed,
             &stats,
             &risk,
+            &execution,
             &mut trade_book,
             &command_center,
             paused.load(Ordering::SeqCst),
@@ -3625,6 +4184,7 @@ pub async fn run_paper(
             start_time_ms,
             now_ms,
             &monitor_events,
+            trading_mode,
         );
 
         // Update current state and broadcast
@@ -3666,6 +4226,7 @@ pub async fn run_paper(
                 &observed,
                 &stats,
                 &risk,
+                &execution,
                 &mut trade_book,
                 &command_center,
                 paused.load(Ordering::SeqCst),
@@ -3673,6 +4234,7 @@ pub async fn run_paper(
                 start_time_ms,
                 now_millis(),
                 &monitor_events,
+                trading_mode,
             )
         });
     if let Ok(mut guard) = current_state.write() {
@@ -3685,6 +4247,7 @@ pub async fn run_paper(
         .collect();
     let artifact = PaperArtifact {
         schema_version: PAPER_ARTIFACT_SCHEMA_VERSION,
+        trading_mode,
         env: env.to_owned(),
         market_index,
         market: market.symbol.0.clone(),
@@ -3699,9 +4262,13 @@ pub async fn run_paper(
         recent_events: recent_events.into_iter().collect(),
         snapshots,
     };
-    let artifact_path = artifact_path(&settings, env)?;
+    let artifact_path = artifact_path(&settings, env, trading_mode)?;
     persist_artifact(&artifact_path, &artifact)?;
-    println!("纸面盘结果已写入：{}", artifact_path.display());
+    println!(
+        "{}结果已写入：{}",
+        artifact_runtime_label(trading_mode),
+        artifact_path.display()
+    );
     if let Some(audit) = audit.as_mut() {
         if let Some(monitor_state) = current_state.read().ok().and_then(|guard| guard.clone()) {
             audit.finalize(&stats, &monitor_state, stats.ticks_processed, now_millis())?;
@@ -3713,12 +4280,25 @@ pub async fn run_paper(
 }
 
 pub fn inspect_paper(env: &str, format: PaperInspectFormat) -> Result<()> {
+    inspect_runtime_artifact(env, polyalpha_core::TradingMode::Paper, format)
+}
+
+pub fn inspect_live(env: &str, format: PaperInspectFormat) -> Result<()> {
+    inspect_runtime_artifact(env, polyalpha_core::TradingMode::Live, format)
+}
+
+fn inspect_runtime_artifact(
+    env: &str,
+    trading_mode: polyalpha_core::TradingMode,
+    format: PaperInspectFormat,
+) -> Result<()> {
     let settings = Settings::load(env).with_context(|| format!("加载配置环境 `{env}` 失败"))?;
-    let artifact_path = resolve_artifact_for_read(&settings, env)?;
+    let artifact_path = resolve_artifact_for_read(&settings, env, trading_mode)?;
+    let runtime_label = artifact_runtime_label(trading_mode);
     let raw = fs::read_to_string(&artifact_path)
-        .with_context(|| format!("读取纸面盘结果 `{}` 失败", artifact_path.display()))?;
+        .with_context(|| format!("读取{runtime_label}结果 `{}` 失败", artifact_path.display()))?;
     let artifact: PaperArtifact = serde_json::from_str(&raw)
-        .with_context(|| format!("解析纸面盘结果 `{}` 失败", artifact_path.display()))?;
+        .with_context(|| format!("解析{runtime_label}结果 `{}` 失败", artifact_path.display()))?;
 
     match format {
         PaperInspectFormat::Table => print_artifact_table(&artifact, &artifact_path),
@@ -3740,7 +4320,65 @@ pub async fn run_paper_multi(
     json: bool,
     warmup_klines: u16,
 ) -> Result<()> {
-    let mut settings = Settings::load(env).with_context(|| format!("加载配置环境 `{env}` 失败"))?;
+    let settings = Settings::load(env).with_context(|| format!("加载配置环境 `{env}` 失败"))?;
+    run_runtime_multi(
+        env,
+        settings,
+        poll_interval_ms,
+        print_every,
+        max_ticks,
+        depth,
+        include_funding,
+        json,
+        warmup_klines,
+        RuntimeExecutionMode::Paper,
+        polyalpha_core::TradingMode::Paper,
+    )
+    .await
+}
+
+pub async fn run_live_multi(
+    env: &str,
+    poll_interval_ms: u64,
+    print_every: usize,
+    max_ticks: usize,
+    depth: u16,
+    include_funding: bool,
+    json: bool,
+    warmup_klines: u16,
+    executor_mode: LiveExecutorMode,
+    confirm_live: bool,
+) -> Result<()> {
+    let settings = Settings::load(env).with_context(|| format!("加载配置环境 `{env}` 失败"))?;
+    run_runtime_multi(
+        env,
+        settings,
+        poll_interval_ms,
+        print_every,
+        max_ticks,
+        depth,
+        include_funding,
+        json,
+        warmup_klines,
+        resolve_live_execution_mode(executor_mode, confirm_live)?,
+        polyalpha_core::TradingMode::Live,
+    )
+    .await
+}
+
+async fn run_runtime_multi(
+    env: &str,
+    mut settings: Settings,
+    poll_interval_ms: u64,
+    print_every: usize,
+    max_ticks: usize,
+    depth: u16,
+    include_funding: bool,
+    json: bool,
+    warmup_klines: u16,
+    execution_mode: RuntimeExecutionMode,
+    trading_mode: polyalpha_core::TradingMode,
+) -> Result<()> {
     if matches!(settings.strategy.market_data.mode, MarketDataMode::Ws) {
         return run_paper_multi_ws_mode(
             env,
@@ -3752,6 +4390,8 @@ pub async fn run_paper_multi(
             include_funding,
             json,
             warmup_klines,
+            execution_mode,
+            trading_mode,
         )
         .await;
     }
@@ -3764,10 +4404,7 @@ pub async fn run_paper_multi(
     let registry = SymbolRegistry::new(markets.clone());
     let symbols: Vec<Symbol> = markets.iter().map(|m| m.symbol.clone()).collect();
     let channels = create_channels(&symbols);
-    let manager = DataManager::new(
-        MarketDataNormalizer::new(registry.clone()),
-        channels.market_data_tx.clone(),
-    );
+    let manager = build_data_manager(&registry, channels.market_data_tx.clone());
 
     // Create socket server for monitor
     let socket_path = monitor_socket_path(&settings);
@@ -3870,8 +4507,14 @@ pub async fn run_paper_multi(
     });
 
     let executor_start_ms = now_millis();
-    let (orderbook_provider, executor, mut execution) =
-        build_paper_execution_stack(&settings, &registry, executor_start_ms);
+    let (orderbook_provider, executor, mut execution) = build_paper_execution_stack(
+        &settings,
+        &registry,
+        executor_start_ms,
+        execution_mode,
+        None,
+    )
+    .await?;
     let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
     let mut observed: HashMap<Symbol, ObservedState> = markets
         .iter()
@@ -3885,7 +4528,7 @@ pub async fn run_paper_multi(
 
     let start_time_ms = executor_start_ms;
     let mut audit = if settings.audit.enabled {
-        let audit = PaperAudit::start(&settings, env, &markets, executor_start_ms)?;
+        let audit = PaperAudit::start(&settings, env, &markets, executor_start_ms, trading_mode)?;
         println!(
             "审计会话已启动：{} -> {}",
             audit.session_id(),
@@ -4171,7 +4814,7 @@ pub async fn run_paper_multi(
                             candidate,
                             &settings,
                             &registry,
-                            &observed,
+                            &mut observed,
                             &mut stats,
                             &mut recent_events,
                             &mut engine,
@@ -4203,6 +4846,20 @@ pub async fn run_paper_multi(
                                 &mut stats,
                                 &mut recent_events,
                                 &mut trade_book,
+                            )
+                            .await?;
+                        } else {
+                            maybe_execute_delta_rebalance(
+                                &settings,
+                                &observed,
+                                symbol,
+                                &mut engine,
+                                &mut execution,
+                                &mut risk,
+                                &mut stats,
+                                &mut recent_events,
+                                &mut trade_book,
+                                now_millis(),
                             )
                             .await?;
                         }
@@ -4243,6 +4900,7 @@ pub async fn run_paper_multi(
             &observed,
             &stats,
             &risk,
+            &execution,
             &mut trade_book,
             &command_center,
             paused.load(Ordering::SeqCst),
@@ -4250,6 +4908,7 @@ pub async fn run_paper_multi(
             start_time_ms,
             now_ms,
             &monitor_events,
+            trading_mode,
         );
 
         if let Ok(mut guard) = current_state.write() {
@@ -4277,11 +4936,78 @@ pub async fn run_paper_multi(
         "多市场模拟盘已完成，共处理 {} 个轮次。",
         stats.ticks_processed
     );
+    let final_snapshot = snapshots
+        .last()
+        .cloned()
+        .ok_or_else(|| anyhow!("纸面盘会话未生成任何快照"))?;
+    let final_monitor_state = current_state
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_else(|| {
+            let monitor_events = build_monitor_events(&recent_events);
+            build_multi_monitor_state(
+                &settings,
+                &markets,
+                &engine,
+                &observed,
+                &stats,
+                &risk,
+                &execution,
+                &mut trade_book,
+                &command_center,
+                paused.load(Ordering::SeqCst),
+                emergency.load(Ordering::SeqCst),
+                start_time_ms,
+                now_millis(),
+                &monitor_events,
+                trading_mode,
+            )
+        });
+    if let Ok(mut guard) = current_state.write() {
+        *guard = Some(final_monitor_state.clone());
+    }
+    let open_orders = executor
+        .open_order_snapshots()?
+        .into_iter()
+        .map(order_view_from_snapshot)
+        .collect();
+    let hedge_exchange = markets
+        .first()
+        .map(|market| format!("{:?}", market.hedge_exchange))
+        .unwrap_or_else(|| "Unknown".to_owned());
+    let artifact = PaperArtifact {
+        schema_version: PAPER_ARTIFACT_SCHEMA_VERSION,
+        trading_mode,
+        env: env.to_owned(),
+        market_index: 0,
+        market: format!("multi:{}", markets.len()),
+        hedge_exchange,
+        market_data_mode: Some("poll".to_owned()),
+        poll_interval_ms,
+        depth,
+        include_funding,
+        ticks_processed: stats.ticks_processed,
+        final_snapshot,
+        open_orders,
+        recent_events: recent_events.into_iter().collect(),
+        snapshots,
+    };
+    let artifact_path = artifact_path(&settings, env, trading_mode)?;
+    persist_artifact(&artifact_path, &artifact)?;
+    println!(
+        "{}结果已写入：{}",
+        artifact_runtime_label(trading_mode),
+        artifact_path.display()
+    );
     if let Some(audit) = audit.as_mut() {
-        if let Some(monitor_state) = current_state.read().ok().and_then(|guard| guard.clone()) {
-            audit.finalize(&stats, &monitor_state, stats.ticks_processed, now_millis())?;
-            println!("审计会话已完成：{}", audit.session_dir().display());
-        }
+        audit.finalize(
+            &stats,
+            &final_monitor_state,
+            stats.ticks_processed,
+            now_millis(),
+        )?;
+        println!("审计会话已完成：{}", audit.session_dir().display());
     }
     Ok(())
 }
@@ -4342,6 +5068,479 @@ fn ws_housekeeping_interval(poll_interval_ms: u64) -> tokio::time::Interval {
     timer
 }
 
+type WsSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WsProxyKind {
+    Socks5,
+    HttpConnect,
+}
+
+impl WsProxyKind {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Socks5 => "SOCKS5",
+            Self::HttpConnect => "HTTP CONNECT",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WsProxyEndpoint {
+    host: String,
+    port: u16,
+}
+
+impl WsProxyEndpoint {
+    fn address(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WsProxyConfig {
+    kind: WsProxyKind,
+    endpoint: WsProxyEndpoint,
+}
+
+impl WsProxyConfig {
+    fn describe(&self) -> String {
+        format!("{} {}", self.kind.label(), self.endpoint.address())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SystemProxyConfig {
+    socks: Option<WsProxyEndpoint>,
+    https: Option<WsProxyEndpoint>,
+    http: Option<WsProxyEndpoint>,
+}
+
+impl SystemProxyConfig {
+    fn is_empty(&self) -> bool {
+        self.socks.is_none() && self.https.is_none() && self.http.is_none()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct WsProxySettings {
+    all_proxy: Option<String>,
+    https_proxy: Option<String>,
+    http_proxy: Option<String>,
+    system_proxy: Option<SystemProxyConfig>,
+}
+
+impl WsProxySettings {
+    fn detect() -> Self {
+        Self {
+            all_proxy: read_proxy_env(&["ALL_PROXY", "all_proxy"]),
+            https_proxy: read_proxy_env(&["HTTPS_PROXY", "https_proxy"]),
+            http_proxy: read_proxy_env(&["HTTP_PROXY", "http_proxy"]),
+            system_proxy: load_system_proxy_config(),
+        }
+    }
+
+    fn resolve_for_url(&self, ws_url: &str) -> Result<Option<WsProxyConfig>> {
+        let target = parse_ws_target(ws_url)?;
+        select_ws_proxy(
+            &target.scheme,
+            self.all_proxy.as_deref(),
+            self.https_proxy.as_deref(),
+            self.http_proxy.as_deref(),
+            self.system_proxy.as_ref(),
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WsConnectTarget {
+    scheme: String,
+    host: String,
+    port: u16,
+}
+
+impl WsConnectTarget {
+    fn authority(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+}
+
+fn read_proxy_env(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        env::var(name)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn parse_proxy_url(raw: &str) -> Result<WsProxyConfig> {
+    let raw = raw.trim();
+    let url = Url::parse(raw).with_context(|| format!("invalid proxy URL `{raw}`"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(anyhow!(
+            "proxy authentication is not supported for websocket transport"
+        ));
+    }
+
+    let host = url
+        .host_str()
+        .context("proxy URL is missing host")?
+        .to_owned();
+    let port = url
+        .port_or_known_default()
+        .context("proxy URL is missing port")?;
+    let kind = match url.scheme() {
+        "socks5" | "socks5h" => WsProxyKind::Socks5,
+        "http" => WsProxyKind::HttpConnect,
+        "https" => {
+            return Err(anyhow!(
+                "https proxy URLs are not supported; use http:// or socks5://"
+            ))
+        }
+        other => return Err(anyhow!("unsupported proxy scheme `{other}`")),
+    };
+
+    Ok(WsProxyConfig {
+        kind,
+        endpoint: WsProxyEndpoint { host, port },
+    })
+}
+
+fn parse_scutil_proxy_config(raw: &str) -> SystemProxyConfig {
+    let mut values = HashMap::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if let Some((key, value)) = line.split_once(':') {
+            values.insert(key.trim().to_owned(), value.trim().to_owned());
+        }
+    }
+
+    SystemProxyConfig {
+        socks: parse_scutil_proxy_endpoint("SOCKS", &values),
+        https: parse_scutil_proxy_endpoint("HTTPS", &values),
+        http: parse_scutil_proxy_endpoint("HTTP", &values),
+    }
+}
+
+fn parse_scutil_proxy_endpoint(
+    prefix: &str,
+    values: &HashMap<String, String>,
+) -> Option<WsProxyEndpoint> {
+    let enabled = values
+        .get(&format!("{prefix}Enable"))
+        .is_some_and(|value| value == "1");
+    if !enabled {
+        return None;
+    }
+
+    let host = values.get(&format!("{prefix}Proxy"))?.trim();
+    if host.is_empty() {
+        return None;
+    }
+
+    let port = values.get(&format!("{prefix}Port"))?.parse().ok()?;
+    Some(WsProxyEndpoint {
+        host: host.to_owned(),
+        port,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn load_system_proxy_config() -> Option<SystemProxyConfig> {
+    let output = Command::new("scutil").arg("--proxy").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let config = parse_scutil_proxy_config(&String::from_utf8_lossy(&output.stdout));
+    (!config.is_empty()).then_some(config)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn load_system_proxy_config() -> Option<SystemProxyConfig> {
+    None
+}
+
+fn select_ws_proxy(
+    scheme: &str,
+    env_all_proxy: Option<&str>,
+    env_https_proxy: Option<&str>,
+    env_http_proxy: Option<&str>,
+    system_proxy: Option<&SystemProxyConfig>,
+) -> Result<Option<WsProxyConfig>> {
+    let env_proxy = match scheme {
+        "wss" => env_all_proxy.or(env_https_proxy),
+        "ws" => env_all_proxy.or(env_http_proxy),
+        other => return Err(anyhow!("unsupported websocket scheme `{other}`")),
+    };
+
+    if let Some(raw) = env_proxy {
+        return parse_proxy_url(raw).map(Some);
+    }
+
+    let Some(system_proxy) = system_proxy else {
+        return Ok(None);
+    };
+
+    if let Some(endpoint) = system_proxy.socks.as_ref() {
+        return Ok(Some(WsProxyConfig {
+            kind: WsProxyKind::Socks5,
+            endpoint: endpoint.clone(),
+        }));
+    }
+
+    if scheme == "wss" {
+        if let Some(endpoint) = system_proxy.https.as_ref() {
+            return Ok(Some(WsProxyConfig {
+                kind: WsProxyKind::HttpConnect,
+                endpoint: endpoint.clone(),
+            }));
+        }
+    }
+
+    if let Some(endpoint) = system_proxy.http.as_ref() {
+        return Ok(Some(WsProxyConfig {
+            kind: WsProxyKind::HttpConnect,
+            endpoint: endpoint.clone(),
+        }));
+    }
+
+    Ok(None)
+}
+
+fn parse_ws_target(ws_url: &str) -> Result<WsConnectTarget> {
+    let url = Url::parse(ws_url).with_context(|| format!("invalid websocket URL `{ws_url}`"))?;
+    let scheme = url.scheme().to_owned();
+    if scheme != "ws" && scheme != "wss" {
+        return Err(anyhow!("unsupported websocket scheme `{scheme}`"));
+    }
+
+    let host = url
+        .host_str()
+        .context("websocket URL is missing host")?
+        .to_owned();
+    let port = url
+        .port_or_known_default()
+        .context("websocket URL is missing port")?;
+
+    Ok(WsConnectTarget { scheme, host, port })
+}
+
+fn ws_transport_error(message: impl Into<String>) -> tungstenite::Error {
+    tungstenite::Error::Io(std::io::Error::other(message.into()))
+}
+
+async fn connect_websocket(
+    ws_url: &str,
+    proxy: Option<&WsProxyConfig>,
+) -> std::result::Result<
+    (
+        WsSocket,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    tungstenite::Error,
+> {
+    let target = parse_ws_target(ws_url).map_err(|err| ws_transport_error(err.to_string()))?;
+    let stream = match proxy {
+        Some(proxy) => connect_via_proxy(&target, proxy).await?,
+        None => TcpStream::connect((target.host.as_str(), target.port))
+            .await
+            .map_err(|err| {
+                ws_transport_error(format!(
+                    "tcp connect failed for {}: {err}",
+                    target.authority()
+                ))
+            })?,
+    };
+
+    client_async_tls_with_config(ws_url, stream, None, None).await
+}
+
+async fn connect_via_proxy(
+    target: &WsConnectTarget,
+    proxy: &WsProxyConfig,
+) -> std::result::Result<TcpStream, tungstenite::Error> {
+    let mut stream = TcpStream::connect((proxy.endpoint.host.as_str(), proxy.endpoint.port))
+        .await
+        .map_err(|err| {
+            ws_transport_error(format!(
+                "proxy tcp connect failed for {}: {err}",
+                proxy.endpoint.address()
+            ))
+        })?;
+
+    match proxy.kind {
+        WsProxyKind::Socks5 => socks5_connect(&mut stream, target, proxy).await?,
+        WsProxyKind::HttpConnect => http_connect_tunnel(&mut stream, target, proxy).await?,
+    }
+
+    Ok(stream)
+}
+
+async fn socks5_connect(
+    stream: &mut TcpStream,
+    target: &WsConnectTarget,
+    proxy: &WsProxyConfig,
+) -> std::result::Result<(), tungstenite::Error> {
+    stream.write_all(&[0x05, 0x01, 0x00]).await.map_err(|err| {
+        ws_transport_error(format!("{} auth write failed: {err}", proxy.describe()))
+    })?;
+
+    let mut method_response = [0_u8; 2];
+    stream
+        .read_exact(&mut method_response)
+        .await
+        .map_err(|err| {
+            ws_transport_error(format!("{} auth read failed: {err}", proxy.describe()))
+        })?;
+    if method_response != [0x05, 0x00] {
+        return Err(ws_transport_error(format!(
+            "{} rejected no-auth SOCKS5 handshake: version={} method={}",
+            proxy.describe(),
+            method_response[0],
+            method_response[1]
+        )));
+    }
+
+    let mut request = vec![0x05, 0x01, 0x00];
+    match IpAddr::from_str(&target.host) {
+        Ok(IpAddr::V4(address)) => {
+            request.push(0x01);
+            request.extend_from_slice(&address.octets());
+        }
+        Ok(IpAddr::V6(address)) => {
+            request.push(0x04);
+            request.extend_from_slice(&address.octets());
+        }
+        Err(_) => {
+            let host = target.host.as_bytes();
+            if host.len() > u8::MAX as usize {
+                return Err(ws_transport_error(format!(
+                    "SOCKS5 target host is too long: {}",
+                    target.host
+                )));
+            }
+            request.push(0x03);
+            request.push(host.len() as u8);
+            request.extend_from_slice(host);
+        }
+    }
+    request.extend_from_slice(&target.port.to_be_bytes());
+
+    stream.write_all(&request).await.map_err(|err| {
+        ws_transport_error(format!("{} connect write failed: {err}", proxy.describe()))
+    })?;
+
+    let mut response_header = [0_u8; 4];
+    stream
+        .read_exact(&mut response_header)
+        .await
+        .map_err(|err| {
+            ws_transport_error(format!("{} connect read failed: {err}", proxy.describe()))
+        })?;
+    if response_header[0] != 0x05 {
+        return Err(ws_transport_error(format!(
+            "{} returned invalid SOCKS version {}",
+            proxy.describe(),
+            response_header[0]
+        )));
+    }
+    if response_header[1] != 0x00 {
+        return Err(ws_transport_error(format!(
+            "{} rejected CONNECT with reply code {}",
+            proxy.describe(),
+            response_header[1]
+        )));
+    }
+
+    let address_length = match response_header[3] {
+        0x01 => 4,
+        0x04 => 16,
+        0x03 => {
+            let mut length = [0_u8; 1];
+            stream.read_exact(&mut length).await.map_err(|err| {
+                ws_transport_error(format!(
+                    "{} reply length read failed: {err}",
+                    proxy.describe()
+                ))
+            })?;
+            length[0] as usize
+        }
+        atyp => {
+            return Err(ws_transport_error(format!(
+                "{} returned unsupported address type {atyp}",
+                proxy.describe()
+            )))
+        }
+    };
+
+    let mut discard = vec![0_u8; address_length + 2];
+    stream.read_exact(&mut discard).await.map_err(|err| {
+        ws_transport_error(format!(
+            "{} reply tail read failed: {err}",
+            proxy.describe()
+        ))
+    })?;
+
+    Ok(())
+}
+
+async fn http_connect_tunnel(
+    stream: &mut TcpStream,
+    target: &WsConnectTarget,
+    proxy: &WsProxyConfig,
+) -> std::result::Result<(), tungstenite::Error> {
+    let authority = target.authority();
+    let request = format!(
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.map_err(|err| {
+        ws_transport_error(format!("{} CONNECT write failed: {err}", proxy.describe()))
+    })?;
+
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        let read = stream.read(&mut buffer).await.map_err(|err| {
+            ws_transport_error(format!("{} CONNECT read failed: {err}", proxy.describe()))
+        })?;
+        if read == 0 {
+            return Err(ws_transport_error(format!(
+                "{} closed before CONNECT completed",
+                proxy.describe()
+            )));
+        }
+        response.extend_from_slice(&buffer[..read]);
+        if response.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        if response.len() > 8 * 1024 {
+            return Err(ws_transport_error(format!(
+                "{} CONNECT response exceeded 8KiB",
+                proxy.describe()
+            )));
+        }
+    }
+
+    let response_text = String::from_utf8_lossy(&response);
+    let status_line = response_text.lines().next().unwrap_or_default();
+    let status_code = status_line.split_whitespace().nth(1).unwrap_or_default();
+    if status_code != "200" {
+        return Err(ws_transport_error(format!(
+            "{} CONNECT failed: {}",
+            proxy.describe(),
+            status_line
+        )));
+    }
+
+    Ok(())
+}
+
 fn spawn_ws_market_data_tasks(
     manager: DataManager,
     settings: &Settings,
@@ -4350,6 +5549,7 @@ fn spawn_ws_market_data_tasks(
 ) -> Vec<JoinHandle<()>> {
     let mut handles = Vec::new();
     let reconnect_backoff_ms = settings.strategy.market_data.reconnect_backoff_ms.max(250);
+    let proxy_settings = WsProxySettings::detect();
 
     let poly_asset_ids: Vec<String> = markets
         .iter()
@@ -4370,6 +5570,7 @@ fn spawn_ws_market_data_tasks(
             settings.polymarket.ws_url.clone(),
             poly_asset_ids,
             reconnect_backoff_ms,
+            proxy_settings.clone(),
         ));
     }
 
@@ -4389,6 +5590,7 @@ fn spawn_ws_market_data_tasks(
                     depth,
                     reconnect_backoff_ms,
                     binance_tracker.clone(),
+                    proxy_settings.clone(),
                 ));
             }
             Exchange::Okx if seen_okx.insert(venue_symbol.clone()) => {
@@ -4398,6 +5600,7 @@ fn spawn_ws_market_data_tasks(
                     venue_symbol,
                     reconnect_backoff_ms,
                     okx_tracker.clone(),
+                    proxy_settings.clone(),
                 ));
             }
             _ => {}
@@ -4412,15 +5615,42 @@ fn spawn_polymarket_ws_task(
     ws_url: String,
     asset_ids: Vec<String>,
     reconnect_backoff_ms: u64,
+    proxy_settings: WsProxySettings,
 ) -> JoinHandle<()> {
     let tracker = ExchangeConnectionTracker::new(Exchange::Polymarket, manager.clone());
+    let proxy_resolution = proxy_settings.resolve_for_url(&ws_url);
+    if let Ok(Some(proxy)) = proxy_resolution.as_ref() {
+        eprintln!("polymarket ws using {}", proxy.describe());
+    } else if let Err(err) = proxy_resolution.as_ref() {
+        log_ws_warning(format!("polymarket ws proxy resolution failed: {err}"));
+    }
     tokio::spawn(async move {
         let stream_key = "market".to_owned();
         let books: Arc<Mutex<HashMap<String, LocalPolyBook>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        tracker.mark_connecting();
+        let proxy = match proxy_resolution {
+            Ok(proxy) => proxy,
+            Err(_) => {
+                tracker.mark_disconnected(&stream_key);
+                return;
+            }
+        };
 
         loop {
-            match connect_async(ws_url.as_str()).await {
+            sleep(Duration::from_millis(ws_connect_delay_ms(
+                reconnect_backoff_ms,
+                &format!("polymarket:{stream_key}"),
+            )))
+            .await;
+            tracker.mark_connecting();
+            match run_ws_future_with_timeout(
+                connect_websocket(ws_url.as_str(), proxy.as_ref()),
+                Duration::from_millis(WS_CONNECT_TIMEOUT_MS),
+                "polymarket ws connect".to_owned(),
+            )
+            .await
+            {
                 Ok((socket, _)) => {
                     let (mut writer, mut reader) = socket.split();
                     let subscribe =
@@ -4429,12 +5659,12 @@ fn spawn_polymarket_ws_task(
                         .send(Message::Text(subscribe.to_string().into()))
                         .await
                     {
-                        tracing::warn!("polymarket ws subscribe failed: {}", err);
+                        log_ws_warning(format!("polymarket ws subscribe failed: {err}"));
                         tracker.mark_disconnected(&stream_key);
-                        sleep(Duration::from_millis(reconnect_backoff_ms)).await;
                         continue;
                     }
                     tracker.mark_connected(&stream_key);
+                    eprintln!("polymarket ws connected");
 
                     let mut heartbeat = interval(Duration::from_secs(10));
                     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -4443,7 +5673,7 @@ fn spawn_polymarket_ws_task(
                         tokio::select! {
                             _ = heartbeat.tick() => {
                                 if let Err(err) = writer.send(Message::Text("PING".to_owned().into())).await {
-                                    tracing::warn!("polymarket ws heartbeat failed: {}", err);
+                                    log_ws_warning(format!("polymarket ws heartbeat failed: {err}"));
                                     break;
                                 }
                             }
@@ -4454,7 +5684,7 @@ fn spawn_polymarket_ws_task(
                                             continue;
                                         }
                                         if let Err(err) = handle_polymarket_ws_text(&manager, &books, &text).await {
-                                            tracing::warn!("polymarket ws payload ignored: {}", err);
+                                            log_ws_warning(format!("polymarket ws payload ignored: {err}"));
                                         }
                                     }
                                     Some(Ok(Message::Ping(payload))) => {
@@ -4462,9 +5692,19 @@ fn spawn_polymarket_ws_task(
                                             break;
                                         }
                                     }
-                                    Some(Ok(Message::Close(_))) | None => break,
+                                    Some(Ok(Message::Close(frame))) => {
+                                        log_ws_warning(format!(
+                                            "polymarket ws closed: {}",
+                                            format_ws_close_reason(frame.as_ref())
+                                        ));
+                                        break;
+                                    }
+                                    None => {
+                                        log_ws_warning("polymarket ws stream ended without close frame");
+                                        break;
+                                    }
                                     Some(Err(err)) => {
-                                        tracing::warn!("polymarket ws read error: {}", err);
+                                        log_ws_warning(format!("polymarket ws read error: {err}"));
                                         break;
                                     }
                                     _ => {}
@@ -4473,11 +5713,10 @@ fn spawn_polymarket_ws_task(
                         }
                     }
                 }
-                Err(err) => tracing::warn!("polymarket ws connect failed: {}", err),
+                Err(err) => log_ws_warning(format!("polymarket ws connect failed: {err}")),
             }
 
             tracker.mark_disconnected(&stream_key);
-            sleep(Duration::from_millis(reconnect_backoff_ms)).await;
         }
     })
 }
@@ -4489,17 +5728,48 @@ fn spawn_binance_ws_task(
     depth: u16,
     reconnect_backoff_ms: u64,
     tracker: ExchangeConnectionTracker,
+    proxy_settings: WsProxySettings,
 ) -> JoinHandle<()> {
+    let stream_name =
+        BinanceFuturesDataSource::build_partial_depth_stream_name(&venue_symbol, depth);
+    let endpoint = format!("{}/ws/{}", ws_url.trim_end_matches('/'), stream_name);
+    let proxy_resolution = proxy_settings.resolve_for_url(&endpoint);
+    if let Ok(Some(proxy)) = proxy_resolution.as_ref() {
+        eprintln!("binance ws using {} for {}", proxy.describe(), venue_symbol);
+    } else if let Err(err) = proxy_resolution.as_ref() {
+        log_ws_warning(format!(
+            "binance ws proxy resolution failed for {}: {}",
+            venue_symbol, err
+        ));
+    }
     tokio::spawn(async move {
-        let stream_name =
-            BinanceFuturesDataSource::build_partial_depth_stream_name(&venue_symbol, depth);
-        let endpoint = format!("{}/ws/{}", ws_url.trim_end_matches('/'), stream_name);
+        tracker.mark_connecting();
+        let proxy = match proxy_resolution {
+            Ok(proxy) => proxy,
+            Err(_) => {
+                tracker.mark_disconnected(&venue_symbol);
+                return;
+            }
+        };
 
         loop {
-            match connect_async(endpoint.as_str()).await {
+            sleep(Duration::from_millis(ws_connect_delay_ms(
+                reconnect_backoff_ms,
+                &format!("binance:{venue_symbol}"),
+            )))
+            .await;
+            tracker.mark_connecting();
+            match run_ws_future_with_timeout(
+                connect_websocket(endpoint.as_str(), proxy.as_ref()),
+                Duration::from_millis(WS_CONNECT_TIMEOUT_MS),
+                format!("binance ws connect for {venue_symbol}"),
+            )
+            .await
+            {
                 Ok((socket, _)) => {
                     let (_writer, mut reader) = socket.split();
                     tracker.mark_connected(&venue_symbol);
+                    eprintln!("binance ws connected for {venue_symbol}");
 
                     while let Some(message) = reader.next().await {
                         match message {
@@ -4512,41 +5782,45 @@ fn spawn_binance_ws_task(
                                         if let Err(err) =
                                             manager.normalize_and_publish_cex_orderbook(update)
                                         {
-                                            tracing::warn!(
+                                            log_ws_warning(format!(
                                                 "binance ws publish failed for {}: {}",
-                                                venue_symbol,
-                                                err
-                                            );
+                                                venue_symbol, err
+                                            ));
                                         }
                                     }
                                     Ok(None) => {}
-                                    Err(err) => tracing::warn!(
+                                    Err(err) => log_ws_warning(format!(
                                         "binance ws payload ignored for {}: {}",
-                                        venue_symbol,
-                                        err
-                                    ),
+                                        venue_symbol, err
+                                    )),
                                 }
                             }
-                            Ok(Message::Close(_)) => break,
-                            Err(err) => {
-                                tracing::warn!(
-                                    "binance ws read error for {}: {}",
+                            Ok(Message::Close(frame)) => {
+                                log_ws_warning(format!(
+                                    "binance ws closed for {}: {}",
                                     venue_symbol,
-                                    err
-                                );
+                                    format_ws_close_reason(frame.as_ref())
+                                ));
+                                break;
+                            }
+                            Err(err) => {
+                                log_ws_warning(format!(
+                                    "binance ws read error for {}: {}",
+                                    venue_symbol, err
+                                ));
                                 break;
                             }
                             _ => {}
                         }
                     }
                 }
-                Err(err) => {
-                    tracing::warn!("binance ws connect failed for {}: {}", venue_symbol, err)
-                }
+                Err(err) => log_ws_warning(format!(
+                    "binance ws connect failed for {}: {}",
+                    venue_symbol, err
+                )),
             }
 
             tracker.mark_disconnected(&venue_symbol);
-            sleep(Duration::from_millis(reconnect_backoff_ms)).await;
         }
     })
 }
@@ -4557,10 +5831,40 @@ fn spawn_okx_ws_task(
     venue_symbol: String,
     reconnect_backoff_ms: u64,
     tracker: ExchangeConnectionTracker,
+    proxy_settings: WsProxySettings,
 ) -> JoinHandle<()> {
+    let proxy_resolution = proxy_settings.resolve_for_url(&ws_url);
+    if let Ok(Some(proxy)) = proxy_resolution.as_ref() {
+        eprintln!("okx ws using {} for {}", proxy.describe(), venue_symbol);
+    } else if let Err(err) = proxy_resolution.as_ref() {
+        log_ws_warning(format!(
+            "okx ws proxy resolution failed for {}: {}",
+            venue_symbol, err
+        ));
+    }
     tokio::spawn(async move {
+        tracker.mark_connecting();
+        let proxy = match proxy_resolution {
+            Ok(proxy) => proxy,
+            Err(_) => {
+                tracker.mark_disconnected(&venue_symbol);
+                return;
+            }
+        };
         loop {
-            match connect_async(ws_url.as_str()).await {
+            sleep(Duration::from_millis(ws_connect_delay_ms(
+                reconnect_backoff_ms,
+                &format!("okx:{venue_symbol}"),
+            )))
+            .await;
+            tracker.mark_connecting();
+            match run_ws_future_with_timeout(
+                connect_websocket(ws_url.as_str(), proxy.as_ref()),
+                Duration::from_millis(WS_CONNECT_TIMEOUT_MS),
+                format!("okx ws connect for {venue_symbol}"),
+            )
+            .await
+            {
                 Ok((socket, _)) => {
                     let (mut writer, mut reader) = socket.split();
                     let subscribe =
@@ -4569,12 +5873,15 @@ fn spawn_okx_ws_task(
                         .send(Message::Text(subscribe.to_string().into()))
                         .await
                     {
-                        tracing::warn!("okx ws subscribe failed for {}: {}", venue_symbol, err);
+                        log_ws_warning(format!(
+                            "okx ws subscribe failed for {}: {}",
+                            venue_symbol, err
+                        ));
                         tracker.mark_disconnected(&venue_symbol);
-                        sleep(Duration::from_millis(reconnect_backoff_ms)).await;
                         continue;
                     }
                     tracker.mark_connected(&venue_symbol);
+                    eprintln!("okx ws connected for {venue_symbol}");
 
                     let mut heartbeat = interval(Duration::from_secs(20));
                     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -4583,7 +5890,10 @@ fn spawn_okx_ws_task(
                         tokio::select! {
                             _ = heartbeat.tick() => {
                                 if let Err(err) = writer.send(Message::Text("ping".to_owned().into())).await {
-                                    tracing::warn!("okx ws heartbeat failed for {}: {}", venue_symbol, err);
+                                    log_ws_warning(format!(
+                                        "okx ws heartbeat failed for {}: {}",
+                                        venue_symbol, err
+                                    ));
                                     break;
                                 }
                             }
@@ -4596,11 +5906,17 @@ fn spawn_okx_ws_task(
                                         match OkxMarketDataSource::parse_orderbook_ws_message(&text, &venue_symbol) {
                                             Ok(Some(update)) => {
                                                 if let Err(err) = manager.normalize_and_publish_cex_orderbook(update) {
-                                                    tracing::warn!("okx ws publish failed for {}: {}", venue_symbol, err);
+                                                    log_ws_warning(format!(
+                                                        "okx ws publish failed for {}: {}",
+                                                        venue_symbol, err
+                                                    ));
                                                 }
                                             }
                                             Ok(None) => {}
-                                            Err(err) => tracing::warn!("okx ws payload ignored for {}: {}", venue_symbol, err),
+                                            Err(err) => log_ws_warning(format!(
+                                                "okx ws payload ignored for {}: {}",
+                                                venue_symbol, err
+                                            )),
                                         }
                                     }
                                     Some(Ok(Message::Ping(payload))) => {
@@ -4608,9 +5924,26 @@ fn spawn_okx_ws_task(
                                             break;
                                         }
                                     }
-                                    Some(Ok(Message::Close(_))) | None => break,
+                                    Some(Ok(Message::Close(frame))) => {
+                                        log_ws_warning(format!(
+                                            "okx ws closed for {}: {}",
+                                            venue_symbol,
+                                            format_ws_close_reason(frame.as_ref())
+                                        ));
+                                        break;
+                                    }
+                                    None => {
+                                        log_ws_warning(format!(
+                                            "okx ws stream ended for {} without close frame",
+                                            venue_symbol
+                                        ));
+                                        break;
+                                    }
                                     Some(Err(err)) => {
-                                        tracing::warn!("okx ws read error for {}: {}", venue_symbol, err);
+                                        log_ws_warning(format!(
+                                            "okx ws read error for {}: {}",
+                                            venue_symbol, err
+                                        ));
                                         break;
                                     }
                                     _ => {}
@@ -4619,11 +5952,13 @@ fn spawn_okx_ws_task(
                         }
                     }
                 }
-                Err(err) => tracing::warn!("okx ws connect failed for {}: {}", venue_symbol, err),
+                Err(err) => log_ws_warning(format!(
+                    "okx ws connect failed for {}: {}",
+                    venue_symbol, err
+                )),
             }
 
             tracker.mark_disconnected(&venue_symbol);
-            sleep(Duration::from_millis(reconnect_backoff_ms)).await;
         }
     })
 }
@@ -4675,10 +6010,16 @@ async fn handle_polymarket_ws_text(
             || message.get("bids").is_some()
             || message.get("asks").is_some()
         {
-            let update =
+            let mut update =
                 PolymarketLiveDataSource::parse_ws_orderbook_payload(&message.to_string(), "")?;
             if let Ok(mut guard) = books.lock() {
-                guard.insert(update.asset_id.clone(), LocalPolyBook::from_update(&update));
+                let previous_sequence = guard
+                    .get(&update.asset_id)
+                    .map(|book| book.sequence)
+                    .unwrap_or(0);
+                let book = LocalPolyBook::from_update_with_previous(&update, previous_sequence);
+                update.sequence = book.sequence;
+                guard.insert(update.asset_id.clone(), book);
             }
             let _ = manager.normalize_and_publish_poly_orderbook(update)?;
         }
@@ -4706,9 +6047,11 @@ fn apply_polymarket_price_changes(
         entry.1.apply_level(change.side, change.price, change.size);
     }
 
-    for (asset_id, (timestamp_ms, book)) in grouped {
+    for (asset_id, (timestamp_ms, mut book)) in grouped {
+        let sequence = book.next_sequence();
+        book.sequence = sequence;
         guard.insert(asset_id.clone(), book.clone());
-        let update = book.to_update(&asset_id, timestamp_ms);
+        let update = book.to_update(&asset_id, timestamp_ms, sequence);
         let _ = manager.normalize_and_publish_poly_orderbook(update)?;
     }
 
@@ -4873,11 +6216,11 @@ async fn process_signal_single(
     candidate: OpenCandidate,
     settings: &Settings,
     registry: &SymbolRegistry,
-    observed: &ObservedState,
+    observed: &mut ObservedState,
     stats: &mut PaperStats,
     recent_events: &mut VecDeque<PaperEventLog>,
     engine: &mut SimpleAlphaEngine,
-    execution: &mut ExecutionManager<DryRunExecutor>,
+    execution: &mut ExecutionManager<RuntimeExecutor>,
     risk: &mut InMemoryRiskManager,
     trade_book: &mut TradeBook,
     paused: &Arc<AtomicBool>,
@@ -4886,6 +6229,7 @@ async fn process_signal_single(
     audit: &mut Option<PaperAudit>,
 ) -> Result<()> {
     let fallback_token_side = Some(candidate.token_side);
+    note_focus_market_activity(observed, candidate.timestamp_ms);
     let observed_snapshot = audit_snapshot_for_candidate(settings, registry, &candidate, observed);
     stats.signals_seen += 1;
     push_signal_event(
@@ -5089,7 +6433,58 @@ async fn process_signal_single(
         }
     }
 
-    if let Some(risk_rejection) = signal_rejection_reason(risk, registry, &candidate).await? {
+    let plan = match preview_open_plan(execution, &candidate) {
+        Ok(plan) => plan,
+        Err(err) => {
+            stats.signals_rejected += 1;
+            stats.execution_rejected += 1;
+            record_signal_rejection(stats, "execution_planner");
+            let reason_code = extract_plan_rejection_reason(&err.to_string())
+                .unwrap_or_else(|| "trade_plan_rejected".to_owned());
+            let summary = format!(
+                "候选被拒绝：未通过交易规划 {}（{}）",
+                candidate.candidate_id,
+                gate_reason_label_zh("trade_plan", &reason_code)
+            );
+            if let Some(audit) = audit.as_mut() {
+                audit.record_gate_decision(
+                    &candidate,
+                    "trade_plan",
+                    AuditGateResult::Rejected,
+                    &reason_code,
+                    summary.clone(),
+                    observed_snapshot.clone(),
+                )?;
+            }
+            reject_signal(
+                stats,
+                recent_events,
+                &candidate,
+                "risk",
+                &reason_code,
+                summary,
+                build_gate_event_details(
+                    &candidate,
+                    observed_snapshot.as_ref(),
+                    settings,
+                    "trade_plan",
+                    AuditGateResult::Rejected,
+                    &reason_code,
+                    None,
+                ),
+            );
+            sync_engine_position_state_from_runtime(
+                engine,
+                risk,
+                trade_book,
+                &candidate.symbol,
+                fallback_token_side,
+            );
+            return Ok(());
+        }
+    };
+
+    if let Some(risk_rejection) = open_plan_risk_rejection_reason(risk, &plan) {
         let summary = format!(
             "候选被拒绝：未通过风控检查 {}（{}）",
             candidate.candidate_id,
@@ -5157,14 +6552,17 @@ async fn process_signal_single(
         ),
     );
 
-    if !candidate_passes_price_filter(&candidate, observed, settings) {
+    if let Some(filter_reason) =
+        candidate_price_filter_rejection_reason(&candidate, observed, settings)
+    {
         let filter_price = observed_snapshot
             .as_ref()
             .and_then(|observed| candidate_price_for_audit_observed(&candidate, observed))
             .map(format_detail_f64)
             .unwrap_or_else(|| "无可用价格".to_owned());
         let summary = format!(
-            "候选被拒绝：价格过滤未通过 {}（价格 {}，区间 {}）",
+            "候选被拒绝：{} {}（价格 {}，区间 {}）",
+            gate_reason_label_zh("price_filter", filter_reason),
             candidate.candidate_id,
             filter_price,
             price_filter_window_text(settings)
@@ -5174,7 +6572,7 @@ async fn process_signal_single(
                 &candidate,
                 "price_filter",
                 AuditGateResult::Rejected,
-                "price_filter",
+                filter_reason,
                 summary.clone(),
                 observed_snapshot.clone(),
             )?;
@@ -5184,7 +6582,7 @@ async fn process_signal_single(
             recent_events,
             &candidate,
             "price_filter",
-            "price_filter",
+            filter_reason,
             summary,
             build_gate_event_details(
                 &candidate,
@@ -5192,7 +6590,7 @@ async fn process_signal_single(
                 settings,
                 "price_filter",
                 AuditGateResult::Rejected,
-                "price_filter",
+                filter_reason,
                 None,
             ),
         );
@@ -5237,10 +6635,7 @@ async fn process_signal_single(
 
     register_open_trade_from_candidate(trade_book, &candidate, engine);
     let trigger = RuntimeTrigger::Candidate(candidate.clone());
-    let events = match execution
-        .process_intent(open_intent_from_candidate(&candidate))
-        .await
-    {
+    let events = match execution.process_plan(plan).await {
         Ok(events) => events,
         Err(err) => {
             stats.signals_rejected += 1;
@@ -5278,6 +6673,9 @@ async fn process_signal_single(
             return Ok(());
         }
     };
+    if execution_events_include_trade_plan_created(&events) {
+        note_tradeable_market_activity(observed, candidate.timestamp_ms);
+    }
     track_open_signal_execution_outcome(
         stats,
         recent_events,
@@ -5310,11 +6708,11 @@ async fn process_signal_multi(
     candidate: OpenCandidate,
     settings: &Settings,
     registry: &SymbolRegistry,
-    observed_map: &HashMap<Symbol, ObservedState>,
+    observed_map: &mut HashMap<Symbol, ObservedState>,
     stats: &mut PaperStats,
     recent_events: &mut VecDeque<PaperEventLog>,
     engine: &mut SimpleAlphaEngine,
-    execution: &mut ExecutionManager<DryRunExecutor>,
+    execution: &mut ExecutionManager<RuntimeExecutor>,
     risk: &mut InMemoryRiskManager,
     trade_book: &mut TradeBook,
     paused: &Arc<AtomicBool>,
@@ -5323,6 +6721,9 @@ async fn process_signal_multi(
     audit: &mut Option<PaperAudit>,
 ) -> Result<()> {
     let fallback_token_side = Some(candidate.token_side);
+    if let Some(observed) = observed_map.get_mut(&candidate.symbol) {
+        note_focus_market_activity(observed, candidate.timestamp_ms);
+    }
     let observed_snapshot = observed_map.get(&candidate.symbol).and_then(|observed| {
         audit_snapshot_for_candidate(settings, registry, &candidate, observed)
     });
@@ -5528,7 +6929,58 @@ async fn process_signal_multi(
         }
     }
 
-    if let Some(risk_rejection) = signal_rejection_reason(risk, registry, &candidate).await? {
+    let plan = match preview_open_plan(execution, &candidate) {
+        Ok(plan) => plan,
+        Err(err) => {
+            stats.signals_rejected += 1;
+            stats.execution_rejected += 1;
+            record_signal_rejection(stats, "execution_planner");
+            let reason_code = extract_plan_rejection_reason(&err.to_string())
+                .unwrap_or_else(|| "trade_plan_rejected".to_owned());
+            let summary = format!(
+                "候选被拒绝：未通过交易规划 {}（{}）",
+                candidate.candidate_id,
+                gate_reason_label_zh("trade_plan", &reason_code)
+            );
+            if let Some(audit) = audit.as_mut() {
+                audit.record_gate_decision(
+                    &candidate,
+                    "trade_plan",
+                    AuditGateResult::Rejected,
+                    &reason_code,
+                    summary.clone(),
+                    observed_snapshot.clone(),
+                )?;
+            }
+            reject_signal(
+                stats,
+                recent_events,
+                &candidate,
+                "risk",
+                &reason_code,
+                summary,
+                build_gate_event_details(
+                    &candidate,
+                    observed_snapshot.as_ref(),
+                    settings,
+                    "trade_plan",
+                    AuditGateResult::Rejected,
+                    &reason_code,
+                    None,
+                ),
+            );
+            sync_engine_position_state_from_runtime(
+                engine,
+                risk,
+                trade_book,
+                &candidate.symbol,
+                fallback_token_side,
+            );
+            return Ok(());
+        }
+    };
+
+    if let Some(risk_rejection) = open_plan_risk_rejection_reason(risk, &plan) {
         let summary = format!(
             "候选被拒绝：未通过风控检查 {}（{}）",
             candidate.candidate_id,
@@ -5596,14 +7048,17 @@ async fn process_signal_multi(
         ),
     );
 
-    if !candidate_passes_price_filter_multi(&candidate, observed_map, settings) {
+    if let Some(filter_reason) =
+        candidate_price_filter_rejection_reason_multi(&candidate, observed_map, settings)
+    {
         let filter_price = observed_snapshot
             .as_ref()
             .and_then(|observed| candidate_price_for_audit_observed(&candidate, observed))
             .map(format_detail_f64)
             .unwrap_or_else(|| "无可用价格".to_owned());
         let summary = format!(
-            "候选被拒绝：价格过滤未通过 {}（价格 {}，区间 {}）",
+            "候选被拒绝：{} {}（价格 {}，区间 {}）",
+            gate_reason_label_zh("price_filter", filter_reason),
             candidate.candidate_id,
             filter_price,
             price_filter_window_text(settings)
@@ -5613,7 +7068,7 @@ async fn process_signal_multi(
                 &candidate,
                 "price_filter",
                 AuditGateResult::Rejected,
-                "price_filter",
+                filter_reason,
                 summary.clone(),
                 observed_snapshot.clone(),
             )?;
@@ -5623,7 +7078,7 @@ async fn process_signal_multi(
             recent_events,
             &candidate,
             "price_filter",
-            "price_filter",
+            filter_reason,
             summary,
             build_gate_event_details(
                 &candidate,
@@ -5631,7 +7086,7 @@ async fn process_signal_multi(
                 settings,
                 "price_filter",
                 AuditGateResult::Rejected,
-                "price_filter",
+                filter_reason,
                 None,
             ),
         );
@@ -5676,10 +7131,7 @@ async fn process_signal_multi(
 
     register_open_trade_from_candidate(trade_book, &candidate, engine);
     let trigger = RuntimeTrigger::Candidate(candidate.clone());
-    let events = match execution
-        .process_intent(open_intent_from_candidate(&candidate))
-        .await
-    {
+    let events = match execution.process_plan(plan).await {
         Ok(events) => events,
         Err(err) => {
             stats.signals_rejected += 1;
@@ -5717,6 +7169,11 @@ async fn process_signal_multi(
             return Ok(());
         }
     };
+    if execution_events_include_trade_plan_created(&events) {
+        if let Some(observed) = observed_map.get_mut(&candidate.symbol) {
+            note_tradeable_market_activity(observed, candidate.timestamp_ms);
+        }
+    }
     track_open_signal_execution_outcome(
         stats,
         recent_events,
@@ -5755,7 +7212,7 @@ async fn handle_single_market_event(
     stats: &mut PaperStats,
     recent_events: &mut VecDeque<PaperEventLog>,
     engine: &mut SimpleAlphaEngine,
-    execution: &mut ExecutionManager<DryRunExecutor>,
+    execution: &mut ExecutionManager<RuntimeExecutor>,
     risk: &mut InMemoryRiskManager,
     trade_book: &mut TradeBook,
     paused: &Arc<AtomicBool>,
@@ -5878,6 +7335,20 @@ async fn handle_single_market_event(
             trade_book,
         )
         .await?;
+    } else {
+        maybe_execute_delta_rebalance(
+            settings,
+            &HashMap::from([(market.symbol.clone(), observed.clone())]),
+            &market.symbol,
+            engine,
+            execution,
+            risk,
+            stats,
+            recent_events,
+            trade_book,
+            now_millis(),
+        )
+        .await?;
     }
 
     let _ = market;
@@ -5893,7 +7364,7 @@ async fn handle_multi_market_event(
     stats: &mut PaperStats,
     recent_events: &mut VecDeque<PaperEventLog>,
     engine: &mut SimpleAlphaEngine,
-    execution: &mut ExecutionManager<DryRunExecutor>,
+    execution: &mut ExecutionManager<RuntimeExecutor>,
     risk: &mut InMemoryRiskManager,
     trade_book: &mut TradeBook,
     paused: &Arc<AtomicBool>,
@@ -6043,6 +7514,20 @@ async fn handle_multi_market_event(
                 trade_book,
             )
             .await?;
+        } else {
+            maybe_execute_delta_rebalance(
+                settings,
+                observed,
+                symbol,
+                engine,
+                execution,
+                risk,
+                stats,
+                recent_events,
+                trade_book,
+                now_millis(),
+            )
+            .await?;
         }
     }
 
@@ -6060,14 +7545,13 @@ async fn run_paper_ws_mode(
     include_funding: bool,
     json: bool,
     warmup_klines: u16,
+    execution_mode: RuntimeExecutionMode,
+    trading_mode: polyalpha_core::TradingMode,
 ) -> Result<()> {
     let market = select_market(&settings, market_index)?;
     let registry = SymbolRegistry::new(settings.markets.clone());
     let channels = create_channels(std::slice::from_ref(&market.symbol));
-    let manager = DataManager::new(
-        MarketDataNormalizer::new(registry.clone()),
-        channels.market_data_tx.clone(),
-    );
+    let manager = build_data_manager(&registry, channels.market_data_tx.clone());
 
     let socket_path = monitor_socket_path(&settings);
     let current_state: Arc<std::sync::RwLock<Option<MonitorState>>> =
@@ -6134,8 +7618,14 @@ async fn run_paper_ws_mode(
     });
 
     let executor_start_ms = now_millis();
-    let (orderbook_provider, executor, mut execution) =
-        build_paper_execution_stack(&settings, &registry, executor_start_ms);
+    let (orderbook_provider, executor, mut execution) = build_paper_execution_stack(
+        &settings,
+        &registry,
+        executor_start_ms,
+        execution_mode,
+        Some(&market),
+    )
+    .await?;
     let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
     let mut observed = ObservedState::default();
     let mut stats = PaperStats::default();
@@ -6150,6 +7640,7 @@ async fn run_paper_ws_mode(
             env,
             std::slice::from_ref(&market),
             executor_start_ms,
+            trading_mode,
         )?;
         println!(
             "审计会话已启动：{} -> {}",
@@ -6190,7 +7681,7 @@ async fn run_paper_ws_mode(
     )
     .await;
 
-    let _ws_tasks = spawn_ws_market_data_tasks(
+    let mut ws_tasks = spawn_ws_market_data_tasks(
         manager.clone(),
         &settings,
         std::slice::from_ref(&market),
@@ -6330,6 +7821,7 @@ async fn run_paper_ws_mode(
                     &observed,
                     &stats,
                     &risk,
+                    &execution,
                     &mut trade_book,
                     &command_center,
                     paused.load(Ordering::SeqCst),
@@ -6337,6 +7829,7 @@ async fn run_paper_ws_mode(
                     start_time_ms,
                     now_ms,
                     &monitor_events,
+                    trading_mode,
                 );
                 if let Ok(mut guard) = current_state.write() {
                     *guard = Some(monitor_state.clone());
@@ -6387,9 +7880,8 @@ async fn run_paper_ws_mode(
         }
     }
 
-    if let Some(handle) = funding_refresh_task.take() {
-        handle.abort();
-    }
+    abort_join_handles(&mut ws_tasks).await;
+    abort_optional_join_handle(&mut funding_refresh_task).await;
 
     let final_snapshot = snapshots
         .last()
@@ -6408,6 +7900,7 @@ async fn run_paper_ws_mode(
                 &observed,
                 &stats,
                 &risk,
+                &execution,
                 &mut trade_book,
                 &command_center,
                 paused.load(Ordering::SeqCst),
@@ -6415,6 +7908,7 @@ async fn run_paper_ws_mode(
                 start_time_ms,
                 now_millis(),
                 &monitor_events,
+                trading_mode,
             )
         });
     if let Ok(mut guard) = current_state.write() {
@@ -6427,6 +7921,7 @@ async fn run_paper_ws_mode(
         .collect();
     let artifact = PaperArtifact {
         schema_version: PAPER_ARTIFACT_SCHEMA_VERSION,
+        trading_mode,
         env: env.to_owned(),
         market_index,
         market: market.symbol.0.clone(),
@@ -6441,9 +7936,13 @@ async fn run_paper_ws_mode(
         recent_events: recent_events.into_iter().collect(),
         snapshots,
     };
-    let artifact_path = artifact_path(&settings, env)?;
+    let artifact_path = artifact_path(&settings, env, trading_mode)?;
     persist_artifact(&artifact_path, &artifact)?;
-    println!("纸面盘结果已写入：{}", artifact_path.display());
+    println!(
+        "{}结果已写入：{}",
+        artifact_runtime_label(trading_mode),
+        artifact_path.display()
+    );
     if let Some(audit) = audit.as_mut() {
         audit.finalize(
             &stats,
@@ -6467,6 +7966,8 @@ async fn run_paper_multi_ws_mode(
     include_funding: bool,
     json: bool,
     warmup_klines: u16,
+    execution_mode: RuntimeExecutionMode,
+    trading_mode: polyalpha_core::TradingMode,
 ) -> Result<()> {
     let markets = settings.markets.clone();
     if markets.is_empty() {
@@ -6476,10 +7977,7 @@ async fn run_paper_multi_ws_mode(
     let registry = SymbolRegistry::new(markets.clone());
     let symbols: Vec<Symbol> = markets.iter().map(|m| m.symbol.clone()).collect();
     let channels = create_channels(&symbols);
-    let manager = DataManager::new(
-        MarketDataNormalizer::new(registry.clone()),
-        channels.market_data_tx.clone(),
-    );
+    let manager = build_data_manager(&registry, channels.market_data_tx.clone());
 
     let socket_path = monitor_socket_path(&settings);
     let current_state: Arc<std::sync::RwLock<Option<MonitorState>>> =
@@ -6559,8 +8057,14 @@ async fn run_paper_multi_ws_mode(
     });
 
     let executor_start_ms = now_millis();
-    let (orderbook_provider, executor, mut execution) =
-        build_paper_execution_stack(&settings, &registry, executor_start_ms);
+    let (orderbook_provider, executor, mut execution) = build_paper_execution_stack(
+        &settings,
+        &registry,
+        executor_start_ms,
+        execution_mode,
+        None,
+    )
+    .await?;
     let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
     let mut observed: HashMap<Symbol, ObservedState> = markets
         .iter()
@@ -6573,7 +8077,7 @@ async fn run_paper_multi_ws_mode(
     let mut trade_book = TradeBook::default();
     let start_time_ms = executor_start_ms;
     let mut audit = if settings.audit.enabled {
-        let audit = PaperAudit::start(&settings, env, &markets, executor_start_ms)?;
+        let audit = PaperAudit::start(&settings, env, &markets, executor_start_ms, trading_mode)?;
         println!(
             "审计会话已启动：{} -> {}",
             audit.session_id(),
@@ -6618,6 +8122,7 @@ async fn run_paper_multi_ws_mode(
         &observed,
         &stats,
         &risk,
+        &execution,
         &mut trade_book,
         &command_center,
         paused.load(Ordering::SeqCst),
@@ -6625,13 +8130,14 @@ async fn run_paper_multi_ws_mode(
         start_time_ms,
         now_millis(),
         &initial_monitor_events,
+        trading_mode,
     );
     if let Ok(mut guard) = current_state.write() {
         *guard = Some(initial_monitor_state.clone());
     }
     let _ = state_broadcaster.send(initial_monitor_state);
 
-    let _ws_tasks = spawn_ws_market_data_tasks(manager.clone(), &settings, &markets, depth);
+    let mut ws_tasks = spawn_ws_market_data_tasks(manager.clone(), &settings, &markets, depth);
 
     let mut warmup_task: Option<JoinHandle<()>> = None;
     let mut warmup_completed_markets = 0usize;
@@ -6925,6 +8431,7 @@ async fn run_paper_multi_ws_mode(
                     &observed,
                     &stats,
                     &risk,
+                    &execution,
                     &mut trade_book,
                     &command_center,
                     paused.load(Ordering::SeqCst),
@@ -6932,6 +8439,7 @@ async fn run_paper_multi_ws_mode(
                     start_time_ms,
                     now_ms,
                     &monitor_events,
+                    trading_mode,
                 );
                 if let Ok(mut guard) = current_state.write() {
                     *guard = Some(monitor_state.clone());
@@ -6993,46 +8501,80 @@ async fn run_paper_multi_ws_mode(
         }
     }
 
-    if let Some(handle) = bootstrap_task.take() {
-        handle.abort();
-    }
-    if let Some(handle) = warmup_task.take() {
-        handle.abort();
-    }
-    if let Some(handle) = funding_refresh_task.take() {
-        handle.abort();
-    }
+    abort_join_handles(&mut ws_tasks).await;
+    abort_optional_join_handle(&mut bootstrap_task).await;
+    abort_optional_join_handle(&mut warmup_task).await;
+    abort_optional_join_handle(&mut funding_refresh_task).await;
 
     println!(
         "多市场模拟盘已完成，共处理 {} 个轮次。",
         stats.ticks_processed
     );
+    let final_snapshot = snapshots
+        .last()
+        .cloned()
+        .ok_or_else(|| anyhow!("纸面盘会话未生成任何快照"))?;
+    let final_monitor_state = current_state
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_else(|| {
+            let monitor_events = build_monitor_events(&recent_events);
+            build_multi_monitor_state(
+                &settings,
+                &markets,
+                &engine,
+                &observed,
+                &stats,
+                &risk,
+                &execution,
+                &mut trade_book,
+                &command_center,
+                paused.load(Ordering::SeqCst),
+                emergency.load(Ordering::SeqCst),
+                start_time_ms,
+                now_millis(),
+                &monitor_events,
+                trading_mode,
+            )
+        });
+    if let Ok(mut guard) = current_state.write() {
+        *guard = Some(final_monitor_state.clone());
+    }
+    let open_orders = executor
+        .open_order_snapshots()?
+        .into_iter()
+        .map(order_view_from_snapshot)
+        .collect();
+    let hedge_exchange = markets
+        .first()
+        .map(|market| format!("{:?}", market.hedge_exchange))
+        .unwrap_or_else(|| "Unknown".to_owned());
+    let artifact = PaperArtifact {
+        schema_version: PAPER_ARTIFACT_SCHEMA_VERSION,
+        trading_mode,
+        env: env.to_owned(),
+        market_index: 0,
+        market: format!("multi:{}", markets.len()),
+        hedge_exchange,
+        market_data_mode: Some("ws".to_owned()),
+        poll_interval_ms,
+        depth,
+        include_funding,
+        ticks_processed: stats.ticks_processed,
+        final_snapshot,
+        open_orders,
+        recent_events: recent_events.into_iter().collect(),
+        snapshots,
+    };
+    let artifact_path = artifact_path(&settings, env, trading_mode)?;
+    persist_artifact(&artifact_path, &artifact)?;
+    println!(
+        "{}结果已写入：{}",
+        artifact_runtime_label(trading_mode),
+        artifact_path.display()
+    );
     if let Some(audit) = audit.as_mut() {
-        let final_monitor_state = current_state
-            .read()
-            .ok()
-            .and_then(|guard| guard.clone())
-            .unwrap_or_else(|| {
-                let monitor_events = build_monitor_events(&recent_events);
-                build_multi_monitor_state(
-                    &settings,
-                    &markets,
-                    &engine,
-                    &observed,
-                    &stats,
-                    &risk,
-                    &mut trade_book,
-                    &command_center,
-                    paused.load(Ordering::SeqCst),
-                    emergency.load(Ordering::SeqCst),
-                    start_time_ms,
-                    now_millis(),
-                    &monitor_events,
-                )
-            });
-        if let Ok(mut guard) = current_state.write() {
-            *guard = Some(final_monitor_state.clone());
-        }
         audit.finalize(
             &stats,
             &final_monitor_state,
@@ -7175,12 +8717,9 @@ fn record_connection_activity(
     exchange: Exchange,
     updated_at_ms: u64,
 ) {
-    update_connection_state(
-        observed,
-        exchange,
-        ConnectionStatus::Connected,
-        updated_at_ms,
-    );
+    observed
+        .connection_updated_at_ms
+        .insert(connection_name(exchange), updated_at_ms);
 }
 
 fn should_apply_observed_update(
@@ -7300,8 +8839,8 @@ fn build_snapshot(
     observed: &ObservedState,
     stats: &PaperStats,
     risk: &InMemoryRiskManager,
-    execution: &ExecutionManager<DryRunExecutor>,
-    executor: &DryRunExecutor,
+    execution: &ExecutionManager<RuntimeExecutor>,
+    executor: &RuntimeExecutor,
 ) -> Result<PaperSnapshot> {
     let risk_snapshot = risk.build_snapshot(now_millis());
     let positions = risk_snapshot
@@ -7412,6 +8951,13 @@ async fn apply_execution_events(
                 );
             }
             ExecutionEvent::ExecutionResultRecorded { result } => {
+                if !result.actual_funding_cost_usd.0.is_zero() {
+                    let funding_adjustment =
+                        UsdNotional(Decimal::ZERO - result.actual_funding_cost_usd.0);
+                    risk.apply_realized_pnl_adjustment(UsdNotional(funding_adjustment.0))
+                        .await?;
+                    stats.total_pnl_usd += funding_adjustment.0.to_f64().unwrap_or_default();
+                }
                 push_event_with_context_and_payload(
                     recent_events,
                     "result",
@@ -7499,7 +9045,6 @@ async fn apply_execution_events(
                 timestamp_ms,
             } => {
                 stats.trades_closed += 1;
-                stats.total_pnl_usd += realized_pnl.0.to_f64().unwrap_or(0.0);
                 trade_book.close_trade(
                     symbol,
                     *timestamp_ms,
@@ -7797,8 +9342,7 @@ fn execution_event_monitor_payload(
     };
 
     match event {
-        ExecutionEvent::TradePlanCreated { plan }
-        | ExecutionEvent::RecoveryPlanCreated { plan } => Some(execution_pipeline_payload(
+        ExecutionEvent::TradePlanCreated { plan } => Some(execution_pipeline_payload(
             candidate,
             intent,
             Some(plan.clone()),
@@ -7806,6 +9350,17 @@ fn execution_event_monitor_payload(
             None,
             None,
             None,
+        )),
+        ExecutionEvent::RecoveryPlanCreated { plan } => Some(execution_pipeline_payload(
+            candidate,
+            intent,
+            Some(plan.clone()),
+            None,
+            None,
+            None,
+            plan.recovery_decision_reason
+                .clone()
+                .map(|reason| reason.code().to_owned()),
         )),
         ExecutionEvent::ExecutionResultRecorded { result } => Some(execution_pipeline_payload(
             candidate,
@@ -7820,11 +9375,23 @@ fn execution_event_monitor_payload(
     }
 }
 
-fn extract_plan_rejection_reason(message: &str) -> Option<String> {
-    let prefix = "plan rejected [";
+fn extract_reason_code(message: &str, prefix: &str) -> Option<String> {
     let rest = message.strip_prefix(prefix)?;
     let (code, _) = rest.split_once(']')?;
     (!code.is_empty()).then(|| code.to_owned())
+}
+
+fn extract_direct_plan_rejection_reason(message: &str) -> Option<String> {
+    extract_reason_code(message, "plan rejected [")
+}
+
+fn extract_revalidation_failure_reason(message: &str) -> Option<String> {
+    extract_reason_code(message, "plan revalidation failed [")
+}
+
+fn extract_plan_rejection_reason(message: &str) -> Option<String> {
+    extract_direct_plan_rejection_reason(message)
+        .or_else(|| extract_revalidation_failure_reason(message))
 }
 
 fn post_submit_rejection_payload(
@@ -7833,14 +9400,17 @@ fn post_submit_rejection_payload(
 ) -> MonitorEventPayload {
     let plan_rejection_reason = rejection_reasons
         .iter()
-        .find_map(|reason| extract_plan_rejection_reason(reason));
+        .find_map(|reason| extract_direct_plan_rejection_reason(reason));
+    let revalidation_failure_reason = rejection_reasons
+        .iter()
+        .find_map(|reason| extract_revalidation_failure_reason(reason));
     execution_pipeline_payload(
         Some(candidate.clone()),
         None,
         None,
         None,
         plan_rejection_reason,
-        None,
+        revalidation_failure_reason,
         None,
     )
 }
@@ -7904,6 +9474,7 @@ fn signal_strength_label_zh(strength: SignalStrength) -> &'static str {
 fn gate_label_zh(gate: &str) -> &str {
     match gate {
         "ws_freshness" => "WS 行情新鲜度",
+        "trade_plan" => "交易规划",
         "risk_guard" => "风控",
         "hedge_qty_guard" => "CEX 对冲量",
         "price_filter" => "价格过滤",
@@ -7920,6 +9491,9 @@ fn gate_reason_label_zh(gate: &str, reason: &str) -> String {
             "ok" => "价格在允许区间".to_owned(),
             "close_position" => "平仓信号绕过价格过滤".to_owned(),
             "price_filter" => "价格不在允许区间".to_owned(),
+            "below_min_poly_price" => "低于最小 Poly 价格带".to_owned(),
+            "above_or_equal_max_poly_price" => "高于或等于最大 Poly 价格带".to_owned(),
+            "missing_poly_quote" => "缺少 Poly 报价".to_owned(),
             _ => "价格过滤未通过".to_owned(),
         },
         "risk_guard" => {
@@ -7927,6 +9501,13 @@ fn gate_reason_label_zh(gate: &str, reason: &str) -> String {
                 "通过风控检查".to_owned()
             } else {
                 translate_risk_rejection(reason)
+            }
+        }
+        "trade_plan" => {
+            if reason == "ok" {
+                "通过交易规划".to_owned()
+            } else {
+                translate_trade_plan_rejection(reason)
             }
         }
         "hedge_qty_guard" => match reason {
@@ -7953,6 +9534,9 @@ fn translate_risk_rejection(reason: &str) -> String {
     if reason == "quantity became zero after precision normalization" {
         return "下单数量在精度归一后变为 0".to_owned();
     }
+    if reason == "zero_cex_hedge_qty" {
+        return "CEX 对冲量为 0，禁止开仓".to_owned();
+    }
     if let Some(limit_reason) = reason.strip_prefix("risk limit breached: ") {
         if limit_reason == "daily realized pnl is below max loss" {
             return "当日已实现盈亏触发止损线".to_owned();
@@ -7972,6 +9556,39 @@ fn translate_risk_rejection(reason: &str) -> String {
     reason.to_owned()
 }
 
+fn translate_trade_plan_rejection(reason: &str) -> String {
+    match reason {
+        "missing_poly_book" => "缺少 Poly 订单簿".to_owned(),
+        "missing_cex_book" => "缺少 CEX 订单簿".to_owned(),
+        "one_sided_poly_book" => "Poly 订单簿单边".to_owned(),
+        "one_sided_cex_book" => "CEX 订单簿单边".to_owned(),
+        "stale_book_sequence" => "订单簿序列回退".to_owned(),
+        "book_conflict_same_sequence" => "同序列订单簿内容冲突".to_owned(),
+        "non_positive_planned_edge" => "可成交净边际不为正".to_owned(),
+        "insufficient_poly_depth" => "Poly 深度不足".to_owned(),
+        "insufficient_cex_depth" => "CEX 深度不足".to_owned(),
+        "poly_max_price_exceeded" => "Poly 成交均价超过上限".to_owned(),
+        "poly_min_proceeds_not_met" => "Poly 平仓回款低于下限".to_owned(),
+        "zero_cex_hedge_qty" => "CEX 对冲量为 0，禁止开仓".to_owned(),
+        "residual_delta_too_large" => "残余 Delta 超过阈值".to_owned(),
+        "shock_loss_too_large" => "冲击场景风险超过阈值".to_owned(),
+        "market_phase_disallows_intent" => "当前市场阶段不允许该计划".to_owned(),
+        "higher_priority_plan_active" => "已有更高优先级计划在执行".to_owned(),
+        "adapter_cannot_preserve_constraints" => "交易适配层无法保留计划约束".to_owned(),
+        "plan_ttl_expired" => "计划已过期".to_owned(),
+        "poly_sequence_drift_exceeded" => "Poly 行情序列漂移超限".to_owned(),
+        "cex_sequence_drift_exceeded" => "CEX 行情序列漂移超限".to_owned(),
+        "poly_price_move_exceeded" => "Poly 行情变动超出容忍范围".to_owned(),
+        "cex_price_move_exceeded" => "CEX 行情变动超出容忍范围".to_owned(),
+        "planned_edge_deteriorated" => "计划边际恶化到阈值以下".to_owned(),
+        "residual_risk_deteriorated" => "残余风险恶化到阈值以上".to_owned(),
+        "plan_superseded" => "计划已被更高优先级计划覆盖".to_owned(),
+        "book_missing_on_revalidate" => "重验时缺少订单簿".to_owned(),
+        "book_conflict_on_revalidate" => "重验时订单簿冲突".to_owned(),
+        _ => reason.to_owned(),
+    }
+}
+
 fn candidate_price_for_audit_observed(
     candidate: &OpenCandidate,
     observed: &AuditObservedMarket,
@@ -7983,6 +9600,9 @@ fn candidate_price_for_audit_observed(
 }
 
 fn price_filter_window_text(settings: &Settings) -> String {
+    if !settings.strategy.basis.band_policy.uses_configured_band() {
+        return "已禁用".to_owned();
+    }
     let min_price = settings
         .strategy
         .basis
@@ -9134,10 +10754,14 @@ fn print_snapshot(snapshot: &PaperSnapshot, json: bool) {
 }
 
 fn print_artifact_table(artifact: &PaperArtifact, artifact_path: &PathBuf) {
-    print_report_title("纸面盘会话回看");
+    print_report_title(&format!(
+        "{}会话回看",
+        artifact_runtime_label(artifact.trading_mode)
+    ));
 
     print_report_section("会话概览");
     print_report_kv("结果文件", artifact_path.display().to_string());
+    print_report_kv("运行模式", artifact_runtime_label(artifact.trading_mode));
     print_report_kv("环境", artifact.env.as_str());
     print_report_kv("市场", artifact.market.as_str());
     print_report_kv(
@@ -9365,18 +10989,59 @@ fn format_connection_status(status: ConnectionStatus) -> &'static str {
     }
 }
 
-fn artifact_path(settings: &Settings, env: &str) -> Result<PathBuf> {
+fn artifact_runtime_dir(trading_mode: polyalpha_core::TradingMode) -> &'static str {
+    match trading_mode {
+        polyalpha_core::TradingMode::Paper => "paper",
+        polyalpha_core::TradingMode::Live => "live",
+        polyalpha_core::TradingMode::Backtest => "backtest",
+    }
+}
+
+fn artifact_runtime_label(trading_mode: polyalpha_core::TradingMode) -> &'static str {
+    match trading_mode {
+        polyalpha_core::TradingMode::Paper => "纸面盘",
+        polyalpha_core::TradingMode::Live => "实盘",
+        polyalpha_core::TradingMode::Backtest => "回测",
+    }
+}
+
+fn runtime_initial_capital(settings: &Settings, trading_mode: polyalpha_core::TradingMode) -> f64 {
+    match trading_mode {
+        polyalpha_core::TradingMode::Paper => settings.paper.initial_capital,
+        polyalpha_core::TradingMode::Live => 0.0,
+        polyalpha_core::TradingMode::Backtest => settings.paper.initial_capital,
+    }
+}
+
+fn artifact_path(
+    settings: &Settings,
+    env: &str,
+    trading_mode: polyalpha_core::TradingMode,
+) -> Result<PathBuf> {
     let mut path = PathBuf::from(&settings.general.data_dir);
-    path.push("paper");
-    fs::create_dir_all(&path)
-        .with_context(|| format!("创建纸面盘结果目录 `{}` 失败", path.display()))?;
+    path.push(artifact_runtime_dir(trading_mode));
+    fs::create_dir_all(&path).with_context(|| {
+        format!(
+            "创建{}结果目录 `{}` 失败",
+            artifact_runtime_label(trading_mode),
+            path.display()
+        )
+    })?;
     path.push(format!("{env}-last-run.json"));
     Ok(path)
 }
 
-fn resolve_artifact_for_read(settings: &Settings, env: &str) -> Result<PathBuf> {
-    let current = artifact_path(settings, env)?;
+fn resolve_artifact_for_read(
+    settings: &Settings,
+    env: &str,
+    trading_mode: polyalpha_core::TradingMode,
+) -> Result<PathBuf> {
+    let current = artifact_path(settings, env, trading_mode)?;
     if current.exists() {
+        return Ok(current);
+    }
+
+    if trading_mode == polyalpha_core::TradingMode::Live {
         return Ok(current);
     }
 
@@ -9569,6 +11234,7 @@ fn build_monitor_state(
     observed: &ObservedState,
     stats: &PaperStats,
     risk: &InMemoryRiskManager,
+    execution: &ExecutionManager<RuntimeExecutor>,
     trade_book: &mut TradeBook,
     command_center: &Arc<Mutex<CommandCenter>>,
     paused: bool,
@@ -9576,6 +11242,7 @@ fn build_monitor_state(
     start_time_ms: u64,
     now_ms: u64,
     recent_events: &[MonitorEvent],
+    trading_mode: polyalpha_core::TradingMode,
 ) -> MonitorState {
     let observed_map = HashMap::from([(market.symbol.clone(), observed.clone())]);
     build_monitor_state_common(
@@ -9585,6 +11252,7 @@ fn build_monitor_state(
         &observed_map,
         stats,
         risk,
+        execution,
         trade_book,
         command_center,
         paused,
@@ -9592,6 +11260,7 @@ fn build_monitor_state(
         start_time_ms,
         now_ms,
         recent_events,
+        trading_mode,
     )
 }
 
@@ -9626,6 +11295,7 @@ fn build_monitor_state_common(
     observed_map: &HashMap<Symbol, ObservedState>,
     stats: &PaperStats,
     risk: &InMemoryRiskManager,
+    execution: &ExecutionManager<RuntimeExecutor>,
     trade_book: &mut TradeBook,
     command_center: &Arc<Mutex<CommandCenter>>,
     paused: bool,
@@ -9633,6 +11303,7 @@ fn build_monitor_state_common(
     start_time_ms: u64,
     now_ms: u64,
     recent_events: &[MonitorEvent],
+    trading_mode: polyalpha_core::TradingMode,
 ) -> MonitorState {
     let grouped_positions = group_positions_by_symbol(risk, now_ms);
     let position_views = build_position_views(
@@ -9647,8 +11318,14 @@ fn build_monitor_state_common(
         .iter()
         .map(|position| position.total_pnl_usd)
         .sum();
-    let total_pnl_usd = stats.total_pnl_usd + open_unrealized_pnl;
-    let initial_capital = settings.paper.initial_capital;
+    let realized_pnl_usd: f64 = risk
+        .build_snapshot(now_ms)
+        .positions
+        .values()
+        .map(|position| position.realized_pnl.0.to_f64().unwrap_or_default())
+        .sum();
+    let total_pnl_usd = stats.total_pnl_usd + realized_pnl_usd + open_unrealized_pnl;
+    let initial_capital = runtime_initial_capital(settings, trading_mode);
     let equity = initial_capital + total_pnl_usd;
     trade_book.push_equity(now_ms, equity);
 
@@ -9658,6 +11335,7 @@ fn build_monitor_state_common(
         markets,
         observed_map,
         engine,
+        execution,
         &position_views,
         now_ms,
     );
@@ -9669,7 +11347,7 @@ fn build_monitor_state_common(
     MonitorState {
         schema_version: PLANNING_SCHEMA_VERSION,
         timestamp_ms: now_ms,
-        mode: polyalpha_core::TradingMode::Paper,
+        mode: trading_mode,
         uptime_secs: (now_ms.saturating_sub(start_time_ms)) / 1000,
         paused,
         emergency,
@@ -9719,6 +11397,7 @@ fn build_monitor_state_common(
                 .to_f64()
                 .unwrap_or_default(),
             rolling_window: settings.strategy.basis.rolling_window_secs,
+            band_policy: settings.strategy.basis.band_policy.to_string(),
             market_data_mode: match settings.strategy.market_data.mode {
                 MarketDataMode::Poll => "poll".to_owned(),
                 MarketDataMode::Ws => "ws".to_owned(),
@@ -9890,6 +11569,7 @@ fn build_market_views(
     markets: &[MarketConfig],
     observed_map: &HashMap<Symbol, ObservedState>,
     engine: &SimpleAlphaEngine,
+    execution: &ExecutionManager<RuntimeExecutor>,
     position_views: &[polyalpha_core::PositionView],
     now_ms: u64,
 ) -> Vec<MarketView> {
@@ -9904,6 +11584,9 @@ fn build_market_views(
             let active_token_side = snapshot
                 .as_ref()
                 .map(|item| format!("{:?}", item.token_side).to_ascii_uppercase());
+            let has_position = position_views
+                .iter()
+                .any(|position| position.market == market.symbol.0);
             let poly_yes_price =
                 observed.and_then(|item| item.poly_yes_mid.and_then(|value| value.to_f64()));
             let poly_no_price =
@@ -9924,6 +11607,20 @@ fn build_market_views(
                     require_connections,
                 )
             });
+            let retention_reason = market_retention_reason(
+                has_position,
+                execution.active_plan_priority(&market.symbol),
+            );
+            let near_opportunity = market_is_near_opportunity(settings, snapshot.as_ref());
+            let market_tier = determine_market_tier(
+                settings,
+                async_snapshot.as_ref(),
+                retention_reason,
+                near_opportunity,
+                observed.and_then(|item| item.last_focus_at_ms),
+                observed.and_then(|item| item.last_tradeable_at_ms),
+                now_ms,
+            );
             MarketView {
                 symbol: market.symbol.0.clone(),
                 z_score: snapshot.as_ref().and_then(|item| item.z_score),
@@ -9933,9 +11630,7 @@ fn build_market_views(
                 poly_no_price,
                 cex_price: observed.and_then(|item| item.cex_mid.and_then(|value| value.to_f64())),
                 fair_value: snapshot.as_ref().map(|item| item.fair_value),
-                has_position: position_views
-                    .iter()
-                    .any(|position| position.market == market.symbol.0),
+                has_position,
                 minutes_to_expiry: snapshot.as_ref().map(|item| item.minutes_to_expiry),
                 active_token_side,
                 poly_updated_at_ms: async_snapshot
@@ -9961,6 +11656,10 @@ fn build_market_views(
                     .as_ref()
                     .map(|item| item.async_classification)
                     .unwrap_or_default(),
+                market_tier,
+                retention_reason,
+                last_focus_at_ms: observed.and_then(|item| item.last_focus_at_ms),
+                last_tradeable_at_ms: observed.and_then(|item| item.last_tradeable_at_ms),
             }
         })
         .collect()
@@ -10184,36 +11883,25 @@ fn register_open_trade_from_candidate(
     trade_book.register_open_signal(candidate, basis_entry_bps, 1.0, candidate.delta_estimate);
 }
 
-fn build_paper_slippage_config(settings: &Settings) -> SlippageConfig {
-    SlippageConfig {
-        poly_slippage_bps: settings.paper_slippage.poly_slippage_bps,
-        cex_slippage_bps: settings.paper_slippage.cex_slippage_bps,
-        min_liquidity: settings.paper_slippage.min_liquidity,
-        allow_partial_fill: settings.paper_slippage.allow_partial_fill,
-    }
-}
-
-fn build_paper_execution_stack(
+async fn build_paper_execution_stack(
     settings: &Settings,
     registry: &SymbolRegistry,
     executor_start_ms: u64,
-) -> (
+    execution_mode: RuntimeExecutionMode,
+    live_market: Option<&MarketConfig>,
+) -> Result<(
     Arc<InMemoryOrderbookProvider>,
-    DryRunExecutor,
-    ExecutionManager<DryRunExecutor>,
-) {
-    let orderbook_provider = Arc::new(InMemoryOrderbookProvider::new());
-    let executor = DryRunExecutor::with_orderbook_and_start_timestamp(
-        orderbook_provider.clone(),
-        build_paper_slippage_config(settings),
+    RuntimeExecutor,
+    ExecutionManager<RuntimeExecutor>,
+)> {
+    build_execution_stack(
+        settings,
+        registry,
+        execution_mode,
         executor_start_ms,
-    );
-    let execution = ExecutionManager::with_symbol_registry_and_orderbook_provider(
-        executor.clone(),
-        registry.clone(),
-        orderbook_provider.clone(),
-    );
-    (orderbook_provider, executor, execution)
+        live_market,
+    )
+    .await
 }
 
 fn update_paper_orderbook(
@@ -10221,21 +11909,7 @@ fn update_paper_orderbook(
     registry: &SymbolRegistry,
     snapshot: &polyalpha_core::OrderBookSnapshot,
 ) {
-    match snapshot.instrument {
-        InstrumentKind::CexPerp => {
-            let venue_symbol = registry
-                .get_config(&snapshot.symbol)
-                .map(|config| cex_venue_symbol(config.hedge_exchange, &config.cex_symbol))
-                .unwrap_or_else(|| {
-                    cex_venue_symbol(
-                        snapshot.exchange,
-                        &snapshot.symbol.0.to_ascii_uppercase().replace('-', ""),
-                    )
-                });
-            provider.update_cex(snapshot.clone(), venue_symbol);
-        }
-        InstrumentKind::PolyYes | InstrumentKind::PolyNo => provider.update(snapshot.clone()),
-    }
+    apply_orderbook_snapshot(provider, registry, snapshot);
 }
 
 fn record_signal_rejection(stats: &mut PaperStats, reason: impl Into<String>) {
@@ -10389,6 +12063,12 @@ fn opening_signal_rejection_reasons(events: &[ExecutionEvent]) -> Vec<String> {
     reasons
 }
 
+fn execution_events_include_trade_plan_created(events: &[ExecutionEvent]) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, ExecutionEvent::TradePlanCreated { .. }))
+}
+
 fn track_open_signal_execution_outcome(
     stats: &mut PaperStats,
     recent_events: &mut VecDeque<PaperEventLog>,
@@ -10443,8 +12123,8 @@ fn build_multi_snapshot(
     observed_map: &HashMap<Symbol, ObservedState>,
     stats: &PaperStats,
     risk: &InMemoryRiskManager,
-    execution: &ExecutionManager<DryRunExecutor>,
-    executor: &DryRunExecutor,
+    execution: &ExecutionManager<RuntimeExecutor>,
+    executor: &RuntimeExecutor,
 ) -> Result<PaperSnapshot> {
     let risk_snapshot = risk.build_snapshot(now_millis());
     let focus_market = markets
@@ -10560,6 +12240,7 @@ fn build_multi_monitor_state(
     observed_map: &HashMap<Symbol, ObservedState>,
     stats: &PaperStats,
     risk: &InMemoryRiskManager,
+    execution: &ExecutionManager<RuntimeExecutor>,
     trade_book: &mut TradeBook,
     command_center: &Arc<Mutex<CommandCenter>>,
     paused: bool,
@@ -10567,6 +12248,7 @@ fn build_multi_monitor_state(
     start_time_ms: u64,
     now_ms: u64,
     recent_events: &[MonitorEvent],
+    trading_mode: polyalpha_core::TradingMode,
 ) -> MonitorState {
     build_monitor_state_common(
         settings,
@@ -10575,6 +12257,7 @@ fn build_multi_monitor_state(
         observed_map,
         stats,
         risk,
+        execution,
         trade_book,
         command_center,
         paused,
@@ -10582,6 +12265,7 @@ fn build_multi_monitor_state(
         start_time_ms,
         now_ms,
         recent_events,
+        trading_mode,
     )
 }
 
@@ -10630,6 +12314,63 @@ fn build_market_overrides(
     }
 
     overrides
+}
+
+fn format_ws_close_reason(
+    frame: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+) -> String {
+    match frame {
+        Some(frame) if frame.reason.is_empty() => format!("code={}", frame.code),
+        Some(frame) => format!("code={} reason={}", frame.code, frame.reason),
+        None => "peer closed without frame".to_owned(),
+    }
+}
+
+fn log_ws_warning(message: impl AsRef<str>) {
+    let message = message.as_ref();
+    eprintln!("{message}");
+    tracing::warn!("{message}");
+}
+
+async fn run_ws_future_with_timeout<F, T>(
+    future: F,
+    timeout_duration: Duration,
+    label: String,
+) -> Result<T>
+where
+    F: Future<Output = std::result::Result<T, tokio_tungstenite::tungstenite::Error>>,
+{
+    match tokio::time::timeout(timeout_duration, future).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(anyhow!("{label} failed: {err}")),
+        Err(_) => Err(anyhow!(
+            "{label} timed out after {}ms",
+            timeout_duration.as_millis()
+        )),
+    }
+}
+
+async fn abort_join_handles(handles: &mut Vec<JoinHandle<()>>) {
+    for handle in handles.iter() {
+        handle.abort();
+    }
+    while let Some(handle) = handles.pop() {
+        let _ = handle.await;
+    }
+}
+
+async fn abort_optional_join_handle(handle: &mut Option<JoinHandle<()>>) {
+    if let Some(handle) = handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+fn ws_connect_delay_ms(base_backoff_ms: u64, stream_key: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    stream_key.hash(&mut hasher);
+    let jitter_ms = hasher.finish() % 2_000;
+    base_backoff_ms.saturating_add(jitter_ms)
 }
 
 #[cfg(test)]
@@ -10734,6 +12475,184 @@ mod tests {
         }
     }
 
+    fn cex_fill_with_price(
+        side: polyalpha_core::OrderSide,
+        price: i64,
+        fee: i64,
+        timestamp_ms: u64,
+    ) -> Fill {
+        Fill {
+            fill_id: format!("fill-cex-{timestamp_ms}"),
+            correlation_id: format!("corr-{timestamp_ms}"),
+            exchange: Exchange::Binance,
+            symbol: Symbol::new("btc-test"),
+            instrument: InstrumentKind::CexPerp,
+            order_id: polyalpha_core::OrderId(format!("ord-cex-{timestamp_ms}")),
+            side,
+            price: Price(Decimal::new(price, 0)),
+            quantity: VenueQuantity::CexBaseQty(polyalpha_core::CexBaseQty(Decimal::new(1, 3))),
+            notional_usd: UsdNotional(Decimal::new(price / 1000, 0)),
+            fee: UsdNotional(Decimal::new(fee, 0)),
+            is_maker: false,
+            timestamp_ms,
+        }
+    }
+
+    fn sample_execution_result_with_funding(funding_cost_usd: i64) -> ExecutionResult {
+        ExecutionResult {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            plan_id: "plan-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            symbol: Symbol::new("btc-test"),
+            status: "completed".to_owned(),
+            poly_order_ledger: Vec::new(),
+            cex_order_ledger: Vec::new(),
+            actual_poly_cost_usd: UsdNotional::ZERO,
+            actual_cex_cost_usd: UsdNotional(Decimal::new(100, 0)),
+            actual_poly_fee_usd: UsdNotional::ZERO,
+            actual_cex_fee_usd: UsdNotional::ZERO,
+            actual_funding_cost_usd: UsdNotional(Decimal::new(funding_cost_usd, 0)),
+            realized_edge_usd: UsdNotional::ZERO,
+            plan_vs_fill_deviation_usd: UsdNotional::ZERO,
+            actual_residual_delta: 0.0,
+            actual_shock_loss_up_1pct: UsdNotional::ZERO,
+            actual_shock_loss_down_1pct: UsdNotional::ZERO,
+            actual_shock_loss_up_2pct: UsdNotional::ZERO,
+            actual_shock_loss_down_2pct: UsdNotional::ZERO,
+            recovery_required: false,
+            timestamp_ms: 1,
+        }
+    }
+
+    fn sample_trade_plan() -> TradePlan {
+        TradePlan {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            plan_id: "plan-1".to_owned(),
+            parent_plan_id: None,
+            supersedes_plan_id: None,
+            idempotency_key: "idem-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            symbol: Symbol::new("btc-test"),
+            intent_type: "open_position".to_owned(),
+            priority: "open_position".to_owned(),
+            recovery_decision_reason: None,
+            created_at_ms: 1_000,
+            poly_exchange_timestamp_ms: 1_000,
+            poly_received_at_ms: 1_001,
+            poly_sequence: 11,
+            cex_exchange_timestamp_ms: 1_002,
+            cex_received_at_ms: 1_003,
+            cex_sequence: 21,
+            plan_hash: "hash-1".to_owned(),
+            poly_side: polyalpha_core::OrderSide::Buy,
+            poly_token_side: TokenSide::Yes,
+            poly_sizing_mode: "buy_budget_cap".to_owned(),
+            poly_requested_shares: PolyShares(Decimal::new(10, 0)),
+            poly_planned_shares: PolyShares(Decimal::new(10, 0)),
+            poly_max_cost_usd: UsdNotional(Decimal::new(100, 0)),
+            poly_max_avg_price: Price(Decimal::new(35, 2)),
+            poly_max_shares: PolyShares(Decimal::new(10, 0)),
+            poly_min_avg_price: Price(Decimal::ZERO),
+            poly_min_proceeds_usd: UsdNotional::ZERO,
+            poly_book_avg_price: Price(Decimal::new(34, 2)),
+            poly_executable_price: Price(Decimal::new(35, 2)),
+            poly_friction_cost_usd: UsdNotional(Decimal::new(2, 1)),
+            poly_fee_usd: UsdNotional(Decimal::new(1, 1)),
+            cex_side: polyalpha_core::OrderSide::Sell,
+            cex_planned_qty: polyalpha_core::CexBaseQty(Decimal::new(25, 3)),
+            cex_book_avg_price: Price(Decimal::new(100_000, 0)),
+            cex_executable_price: Price(Decimal::new(100_010, 0)),
+            cex_friction_cost_usd: UsdNotional(Decimal::new(2, 1)),
+            cex_fee_usd: UsdNotional(Decimal::new(1, 1)),
+            raw_edge_usd: UsdNotional(Decimal::new(12, 0)),
+            planned_edge_usd: UsdNotional(Decimal::new(10, 0)),
+            expected_funding_cost_usd: UsdNotional(Decimal::new(1, 1)),
+            residual_risk_penalty_usd: UsdNotional(Decimal::new(1, 1)),
+            post_rounding_residual_delta: 0.01,
+            shock_loss_up_1pct: UsdNotional(Decimal::new(3, 0)),
+            shock_loss_down_1pct: UsdNotional(Decimal::new(3, 0)),
+            shock_loss_up_2pct: UsdNotional(Decimal::new(6, 0)),
+            shock_loss_down_2pct: UsdNotional(Decimal::new(6, 0)),
+            plan_ttl_ms: 250,
+            max_poly_sequence_drift: 1,
+            max_cex_sequence_drift: 1,
+            max_poly_price_move: Price(Decimal::new(1, 3)),
+            max_cex_price_move: Price(Decimal::new(50, 0)),
+            min_planned_edge_usd: UsdNotional(Decimal::new(1, 0)),
+            max_residual_delta: 0.05,
+            max_shock_loss_usd: UsdNotional(Decimal::new(8, 0)),
+            max_plan_vs_fill_deviation_usd: UsdNotional(Decimal::new(5, 0)),
+        }
+    }
+
+    fn poly_book_snapshot(
+        token_side: TokenSide,
+        sequence: u64,
+    ) -> polyalpha_core::OrderBookSnapshot {
+        polyalpha_core::OrderBookSnapshot {
+            exchange: Exchange::Polymarket,
+            symbol: Symbol::new("btc-test"),
+            instrument: match token_side {
+                TokenSide::Yes => InstrumentKind::PolyYes,
+                TokenSide::No => InstrumentKind::PolyNo,
+            },
+            bids: vec![polyalpha_core::PriceLevel {
+                price: Price(Decimal::new(44, 2)),
+                quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(500, 0))),
+            }],
+            asks: vec![polyalpha_core::PriceLevel {
+                price: Price(Decimal::new(46, 2)),
+                quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(500, 0))),
+            }],
+            exchange_timestamp_ms: 1_000 + sequence,
+            received_at_ms: 1_100 + sequence,
+            sequence,
+            last_trade_price: None,
+        }
+    }
+
+    fn cex_book_snapshot(sequence: u64) -> polyalpha_core::OrderBookSnapshot {
+        polyalpha_core::OrderBookSnapshot {
+            exchange: Exchange::Binance,
+            symbol: Symbol::new("btc-test"),
+            instrument: InstrumentKind::CexPerp,
+            bids: vec![polyalpha_core::PriceLevel {
+                price: Price(Decimal::new(99_990, 0)),
+                quantity: VenueQuantity::CexBaseQty(polyalpha_core::CexBaseQty(Decimal::new(
+                    500, 0,
+                ))),
+            }],
+            asks: vec![polyalpha_core::PriceLevel {
+                price: Price(Decimal::new(100_010, 0)),
+                quantity: VenueQuantity::CexBaseQty(polyalpha_core::CexBaseQty(Decimal::new(
+                    500, 0,
+                ))),
+            }],
+            exchange_timestamp_ms: 2_000 + sequence,
+            received_at_ms: 2_100 + sequence,
+            sequence,
+            last_trade_price: None,
+        }
+    }
+
+    fn seed_runtime_books(
+        provider: &InMemoryOrderbookProvider,
+        registry: &SymbolRegistry,
+        sequence: u64,
+    ) {
+        update_paper_orderbook(
+            provider,
+            registry,
+            &poly_book_snapshot(TokenSide::Yes, sequence),
+        );
+        update_paper_orderbook(
+            provider,
+            registry,
+            &poly_book_snapshot(TokenSide::No, sequence),
+        );
+        update_paper_orderbook(provider, registry, &cex_book_snapshot(sequence));
+    }
+
     fn test_recent_event(kind: &str, summary: impl Into<String>) -> PaperEventLog {
         PaperEventLog {
             seq: 0,
@@ -10784,6 +12703,11 @@ mod tests {
                 clob_api_url: "https://example.com".to_owned(),
                 ws_url: "wss://example.com/ws".to_owned(),
                 chain_id: 137,
+                private_key: None,
+                signature_type: None,
+                funder: None,
+                api_key_nonce: None,
+                use_server_time: true,
             },
             binance: BinanceConfig {
                 rest_url: "https://example.com".to_owned(),
@@ -10823,6 +12747,7 @@ mod tests {
                     max_position_usd: UsdNotional(Decimal::new(100, 0)),
                     delta_rebalance_threshold: Decimal::new(5, 2),
                     delta_rebalance_interval_secs: 60,
+                    band_policy: polyalpha_core::BandPolicyMode::ConfiguredBand,
                     min_poly_price: min_price,
                     max_poly_price: max_price,
                     max_data_age_minutes: 1,
@@ -10860,6 +12785,7 @@ mod tests {
             },
             paper: PaperTradingConfig::default(),
             paper_slippage: PaperSlippageConfig::default(),
+            execution_costs: polyalpha_core::ExecutionCostConfig::default(),
             audit: AuditConfig::default(),
         }
     }
@@ -10920,6 +12846,7 @@ mod tests {
     fn paper_artifact_rejects_incompatible_schema_version() {
         let artifact = PaperArtifact {
             schema_version: PAPER_ARTIFACT_SCHEMA_VERSION,
+            trading_mode: polyalpha_core::TradingMode::Paper,
             env: "test".to_owned(),
             market_index: 0,
             market: "btc-test".to_owned(),
@@ -10975,6 +12902,273 @@ mod tests {
     }
 
     #[test]
+    fn paper_artifact_defaults_missing_trading_mode_to_paper() {
+        let artifact = PaperArtifact {
+            schema_version: PAPER_ARTIFACT_SCHEMA_VERSION,
+            trading_mode: polyalpha_core::TradingMode::Paper,
+            env: "test".to_owned(),
+            market_index: 0,
+            market: "btc-test".to_owned(),
+            hedge_exchange: "Binance".to_owned(),
+            market_data_mode: Some("poll".to_owned()),
+            poll_interval_ms: 1_000,
+            depth: 5,
+            include_funding: false,
+            ticks_processed: 0,
+            final_snapshot: PaperSnapshot {
+                tick_index: 0,
+                market: "btc-test".to_owned(),
+                hedge_exchange: "Binance".to_owned(),
+                hedge_symbol: "BTCUSDT".to_owned(),
+                market_phase: "Trading".to_owned(),
+                connections: Vec::new(),
+                poly_yes_mid: None,
+                poly_no_mid: None,
+                cex_mid: None,
+                current_basis: None,
+                signal_token_side: None,
+                current_zscore: None,
+                current_fair_value: None,
+                current_delta: None,
+                cex_reference_price: None,
+                hedge_state: "Idle".to_owned(),
+                last_signal_id: None,
+                open_orders: 0,
+                active_dmm_orders: 0,
+                signals_seen: 0,
+                signals_rejected: 0,
+                order_submitted: 0,
+                order_cancelled: 0,
+                fills: 0,
+                state_changes: 0,
+                poll_errors: 0,
+                total_exposure_usd: "0".to_owned(),
+                daily_pnl_usd: "0".to_owned(),
+                breaker: "Closed".to_owned(),
+                positions: Vec::new(),
+            },
+            open_orders: Vec::new(),
+            recent_events: Vec::new(),
+            snapshots: Vec::new(),
+        };
+        let mut raw = serde_json::to_value(artifact).expect("serialize artifact");
+        raw.as_object_mut()
+            .expect("artifact object")
+            .remove("trading_mode");
+
+        let artifact: PaperArtifact = serde_json::from_value(raw).expect("artifact without mode");
+
+        assert_eq!(artifact.trading_mode, polyalpha_core::TradingMode::Paper);
+    }
+
+    #[test]
+    fn artifact_path_uses_live_directory_for_live_mode() {
+        let data_dir = unique_test_data_dir("live-artifact-path");
+        let mut settings = test_settings_with_price_filter(None, None);
+        settings.general.data_dir = data_dir.clone();
+
+        let path = artifact_path(&settings, "paper-trial", polyalpha_core::TradingMode::Live)
+            .expect("live artifact path");
+
+        assert!(path.ends_with("live/paper-trial-last-run.json"));
+
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn multi_ws_runtime_persists_live_artifact_even_when_ws_bootstrap_fails() {
+        let data_dir = unique_test_data_dir("live-multi-ws-artifact");
+        let socket_path = PathBuf::from(&data_dir).join("monitor.sock");
+        let mut settings = test_settings_with_price_filter(None, None);
+        settings.general.data_dir = data_dir.clone();
+        settings.general.monitor_socket_path = socket_path.display().to_string();
+        settings.strategy.market_data.mode = MarketDataMode::Ws;
+        settings.polymarket.clob_api_url = "http://127.0.0.1:9".to_owned();
+        settings.polymarket.ws_url = "ws://127.0.0.1:9/ws/market".to_owned();
+        settings.binance.rest_url = "http://127.0.0.1:9".to_owned();
+        settings.binance.ws_url = "ws://127.0.0.1:9/ws".to_owned();
+        settings.okx.rest_url = "http://127.0.0.1:9".to_owned();
+        settings.okx.ws_public_url = "ws://127.0.0.1:9/ws/public".to_owned();
+        settings.okx.ws_private_url = "ws://127.0.0.1:9/ws/private".to_owned();
+        settings.audit.enabled = false;
+
+        run_paper_multi_ws_mode(
+            "live-multi-artifact",
+            settings.clone(),
+            0,
+            1,
+            1,
+            5,
+            false,
+            false,
+            0,
+            RuntimeExecutionMode::LiveMock,
+            polyalpha_core::TradingMode::Live,
+        )
+        .await
+        .expect("runtime should complete even when bootstrap endpoints fail");
+
+        let artifact_path = artifact_path(
+            &settings,
+            "live-multi-artifact",
+            polyalpha_core::TradingMode::Live,
+        )
+        .expect("artifact path");
+        assert!(
+            artifact_path.exists(),
+            "multi-market ws runtime should persist live artifact at {}",
+            artifact_path.display()
+        );
+
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn market_retention_reason_prefers_active_plan_over_position() {
+        assert_eq!(
+            market_retention_reason(true, Some("force_exit")),
+            polyalpha_core::MarketRetentionReason::ForceExit
+        );
+        assert_eq!(
+            market_retention_reason(true, Some("residual_recovery")),
+            polyalpha_core::MarketRetentionReason::ResidualRecovery
+        );
+        assert_eq!(
+            market_retention_reason(true, Some("close_position")),
+            polyalpha_core::MarketRetentionReason::CloseInProgress
+        );
+        assert_eq!(
+            market_retention_reason(true, Some("delta_rebalance")),
+            polyalpha_core::MarketRetentionReason::DeltaRebalance
+        );
+        assert_eq!(
+            market_retention_reason(true, None),
+            polyalpha_core::MarketRetentionReason::HasPosition
+        );
+        assert_eq!(
+            market_retention_reason(false, None),
+            polyalpha_core::MarketRetentionReason::None
+        );
+    }
+
+    #[test]
+    fn record_market_tier_activity_updates_focus_and_tradeable_timestamps() {
+        let mut observed = ObservedState::default();
+        note_focus_market_activity(&mut observed, 1_000);
+        assert_eq!(observed.last_focus_at_ms, Some(1_000));
+        assert_eq!(observed.last_tradeable_at_ms, None);
+
+        note_tradeable_market_activity(&mut observed, 1_500);
+        assert_eq!(observed.last_focus_at_ms, Some(1_500));
+        assert_eq!(observed.last_tradeable_at_ms, Some(1_500));
+    }
+
+    #[test]
+    fn determine_market_tier_distinguishes_tradeable_focus_and_observation() {
+        let settings = test_settings_with_price_filter(None, None);
+        let healthy = AsyncMarketSnapshot {
+            poly_updated_at_ms: Some(1_900),
+            cex_updated_at_ms: Some(1_950),
+            poly_quote_age_ms: Some(100),
+            cex_quote_age_ms: Some(50),
+            cross_leg_skew_ms: Some(50),
+            transport_idle_ms_by_connection: HashMap::new(),
+            evaluable_status: EvaluableStatus::Evaluable,
+            async_classification: AsyncClassification::BalancedFresh,
+        };
+        let unhealthy = AsyncMarketSnapshot {
+            evaluable_status: EvaluableStatus::PolyQuoteStale,
+            async_classification: AsyncClassification::PolyQuoteStale,
+            ..healthy.clone()
+        };
+
+        assert_eq!(
+            determine_market_tier(
+                &settings,
+                Some(&healthy),
+                polyalpha_core::MarketRetentionReason::None,
+                false,
+                Some(1_990),
+                Some(1_995),
+                2_000,
+            ),
+            polyalpha_core::MarketTier::Tradeable
+        );
+        assert_eq!(
+            determine_market_tier(
+                &settings,
+                Some(&healthy),
+                polyalpha_core::MarketRetentionReason::None,
+                true,
+                Some(1_990),
+                None,
+                2_000,
+            ),
+            polyalpha_core::MarketTier::Focus
+        );
+        assert_eq!(
+            determine_market_tier(
+                &settings,
+                Some(&unhealthy),
+                polyalpha_core::MarketRetentionReason::HasPosition,
+                false,
+                None,
+                Some(1_995),
+                2_000,
+            ),
+            polyalpha_core::MarketTier::Focus
+        );
+        assert_eq!(
+            determine_market_tier(
+                &settings,
+                Some(&unhealthy),
+                polyalpha_core::MarketRetentionReason::None,
+                false,
+                None,
+                Some(1_995),
+                2_000,
+            ),
+            polyalpha_core::MarketTier::Observation
+        );
+    }
+
+    #[test]
+    fn execution_events_include_trade_plan_created_only_when_plan_exists() {
+        assert!(!execution_events_include_trade_plan_created(&[
+            rejected_order_submitted_event("price_filter"),
+        ]));
+        assert!(execution_events_include_trade_plan_created(&[
+            ExecutionEvent::TradePlanCreated {
+                plan: sample_trade_plan(),
+            },
+        ]));
+    }
+
+    #[test]
+    fn resolve_artifact_for_read_keeps_legacy_fallback_paper_only() {
+        let data_dir = unique_test_data_dir("legacy-paper-fallback");
+        let mut settings = test_settings_with_price_filter(None, None);
+        settings.general.data_dir = data_dir.clone();
+
+        let paper_dir = PathBuf::from(&data_dir).join("paper");
+        fs::create_dir_all(&paper_dir).expect("create paper dir");
+        let legacy_path = paper_dir.join("paper-trial-last-session.json");
+        fs::write(&legacy_path, "{}").expect("write legacy artifact");
+
+        let paper =
+            resolve_artifact_for_read(&settings, "paper-trial", polyalpha_core::TradingMode::Paper)
+                .expect("paper artifact path");
+        let live =
+            resolve_artifact_for_read(&settings, "paper-trial", polyalpha_core::TradingMode::Live)
+                .expect("live artifact path");
+
+        assert_eq!(paper, legacy_path);
+        assert!(live.ends_with("live/paper-trial-last-run.json"));
+
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
     fn add_trigger_details_formats_structured_residual_snapshot() {
         let intent = PlanningIntent::ResidualRecovery {
             schema_version: PLANNING_SCHEMA_VERSION,
@@ -11004,15 +13198,422 @@ mod tests {
         assert!(snapshot_detail.contains("preferred_cex_side=Buy"));
     }
 
-    #[test]
-    fn paper_execution_stack_wires_orderbook_provider_into_execution_manager() {
+    #[tokio::test]
+    async fn paper_execution_stack_wires_orderbook_provider_into_execution_manager() {
         let settings = test_settings_with_price_filter(None, None);
         let registry = SymbolRegistry::new(settings.markets.clone());
 
-        let (_provider, _executor, execution) =
-            build_paper_execution_stack(&settings, &registry, 1_700_000_000_000);
+        let (_provider, _executor, execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
 
         assert!(execution.orderbook_provider().is_some());
+    }
+
+    #[tokio::test]
+    async fn emergency_stop_submits_force_exit_when_position_exists() {
+        let mut settings = test_settings_with_price_filter(None, None);
+        let market = settings.markets[0].clone();
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let (provider, _executor, mut execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
+        seed_runtime_books(&provider, &registry, 1);
+
+        let mut engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
+        let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        let mut stats = PaperStats::default();
+        let mut recent_events = VecDeque::new();
+        let mut trade_book = TradeBook::default();
+        let mut candidate = open_candidate(TokenSide::Yes);
+        candidate.fair_value = 0.70;
+        candidate.raw_mispricing = 0.24;
+        candidate.delta_estimate = 0.0005;
+        let open_trigger = RuntimeTrigger::Candidate(candidate.clone());
+        let open_events = execution
+            .process_intent(open_intent_from_candidate(&candidate))
+            .await
+            .expect("seed open position");
+        let mut no_audit = None;
+        apply_execution_events(
+            &mut risk,
+            &mut stats,
+            &mut recent_events,
+            &mut trade_book,
+            Some(&open_trigger),
+            open_events,
+            &mut no_audit,
+        )
+        .await
+        .expect("apply open execution events");
+        sync_engine_position_state_from_runtime(
+            &mut engine,
+            &risk,
+            &trade_book,
+            &market.symbol,
+            Some(TokenSide::Yes),
+        );
+        let open_context = execution
+            .planning_context_for_symbol(&market.symbol)
+            .expect("open planning context");
+        assert!(open_context.current_poly_yes_shares > Decimal::ZERO);
+        recent_events.clear();
+
+        let command_center = Arc::new(Mutex::new(CommandCenter::default()));
+        command_center.lock().expect("command center").enqueue(
+            "cmd-emergency".to_owned(),
+            CommandKind::EmergencyStop,
+            10_000,
+        );
+        let paused = Arc::new(AtomicBool::new(false));
+        let emergency = Arc::new(AtomicBool::new(false));
+        let pre_emergency_paused = Arc::new(AtomicBool::new(false));
+
+        process_pending_command_single(
+            &command_center,
+            &paused,
+            &emergency,
+            &pre_emergency_paused,
+            &mut settings,
+            &market,
+            &mut engine,
+            &mut execution,
+            &mut risk,
+            &mut stats,
+            &mut recent_events,
+            &mut trade_book,
+            10_000,
+        )
+        .await
+        .expect("process emergency stop");
+
+        let center = command_center.lock().expect("command center");
+        let command = center
+            .commands
+            .get("cmd-emergency")
+            .expect("stored command");
+        assert_eq!(command.status, CommandStatus::Success);
+        assert!(command
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("紧急停止已激活")));
+        assert!(paused.load(Ordering::SeqCst));
+        assert!(emergency.load(Ordering::SeqCst));
+        let flattened_context = execution
+            .planning_context_for_symbol(&market.symbol)
+            .expect("flattened planning context");
+        assert_eq!(flattened_context.current_poly_yes_shares, Decimal::ZERO);
+        assert_eq!(flattened_context.current_poly_no_shares, Decimal::ZERO);
+        assert_eq!(flattened_context.current_cex_net_qty, Decimal::ZERO);
+        assert!(!risk
+            .position_tracker()
+            .symbol_has_open_position(&market.symbol));
+    }
+
+    #[tokio::test]
+    async fn delta_rebalance_emits_intent_when_threshold_exceeded() {
+        let settings = test_settings_with_price_filter(None, None);
+        let market = settings.markets[0].clone();
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let (provider, _executor, mut execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
+        seed_runtime_books(&provider, &registry, 2);
+
+        let mut engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
+        let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        risk.on_fill(&poly_fill(TokenSide::Yes))
+            .await
+            .expect("seed poly fill");
+        let mut stats = PaperStats::default();
+        let mut recent_events = VecDeque::new();
+        let mut trade_book = TradeBook::default();
+        trade_book.register_open_signal(&open_candidate(TokenSide::Yes), 0, 1.0, 0.25);
+        let observed_map = HashMap::from([(
+            market.symbol.clone(),
+            ObservedState {
+                cex_mid: Some(Decimal::new(100_000, 0)),
+                ..ObservedState::default()
+            },
+        )]);
+        let now_ms = 70_000;
+
+        maybe_execute_delta_rebalance(
+            &settings,
+            &observed_map,
+            &market.symbol,
+            &mut engine,
+            &mut execution,
+            &mut risk,
+            &mut stats,
+            &mut recent_events,
+            &mut trade_book,
+            now_ms,
+        )
+        .await
+        .expect("delta rebalance should execute");
+
+        assert_eq!(
+            stats
+                .last_delta_rebalance_at_ms
+                .get(&market.symbol)
+                .copied(),
+            Some(now_ms)
+        );
+        assert!(recent_events.iter().any(|event| {
+            event
+                .details
+                .as_ref()
+                .and_then(|details| details.get("动作"))
+                .is_some_and(|action| action == "Delta 再平衡意图")
+        }));
+    }
+
+    #[tokio::test]
+    async fn delta_rebalance_is_throttled_within_interval() {
+        let settings = test_settings_with_price_filter(None, None);
+        let market = settings.markets[0].clone();
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let (_provider, _executor, mut execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
+        let mut engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
+        let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        risk.on_fill(&poly_fill(TokenSide::Yes))
+            .await
+            .expect("seed poly fill");
+        let mut stats = PaperStats::default();
+        let mut recent_events = VecDeque::new();
+        let mut trade_book = TradeBook::default();
+        trade_book.register_open_signal(&open_candidate(TokenSide::Yes), 0, 1.0, 0.25);
+        let last_ms = 10_000;
+        stats
+            .last_delta_rebalance_at_ms
+            .insert(market.symbol.clone(), last_ms);
+        let observed_map = HashMap::from([(
+            market.symbol.clone(),
+            ObservedState {
+                cex_mid: Some(Decimal::new(100_000, 0)),
+                ..ObservedState::default()
+            },
+        )]);
+
+        maybe_execute_delta_rebalance(
+            &settings,
+            &observed_map,
+            &market.symbol,
+            &mut engine,
+            &mut execution,
+            &mut risk,
+            &mut stats,
+            &mut recent_events,
+            &mut trade_book,
+            last_ms + 1_000,
+        )
+        .await
+        .expect("delta rebalance should be throttled");
+
+        assert_eq!(
+            stats
+                .last_delta_rebalance_at_ms
+                .get(&market.symbol)
+                .copied(),
+            Some(last_ms)
+        );
+        assert!(recent_events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ws_price_change_keeps_monotonic_poly_book_sequence() {
+        let settings = test_settings_with_price_filter(None, None);
+        let market = settings.markets[0].clone();
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let channels = create_channels(std::slice::from_ref(&market.symbol));
+        let manager = build_data_manager(&registry, channels.market_data_tx.clone());
+        let books = Arc::new(Mutex::new(HashMap::new()));
+        let mut market_data_rx = channels.market_data_tx.subscribe();
+
+        handle_polymarket_ws_text(
+            &manager,
+            &books,
+            r#"{
+                "asset_id": "yes",
+                "timestamp": "1715000000000",
+                "sequence": "7",
+                "bids": [{"price":"0.49","size":"12"}],
+                "asks": [{"price":"0.51","size":"13"}]
+            }"#,
+        )
+        .await
+        .expect("full snapshot should parse");
+        handle_polymarket_ws_text(
+            &manager,
+            &books,
+            r#"{
+                "event_type": "price_change",
+                "asset_id": "yes",
+                "timestamp": "1715000000123",
+                "changes": [{
+                    "price": "0.52",
+                    "size": "9",
+                    "side": "ask"
+                }]
+            }"#,
+        )
+        .await
+        .expect("price change should parse");
+
+        let mut observed_sequences = Vec::new();
+        loop {
+            match market_data_rx.try_recv() {
+                Ok(MarketDataEvent::OrderBookUpdate { snapshot })
+                    if snapshot.exchange == Exchange::Polymarket
+                        && snapshot.instrument == InstrumentKind::PolyYes =>
+                {
+                    observed_sequences.push(snapshot.sequence);
+                }
+                Ok(_) => continue,
+                Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+                Err(TryRecvError::Lagged(_)) => continue,
+            }
+        }
+
+        assert_eq!(observed_sequences.first().copied(), Some(7));
+        assert_eq!(observed_sequences.get(1).copied(), Some(8));
+    }
+
+    #[test]
+    fn extract_plan_rejection_reason_recognizes_revalidation_failure_codes() {
+        assert_eq!(
+            extract_plan_rejection_reason(
+                "plan revalidation failed [poly_price_move_exceeded] and replan rejected [non_positive_planned_edge]: price drift exceeded tolerance"
+            ),
+            Some("poly_price_move_exceeded".to_owned())
+        );
+    }
+
+    #[test]
+    fn armed_live_requires_confirmation() {
+        let err = resolve_live_execution_mode(LiveExecutorMode::Live, false)
+            .expect_err("armed live should require confirmation");
+
+        assert!(err.to_string().contains("--confirm-live"));
+    }
+
+    #[test]
+    fn armed_live_allows_multi_market_runtime_when_confirmed() {
+        let mode = resolve_live_execution_mode(LiveExecutorMode::Live, true)
+            .expect("armed live should remain available until runtime venue validation");
+
+        assert_eq!(mode, RuntimeExecutionMode::Live);
+    }
+
+    #[test]
+    fn recovery_plan_payload_surfaces_recovery_reason_code() {
+        let plan: TradePlan = serde_json::from_str(
+            r#"{
+                "schema_version": 1,
+                "plan_id": "plan-recovery-1",
+                "parent_plan_id": null,
+                "supersedes_plan_id": null,
+                "idempotency_key": "idem-recovery-1",
+                "correlation_id": "corr-1",
+                "symbol": "btc-test",
+                "intent_type": "residual_recovery",
+                "priority": "residual_recovery",
+                "created_at_ms": 1,
+                "poly_exchange_timestamp_ms": 1,
+                "poly_received_at_ms": 1,
+                "poly_sequence": 1,
+                "cex_exchange_timestamp_ms": 1,
+                "cex_received_at_ms": 1,
+                "cex_sequence": 1,
+                "plan_hash": "hash-recovery-1",
+                "poly_side": "Sell",
+                "poly_token_side": "Yes",
+                "poly_sizing_mode": "sell_exact_shares",
+                "poly_requested_shares": "10",
+                "poly_planned_shares": "10",
+                "poly_max_cost_usd": "0",
+                "poly_max_avg_price": "0",
+                "poly_max_shares": "0",
+                "poly_min_avg_price": "0.42",
+                "poly_min_proceeds_usd": "0",
+                "poly_book_avg_price": "0.42",
+                "poly_executable_price": "0.42",
+                "poly_friction_cost_usd": "0.1",
+                "poly_fee_usd": "0.02",
+                "cex_side": "Buy",
+                "cex_planned_qty": "0.005",
+                "cex_book_avg_price": "100000",
+                "cex_executable_price": "100010",
+                "cex_friction_cost_usd": "0.03",
+                "cex_fee_usd": "0.01",
+                "raw_edge_usd": "1.2",
+                "planned_edge_usd": "0.9",
+                "expected_funding_cost_usd": "0.01",
+                "residual_risk_penalty_usd": "0.02",
+                "post_rounding_residual_delta": 0.001,
+                "shock_loss_up_1pct": "0.1",
+                "shock_loss_down_1pct": "0.1",
+                "shock_loss_up_2pct": "0.2",
+                "shock_loss_down_2pct": "0.2",
+                "plan_ttl_ms": 250,
+                "max_poly_sequence_drift": 1,
+                "max_cex_sequence_drift": 1,
+                "max_poly_price_move": "0.01",
+                "max_cex_price_move": "50",
+                "min_planned_edge_usd": "0.01",
+                "max_residual_delta": 0.01,
+                "max_shock_loss_usd": "1.0",
+                "max_plan_vs_fill_deviation_usd": "0.5",
+                "recovery_decision_reason": "cex_top_up_faster"
+            }"#,
+        )
+        .expect("recovery trade plan");
+
+        let payload =
+            execution_event_monitor_payload(&ExecutionEvent::RecoveryPlanCreated { plan }, None)
+                .expect("recovery payload");
+
+        let MonitorEventPayload::ExecutionPipeline(view) = payload;
+        assert_eq!(
+            view.recovery_decision_reason.as_deref(),
+            Some("cex_top_up_faster")
+        );
     }
 
     #[test]
@@ -11153,12 +13754,136 @@ mod tests {
     }
 
     #[test]
+    fn format_ws_close_reason_handles_missing_and_explicit_reason() {
+        assert_eq!(
+            format_ws_close_reason(None),
+            "peer closed without frame".to_owned()
+        );
+
+        let close_frame = tokio_tungstenite::tungstenite::protocol::CloseFrame {
+            code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+            reason: "heartbeat timeout".into(),
+        };
+        assert_eq!(
+            format_ws_close_reason(Some(&close_frame)),
+            "code=1008 reason=heartbeat timeout".to_owned()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_ws_future_with_timeout_times_out_slow_connect_attempts() {
+        let err = run_ws_future_with_timeout(
+            async {
+                sleep(Duration::from_millis(50)).await;
+                Ok::<(), tokio_tungstenite::tungstenite::Error>(())
+            },
+            Duration::from_millis(5),
+            "polymarket ws connect".to_owned(),
+        )
+        .await
+        .expect_err("slow ws future should time out");
+
+        assert!(err
+            .to_string()
+            .contains("polymarket ws connect timed out after 5ms"));
+    }
+
+    #[test]
+    fn ws_connect_delay_ms_is_deterministic_and_spread() {
+        let first = ws_connect_delay_ms(1_000, "binance:BTCUSDT");
+        let second = ws_connect_delay_ms(1_000, "binance:BTCUSDT");
+        let other = ws_connect_delay_ms(1_000, "polymarket:market");
+
+        assert_eq!(first, second);
+        assert!(first >= 1_000);
+        assert!(first < 3_000);
+        assert!(other >= 1_000);
+        assert!(other < 3_000);
+    }
+
+    #[tokio::test]
+    async fn abort_join_handles_aborts_and_drains_spawned_tasks() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct DropMarker(Arc<AtomicUsize>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let dropped = dropped.clone();
+            handles.push(tokio::spawn(async move {
+                let _marker = DropMarker(dropped);
+                sleep(Duration::from_secs(60)).await;
+            }));
+        }
+        tokio::task::yield_now().await;
+
+        abort_join_handles(&mut handles).await;
+
+        assert!(handles.is_empty());
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn apply_config_update_accepts_band_policy_disabled() {
+        let mut settings =
+            test_settings_with_price_filter(Some(Decimal::new(2, 1)), Some(Decimal::new(8, 1)));
+        let mut engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
+        let update = polyalpha_core::ConfigUpdate {
+            band_policy: Some("disabled".to_owned()),
+            min_poly_price: Some(0.0),
+            max_poly_price: Some(1.0),
+            ..polyalpha_core::ConfigUpdate::default()
+        };
+
+        let changed = apply_runtime_config_update(&mut settings, &mut engine, &update)
+            .expect("config update");
+
+        assert!(changed.contains("价格带策略=disabled"));
+        assert_eq!(
+            settings.strategy.basis.band_policy,
+            polyalpha_core::BandPolicyMode::Disabled
+        );
+    }
+
+    #[test]
+    fn gate_reason_label_zh_distinguishes_band_policy_rejections() {
+        assert_eq!(
+            gate_reason_label_zh("price_filter", "below_min_poly_price"),
+            "低于最小 Poly 价格带"
+        );
+        assert_eq!(
+            gate_reason_label_zh("price_filter", "above_or_equal_max_poly_price"),
+            "高于或等于最大 Poly 价格带"
+        );
+        assert_eq!(
+            gate_reason_label_zh("price_filter", "missing_poly_quote"),
+            "缺少 Poly 报价"
+        );
+    }
+
+    #[test]
     fn paper_audit_runtime_warehouse_sync_error_is_non_fatal() {
         let data_dir = unique_test_data_dir("paper-audit-runtime-sync");
         let settings = test_settings_with_audit_data_dir(data_dir.clone());
         let start_ms = 1_000;
-        let mut audit = PaperAudit::start(&settings, "test-env", &settings.markets, start_ms)
-            .expect("start paper audit");
+        let mut audit = PaperAudit::start(
+            &settings,
+            "test-env",
+            &settings.markets,
+            start_ms,
+            polyalpha_core::TradingMode::Paper,
+        )
+        .expect("start paper audit");
         let session_id = audit.session_id().to_owned();
 
         break_audit_warehouse_path(&data_dir);
@@ -11190,8 +13915,14 @@ mod tests {
         let data_dir = unique_test_data_dir("paper-audit-finalize-sync");
         let settings = test_settings_with_audit_data_dir(data_dir.clone());
         let start_ms = 1_000;
-        let mut audit = PaperAudit::start(&settings, "test-env", &settings.markets, start_ms)
-            .expect("start paper audit");
+        let mut audit = PaperAudit::start(
+            &settings,
+            "test-env",
+            &settings.markets,
+            start_ms,
+            polyalpha_core::TradingMode::Paper,
+        )
+        .expect("start paper audit");
         let session_id = audit.session_id().to_owned();
 
         break_audit_warehouse_path(&data_dir);
@@ -11311,6 +14042,100 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn build_monitor_state_keeps_realized_pnl_after_position_is_flat() {
+        let settings = test_settings_with_price_filter(None, None);
+        let market = settings.markets[0].clone();
+        let mut engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
+        let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        risk.on_fill(&cex_fill_with_price(
+            polyalpha_core::OrderSide::Buy,
+            100_000,
+            0,
+            1,
+        ))
+        .await
+        .expect("entry fill");
+        risk.on_fill(&cex_fill_with_price(
+            polyalpha_core::OrderSide::Sell,
+            110_000,
+            0,
+            2,
+        ))
+        .await
+        .expect("exit fill");
+        sync_engine_position_state_from_runtime(
+            &mut engine,
+            &risk,
+            &TradeBook::default(),
+            &market.symbol,
+            Some(TokenSide::Yes),
+        );
+
+        let observed = ObservedState::default();
+        let mut trade_book = TradeBook::default();
+        let command_center = Arc::new(Mutex::new(CommandCenter::default()));
+        let execution = ExecutionManager::new(RuntimeExecutor::DryRun(DryRunExecutor::default()));
+        let monitor = build_monitor_state(
+            &settings,
+            &market,
+            &engine,
+            &observed,
+            &PaperStats::default(),
+            &risk,
+            &execution,
+            &mut trade_book,
+            &command_center,
+            false,
+            false,
+            0,
+            10,
+            &[],
+            polyalpha_core::TradingMode::Paper,
+        );
+
+        assert_eq!(
+            monitor.positions.len(),
+            0,
+            "flat positions stay out of the position table"
+        );
+        assert!(
+            (monitor.performance.total_pnl_usd - 10.0).abs() < f64::EPSILON,
+            "closed-position realized pnl should still contribute to monitor equity"
+        );
+    }
+
+    #[tokio::test]
+    async fn execution_result_funding_adjustment_hits_risk_accounting() {
+        let settings = test_settings_with_price_filter(None, None);
+        let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        let mut stats = PaperStats::default();
+        let mut recent_events = VecDeque::new();
+        let mut trade_book = TradeBook::default();
+        let mut audit = None;
+
+        apply_execution_events(
+            &mut risk,
+            &mut stats,
+            &mut recent_events,
+            &mut trade_book,
+            None,
+            vec![ExecutionEvent::ExecutionResultRecorded {
+                result: sample_execution_result_with_funding(3),
+            }],
+            &mut audit,
+        )
+        .await
+        .expect("funding adjustment should be applied");
+
+        let snapshot = risk.build_snapshot(10);
+        assert_eq!(snapshot.daily_pnl, UsdNotional(Decimal::new(-3, 0)));
+        assert_eq!(stats.total_pnl_usd, -3.0);
+    }
+
     #[test]
     fn observe_market_event_keeps_newer_ws_book_over_late_rest_snapshot() {
         let mut observed = ObservedState::default();
@@ -11401,6 +14226,23 @@ mod tests {
     }
 
     #[test]
+    fn candidate_passes_price_filter_ignores_limits_when_band_policy_is_disabled() {
+        let mut settings =
+            test_settings_with_price_filter(Some(Decimal::new(2, 1)), Some(Decimal::new(8, 1)));
+        settings.strategy.basis.band_policy = polyalpha_core::BandPolicyMode::Disabled;
+        let observed = ObservedState {
+            poly_yes_mid: Some(Decimal::new(9, 1)),
+            ..ObservedState::default()
+        };
+
+        assert!(candidate_passes_price_filter(
+            &open_candidate(TokenSide::Yes),
+            &observed,
+            &settings
+        ));
+    }
+
+    #[test]
     fn connection_counters_track_disconnect_and_reconnect() {
         let mut observed = ObservedState::default();
 
@@ -11483,7 +14325,7 @@ mod tests {
     }
 
     #[test]
-    fn market_data_activity_refreshes_connected_exchange_timestamp() {
+    fn market_data_activity_keeps_transport_status_until_explicit_reconnect() {
         let mut observed = ObservedState::default();
         record_connection_status(
             &mut observed,
@@ -11513,7 +14355,7 @@ mod tests {
 
         assert_eq!(
             observed.connections.get("Binance"),
-            Some(&ConnectionStatus::Connected)
+            Some(&ConnectionStatus::Reconnecting)
         );
         assert_eq!(
             observed.connection_updated_at_ms.get("Binance"),
@@ -11521,7 +14363,7 @@ mod tests {
         );
         assert_eq!(
             observed.connection_reconnect_count.get("Binance").copied(),
-            Some(1)
+            None
         );
         assert_eq!(
             observed
@@ -11529,6 +14371,165 @@ mod tests {
                 .get("Binance")
                 .copied(),
             Some(2_000)
+        );
+    }
+
+    #[test]
+    fn missing_connection_status_is_impaired_when_connections_are_required() {
+        let settings = test_settings_with_price_filter(None, None);
+        let market = settings.markets[0].clone();
+        let observed = ObservedState {
+            poly_yes_mid: Some(Decimal::new(5, 1)),
+            cex_mid: Some(Decimal::new(100_000, 0)),
+            poly_yes_updated_at_ms: Some(1_000),
+            cex_updated_at_ms: Some(1_050),
+            ..ObservedState::default()
+        };
+
+        let snapshot = classify_async_market(
+            1_500,
+            &market,
+            &observed,
+            freshness_thresholds(&settings),
+            Some(TokenSide::Yes),
+            false,
+            true,
+        );
+
+        assert_eq!(
+            snapshot.evaluable_status,
+            EvaluableStatus::ConnectionImpaired
+        );
+        assert_eq!(
+            snapshot.async_classification,
+            AsyncClassification::ConnectionImpaired
+        );
+    }
+
+    #[test]
+    fn exchange_connection_tracker_mark_connecting_publishes_event() {
+        let settings = test_settings_with_price_filter(None, None);
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let symbol = settings.markets[0].symbol.clone();
+        let channels = create_channels(std::slice::from_ref(&symbol));
+        let manager = build_data_manager(&registry, channels.market_data_tx.clone());
+        let tracker = ExchangeConnectionTracker::new(Exchange::Binance, manager);
+        let mut rx = channels.market_data_tx.subscribe();
+
+        tracker.mark_connecting();
+
+        match rx.try_recv() {
+            Ok(MarketDataEvent::ConnectionEvent { exchange, status }) => {
+                assert_eq!(exchange, Exchange::Binance);
+                assert_eq!(status, ConnectionStatus::Connecting);
+            }
+            other => panic!("unexpected tracker event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_proxy_url_supports_socks5_and_http_connect() {
+        assert_eq!(
+            parse_proxy_url("socks5://127.0.0.1:7897").expect("parse socks proxy"),
+            WsProxyConfig {
+                kind: WsProxyKind::Socks5,
+                endpoint: WsProxyEndpoint {
+                    host: "127.0.0.1".to_owned(),
+                    port: 7897,
+                },
+            }
+        );
+
+        assert_eq!(
+            parse_proxy_url("http://127.0.0.1:8080").expect("parse http proxy"),
+            WsProxyConfig {
+                kind: WsProxyKind::HttpConnect,
+                endpoint: WsProxyEndpoint {
+                    host: "127.0.0.1".to_owned(),
+                    port: 8080,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_scutil_proxy_config_extracts_enabled_endpoints() {
+        let proxy = parse_scutil_proxy_config(
+            r#"<dictionary> {
+  HTTPEnable : 1
+  HTTPPort : 7897
+  HTTPProxy : 127.0.0.1
+  HTTPSEnable : 1
+  HTTPSPort : 7898
+  HTTPSProxy : 127.0.0.2
+  SOCKSEnable : 1
+  SOCKSPort : 7899
+  SOCKSProxy : 127.0.0.3
+}"#,
+        );
+
+        assert_eq!(
+            proxy,
+            SystemProxyConfig {
+                socks: Some(WsProxyEndpoint {
+                    host: "127.0.0.3".to_owned(),
+                    port: 7899,
+                }),
+                https: Some(WsProxyEndpoint {
+                    host: "127.0.0.2".to_owned(),
+                    port: 7898,
+                }),
+                http: Some(WsProxyEndpoint {
+                    host: "127.0.0.1".to_owned(),
+                    port: 7897,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn select_ws_proxy_prefers_env_then_system_socks() {
+        let system = parse_scutil_proxy_config(
+            r#"<dictionary> {
+  HTTPEnable : 1
+  HTTPPort : 7897
+  HTTPProxy : 127.0.0.1
+  HTTPSEnable : 1
+  HTTPSPort : 7897
+  HTTPSProxy : 127.0.0.1
+  SOCKSEnable : 1
+  SOCKSPort : 7897
+  SOCKSProxy : 127.0.0.1
+}"#,
+        );
+
+        assert_eq!(
+            select_ws_proxy("wss", None, None, None, Some(&system)).expect("select system proxy"),
+            Some(WsProxyConfig {
+                kind: WsProxyKind::Socks5,
+                endpoint: WsProxyEndpoint {
+                    host: "127.0.0.1".to_owned(),
+                    port: 7897,
+                },
+            })
+        );
+
+        assert_eq!(
+            select_ws_proxy(
+                "wss",
+                Some("http://10.0.0.1:9000"),
+                None,
+                None,
+                Some(&system),
+            )
+            .expect("select env proxy"),
+            Some(WsProxyConfig {
+                kind: WsProxyKind::HttpConnect,
+                endpoint: WsProxyEndpoint {
+                    host: "10.0.0.1".to_owned(),
+                    port: 9000,
+                },
+            })
         );
     }
 
@@ -11597,5 +14598,13 @@ mod tests {
         assert_eq!(stats.evaluation_skipped, 0);
         assert!(stats.skip_reasons.is_empty());
         assert!(recent_events.is_empty());
+    }
+
+    #[test]
+    fn translate_risk_rejection_handles_zero_cex_hedge_qty() {
+        assert_eq!(
+            translate_risk_rejection("zero_cex_hedge_qty"),
+            "CEX 对冲量为 0，禁止开仓"
+        );
     }
 }

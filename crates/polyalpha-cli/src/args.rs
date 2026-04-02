@@ -26,6 +26,10 @@ pub enum Command {
         #[arg(long, default_value = "default")]
         env: String,
     },
+    Live {
+        #[command(subcommand)]
+        command: LiveCommand,
+    },
     LiveDataCheck {
         #[arg(long, default_value = "default")]
         env: String,
@@ -214,6 +218,95 @@ pub enum SimCommand {
         #[arg(long, value_enum, default_value_t = SimInspectFormat::Table)]
         format: SimInspectFormat,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LiveCommand {
+    Run {
+        #[arg(long, default_value = "default")]
+        env: String,
+        #[arg(long, default_value_t = 0)]
+        market_index: usize,
+        #[arg(long, default_value_t = 2_000)]
+        poll_interval_ms: u64,
+        #[arg(long, default_value_t = 1)]
+        print_every: usize,
+        #[arg(long, default_value_t = 0)]
+        max_ticks: usize,
+        #[arg(long, default_value_t = 20)]
+        depth: u16,
+        #[arg(long, default_value_t = true)]
+        include_funding: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long, default_value_t = 600)]
+        warmup_klines: u16,
+        #[arg(long, value_enum, default_value_t = LiveExecutorMode::Mock)]
+        executor_mode: LiveExecutorMode,
+        #[arg(long, default_value_t = false)]
+        confirm_live: bool,
+    },
+    RunMulti {
+        #[arg(long, default_value = "default")]
+        env: String,
+        #[arg(long, default_value_t = 5_000)]
+        poll_interval_ms: u64,
+        #[arg(long, default_value_t = 1)]
+        print_every: usize,
+        #[arg(long, default_value_t = 0)]
+        max_ticks: usize,
+        #[arg(long, default_value_t = 20)]
+        depth: u16,
+        #[arg(long, default_value_t = true)]
+        include_funding: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        #[arg(long, default_value_t = 600)]
+        warmup_klines: u16,
+        #[arg(long, value_enum, default_value_t = LiveExecutorMode::Mock)]
+        executor_mode: LiveExecutorMode,
+        #[arg(long, default_value_t = false)]
+        confirm_live: bool,
+    },
+    DataCheck {
+        #[arg(long, default_value = "default")]
+        env: String,
+        #[arg(long, default_value_t = 0)]
+        market_index: usize,
+        #[arg(long, default_value_t = 20)]
+        depth: u16,
+    },
+    ExecPreview {
+        #[arg(long, default_value = "default")]
+        env: String,
+        #[arg(long, default_value_t = 0)]
+        market_index: usize,
+        #[arg(long, value_enum)]
+        exchange: PreviewExchange,
+        #[arg(long, value_enum)]
+        side: PreviewSide,
+        #[arg(long, value_enum, default_value_t = PreviewOrderType::Market)]
+        order_type: PreviewOrderType,
+        #[arg(long)]
+        qty: String,
+        #[arg(long)]
+        price: Option<String>,
+        #[arg(long, default_value_t = false)]
+        reduce_only: bool,
+    },
+    Inspect {
+        #[arg(long, default_value = "default")]
+        env: String,
+        #[arg(long, value_enum, default_value_t = PaperInspectFormat::Table)]
+        format: PaperInspectFormat,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Default, PartialEq, Eq)]
+pub enum LiveExecutorMode {
+    #[default]
+    Mock,
+    Live,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -447,32 +540,40 @@ pub enum BacktestCommand {
         start: Option<String>,
         #[arg(long)]
         end: Option<String>,
-        #[arg(long, default_value_t = 100_000.0)]
-        initial_capital: f64,
-        #[arg(long, default_value_t = 360)]
-        rolling_window: usize,
-        #[arg(long, default_value_t = 2.0)]
-        entry_z: f64,
-        #[arg(long, default_value_t = 0.5)]
-        exit_z: f64,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        initial_capital: Option<f64>,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        rolling_window: Option<usize>,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        entry_z: Option<f64>,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        exit_z: Option<f64>,
         #[arg(long)]
         position_notional_usd: Option<f64>,
-        #[arg(long, default_value_t = 0.25)]
-        max_capital_usage: f64,
-        #[arg(long, default_value_t = 1.0)]
-        cex_hedge_ratio: f64,
-        #[arg(long, default_value_t = 0.10)]
-        cex_margin_ratio: f64,
-        #[arg(long, default_value_t = 2.0)]
-        poly_fee_bps: f64,
-        #[arg(long, default_value_t = 10.0)]
-        poly_slippage_bps: f64,
-        #[arg(long, default_value_t = 2.0)]
-        cex_fee_bps: f64,
-        #[arg(long, default_value_t = 10.0)]
-        cex_slippage_bps: f64,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        max_capital_usage: Option<f64>,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        cex_hedge_ratio: Option<f64>,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        cex_margin_ratio: Option<f64>,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        poly_fee_bps: Option<f64>,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        poly_slippage_bps: Option<f64>,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        cex_fee_bps: Option<f64>,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        cex_slippage_bps: Option<f64>,
         #[arg(long, default_value_t = 1.0)]
         entry_fill_ratio: f64,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        planner_depth_levels: Option<usize>,
+        #[arg(
+            long,
+            value_parser = ["configured_band", "disabled"],
+            help = "显式控制 Polymarket 价格带策略"
+        )]
+        band_policy: Option<String>,
         #[arg(long)]
         min_poly_price: Option<f64>,
         #[arg(long)]
@@ -481,6 +582,10 @@ pub enum BacktestCommand {
         max_holding_bars: Option<usize>,
         #[arg(long)]
         report_json: Option<String>,
+        #[arg(long)]
+        anomaly_report_json: Option<String>,
+        #[arg(long, default_value_t = false)]
+        fail_on_anomaly: bool,
         #[arg(long)]
         equity_csv: Option<String>,
         #[arg(long)]
@@ -500,27 +605,183 @@ pub enum BacktestCommand {
         start: Option<String>,
         #[arg(long)]
         end: Option<String>,
-        #[arg(long, default_value_t = 100_000.0)]
-        initial_capital: f64,
-        #[arg(long, default_value_t = 360)]
-        rolling_window: usize,
-        #[arg(long, default_value_t = 2.0)]
-        entry_z: f64,
-        #[arg(long, default_value_t = 0.5)]
-        exit_z: f64,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        initial_capital: Option<f64>,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        rolling_window: Option<usize>,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        entry_z: Option<f64>,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        exit_z: Option<f64>,
         #[arg(long)]
         position_notional_usd: Option<f64>,
-        #[arg(long, default_value_t = 0.25)]
-        max_capital_usage: f64,
-        #[arg(long, default_value_t = 1.0)]
-        cex_hedge_ratio: f64,
-        #[arg(long, default_value_t = 0.10)]
-        cex_margin_ratio: f64,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        max_capital_usage: Option<f64>,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        cex_hedge_ratio: Option<f64>,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        cex_margin_ratio: Option<f64>,
+        #[arg(long, help = "默认取自 config/default.toml")]
+        planner_depth_levels: Option<usize>,
         #[arg(long, value_enum)]
         preset: Option<RustStressPreset>,
         #[arg(long)]
         report_json: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod live_command_tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn parses_live_run_with_executor_mode_and_confirmation() {
+        let cli = Cli::try_parse_from([
+            "polyalpha-cli",
+            "live",
+            "run",
+            "--env",
+            "prod",
+            "--market-index",
+            "2",
+            "--executor-mode",
+            "live",
+            "--confirm-live",
+        ])
+        .expect("live run command should parse");
+
+        match cli.command {
+            Command::Live {
+                command:
+                    LiveCommand::Run {
+                        env,
+                        market_index,
+                        executor_mode,
+                        confirm_live,
+                        ..
+                    },
+            } => {
+                assert_eq!(env, "prod");
+                assert_eq!(market_index, 2);
+                assert_eq!(executor_mode, LiveExecutorMode::Live);
+                assert!(confirm_live);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_live_data_check_subcommand() {
+        let cli = Cli::try_parse_from([
+            "polyalpha-cli",
+            "live",
+            "data-check",
+            "--env",
+            "staging",
+            "--market-index",
+            "1",
+            "--depth",
+            "25",
+        ])
+        .expect("live data-check command should parse");
+
+        match cli.command {
+            Command::Live {
+                command:
+                    LiveCommand::DataCheck {
+                        env,
+                        market_index,
+                        depth,
+                    },
+            } => {
+                assert_eq!(env, "staging");
+                assert_eq!(market_index, 1);
+                assert_eq!(depth, 25);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_live_inspect_subcommand() {
+        let cli = Cli::try_parse_from([
+            "polyalpha-cli",
+            "live",
+            "inspect",
+            "--env",
+            "prod",
+            "--format",
+            "json",
+        ])
+        .expect("live inspect command should parse");
+
+        match cli.command {
+            Command::Live {
+                command: LiveCommand::Inspect { env, format },
+            } => {
+                assert_eq!(env, "prod");
+                assert!(matches!(format, PaperInspectFormat::Json));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_backtest_rust_replay_anomaly_flags() {
+        let cli = Cli::try_parse_from([
+            "polyalpha-cli",
+            "backtest",
+            "rust-replay",
+            "--db-path",
+            "data/replay.duckdb",
+            "--report-json",
+            "report.json",
+            "--anomaly-report-json",
+            "anomalies.json",
+            "--fail-on-anomaly",
+        ])
+        .expect("backtest rust-replay command should parse");
+
+        match cli.command {
+            Command::Backtest {
+                command:
+                    BacktestCommand::RustReplay {
+                        db_path,
+                        report_json,
+                        anomaly_report_json,
+                        fail_on_anomaly,
+                        ..
+                    },
+            } => {
+                assert_eq!(db_path, "data/replay.duckdb");
+                assert_eq!(report_json.as_deref(), Some("report.json"));
+                assert_eq!(anomaly_report_json.as_deref(), Some("anomalies.json"));
+                assert!(fail_on_anomaly);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_backtest_rust_replay_band_policy() {
+        let cli = Cli::try_parse_from([
+            "polyalpha-cli",
+            "backtest",
+            "rust-replay",
+            "--band-policy",
+            "disabled",
+        ])
+        .expect("backtest rust-replay band policy should parse");
+
+        match cli.command {
+            Command::Backtest {
+                command: BacktestCommand::RustReplay { band_policy, .. },
+            } => assert_eq!(band_policy.as_deref(), Some("disabled")),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]

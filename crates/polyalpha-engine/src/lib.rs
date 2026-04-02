@@ -230,12 +230,10 @@ impl SymbolState {
     }
 
     fn mark_poly_update(&mut self, ts_ms: u64) {
-        self.poly_connected = true;
         self.last_poly_update_ms = ts_ms;
     }
 
     fn mark_cex_update(&mut self, ts_ms: u64) {
-        self.cex_connected = true;
         self.last_cex_update_ms = ts_ms;
     }
 
@@ -706,17 +704,14 @@ impl SimpleAlphaEngine {
                     match snapshot.instrument {
                         InstrumentKind::PolyYes => {
                             state.mark_poly_update(snapshot.received_at_ms);
-                            self.poly_connected = true;
                             state.yes.update_mid(snapshot.received_at_ms, mid);
                         }
                         InstrumentKind::PolyNo => {
                             state.mark_poly_update(snapshot.received_at_ms);
-                            self.poly_connected = true;
                             state.no.update_mid(snapshot.received_at_ms, mid);
                         }
                         InstrumentKind::CexPerp => {
                             state.mark_cex_update(snapshot.received_at_ms);
-                            self.cex_connections.insert(snapshot.exchange, true);
                             state.cex_mid = Some(mid.max(Decimal::ZERO));
                             if let Some(price) = state.cex_mid.and_then(|value| value.to_f64()) {
                                 let _ = state.cex_minutes.ingest_price(
@@ -732,7 +727,7 @@ impl SimpleAlphaEngine {
                 Some(symbol)
             }
             MarketDataEvent::TradeUpdate {
-                exchange,
+                exchange: _,
                 symbol,
                 instrument,
                 price,
@@ -748,17 +743,14 @@ impl SimpleAlphaEngine {
                 match instrument {
                     InstrumentKind::PolyYes => {
                         state.mark_poly_update(*timestamp_ms);
-                        self.poly_connected = true;
                         state.yes.update_mid(*timestamp_ms, price.0);
                     }
                     InstrumentKind::PolyNo => {
                         state.mark_poly_update(*timestamp_ms);
-                        self.poly_connected = true;
                         state.no.update_mid(*timestamp_ms, price.0);
                     }
                     InstrumentKind::CexPerp => {
                         state.mark_cex_update(*timestamp_ms);
-                        self.cex_connections.insert(*exchange, true);
                         state.cex_mid = Some(price.0.max(Decimal::ZERO));
                         if let Some(value) = state.cex_mid.and_then(|item| item.to_f64()) {
                             let _ = state.cex_minutes.ingest_price(
@@ -773,7 +765,7 @@ impl SimpleAlphaEngine {
                 Some(symbol)
             }
             MarketDataEvent::FundingRate {
-                exchange,
+                exchange: _,
                 symbol,
                 next_funding_time_ms,
                 ..
@@ -784,8 +776,6 @@ impl SimpleAlphaEngine {
                     .remove(&symbol)
                     .unwrap_or_else(|| self.state_for_symbol(&symbol));
                 state.last_update_ms = *next_funding_time_ms;
-                state.cex_connected = true;
-                self.cex_connections.insert(*exchange, true);
                 self.states.insert(symbol.clone(), state);
                 Some(symbol)
             }
@@ -1979,6 +1969,110 @@ mod tests {
             }
         ));
         assert_eq!(engine.close_reason(&Symbol::new("btc-price-only")), None);
+    }
+
+    #[tokio::test]
+    async fn quote_updates_do_not_restore_connection_after_reconnecting_event() {
+        let mut engine = test_engine();
+
+        let _ = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(100_000, 0),
+                Decimal::new(100_000, 0),
+                0,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&poly_orderbook_event(
+                InstrumentKind::PolyYes,
+                Decimal::new(52, 2),
+                Decimal::new(54, 2),
+                60_000,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&connection_event(
+                Exchange::Polymarket,
+                ConnectionStatus::Reconnecting,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&connection_event(
+                Exchange::Binance,
+                ConnectionStatus::Reconnecting,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&poly_orderbook_event(
+                InstrumentKind::PolyYes,
+                Decimal::new(53, 2),
+                Decimal::new(55, 2),
+                60_100,
+            ))
+            .await;
+        let output = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(101_000, 0),
+                Decimal::new(101_000, 0),
+                60_200,
+            ))
+            .await;
+        assert!(output.open_candidates.is_empty());
+        assert_eq!(output.warnings.len(), 1);
+        assert!(matches!(
+            output.warnings[0],
+            EngineWarning::ConnectionLost {
+                poly_connected: false,
+                cex_connected: false,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn funding_updates_do_not_restore_cex_connection_after_reconnecting_event() {
+        let mut engine = test_engine();
+
+        let _ = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(100_000, 0),
+                Decimal::new(100_000, 0),
+                0,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&poly_orderbook_event(
+                InstrumentKind::PolyYes,
+                Decimal::new(52, 2),
+                Decimal::new(54, 2),
+                60_000,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&connection_event(
+                Exchange::Binance,
+                ConnectionStatus::Reconnecting,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&MarketDataEvent::FundingRate {
+                exchange: Exchange::Binance,
+                symbol: Symbol::new("btc-price-only"),
+                rate: Decimal::new(1, 4),
+                next_funding_time_ms: 60_100,
+            })
+            .await;
+        let output = engine.flush_symbol(&Symbol::new("btc-price-only"));
+        assert!(output.open_candidates.is_empty());
+        assert_eq!(output.warnings.len(), 1);
+        assert!(matches!(
+            output.warnings[0],
+            EngineWarning::ConnectionLost {
+                poly_connected: true,
+                cex_connected: false,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
