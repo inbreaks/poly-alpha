@@ -5,8 +5,8 @@ use rust_decimal::Decimal;
 
 use polyalpha_core::{
     CexOrderRequest, CircuitBreakerStatus, Exchange, Fill, InstrumentKind, MarketPhase,
-    OrderRequest, OrderSide, PolyOrderRequest, PositionKey, PositionTracker, RiskManager,
-    RiskRejection, RiskStateSnapshot, Symbol, TokenSide, UsdNotional,
+    OrderRequest, OrderSide, PolyOrderRequest, PolySizingInstruction, PositionKey, PositionTracker,
+    RiskManager, RiskRejection, RiskStateSnapshot, Symbol, TokenSide, TradePlan, UsdNotional,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,6 +110,19 @@ impl InMemoryRiskManager {
         self.breaker_reason = None;
     }
 
+    pub fn pre_trade_check_open_plan(&self, plan: &TradePlan) -> Result<(), RiskRejection> {
+        if self.breaker_status == CircuitBreakerStatus::Open {
+            return Err(RiskRejection::CircuitBreakerOpen);
+        }
+
+        self.check_open_plan_market_phase(plan)?;
+        self.check_daily_loss_limit()?;
+        // 开仓预算继续沿用 Poly 主腿口径，避免把 CEX 对冲腿也算进 200 USD
+        // 单市场上限里，导致当前配置语义无意中整体漂移。
+        self.check_exposure_limits(&plan.symbol, plan.poly_max_cost_usd)?;
+        Ok(())
+    }
+
     fn check_market_phase(&self, request: &OrderRequest) -> Result<(), RiskRejection> {
         let symbol = request_symbol(request);
         let Some(phase) = self.market_phases.get(symbol) else {
@@ -123,23 +136,39 @@ impl InMemoryRiskManager {
         Err(RiskRejection::MarketPhaseBlocked)
     }
 
-    fn check_limits(&self, request: &OrderRequest) -> Result<(), RiskRejection> {
+    fn check_open_plan_market_phase(&self, plan: &TradePlan) -> Result<(), RiskRejection> {
+        if plan.intent_type != "open_position" {
+            return Ok(());
+        }
+
+        let Some(phase) = self.market_phases.get(&plan.symbol) else {
+            return Ok(());
+        };
+        if phase.allows_new_positions() {
+            return Ok(());
+        }
+
+        Err(RiskRejection::MarketPhaseBlocked)
+    }
+
+    fn check_daily_loss_limit(&self) -> Result<(), RiskRejection> {
         if self.daily_realized_pnl.0 <= -self.limits.max_daily_loss_usd.0 {
             return Err(RiskRejection::LimitBreached(
                 "daily realized pnl is below max loss".to_owned(),
             ));
         }
+        Ok(())
+    }
 
-        if !self.is_order_increasing_risk(request) {
-            return Ok(());
-        }
-
-        let estimate = self.request_notional_estimate(request);
+    fn check_exposure_limits(
+        &self,
+        symbol: &Symbol,
+        estimate: UsdNotional,
+    ) -> Result<(), RiskRejection> {
         if estimate.0 <= Decimal::ZERO {
             return Ok(());
         }
 
-        let symbol = request_symbol(request);
         let projected_symbol = self.position_tracker.symbol_exposure_usd(symbol).0 + estimate.0;
         if projected_symbol > self.limits.max_single_position_usd.0 {
             return Err(RiskRejection::LimitBreached(format!(
@@ -159,28 +188,41 @@ impl InMemoryRiskManager {
         Ok(())
     }
 
+    fn check_limits(&self, request: &OrderRequest) -> Result<(), RiskRejection> {
+        self.check_daily_loss_limit()?;
+
+        if !self.is_order_increasing_risk(request) {
+            return Ok(());
+        }
+
+        let estimate = self.request_notional_estimate(request);
+        self.check_exposure_limits(request_symbol(request), estimate)
+    }
+
     fn request_notional_estimate(&self, request: &OrderRequest) -> UsdNotional {
         match request {
-            OrderRequest::Poly(order) => {
-                if let Some(notional) = order.quote_notional {
-                    return notional;
+            OrderRequest::Poly(order) => match order.sizing {
+                PolySizingInstruction::BuyBudgetCap { max_cost_usd, .. } => max_cost_usd,
+                PolySizingInstruction::SellExactShares {
+                    shares,
+                    min_avg_price,
+                } => {
+                    if min_avg_price.0 > Decimal::ZERO {
+                        UsdNotional(shares.0 * min_avg_price.0)
+                    } else {
+                        // 风控估值兜底：没有显式价格时回退到持仓均价，拿不到则按 0 处理。
+                        let key = poly_position_key(order);
+                        let fallback = self
+                            .position_tracker
+                            .entry_price_for(&key)
+                            .unwrap_or(polyalpha_core::Price::ZERO);
+                        UsdNotional(shares.0 * fallback.0)
+                    }
                 }
-                let Some(shares) = order.shares else {
-                    return UsdNotional::ZERO;
-                };
-
-                if let Some(price) = order.limit_price {
-                    return UsdNotional(shares.0 * price.0);
-                }
-
-                // 风控估值兜底：没有显式价格时回退到持仓均价，拿不到则按 0 处理。
-                let key = poly_position_key(order);
-                let fallback = self
-                    .position_tracker
-                    .entry_price_for(&key)
-                    .unwrap_or(polyalpha_core::Price::ZERO);
-                UsdNotional(shares.0 * fallback.0)
-            }
+                PolySizingInstruction::SellMinProceeds {
+                    min_proceeds_usd, ..
+                } => min_proceeds_usd,
+            },
             OrderRequest::Cex(order) => {
                 if let Some(price) = order.price {
                     return UsdNotional(order.base_qty.0 * price.0);
@@ -260,9 +302,28 @@ impl RiskManager for InMemoryRiskManager {
         Ok(request)
     }
 
+    fn pre_trade_check_open_plan(
+        &self,
+        plan: &TradePlan,
+    ) -> std::result::Result<(), RiskRejection> {
+        InMemoryRiskManager::pre_trade_check_open_plan(self, plan)
+    }
+
     async fn on_fill(&mut self, fill: &Fill) -> polyalpha_core::Result<()> {
         let effect = self.position_tracker.apply_fill(fill);
         self.daily_realized_pnl.0 += effect.realized_pnl_delta.0;
+
+        if self.daily_realized_pnl.0 <= -self.limits.max_daily_loss_usd.0 {
+            self.trigger_circuit_breaker("daily loss limit reached");
+        }
+        Ok(())
+    }
+
+    async fn apply_realized_pnl_adjustment(
+        &mut self,
+        adjustment: UsdNotional,
+    ) -> polyalpha_core::Result<()> {
+        self.daily_realized_pnl.0 += adjustment.0;
 
         if self.daily_realized_pnl.0 <= -self.limits.max_daily_loss_usd.0 {
             self.trigger_circuit_breaker("daily loss limit reached");
@@ -315,9 +376,10 @@ fn cex_position_key(order: &CexOrderRequest) -> PositionKey {
 
 fn request_signed_qty(request: &OrderRequest) -> Option<Decimal> {
     match request {
-        OrderRequest::Poly(order) => order
-            .shares
-            .map(|shares| signed_by_side(order.side, shares.0)),
+        OrderRequest::Poly(order) => Some(signed_by_side(
+            order.side,
+            order.sizing.requested_shares().0,
+        )),
         OrderRequest::Cex(order) => Some(signed_by_side(order.side, order.base_qty.0)),
     }
 }
@@ -343,8 +405,8 @@ fn has_opposite_sign(lhs: Decimal, rhs: Decimal) -> bool {
 mod tests {
     use super::*;
     use polyalpha_core::{
-        CexBaseQty, CexOrderRequest, ClientOrderId, Fill, OrderId, OrderType, Price, TimeInForce,
-        VenueQuantity,
+        CexBaseQty, CexOrderRequest, ClientOrderId, Fill, OrderId, OrderType, PolyShares, Price,
+        TimeInForce, VenueQuantity,
     };
 
     fn manager_with_limits(max_single: i64, max_total: i64, max_loss: i64) -> InMemoryRiskManager {
@@ -444,6 +506,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn realized_adjustments_update_daily_pnl_without_fill() {
+        let mut manager = manager_with_limits(10_000, 50_000, 2_000);
+        manager
+            .apply_realized_pnl_adjustment(UsdNotional(Decimal::new(-42, 0)))
+            .await
+            .expect("adjustment should apply");
+
+        let snapshot = manager.build_snapshot(456);
+        assert_eq!(snapshot.daily_pnl, UsdNotional(Decimal::new(-42, 0)));
+    }
+
+    #[tokio::test]
     async fn pre_trade_rejects_when_exposure_limit_would_be_breached() {
         let manager = manager_with_limits(1_000, 5_000, 2_000);
         let result = manager
@@ -451,6 +525,75 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(RiskRejection::LimitBreached(_))));
+    }
+
+    #[test]
+    fn risk_manager_trait_exposes_open_plan_gate() {
+        fn assert_open_plan_gate<T: RiskManager>(risk: &T, plan: &TradePlan) {
+            let _ = risk.pre_trade_check_open_plan(plan);
+        }
+
+        let manager = manager_with_limits(1_000, 5_000, 2_000);
+        let plan = TradePlan {
+            schema_version: polyalpha_core::PLANNING_SCHEMA_VERSION,
+            plan_id: "plan-open-1".to_owned(),
+            parent_plan_id: None,
+            supersedes_plan_id: None,
+            idempotency_key: "idem-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            symbol: Symbol::new("btc-100k-mar-2026"),
+            intent_type: "open_position".to_owned(),
+            priority: "open_position".to_owned(),
+            recovery_decision_reason: None,
+            created_at_ms: 1,
+            poly_exchange_timestamp_ms: 1,
+            poly_received_at_ms: 1,
+            poly_sequence: 1,
+            cex_exchange_timestamp_ms: 1,
+            cex_received_at_ms: 1,
+            cex_sequence: 1,
+            plan_hash: "hash-1".to_owned(),
+            poly_side: OrderSide::Buy,
+            poly_token_side: TokenSide::Yes,
+            poly_sizing_mode: "buy_budget_cap".to_owned(),
+            poly_requested_shares: PolyShares(Decimal::ONE),
+            poly_planned_shares: PolyShares(Decimal::ONE),
+            poly_max_cost_usd: UsdNotional(Decimal::new(100, 0)),
+            poly_max_avg_price: Price::ONE,
+            poly_max_shares: PolyShares(Decimal::ONE),
+            poly_min_avg_price: Price::ZERO,
+            poly_min_proceeds_usd: UsdNotional::ZERO,
+            poly_book_avg_price: Price::ONE,
+            poly_executable_price: Price::ONE,
+            poly_friction_cost_usd: UsdNotional::ZERO,
+            poly_fee_usd: UsdNotional::ZERO,
+            cex_side: OrderSide::Sell,
+            cex_planned_qty: CexBaseQty(Decimal::ONE),
+            cex_book_avg_price: Price::ONE,
+            cex_executable_price: Price::ONE,
+            cex_friction_cost_usd: UsdNotional::ZERO,
+            cex_fee_usd: UsdNotional::ZERO,
+            raw_edge_usd: UsdNotional::ZERO,
+            planned_edge_usd: UsdNotional::ZERO,
+            expected_funding_cost_usd: UsdNotional::ZERO,
+            residual_risk_penalty_usd: UsdNotional::ZERO,
+            post_rounding_residual_delta: 0.0,
+            shock_loss_up_1pct: UsdNotional::ZERO,
+            shock_loss_down_1pct: UsdNotional::ZERO,
+            shock_loss_up_2pct: UsdNotional::ZERO,
+            shock_loss_down_2pct: UsdNotional::ZERO,
+            plan_ttl_ms: 250,
+            max_poly_sequence_drift: 1,
+            max_cex_sequence_drift: 1,
+            max_poly_price_move: Price::ZERO,
+            max_cex_price_move: Price::ZERO,
+            min_planned_edge_usd: UsdNotional::ZERO,
+            max_residual_delta: 0.01,
+            max_shock_loss_usd: UsdNotional::ZERO,
+            max_plan_vs_fill_deviation_usd: UsdNotional::ZERO,
+        };
+
+        assert_open_plan_gate(&manager, &plan);
     }
 
     #[tokio::test]

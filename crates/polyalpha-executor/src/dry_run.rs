@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use polyalpha_core::{
     CexBaseQty, CoreError, Exchange, InstrumentKind, OrderBookSnapshot, OrderExecutor, OrderId,
-    OrderRequest, OrderResponse, OrderSide, OrderStatus, OrderType, PolyShares, Price, Result,
-    Symbol, TimeInForce, VenueQuantity,
+    OrderRequest, OrderResponse, OrderSide, OrderStatus, OrderType, PolyShares,
+    PolySizingInstruction, Price, Result, Symbol, TimeInForce, UsdNotional, VenueQuantity,
 };
 
 use crate::orderbook_provider::OrderbookProvider;
@@ -50,6 +50,25 @@ pub struct FillEstimation {
     /// Quantity that cannot be filled due to insufficient liquidity.
     pub unfilled_quantity: Decimal,
     /// Whether the order can be completely filled.
+    pub is_complete: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrderExecutionEstimate {
+    pub exchange: Exchange,
+    pub symbol: Symbol,
+    pub instrument: InstrumentKind,
+    pub side: OrderSide,
+    pub status: OrderStatus,
+    pub requested_quantity: VenueQuantity,
+    pub filled_quantity: VenueQuantity,
+    pub orderbook_mid_price: Option<Price>,
+    pub book_average_price: Option<Price>,
+    pub executable_price: Option<Price>,
+    pub executable_notional_usd: UsdNotional,
+    pub friction_cost_usd: Option<UsdNotional>,
+    pub fee_usd: Option<UsdNotional>,
+    pub rejection_reason: Option<String>,
     pub is_complete: bool,
 }
 
@@ -265,122 +284,417 @@ impl DryRunExecutor {
         }
     }
 
+    fn request_context(request: &OrderRequest) -> (Exchange, Symbol, InstrumentKind, OrderSide) {
+        match request {
+            OrderRequest::Poly(req) => (
+                Exchange::Polymarket,
+                req.symbol.clone(),
+                match req.token_side {
+                    polyalpha_core::TokenSide::Yes => InstrumentKind::PolyYes,
+                    polyalpha_core::TokenSide::No => InstrumentKind::PolyNo,
+                },
+                req.side,
+            ),
+            OrderRequest::Cex(req) => (
+                req.exchange,
+                req.symbol.clone(),
+                InstrumentKind::CexPerp,
+                req.side,
+            ),
+        }
+    }
+
+    fn friction_cost_usd(
+        side: OrderSide,
+        orderbook_mid_price: Option<Price>,
+        executable_price: Option<Price>,
+        filled_quantity: Decimal,
+    ) -> Option<UsdNotional> {
+        let mid = orderbook_mid_price?;
+        let exec = executable_price?;
+        let mid_notional = mid.0 * filled_quantity;
+        let exec_notional = exec.0 * filled_quantity;
+        let cost = match side {
+            OrderSide::Buy => (exec_notional - mid_notional).max(Decimal::ZERO),
+            OrderSide::Sell => (mid_notional - exec_notional).max(Decimal::ZERO),
+        };
+        Some(UsdNotional(cost))
+    }
+
+    fn rejected_estimate(
+        request: &OrderRequest,
+        orderbook_mid_price: Option<Price>,
+        rejection_reason: &str,
+    ) -> OrderExecutionEstimate {
+        let (exchange, symbol, instrument, side) = Self::request_context(request);
+        OrderExecutionEstimate {
+            exchange,
+            symbol,
+            instrument,
+            side,
+            status: OrderStatus::Rejected,
+            requested_quantity: Self::requested_quantity(request),
+            filled_quantity: Self::zero_quantity_for_request(request),
+            orderbook_mid_price,
+            book_average_price: None,
+            executable_price: None,
+            executable_notional_usd: UsdNotional::ZERO,
+            friction_cost_usd: None,
+            fee_usd: None,
+            rejection_reason: Some(rejection_reason.to_owned()),
+            is_complete: false,
+        }
+    }
+
+    fn open_estimate(
+        request: &OrderRequest,
+        orderbook_mid_price: Option<Price>,
+    ) -> OrderExecutionEstimate {
+        let (exchange, symbol, instrument, side) = Self::request_context(request);
+        OrderExecutionEstimate {
+            exchange,
+            symbol,
+            instrument,
+            side,
+            status: OrderStatus::Open,
+            requested_quantity: Self::requested_quantity(request),
+            filled_quantity: Self::zero_quantity_for_request(request),
+            orderbook_mid_price,
+            book_average_price: None,
+            executable_price: Self::initial_price(request),
+            executable_notional_usd: UsdNotional::ZERO,
+            friction_cost_usd: None,
+            fee_usd: Some(UsdNotional::ZERO),
+            rejection_reason: None,
+            is_complete: false,
+        }
+    }
+
+    fn poly_buy_budget_outcome(
+        &self,
+        request: &OrderRequest,
+        orderbook: &OrderBookSnapshot,
+        max_cost_usd: UsdNotional,
+        max_avg_price: Price,
+        max_shares: PolyShares,
+    ) -> OrderExecutionEstimate {
+        let mut asks = orderbook.asks.clone();
+        asks.sort_by(|left, right| left.price.cmp(&right.price));
+
+        let mut filled = Decimal::ZERO;
+        let mut book_cost = Decimal::ZERO;
+        for level in &asks {
+            if filled >= max_shares.0 {
+                break;
+            }
+
+            let price = level.price.0;
+            let available = Self::extract_qty(&level.quantity);
+            if available <= Decimal::ZERO || price <= Decimal::ZERO {
+                continue;
+            }
+
+            let max_fill_here = available.min((max_shares.0 - filled).max(Decimal::ZERO));
+            let can_take_full_level = {
+                let next_filled = filled + max_fill_here;
+                let next_book_cost = book_cost + max_fill_here * price;
+                let next_book_avg = Price(next_book_cost / next_filled);
+                let next_exec_price = self.apply_slippage(next_book_avg, OrderSide::Buy, true);
+                next_exec_price.0 <= max_avg_price.0
+                    && next_filled * next_exec_price.0 <= max_cost_usd.0
+            };
+
+            let fill_qty = if can_take_full_level {
+                max_fill_here
+            } else {
+                let mut low = Decimal::ZERO;
+                let mut high = max_fill_here;
+                for _ in 0..48 {
+                    let mid = (low + high) / Decimal::from(2);
+                    if mid <= Decimal::ZERO {
+                        break;
+                    }
+
+                    let next_filled = filled + mid;
+                    let next_book_cost = book_cost + mid * price;
+                    let next_book_avg = Price(next_book_cost / next_filled);
+                    let next_exec_price = self.apply_slippage(next_book_avg, OrderSide::Buy, true);
+                    let within_constraints = next_exec_price.0 <= max_avg_price.0
+                        && next_filled * next_exec_price.0 <= max_cost_usd.0;
+                    if within_constraints {
+                        low = mid;
+                    } else {
+                        high = mid;
+                    }
+                }
+                low
+            };
+
+            if fill_qty <= Decimal::ZERO {
+                if filled <= Decimal::ZERO {
+                    break;
+                }
+                continue;
+            }
+
+            filled += fill_qty;
+            book_cost += fill_qty * price;
+        }
+
+        if filled <= Decimal::ZERO {
+            let rejection_reason = if asks.is_empty() {
+                "insufficient_poly_depth"
+            } else {
+                "poly_max_price_exceeded"
+            };
+            return Self::rejected_estimate(request, Self::mid_price(orderbook), rejection_reason);
+        }
+
+        let book_average_price = Price(book_cost / filled);
+        let executable_price = self.apply_slippage(book_average_price, OrderSide::Buy, true);
+        let requested_quantity = Self::requested_quantity(request);
+        let filled_quantity = VenueQuantity::PolyShares(PolyShares(filled));
+        let orderbook_mid_price = Self::mid_price(orderbook);
+
+        OrderExecutionEstimate {
+            exchange: Exchange::Polymarket,
+            symbol: match request {
+                OrderRequest::Poly(req) => req.symbol.clone(),
+                OrderRequest::Cex(_) => unreachable!("poly estimate requires poly request"),
+            },
+            instrument: match request {
+                OrderRequest::Poly(req) => match req.token_side {
+                    polyalpha_core::TokenSide::Yes => InstrumentKind::PolyYes,
+                    polyalpha_core::TokenSide::No => InstrumentKind::PolyNo,
+                },
+                OrderRequest::Cex(_) => unreachable!("poly estimate requires poly request"),
+            },
+            side: OrderSide::Buy,
+            status: OrderStatus::Filled,
+            requested_quantity,
+            filled_quantity,
+            orderbook_mid_price,
+            book_average_price: Some(book_average_price),
+            executable_price: Some(executable_price),
+            executable_notional_usd: UsdNotional(filled * executable_price.0),
+            friction_cost_usd: Self::friction_cost_usd(
+                OrderSide::Buy,
+                orderbook_mid_price,
+                Some(executable_price),
+                filled,
+            ),
+            fee_usd: Some(UsdNotional::ZERO),
+            rejection_reason: None,
+            is_complete: true,
+        }
+    }
+
+    fn poly_sell_outcome(
+        &self,
+        request: &OrderRequest,
+        orderbook: &OrderBookSnapshot,
+        shares: PolyShares,
+        min_avg_price: Option<Price>,
+        min_proceeds_usd: Option<UsdNotional>,
+    ) -> OrderExecutionEstimate {
+        let fill = self.calculate_fill_price(orderbook, OrderSide::Sell, shares.0);
+        if !fill.is_complete && !self.slippage_config.allow_partial_fill {
+            return Self::rejected_estimate(
+                request,
+                Self::mid_price(orderbook),
+                "insufficient_poly_depth",
+            );
+        }
+        if fill.filled_quantity <= Decimal::ZERO {
+            return Self::rejected_estimate(
+                request,
+                Self::mid_price(orderbook),
+                "insufficient_poly_depth",
+            );
+        }
+
+        let executable_price = self.apply_slippage(fill.average_price, OrderSide::Sell, true);
+        let executable_notional_usd = UsdNotional(fill.filled_quantity * executable_price.0);
+        if let Some(min_avg_price) = min_avg_price {
+            if executable_price.0 < min_avg_price.0 {
+                return Self::rejected_estimate(
+                    request,
+                    Self::mid_price(orderbook),
+                    "poly_min_proceeds_not_met",
+                );
+            }
+        }
+        if let Some(min_proceeds_usd) = min_proceeds_usd {
+            if executable_notional_usd.0 < min_proceeds_usd.0 {
+                return Self::rejected_estimate(
+                    request,
+                    Self::mid_price(orderbook),
+                    "poly_min_proceeds_not_met",
+                );
+            }
+        }
+
+        let filled_quantity = VenueQuantity::PolyShares(PolyShares(fill.filled_quantity));
+        let orderbook_mid_price = Self::mid_price(orderbook);
+        OrderExecutionEstimate {
+            exchange: Exchange::Polymarket,
+            symbol: match request {
+                OrderRequest::Poly(req) => req.symbol.clone(),
+                OrderRequest::Cex(_) => unreachable!("poly estimate requires poly request"),
+            },
+            instrument: match request {
+                OrderRequest::Poly(req) => match req.token_side {
+                    polyalpha_core::TokenSide::Yes => InstrumentKind::PolyYes,
+                    polyalpha_core::TokenSide::No => InstrumentKind::PolyNo,
+                },
+                OrderRequest::Cex(_) => unreachable!("poly estimate requires poly request"),
+            },
+            side: OrderSide::Sell,
+            status: if fill.is_complete {
+                OrderStatus::Filled
+            } else {
+                OrderStatus::PartialFill
+            },
+            requested_quantity: Self::requested_quantity(request),
+            filled_quantity,
+            orderbook_mid_price,
+            book_average_price: Some(fill.average_price),
+            executable_price: Some(executable_price),
+            executable_notional_usd,
+            friction_cost_usd: Self::friction_cost_usd(
+                OrderSide::Sell,
+                orderbook_mid_price,
+                Some(executable_price),
+                fill.filled_quantity,
+            ),
+            fee_usd: Some(UsdNotional::ZERO),
+            rejection_reason: None,
+            is_complete: fill.is_complete,
+        }
+    }
+
+    pub fn estimate_order_request(&self, request: &OrderRequest) -> OrderExecutionEstimate {
+        let requested_quantity = Self::requested_quantity(request);
+        if Self::extract_qty(&requested_quantity) <= Decimal::ZERO {
+            return Self::rejected_estimate(request, None, "zero_quantity");
+        }
+
+        let orderbook = self.get_orderbook_for_request(request);
+        let orderbook_mid_price = orderbook.as_ref().and_then(Self::mid_price);
+
+        if Self::is_gtc_limit(request) {
+            return Self::open_estimate(request, orderbook_mid_price);
+        }
+
+        let Some(orderbook) = orderbook else {
+            return Self::rejected_estimate(request, None, "no_orderbook_for_fill");
+        };
+
+        let available_liquidity: Decimal = {
+            let (_, _, _, side) = Self::request_context(request);
+            let levels = match side {
+                OrderSide::Buy => &orderbook.asks,
+                OrderSide::Sell => &orderbook.bids,
+            };
+            levels
+                .iter()
+                .map(|level| Self::extract_qty(&level.quantity))
+                .sum()
+        };
+
+        if matches!(request, OrderRequest::Poly(_))
+            && available_liquidity < self.slippage_config.min_liquidity
+        {
+            return Self::rejected_estimate(request, orderbook_mid_price, "insufficient_liquidity");
+        }
+
+        match request {
+            OrderRequest::Poly(req) => match req.sizing {
+                PolySizingInstruction::BuyBudgetCap {
+                    max_cost_usd,
+                    max_avg_price,
+                    max_shares,
+                } => self.poly_buy_budget_outcome(
+                    request,
+                    &orderbook,
+                    max_cost_usd,
+                    max_avg_price,
+                    max_shares,
+                ),
+                PolySizingInstruction::SellExactShares {
+                    shares,
+                    min_avg_price,
+                } => self.poly_sell_outcome(request, &orderbook, shares, Some(min_avg_price), None),
+                PolySizingInstruction::SellMinProceeds {
+                    shares,
+                    min_proceeds_usd,
+                } => self.poly_sell_outcome(
+                    request,
+                    &orderbook,
+                    shares,
+                    None,
+                    Some(min_proceeds_usd),
+                ),
+            },
+            OrderRequest::Cex(req) => {
+                let fill = self.calculate_fill_price(&orderbook, req.side, req.base_qty.0);
+                if !fill.is_complete && !self.slippage_config.allow_partial_fill {
+                    return Self::rejected_estimate(
+                        request,
+                        orderbook_mid_price,
+                        "partial_fill_not_allowed",
+                    );
+                }
+
+                let executable_price = self.apply_slippage(fill.average_price, req.side, false);
+                let filled_qty = if fill.is_complete {
+                    VenueQuantity::CexBaseQty(req.base_qty)
+                } else {
+                    VenueQuantity::CexBaseQty(CexBaseQty(fill.filled_quantity))
+                };
+
+                OrderExecutionEstimate {
+                    exchange: req.exchange,
+                    symbol: req.symbol.clone(),
+                    instrument: InstrumentKind::CexPerp,
+                    side: req.side,
+                    status: if fill.is_complete {
+                        OrderStatus::Filled
+                    } else {
+                        OrderStatus::PartialFill
+                    },
+                    requested_quantity,
+                    filled_quantity: filled_qty,
+                    orderbook_mid_price,
+                    book_average_price: Some(fill.average_price),
+                    executable_price: Some(executable_price),
+                    executable_notional_usd: UsdNotional(fill.filled_quantity * executable_price.0),
+                    friction_cost_usd: Self::friction_cost_usd(
+                        req.side,
+                        orderbook_mid_price,
+                        Some(executable_price),
+                        fill.filled_quantity,
+                    ),
+                    fee_usd: Some(UsdNotional::ZERO),
+                    rejection_reason: None,
+                    is_complete: fill.is_complete,
+                }
+            }
+        }
+    }
+
     /// Determine order status and fill details based on orderbook.
     fn determine_fill(
         &self,
         request: &OrderRequest,
     ) -> (OrderStatus, VenueQuantity, Option<Price>, Option<String>) {
-        let requested_qty = Self::requested_quantity(request);
-        if Self::extract_qty(&requested_qty) <= Decimal::ZERO {
-            return (
-                OrderStatus::Rejected,
-                Self::zero_quantity_for_request(request),
-                None,
-                Some("zero_quantity".to_owned()),
-            );
-        }
-
-        if self.orderbook_provider.is_none() {
-            return if Self::is_gtc_limit(request) {
-                (
-                    OrderStatus::Open,
-                    Self::zero_quantity_for_request(request),
-                    Self::initial_price(request),
-                    None,
-                )
-            } else {
-                (
-                    OrderStatus::Rejected,
-                    Self::zero_quantity_for_request(request),
-                    None,
-                    Some("no_orderbook_for_fill".to_owned()),
-                )
-            };
-        }
-
-        // For limit orders with GTC, keep as Open
-        if Self::is_gtc_limit(request) {
-            return (
-                OrderStatus::Open,
-                Self::zero_quantity_for_request(request),
-                Self::initial_price(request),
-                None,
-            );
-        }
-
-        // Try to get orderbook
-        let Some(orderbook) = self.get_orderbook_for_request(request) else {
-            return (
-                OrderStatus::Rejected,
-                Self::zero_quantity_for_request(request),
-                None,
-                Some("no_orderbook_for_fill".to_owned()),
-            );
-        };
-
-        // Get side and quantity
-        let (side, is_poly) = match request {
-            OrderRequest::Poly(req) => (req.side, true),
-            OrderRequest::Cex(req) => (req.side, false),
-        };
-        let requested_qty = Self::extract_qty(&requested_qty);
-
-        // Check minimum liquidity for Polymarket only. CEX hedge sizes are small
-        // base quantities, so a global "100" threshold would incorrectly reject
-        // otherwise fillable hedge legs.
-        let available_liquidity: Decimal = {
-            let levels = match side {
-                OrderSide::Buy => &orderbook.asks,
-                OrderSide::Sell => &orderbook.bids,
-            };
-            levels.iter().map(|l| Self::extract_qty(&l.quantity)).sum()
-        };
-
-        if is_poly && available_liquidity < self.slippage_config.min_liquidity {
-            // Insufficient liquidity, reject
-            return (
-                OrderStatus::Rejected,
-                Self::zero_quantity_for_request(request),
-                None,
-                Some("insufficient_liquidity".to_owned()),
-            );
-        }
-
-        // Calculate fill
-        let fill = self.calculate_fill_price(&orderbook, side, requested_qty);
-
-        if !fill.is_complete && !self.slippage_config.allow_partial_fill {
-            // Partial fill not allowed, reject
-            return (
-                OrderStatus::Rejected,
-                Self::zero_quantity_for_request(request),
-                None,
-                Some("partial_fill_not_allowed".to_owned()),
-            );
-        }
-
-        // Apply slippage
-        let final_price = self.apply_slippage(fill.average_price, side, is_poly);
-
-        let filled_qty = if fill.is_complete {
-            Self::requested_quantity(request)
-        } else {
-            // Partial fill
-            match request {
-                OrderRequest::Poly(_) => {
-                    VenueQuantity::PolyShares(PolyShares(fill.filled_quantity))
-                }
-                OrderRequest::Cex(_) => VenueQuantity::CexBaseQty(CexBaseQty(fill.filled_quantity)),
-            }
-        };
-
-        let status = if fill.is_complete {
-            OrderStatus::Filled
-        } else {
-            OrderStatus::PartialFill
-        };
-
-        (status, filled_qty, Some(final_price), None)
+        let estimate = self.estimate_order_request(request);
+        (
+            estimate.status,
+            estimate.filled_quantity,
+            estimate.executable_price,
+            estimate.rejection_reason,
+        )
     }
 
     /// Check if request is a GTC limit order.
@@ -416,16 +730,7 @@ impl DryRunExecutor {
 
     fn requested_quantity(request: &OrderRequest) -> VenueQuantity {
         match request {
-            OrderRequest::Poly(req) => {
-                if let Some(shares) = req.shares {
-                    VenueQuantity::PolyShares(shares)
-                } else if let Some(notional) = req.quote_notional {
-                    // 边界约束: 仅给 dry-run 使用，notional-only 单按 $1/share 映射。
-                    VenueQuantity::PolyShares(PolyShares(notional.0))
-                } else {
-                    VenueQuantity::PolyShares(PolyShares::ZERO)
-                }
-            }
+            OrderRequest::Poly(req) => VenueQuantity::PolyShares(req.sizing.requested_shares()),
             OrderRequest::Cex(req) => VenueQuantity::CexBaseQty(req.base_qty),
         }
     }
@@ -443,7 +748,7 @@ impl DryRunExecutor {
 
     fn initial_price(request: &OrderRequest) -> Option<Price> {
         match request {
-            OrderRequest::Poly(req) => req.limit_price.or(Some(Price::ONE)),
+            OrderRequest::Poly(req) => req.sizing.boundary_price(),
             OrderRequest::Cex(req) => req.price.or(Some(Price::ONE)),
         }
     }
@@ -603,7 +908,7 @@ mod tests {
 
     use polyalpha_core::{
         CexOrderRequest, ClientOrderId, OrderRequest, OrderSide, OrderType, PolyOrderRequest,
-        TokenSide, UsdNotional,
+        PolySizingInstruction, TokenSide, UsdNotional,
     };
 
     use super::*;
@@ -615,9 +920,11 @@ mod tests {
             token_side: TokenSide::Yes,
             side: OrderSide::Buy,
             order_type: OrderType::Limit,
-            limit_price: Some(Price(Decimal::new(49, 2))),
-            shares: Some(PolyShares(Decimal::new(10, 0))),
-            quote_notional: None,
+            sizing: PolySizingInstruction::BuyBudgetCap {
+                max_cost_usd: UsdNotional(Decimal::new(490, 2)),
+                max_avg_price: Price(Decimal::new(49, 2)),
+                max_shares: PolyShares(Decimal::new(10, 0)),
+            },
             time_in_force: TimeInForce::Gtc,
             post_only: true,
         })
@@ -651,6 +958,44 @@ mod tests {
             time_in_force: TimeInForce::Ioc,
             reduce_only: false,
         })
+    }
+
+    fn sample_poly_provider() -> Arc<crate::orderbook_provider::InMemoryOrderbookProvider> {
+        let provider = Arc::new(crate::orderbook_provider::InMemoryOrderbookProvider::new());
+        provider.update(OrderBookSnapshot {
+            exchange: Exchange::Polymarket,
+            symbol: Symbol::new("btc-price-only"),
+            instrument: InstrumentKind::PolyYes,
+            bids: vec![
+                polyalpha_core::PriceLevel {
+                    price: Price(Decimal::new(34, 2)),
+                    quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(200, 0))),
+                },
+                polyalpha_core::PriceLevel {
+                    price: Price(Decimal::new(33, 2)),
+                    quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(200, 0))),
+                },
+            ],
+            asks: vec![
+                polyalpha_core::PriceLevel {
+                    price: Price(Decimal::new(31, 2)),
+                    quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(300, 0))),
+                },
+                polyalpha_core::PriceLevel {
+                    price: Price(Decimal::new(33, 2)),
+                    quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(400, 0))),
+                },
+                polyalpha_core::PriceLevel {
+                    price: Price(Decimal::new(35, 2)),
+                    quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(500, 0))),
+                },
+            ],
+            exchange_timestamp_ms: 1_700_000_000_000,
+            received_at_ms: 1_700_000_000_000,
+            sequence: 1,
+            last_trade_price: None,
+        });
+        provider
     }
 
     #[tokio::test]
@@ -704,7 +1049,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dry_run_notional_only_poly_order_maps_to_shares() {
+    async fn dry_run_budget_cap_poly_order_without_orderbook_is_rejected() {
         let executor = DryRunExecutor::new();
         let response = executor
             .submit_order(OrderRequest::Poly(PolyOrderRequest {
@@ -713,9 +1058,11 @@ mod tests {
                 token_side: TokenSide::Yes,
                 side: OrderSide::Buy,
                 order_type: OrderType::Market,
-                limit_price: None,
-                shares: None,
-                quote_notional: Some(UsdNotional(Decimal::new(125, 0))),
+                sizing: PolySizingInstruction::BuyBudgetCap {
+                    max_cost_usd: UsdNotional(Decimal::new(125, 0)),
+                    max_avg_price: Price::ONE,
+                    max_shares: PolyShares(Decimal::new(125, 0)),
+                },
                 time_in_force: TimeInForce::Fok,
                 post_only: false,
             }))
@@ -730,6 +1077,68 @@ mod tests {
         assert_eq!(
             response.rejection_reason.as_deref(),
             Some("no_orderbook_for_fill")
+        );
+    }
+
+    #[test]
+    fn buy_budget_cap_stops_at_max_cost_usd() {
+        let executor = DryRunExecutor::with_orderbook(
+            sample_poly_provider(),
+            SlippageConfig {
+                poly_slippage_bps: 50,
+                cex_slippage_bps: 2,
+                min_liquidity: Decimal::new(1, 0),
+                allow_partial_fill: false,
+            },
+        );
+        let request = OrderRequest::Poly(PolyOrderRequest {
+            client_order_id: ClientOrderId("poly-buy-budget".to_owned()),
+            symbol: Symbol::new("btc-price-only"),
+            token_side: TokenSide::Yes,
+            side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            sizing: PolySizingInstruction::BuyBudgetCap {
+                max_cost_usd: UsdNotional(Decimal::new(200, 0)),
+                max_avg_price: Price(Decimal::new(33, 2)),
+                max_shares: PolyShares(Decimal::new(700, 0)),
+            },
+            time_in_force: TimeInForce::Fok,
+            post_only: false,
+        });
+
+        let estimate = executor.estimate_order_request(&request);
+        assert!(estimate.executable_notional_usd.0 <= Decimal::new(200, 0));
+    }
+
+    #[test]
+    fn sell_min_proceeds_rejects_when_book_cannot_pay_enough() {
+        let executor = DryRunExecutor::with_orderbook(
+            sample_poly_provider(),
+            SlippageConfig {
+                poly_slippage_bps: 50,
+                cex_slippage_bps: 2,
+                min_liquidity: Decimal::new(1, 0),
+                allow_partial_fill: false,
+            },
+        );
+        let request = OrderRequest::Poly(PolyOrderRequest {
+            client_order_id: ClientOrderId("poly-sell-min-proceeds".to_owned()),
+            symbol: Symbol::new("btc-price-only"),
+            token_side: TokenSide::Yes,
+            side: OrderSide::Sell,
+            order_type: OrderType::Market,
+            sizing: PolySizingInstruction::SellMinProceeds {
+                shares: PolyShares(Decimal::new(400, 0)),
+                min_proceeds_usd: UsdNotional(Decimal::new(150, 0)),
+            },
+            time_in_force: TimeInForce::Fok,
+            post_only: false,
+        });
+
+        let estimate = executor.estimate_order_request(&request);
+        assert_eq!(
+            estimate.rejection_reason.as_deref(),
+            Some("poly_min_proceeds_not_met")
         );
     }
 
@@ -927,9 +1336,11 @@ mod tests {
                 token_side: TokenSide::No,
                 side: OrderSide::Buy,
                 order_type: OrderType::Market,
-                limit_price: None,
-                shares: Some(PolyShares(Decimal::new(10, 0))),
-                quote_notional: None,
+                sizing: PolySizingInstruction::BuyBudgetCap {
+                    max_cost_usd: UsdNotional(Decimal::new(10, 0)),
+                    max_avg_price: Price::ONE,
+                    max_shares: PolyShares(Decimal::new(10, 0)),
+                },
                 time_in_force: TimeInForce::Fok,
                 post_only: false,
             }))

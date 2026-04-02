@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::types::{
-    CircuitBreakerStatus, Exchange, Fill, HedgeState, InstrumentKind, OrderId, OrderResponse,
-    OrderSide, Position, PositionKey, Price, Symbol, UsdNotional, VenueQuantity,
+    CircuitBreakerStatus, Exchange, ExecutionResult, Fill, HedgeState, InstrumentKind, OrderId,
+    OrderResponse, OrderSide, Position, PositionKey, Price, Symbol, TradePlan, UsdNotional,
+    VenueQuantity,
 };
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,8 +50,22 @@ pub enum MarketDataEvent {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum ExecutionEvent {
+    TradePlanCreated {
+        plan: TradePlan,
+    },
+    PlanSuperseded {
+        symbol: Symbol,
+        superseded_plan_id: String,
+        next_plan_id: String,
+    },
+    RecoveryPlanCreated {
+        plan: TradePlan,
+    },
+    ExecutionResultRecorded {
+        result: ExecutionResult,
+    },
     OrderSubmitted {
         symbol: Symbol,
         exchange: Exchange,

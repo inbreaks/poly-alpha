@@ -2,15 +2,13 @@ use std::fs;
 use std::path::PathBuf;
 
 use rust_decimal::prelude::FromPrimitive;
-use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
 use polyalpha_core::{
-    AlphaEngine, ArbSignalAction, CexBaseQty, Exchange, InstrumentKind, MarketConfig,
-    MarketDataEvent, MarketRule, MarketRuleKind, OrderBookSnapshot, OrderSide, PolyShares,
-    PolymarketIds, Price, PriceLevel, SignalStrength, Symbol, TokenSide, UsdNotional,
-    VenueQuantity,
+    AlphaEngine, CexBaseQty, Exchange, InstrumentKind, MarketConfig, MarketDataEvent, MarketRule,
+    MarketRuleKind, OrderBookSnapshot, PolyShares, PolymarketIds, Price, PriceLevel,
+    SignalStrength, Symbol, TokenSide, UsdNotional, VenueQuantity,
 };
 use polyalpha_engine::{BasisStrategySnapshot, SimpleAlphaEngine, SimpleEngineConfig};
 
@@ -82,8 +80,6 @@ struct FixtureSnapshot {
 struct FixtureSignal {
     kind: String,
     token_side: Option<String>,
-    poly_side: Option<String>,
-    cex_side: Option<String>,
     signal_basis: Option<f64>,
     z_score: Option<f64>,
     delta: Option<f64>,
@@ -193,13 +189,28 @@ async fn run_case(case: FixtureCase) {
                 observation.ts_ms + 1,
             ))
             .await;
+        let close_reason = engine.close_reason(&symbol);
 
         assert_snapshot(
             case.name.as_str(),
             &engine.basis_snapshot(&symbol),
             expected_step,
         );
-        assert_signal(case.name.as_str(), &output.arb_signals, expected_step);
+        assert_output(case.name.as_str(), &output, expected_step, close_reason);
+
+        if let Some(expected) = &expected_step.signal {
+            match expected.kind.as_str() {
+                "open" => {
+                    let candidate = output
+                        .open_candidates
+                        .first()
+                        .expect("open step should produce a candidate");
+                    engine.sync_position_state(&symbol, Some(candidate.token_side));
+                }
+                "close" => engine.sync_position_state(&symbol, None),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -255,78 +266,67 @@ fn assert_snapshot(
     }
 }
 
-fn assert_signal(
+fn assert_output(
     case_name: &str,
-    actual_signals: &[polyalpha_core::ArbSignalEvent],
+    output: &polyalpha_core::AlphaEngineOutput,
     expected_step: &FixtureExpectedStep,
+    close_reason: Option<String>,
 ) {
     match &expected_step.signal {
-        None => assert!(
-            actual_signals.is_empty(),
-            "case {case_name} expected no signal, got {actual_signals:?}"
-        ),
-        Some(expected) => {
-            assert_eq!(
-                actual_signals.len(),
-                1,
-                "case {case_name} expected exactly one signal"
+        None => {
+            assert!(
+                output.open_candidates.is_empty(),
+                "case {case_name} expected no candidate, got {:?}",
+                output.open_candidates
             );
-            let actual = &actual_signals[0];
-            match expected.kind.as_str() {
-                "open" => match &actual.action {
-                    ArbSignalAction::BasisLong {
-                        token_side,
-                        poly_side,
-                        cex_side,
-                        delta,
-                        ..
-                    } => {
-                        assert_eq!(
-                            *token_side,
-                            parse_token_side(expected.token_side.as_deref().unwrap_or("yes"))
-                        );
-                        assert_eq!(
-                            *poly_side,
-                            parse_order_side(expected.poly_side.as_deref().unwrap_or("buy"))
-                        );
-                        assert_eq!(
-                            *cex_side,
-                            parse_order_side(expected.cex_side.as_deref().unwrap_or("sell"))
-                        );
-                        assert_close(
-                            case_name,
-                            "signal_delta",
-                            *delta,
-                            expected.delta.unwrap_or_default(),
-                        );
-                        assert_optional_decimal_close(
-                            case_name,
-                            "signal_basis",
-                            actual.basis_value.as_ref().and_then(|value| value.to_f64()),
-                            expected.signal_basis,
-                        );
-                        assert_optional_decimal_close(
-                            case_name,
-                            "signal_z_score",
-                            actual.z_score.as_ref().and_then(|value| value.to_f64()),
-                            expected.z_score,
-                        );
-                        assert!(matches!(
-                            actual.strength,
-                            SignalStrength::Strong | SignalStrength::Normal | SignalStrength::Weak
-                        ));
-                    }
-                    other => panic!("case {case_name} expected open signal, got {other:?}"),
-                },
-                "close" => match &actual.action {
-                    ArbSignalAction::ClosePosition { reason } => {
-                        assert_eq!(reason, expected.reason.as_deref().unwrap_or_default());
-                    }
-                    other => panic!("case {case_name} expected close signal, got {other:?}"),
-                },
-                other => panic!("unsupported expected signal kind {other}"),
-            }
+            assert_eq!(close_reason, None);
         }
+        Some(expected) => match expected.kind.as_str() {
+            "open" => {
+                assert_eq!(
+                    output.open_candidates.len(),
+                    1,
+                    "case {case_name} expected exactly one candidate"
+                );
+                let actual = &output.open_candidates[0];
+                assert_eq!(
+                    actual.token_side,
+                    parse_token_side(expected.token_side.as_deref().unwrap_or("yes"))
+                );
+                assert_close(
+                    case_name,
+                    "candidate_delta",
+                    actual.delta_estimate,
+                    expected.delta.unwrap_or_default(),
+                );
+                assert_optional_close(
+                    case_name,
+                    "candidate_basis",
+                    Some(actual.raw_mispricing),
+                    expected.signal_basis,
+                );
+                assert_optional_close(
+                    case_name,
+                    "candidate_z_score",
+                    actual.z_score,
+                    expected.z_score,
+                );
+                assert!(matches!(
+                    actual.strength,
+                    SignalStrength::Strong | SignalStrength::Normal | SignalStrength::Weak
+                ));
+                assert_eq!(close_reason, None);
+            }
+            "close" => {
+                assert!(output.open_candidates.is_empty());
+                assert_eq!(
+                    close_reason.as_deref(),
+                    expected.reason.as_deref(),
+                    "case {case_name} expected close reason mismatch"
+                );
+            }
+            other => panic!("unsupported expected signal kind {other}"),
+        },
     }
 }
 
@@ -348,28 +348,11 @@ fn assert_optional_close(case_name: &str, field: &str, actual: Option<f64>, expe
     }
 }
 
-fn assert_optional_decimal_close(
-    case_name: &str,
-    field: &str,
-    actual: Option<f64>,
-    expected: Option<f64>,
-) {
-    assert_optional_close(case_name, field, actual, expected);
-}
-
 fn parse_token_side(value: &str) -> TokenSide {
     match value.to_ascii_lowercase().as_str() {
         "yes" => TokenSide::Yes,
         "no" => TokenSide::No,
         other => panic!("unsupported token side {other}"),
-    }
-}
-
-fn parse_order_side(value: &str) -> OrderSide {
-    match value.to_ascii_lowercase().as_str() {
-        "buy" => OrderSide::Buy,
-        "sell" => OrderSide::Sell,
-        other => panic!("unsupported order side {other}"),
     }
 }
 

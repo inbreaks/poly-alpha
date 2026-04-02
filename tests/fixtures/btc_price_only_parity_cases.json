@@ -65,12 +65,12 @@
           "preferred_snapshot": {
             "token_side": "yes",
             "poly_price": 0.6,
-            "fair_value": 1.0,
-            "signal_basis": -0.4,
+            "fair_value": 0.91783066,
+            "signal_basis": -0.31783066,
             "z_score": null,
-            "delta": 0.0,
+            "delta": 0.00042145,
             "cex_reference_price": 99500.0,
-            "sigma": null,
+            "sigma": 0.00083002,
             "minutes_to_expiry": 19.0
           },
           "signal": null
@@ -80,12 +80,12 @@
           "preferred_snapshot": {
             "token_side": "yes",
             "poly_price": 0.61,
-            "fair_value": 1.0,
-            "signal_basis": -0.39,
+            "fair_value": 0.99968647,
+            "signal_basis": -0.38968647,
             "z_score": null,
-            "delta": 0.0,
+            "delta": 3.27e-06,
             "cex_reference_price": 100200.0,
-            "sigma": null,
+            "sigma": 0.00083002,
             "minutes_to_expiry": 18.0
           },
           "signal": null
@@ -97,7 +97,7 @@
             "poly_price": 0.32,
             "fair_value": 0.82965723,
             "signal_basis": -0.50965723,
-            "z_score": -22.93144597,
+            "z_score": -4.33920834,
             "delta": 0.00017255,
             "cex_reference_price": 100400.0,
             "sigma": 0.00354722,
@@ -109,7 +109,7 @@
             "poly_side": "buy",
             "cex_side": "sell",
             "signal_basis": -0.50965723,
-            "z_score": -22.93144597,
+            "z_score": -4.33920834,
             "delta": 0.00017255
           }
         },
@@ -120,7 +120,7 @@
             "poly_price": 0.58,
             "fair_value": 0.91582592,
             "signal_basis": -0.33582592,
-            "z_score": 1.79679249,
+            "z_score": 0.88334478,
             "delta": 0.00013249,
             "cex_reference_price": 100600.0,
             "sigma": 0.00289744,
@@ -135,7 +135,7 @@
             "poly_price": 0.59,
             "fair_value": 0.87758078,
             "signal_basis": -0.28758078,
-            "z_score": 1.92207752,
+            "z_score": 1.34378265,
             "delta": 0.00015697,
             "cex_reference_price": 100500.0,
             "sigma": 0.00332028,
@@ -150,7 +150,7 @@
             "poly_price": 0.83,
             "fair_value": 0.9925586,
             "signal_basis": -0.1625586,
-            "z_score": 2.63641484,
+            "z_score": 2.63574277,
             "delta": 3.434e-05,
             "cex_reference_price": 100450.0,
             "sigma": 0.00159382,
@@ -223,12 +223,12 @@
           "preferred_snapshot": {
             "token_side": "no",
             "poly_price": 0.47,
-            "fair_value": 1.0,
-            "signal_basis": -0.53,
+            "fair_value": 0.50072168,
+            "signal_basis": -0.03072168,
             "z_score": null,
-            "delta": -0.05,
+            "delta": -0.00110253,
             "cex_reference_price": 100000.0,
-            "sigma": null,
+            "sigma": 0.00083002,
             "minutes_to_expiry": 19.0
           },
           "signal": null
@@ -238,12 +238,12 @@
           "preferred_snapshot": {
             "token_side": "no",
             "poly_price": 0.46,
-            "fair_value": 1.0,
-            "signal_basis": -0.54,
+            "fair_value": 0.92294762,
+            "signal_basis": -0.46294762,
             "z_score": null,
-            "delta": 0.0,
+            "delta": -0.00041244,
             "cex_reference_price": 99500.0,
-            "sigma": null,
+            "sigma": 0.00083002,
             "minutes_to_expiry": 18.0
           },
           "signal": null
@@ -255,21 +255,13 @@
             "poly_price": 0.28,
             "fair_value": 0.91702123,
             "signal_basis": -0.63702123,
-            "z_score": -20.40424569,
+            "z_score": -1.80547506,
             "delta": -0.00026515,
             "cex_reference_price": 99200.0,
             "sigma": 0.0014092,
             "minutes_to_expiry": 17.0
           },
-          "signal": {
-            "kind": "open",
-            "token_side": "no",
-            "poly_side": "buy",
-            "cex_side": "buy",
-            "signal_basis": -0.63702123,
-            "z_score": -20.40424569,
-            "delta": -0.00026515
-          }
+          "signal": null
         },
         {
           "ts_ms": 240000,
@@ -278,7 +270,7 @@
             "poly_price": 0.42,
             "fair_value": 0.95067175,
             "signal_basis": -0.53067175,
-            "z_score": 0.79424736,
+            "z_score": -0.60329918,
             "delta": -0.00016904,
             "cex_reference_price": 99000.0,
             "sigma": 0.0015243,
@@ -289,20 +281,17 @@
         {
           "ts_ms": 300000,
           "preferred_snapshot": {
-            "token_side": "no",
-            "poly_price": 0.45,
-            "fair_value": 0.82505877,
-            "signal_basis": -0.37505877,
-            "z_score": 4.09924462,
-            "delta": -0.00026751,
+            "token_side": "yes",
+            "poly_price": 0.55,
+            "fair_value": 0.17494123,
+            "signal_basis": 0.37505877,
+            "z_score": -0.17470873,
+            "delta": 0.00026751,
             "cex_reference_price": 99100.0,
             "sigma": 0.00251013,
             "minutes_to_expiry": 15.0
           },
-          "signal": {
-            "kind": "close",
-            "reason": "signal basis reverted inside exit band"
-          }
+          "signal": null
         }
       ]
     }

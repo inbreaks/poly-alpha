@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use polyalpha_core::{
-    ArbSignalEvent, AsyncClassification, ConnectionStatus, EngineWarning, EvaluableStatus,
-    ExecutionEvent, MarketView, MonitorState, PerformanceMetrics, PositionView, TradingMode,
+    AsyncClassification, ConnectionStatus, EngineWarning, EvaluableStatus, ExecutionEvent,
+    MarketView, MonitorState, OpenCandidate, PerformanceMetrics, PositionView, TradingMode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -246,7 +246,7 @@ pub struct EvaluationSkipEvent {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SignalEmittedEvent {
-    pub signal: ArbSignalEvent,
+    pub candidate: OpenCandidate,
     #[serde(default)]
     pub observed: Option<AuditObservedMarket>,
 }
@@ -256,7 +256,7 @@ pub struct GateDecisionEvent {
     pub gate: String,
     pub result: AuditGateResult,
     pub reason: String,
-    pub signal: ArbSignalEvent,
+    pub candidate: OpenCandidate,
     #[serde(default)]
     pub observed: Option<AuditObservedMarket>,
 }

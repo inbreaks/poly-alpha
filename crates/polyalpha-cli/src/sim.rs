@@ -2,32 +2,37 @@ use anyhow::{anyhow, Context, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::{sleep, Duration};
 
 use polyalpha_core::{
-    cex_venue_symbol, create_channels, AlphaEngine, ArbSignalAction, ArbSignalEvent, CexBaseQty,
-    ConnectionStatus, EngineParams, EngineWarning, Exchange, ExecutionEvent, HedgeState,
-    InstrumentKind, MarketConfig, MarketDataEvent, MarketDataSource, MarketPhase, OrderStatus,
-    Position, Price, RiskManager, Settings, SymbolRegistry, VenueQuantity,
+    create_channels, AlphaEngine, CexBaseQty, ConnectionStatus, EngineParams, EngineWarning,
+    Exchange, ExecutionEvent, HedgeState, InstrumentKind, MarketConfig, MarketDataEvent,
+    MarketDataSource, MarketPhase, OpenCandidate, OrderStatus, PlanningIntent, Position, Price,
+    RiskManager, Settings, SymbolRegistry, TokenSide, UsdNotional, VenueQuantity,
 };
 use polyalpha_data::{
-    CexBookLevel, CexBookUpdate, DataManager, MarketDataNormalizer, MockMarketDataSource, MockTick,
-    PolyBookLevel, PolyBookUpdate,
+    CexBookLevel, CexBookUpdate, MockMarketDataSource, MockTick, PolyBookLevel, PolyBookUpdate,
 };
 use polyalpha_engine::{SimpleAlphaEngine, SimpleEngineConfig};
-use polyalpha_executor::{
-    dry_run::{DryRunOrderSnapshot, SlippageConfig},
-    DryRunExecutor, ExecutionManager, InMemoryOrderbookProvider,
-};
+use polyalpha_executor::dry_run::DryRunOrderSnapshot;
 use polyalpha_risk::{InMemoryRiskManager, RiskLimits};
 
 use crate::args::{SimInspectFormat, SimScenario};
-use crate::commands::{select_market, signal_allowed};
+use crate::commands::{open_plan_risk_rejection_reason, preview_open_plan, select_market};
+use crate::market_pool::{
+    active_open_cooldown_reason, active_open_cooldown_remaining_ms, clear_expired_open_cooldown,
+    extract_plan_rejection_reason_code, maybe_start_open_cooldown, note_tradeable_activity,
+    MarketPoolState,
+};
+use crate::runtime::{
+    apply_orderbook_snapshot, build_data_manager, build_execution_stack,
+    close_intent_for_symbol as runtime_close_intent_for_symbol, RuntimeExecutionMode,
+    RuntimeExecutor,
+};
 
 const MAX_EVENT_LOGS: usize = 32;
 const REPORT_WIDTH: usize = 78;
@@ -238,6 +243,7 @@ struct ObservedState {
     cex_mid: Option<Decimal>,
     market_phase: Option<MarketPhase>,
     connections: HashMap<String, String>,
+    market_pool: MarketPoolState,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -362,34 +368,52 @@ fn build_sim_engine_config(settings: &Settings) -> SimpleEngineConfig {
     }
 }
 
-fn build_sim_slippage_config(settings: &Settings) -> SlippageConfig {
-    SlippageConfig {
-        poly_slippage_bps: settings.paper_slippage.poly_slippage_bps,
-        cex_slippage_bps: settings.paper_slippage.cex_slippage_bps,
-        min_liquidity: settings.paper_slippage.min_liquidity,
-        allow_partial_fill: settings.paper_slippage.allow_partial_fill,
-    }
+fn close_intent_for_symbol(
+    symbol: &polyalpha_core::Symbol,
+    reason: &str,
+    now_ms: u64,
+) -> PlanningIntent {
+    runtime_close_intent_for_symbol(
+        symbol,
+        reason,
+        &format!("corr-close-{}-{now_ms}", symbol.0),
+        now_ms,
+    )
 }
 
-fn update_sim_orderbook(
-    provider: &InMemoryOrderbookProvider,
-    registry: &SymbolRegistry,
-    snapshot: &polyalpha_core::OrderBookSnapshot,
+fn sync_engine_position_state(
+    engine: &mut SimpleAlphaEngine,
+    risk: &InMemoryRiskManager,
+    symbol: &polyalpha_core::Symbol,
 ) {
-    match snapshot.instrument {
-        InstrumentKind::CexPerp => {
-            let venue_symbol = registry
-                .get_config(&snapshot.symbol)
-                .map(|config| cex_venue_symbol(config.hedge_exchange, &config.cex_symbol))
-                .unwrap_or_else(|| {
-                    cex_venue_symbol(
-                        snapshot.exchange,
-                        &snapshot.symbol.0.to_ascii_uppercase().replace('-', ""),
-                    )
-                });
-            provider.update_cex(snapshot.clone(), venue_symbol);
-        }
-        InstrumentKind::PolyYes | InstrumentKind::PolyNo => provider.update(snapshot.clone()),
+    let active_token_side = if risk
+        .position_tracker()
+        .net_symbol_qty(symbol, InstrumentKind::PolyYes)
+        > Decimal::ZERO
+    {
+        Some(TokenSide::Yes)
+    } else if risk
+        .position_tracker()
+        .net_symbol_qty(symbol, InstrumentKind::PolyNo)
+        > Decimal::ZERO
+    {
+        Some(TokenSide::No)
+    } else {
+        None
+    };
+    engine.sync_position_state(symbol, active_token_side);
+}
+
+fn event_timestamp_ms(event: &MarketDataEvent) -> u64 {
+    match event {
+        MarketDataEvent::OrderBookUpdate { snapshot } => snapshot.received_at_ms,
+        MarketDataEvent::TradeUpdate { timestamp_ms, .. } => *timestamp_ms,
+        MarketDataEvent::FundingRate {
+            next_funding_time_ms,
+            ..
+        } => *next_funding_time_ms,
+        MarketDataEvent::MarketLifecycle { timestamp_ms, .. } => *timestamp_ms,
+        MarketDataEvent::ConnectionEvent { .. } => 0,
     }
 }
 
@@ -407,10 +431,7 @@ async fn run_sim_with_mock_ticks(
     let market = select_market(settings, market_index)?;
     let registry = SymbolRegistry::new(settings.markets.clone());
     let channels = create_channels(std::slice::from_ref(&market.symbol));
-    let manager = DataManager::new(
-        MarketDataNormalizer::new(registry.clone()),
-        channels.market_data_tx.clone(),
-    );
+    let manager = build_data_manager(&registry, channels.market_data_tx.clone());
 
     let mut source = MockMarketDataSource::new(
         manager,
@@ -432,12 +453,14 @@ async fn run_sim_with_mock_ticks(
         max_position_usd: Some(settings.strategy.basis.max_position_usd),
     });
 
-    let orderbook_provider = Arc::new(InMemoryOrderbookProvider::new());
-    let executor = DryRunExecutor::with_orderbook(
-        orderbook_provider.clone(),
-        build_sim_slippage_config(settings),
-    );
-    let mut execution = ExecutionManager::with_symbol_registry(executor.clone(), registry.clone());
+    let (orderbook_provider, executor, mut execution) = build_execution_stack(
+        settings,
+        &registry,
+        RuntimeExecutionMode::Paper,
+        1_700_000_000_000,
+        None,
+    )
+    .await?;
     let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
     let mut observed = ObservedState::default();
     let mut stats = SimStats::default();
@@ -452,7 +475,7 @@ async fn run_sim_with_mock_ticks(
                 Ok(event) => {
                     stats.market_events += 1;
                     if let MarketDataEvent::OrderBookUpdate { snapshot } = &event {
-                        update_sim_orderbook(&orderbook_provider, &registry, snapshot);
+                        apply_orderbook_snapshot(&orderbook_provider, &registry, snapshot);
                     }
                     observe_market_event(&mut observed, &event);
                     push_event(
@@ -477,25 +500,139 @@ async fn run_sim_with_mock_ticks(
                         let events = execution.apply_dmm_quote_update(update).await?;
                         apply_execution_events(&mut risk, &mut stats, &mut recent_events, events)
                             .await?;
+                        sync_engine_position_state(&mut engine, &risk, &market.symbol);
                     }
 
-                    for signal in output.arb_signals {
+                    for candidate in output.open_candidates {
                         stats.signals_seen += 1;
-                        push_event(&mut recent_events, "signal", summarize_signal(&signal));
+                        push_event(
+                            &mut recent_events,
+                            "signal",
+                            summarize_candidate(&candidate),
+                        );
 
-                        if !signal_allowed(&risk, &registry, &signal).await? {
+                        clear_expired_open_cooldown(
+                            &mut observed.market_pool,
+                            candidate.timestamp_ms,
+                        );
+                        if let Some(reason) = active_open_cooldown_reason(
+                            &observed.market_pool,
+                            candidate.timestamp_ms,
+                        ) {
                             stats.signals_rejected += 1;
+                            let remaining_ms = active_open_cooldown_remaining_ms(
+                                &observed.market_pool,
+                                candidate.timestamp_ms,
+                            )
+                            .unwrap_or_default();
                             push_event(
                                 &mut recent_events,
                                 "risk",
-                                format!("信号被拒绝：未通过风控检查 {}", signal.signal_id),
+                                format!(
+                                    "候选被拒绝：市场处于冷却期 {}（{}，剩余冷却 {}ms）",
+                                    candidate.candidate_id, reason, remaining_ms
+                                ),
                             );
                             continue;
                         }
 
-                        let events = execution.process_arb_signal(signal).await?;
+                        let plan = match preview_open_plan(&mut execution, &candidate) {
+                            Ok(plan) => plan,
+                            Err(err) => {
+                                stats.signals_rejected += 1;
+                                let reason_code =
+                                    extract_plan_rejection_reason_code(&err.to_string())
+                                        .unwrap_or_else(|| "trade_plan_rejected".to_owned());
+                                let _ = maybe_start_market_pool_cooldown(
+                                    settings,
+                                    &mut observed,
+                                    candidate.timestamp_ms,
+                                    &reason_code,
+                                );
+                                push_event(
+                                    &mut recent_events,
+                                    "risk",
+                                    format!(
+                                        "候选被交易规划拒绝 {}（{}）",
+                                        candidate.candidate_id, err
+                                    ),
+                                );
+                                continue;
+                            }
+                        };
+
+                        if let Some(risk_rejection) = open_plan_risk_rejection_reason(&risk, &plan)
+                        {
+                            stats.signals_rejected += 1;
+                            push_event(
+                                &mut recent_events,
+                                "risk",
+                                format!(
+                                    "候选被拒绝：未通过风控检查 {}（{}）",
+                                    candidate.candidate_id, risk_rejection
+                                ),
+                            );
+                            continue;
+                        }
+
+                        match execution.process_plan(plan).await {
+                            Ok(events) => {
+                                if execution_events_include_trade_plan_created(&events) {
+                                    note_tradeable_activity(
+                                        &mut observed.market_pool,
+                                        candidate.timestamp_ms,
+                                    );
+                                }
+                                let rejection_reasons = opening_signal_rejection_reasons(&events);
+                                if !rejection_reasons.is_empty() {
+                                    let _ = maybe_start_market_pool_cooldown_from_rejections(
+                                        settings,
+                                        &mut observed,
+                                        candidate.timestamp_ms,
+                                        &rejection_reasons,
+                                    );
+                                }
+                                apply_execution_events(
+                                    &mut risk,
+                                    &mut stats,
+                                    &mut recent_events,
+                                    events,
+                                )
+                                .await?;
+                                sync_engine_position_state(&mut engine, &risk, &market.symbol);
+                            }
+                            Err(err) => {
+                                stats.signals_rejected += 1;
+                                let rejection_reasons = vec![err.to_string()];
+                                let _ = maybe_start_market_pool_cooldown_from_rejections(
+                                    settings,
+                                    &mut observed,
+                                    candidate.timestamp_ms,
+                                    &rejection_reasons,
+                                );
+                                push_event(
+                                    &mut recent_events,
+                                    "risk",
+                                    format!(
+                                        "候选被执行规划拒绝 {}（{}）",
+                                        candidate.candidate_id, err
+                                    ),
+                                );
+                            }
+                        }
+                    }
+
+                    if let Some(reason) = engine.close_reason(&market.symbol) {
+                        let events = execution
+                            .process_intent(close_intent_for_symbol(
+                                &market.symbol,
+                                &reason,
+                                event_timestamp_ms(&event),
+                            ))
+                            .await?;
                         apply_execution_events(&mut risk, &mut stats, &mut recent_events, events)
                             .await?;
+                        sync_engine_position_state(&mut engine, &risk, &market.symbol);
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -813,6 +950,59 @@ fn mid_from_book(snapshot: &polyalpha_core::OrderBookSnapshot) -> Option<Decimal
     Some((best_bid + best_ask) / Decimal::new(2, 0))
 }
 
+fn maybe_start_market_pool_cooldown(
+    settings: &Settings,
+    observed: &mut ObservedState,
+    now_ms: u64,
+    reason: &str,
+) -> bool {
+    maybe_start_open_cooldown(
+        &mut observed.market_pool,
+        settings.strategy.market_data.max_stale_ms,
+        reason,
+        now_ms,
+    )
+}
+
+fn maybe_start_market_pool_cooldown_from_rejections(
+    settings: &Settings,
+    observed: &mut ObservedState,
+    now_ms: u64,
+    rejection_reasons: &[String],
+) -> Option<String> {
+    rejection_reasons.iter().find_map(|reason| {
+        let code = extract_plan_rejection_reason_code(reason).unwrap_or_else(|| reason.clone());
+        maybe_start_market_pool_cooldown(settings, observed, now_ms, &code).then_some(code)
+    })
+}
+
+fn opening_signal_rejection_reasons(events: &[ExecutionEvent]) -> Vec<String> {
+    let mut reasons = Vec::new();
+    let mut seen = HashSet::new();
+
+    for event in events {
+        if let ExecutionEvent::OrderSubmitted { response, .. } = event {
+            if matches!(response.status, OrderStatus::Rejected) {
+                let reason = response
+                    .rejection_reason
+                    .clone()
+                    .unwrap_or_else(|| "order_rejected".to_owned());
+                if seen.insert(reason.clone()) {
+                    reasons.push(reason);
+                }
+            }
+        }
+    }
+
+    reasons
+}
+
+fn execution_events_include_trade_plan_created(events: &[ExecutionEvent]) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, ExecutionEvent::TradePlanCreated { .. }))
+}
+
 fn build_snapshot(
     market: &MarketConfig,
     scenario: &str,
@@ -821,8 +1011,8 @@ fn build_snapshot(
     observed: &ObservedState,
     stats: &SimStats,
     risk: &InMemoryRiskManager,
-    execution: &ExecutionManager<DryRunExecutor>,
-    executor: &DryRunExecutor,
+    execution: &polyalpha_executor::ExecutionManager<RuntimeExecutor>,
+    executor: &RuntimeExecutor,
 ) -> Result<SimSnapshot> {
     let snapshot = risk.build_snapshot(tick_index as u64);
     let positions = snapshot
@@ -885,6 +1075,25 @@ async fn apply_execution_events(
 ) -> Result<()> {
     for event in events {
         match &event {
+            ExecutionEvent::TradePlanCreated { .. } => {
+                push_event(recent_events, "plan", summarize_execution_event(&event));
+            }
+            ExecutionEvent::PlanSuperseded { .. } => {
+                push_event(recent_events, "plan", summarize_execution_event(&event));
+            }
+            ExecutionEvent::RecoveryPlanCreated { .. } => {
+                push_event(recent_events, "recovery", summarize_execution_event(&event));
+            }
+            ExecutionEvent::ExecutionResultRecorded { result } => {
+                if !result.actual_funding_cost_usd.0.is_zero() {
+                    let funding_adjustment =
+                        UsdNotional(Decimal::ZERO - result.actual_funding_cost_usd.0);
+                    risk.apply_realized_pnl_adjustment(UsdNotional(funding_adjustment.0))
+                        .await?;
+                    stats.total_pnl_usd += funding_adjustment.0.to_f64().unwrap_or_default();
+                }
+                push_event(recent_events, "result", summarize_execution_event(&event));
+            }
             ExecutionEvent::OrderSubmitted { .. } => {
                 stats.order_submitted += 1;
                 push_event(
@@ -921,9 +1130,8 @@ async fn apply_execution_events(
                     summarize_execution_event(&event),
                 );
             }
-            ExecutionEvent::TradeClosed { realized_pnl, .. } => {
+            ExecutionEvent::TradeClosed { .. } => {
                 stats.trades_closed += 1;
-                stats.total_pnl_usd += realized_pnl.0.to_f64().unwrap_or(0.0);
                 push_event(
                     recent_events,
                     "trade_closed",
@@ -937,6 +1145,28 @@ async fn apply_execution_events(
 
 fn summarize_execution_event(event: &ExecutionEvent) -> String {
     match event {
+        ExecutionEvent::TradePlanCreated { plan } => format!(
+            "交易计划已生成 {} {} {} / {}",
+            plan.symbol.0, plan.plan_id, plan.intent_type, plan.priority
+        ),
+        ExecutionEvent::PlanSuperseded {
+            symbol,
+            superseded_plan_id,
+            next_plan_id,
+        } => format!(
+            "{} 计划已抢占 {} -> {}",
+            symbol.0, superseded_plan_id, next_plan_id
+        ),
+        ExecutionEvent::RecoveryPlanCreated { plan } => {
+            format!("恢复计划已生成 {} {}", plan.symbol.0, plan.plan_id)
+        }
+        ExecutionEvent::ExecutionResultRecorded { result } => format!(
+            "执行结果已记录 {} {} {} / 实际边际={}",
+            result.symbol.0,
+            result.plan_id,
+            result.status,
+            result.realized_edge_usd.0.normalize()
+        ),
         ExecutionEvent::OrderSubmitted {
             exchange, response, ..
         } => {
@@ -1089,15 +1319,13 @@ fn summarize_engine_warning(warning: &EngineWarning) -> String {
     }
 }
 
-fn summarize_signal(signal: &ArbSignalEvent) -> String {
-    let action = match &signal.action {
-        ArbSignalAction::BasisLong { .. } => "基差做多信号",
-        ArbSignalAction::BasisShort { .. } => "基差做空信号",
-        ArbSignalAction::DeltaRebalance { .. } => "Delta 再平衡信号",
-        ArbSignalAction::NegRiskArb { .. } => "负风险套利信号",
-        ArbSignalAction::ClosePosition { .. } => "平仓信号",
+fn summarize_candidate(candidate: &OpenCandidate) -> String {
+    let action = match candidate.direction.as_str() {
+        "long" => "开仓候选",
+        "short" => "反向候选",
+        _ => "候选机会",
     };
-    format!("{action} {}", signal.signal_id)
+    format!("{action} {}", candidate.candidate_id)
 }
 
 fn push_event(events: &mut VecDeque<SimEventLog>, kind: &str, summary: String) {
@@ -1434,10 +1662,11 @@ mod tests {
     use super::*;
 
     use polyalpha_core::{
-        AuditConfig, BasisStrategyConfig, BinanceConfig, DmmStrategyConfig, GeneralConfig,
-        MarketDataConfig, MarketRule, NegRiskStrategyConfig, OkxConfig, PaperSlippageConfig,
-        PaperTradingConfig, PolymarketConfig, PolymarketIds, RiskConfig, SettlementRules,
-        StrategyConfig, Symbol, UsdNotional,
+        AuditConfig, BasisStrategyConfig, BinanceConfig, ClientOrderId, DmmStrategyConfig,
+        Exchange, ExecutionEvent, GeneralConfig, MarketDataConfig, MarketRule,
+        NegRiskStrategyConfig, OkxConfig, OrderId, OrderResponse, OrderStatus, PaperSlippageConfig,
+        PaperTradingConfig, PolyShares, PolymarketConfig, PolymarketIds, RiskConfig,
+        SettlementRules, StrategyConfig, Symbol, UsdNotional, VenueQuantity,
     };
 
     fn test_market(cex_qty_step: Decimal) -> MarketConfig {
@@ -1473,6 +1702,11 @@ mod tests {
                 clob_api_url: "https://example.com".to_owned(),
                 ws_url: "wss://example.com/ws".to_owned(),
                 chain_id: 137,
+                private_key: None,
+                signature_type: None,
+                funder: None,
+                api_key_nonce: None,
+                use_server_time: true,
             },
             binance: BinanceConfig {
                 rest_url: "https://example.com".to_owned(),
@@ -1494,6 +1728,7 @@ mod tests {
                     max_position_usd: UsdNotional(max_position_usd),
                     delta_rebalance_threshold: Decimal::new(5, 2),
                     delta_rebalance_interval_secs: 60,
+                    band_policy: polyalpha_core::BandPolicyMode::ConfiguredBand,
                     min_poly_price: Some(Decimal::ZERO),
                     max_poly_price: Some(Decimal::ONE),
                     max_data_age_minutes: 1,
@@ -1536,6 +1771,7 @@ mod tests {
                 min_liquidity: Decimal::new(1, 0),
                 allow_partial_fill: false,
             },
+            execution_costs: polyalpha_core::ExecutionCostConfig::default(),
             audit: AuditConfig::default(),
         }
     }
@@ -1658,8 +1894,27 @@ mod tests {
         })
     }
 
+    #[test]
+    fn summarize_execution_event_keeps_band_policy_rejection_code_visible() {
+        let text = summarize_execution_event(&ExecutionEvent::OrderSubmitted {
+            symbol: Symbol::new("btc-test"),
+            exchange: Exchange::Binance,
+            response: OrderResponse {
+                client_order_id: ClientOrderId("client-1".to_owned()),
+                exchange_order_id: OrderId("ord-1".to_owned()),
+                status: OrderStatus::Rejected,
+                filled_quantity: VenueQuantity::PolyShares(PolyShares(Decimal::ZERO)),
+                average_price: None,
+                rejection_reason: Some("below_min_poly_price".to_owned()),
+                timestamp_ms: 1,
+            },
+            correlation_id: "corr-1".to_owned(),
+        });
+        assert!(text.contains("below_min_poly_price"));
+    }
+
     #[tokio::test]
-    async fn sim_round_trip_opens_and_closes_all_legs() {
+    async fn sim_rejects_non_executable_candidate_without_aborting() {
         let market = test_market(Decimal::new(1, 3));
         let settings = test_settings(market.clone(), Decimal::new(1_000, 0));
         let artifact = run_sim_with_mock_ticks(
@@ -1674,16 +1929,16 @@ mod tests {
             false,
         )
         .await
-        .expect("sim round-trip should succeed");
+        .expect("sim candidate rejection should not abort runtime");
 
         assert_eq!(
-            artifact.final_snapshot.signals_seen, 2,
+            artifact.final_snapshot.signals_seen, 1,
             "unexpected snapshots: {:#?}",
             artifact.snapshots
         );
-        assert_eq!(artifact.final_snapshot.signals_rejected, 0);
-        assert_eq!(artifact.final_snapshot.order_submitted, 4);
-        assert_eq!(artifact.final_snapshot.fills, 4);
+        assert_eq!(artifact.final_snapshot.signals_rejected, 1);
+        assert_eq!(artifact.final_snapshot.order_submitted, 0);
+        assert_eq!(artifact.final_snapshot.fills, 0);
         assert!(
             snapshot_positions_are_flat(&artifact.final_snapshot),
             "unexpected final snapshot: {:#?}\nrecent events: {:#?}",
@@ -1695,8 +1950,8 @@ mod tests {
             artifact
                 .recent_events
                 .iter()
-                .any(|event| event.kind == "trade_closed"),
-            "sim acceptance should emit TradeClosed"
+                .any(|event| event.summary.contains("候选被交易规划拒绝")),
+            "planner rejection should be visible in sim event log"
         );
     }
 
@@ -1725,11 +1980,12 @@ mod tests {
                     .is_some_and(|z_score| z_score <= -0.5)
                     && snapshot
                         .current_delta
-                        .is_some_and(|delta| delta.abs() >= 0.05)
+                        .is_some_and(|delta| delta.abs() > 0.0 && delta.abs() < 0.05)
             }),
-            "scenario should produce an entry-quality basis snapshot before hedge floor is applied"
+            "scenario should produce an entry-quality basis snapshot with a tiny hedge delta before step rounding blocks entry"
         );
-        assert_eq!(artifact.final_snapshot.signals_seen, 0);
+        assert_eq!(artifact.final_snapshot.signals_seen, 1);
+        assert_eq!(artifact.final_snapshot.signals_rejected, 1);
         assert_eq!(artifact.final_snapshot.order_submitted, 0);
         assert_eq!(artifact.final_snapshot.fills, 0);
         assert!(snapshot_positions_are_flat(&artifact.final_snapshot));
@@ -1737,8 +1993,37 @@ mod tests {
             artifact
                 .recent_events
                 .iter()
+                .any(|event| { event.summary.contains("zero_cex_hedge_qty") }),
+            "zero-hedge rejection should stay visible in the sim event log"
+        );
+        assert!(
+            artifact
+                .recent_events
+                .iter()
                 .all(|event| event.kind != "trade_closed"),
             "no position should mean no TradeClosed event"
+        );
+    }
+
+    #[test]
+    fn sim_market_pool_cooldown_starts_from_zero_hedge_rejection_reason() {
+        let market = test_market(Decimal::ONE);
+        let settings = test_settings(market, Decimal::ONE);
+        let mut observed = ObservedState::default();
+
+        let reason = maybe_start_market_pool_cooldown_from_rejections(
+            &settings,
+            &mut observed,
+            1_000,
+            &[String::from(
+                "plan rejected [zero_cex_hedge_qty]: open plan cannot produce a non-zero cex hedge after step rounding",
+            )],
+        );
+
+        assert_eq!(reason.as_deref(), Some("zero_cex_hedge_qty"));
+        assert_eq!(
+            active_open_cooldown_reason(&observed.market_pool, 1_001),
+            Some("zero_cex_hedge_qty")
         );
     }
 }

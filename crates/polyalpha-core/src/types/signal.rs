@@ -1,21 +1,12 @@
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use super::{CexBaseQty, OrderSide, PolyShares, Price, Symbol, TokenSide, UsdNotional};
+use super::{OpenCandidate, PolyShares, Price, Symbol};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SignalStrength {
     Strong,
     Normal,
     Weak,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ArbLeg {
-    pub symbol: Symbol,
-    pub token_side: TokenSide,
-    pub side: OrderSide,
-    pub quantity: PolyShares,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,52 +44,6 @@ impl DmmQuoteUpdate {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub enum ArbSignalAction {
-    BasisLong {
-        token_side: TokenSide,
-        poly_side: OrderSide,
-        poly_target_shares: PolyShares,
-        poly_target_notional: UsdNotional,
-        cex_side: OrderSide,
-        cex_hedge_qty: CexBaseQty,
-        delta: f64,
-    },
-    BasisShort {
-        token_side: TokenSide,
-        poly_side: OrderSide,
-        poly_target_shares: PolyShares,
-        poly_target_notional: UsdNotional,
-        cex_side: OrderSide,
-        cex_hedge_qty: CexBaseQty,
-        delta: f64,
-    },
-    DeltaRebalance {
-        cex_side: OrderSide,
-        cex_qty_adjust: CexBaseQty,
-        new_delta: f64,
-    },
-    NegRiskArb {
-        legs: Vec<ArbLeg>,
-    },
-    ClosePosition {
-        reason: String,
-    },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ArbSignalEvent {
-    pub signal_id: String,
-    pub correlation_id: String,
-    pub symbol: Symbol,
-    pub action: ArbSignalAction,
-    pub strength: SignalStrength,
-    pub basis_value: Option<Decimal>,
-    pub z_score: Option<Decimal>,
-    pub expected_pnl: UsdNotional,
-    pub timestamp_ms: u64,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum EngineWarning {
     ConnectionLost {
@@ -133,14 +78,15 @@ pub enum EngineWarning {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct AlphaEngineOutput {
     pub dmm_updates: Vec<DmmQuoteUpdate>,
-    pub arb_signals: Vec<ArbSignalEvent>,
+    #[serde(default)]
+    pub open_candidates: Vec<OpenCandidate>,
     #[serde(default)]
     pub warnings: Vec<EngineWarning>,
 }
 
 impl AlphaEngineOutput {
     pub fn is_empty(&self) -> bool {
-        self.dmm_updates.is_empty() && self.arb_signals.is_empty() && self.warnings.is_empty()
+        self.dmm_updates.is_empty() && self.open_candidates.is_empty() && self.warnings.is_empty()
     }
 
     pub fn push_dmm_update(&mut self, update: DmmQuoteUpdate) {
@@ -155,8 +101,8 @@ impl AlphaEngineOutput {
         self.push_dmm_update(DmmQuoteUpdate::clear(symbol));
     }
 
-    pub fn push_arb_signal(&mut self, signal: ArbSignalEvent) {
-        self.arb_signals.push(signal);
+    pub fn push_open_candidate(&mut self, candidate: OpenCandidate) {
+        self.open_candidates.push(candidate);
     }
 
     pub fn push_warning(&mut self, warning: EngineWarning) {
@@ -169,6 +115,7 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::*;
+    use crate::{SignalStrength, TokenSide, PLANNING_SCHEMA_VERSION};
 
     #[test]
     fn dmm_quote_updates_support_set_and_clear_semantics() {
@@ -190,7 +137,7 @@ mod tests {
     }
 
     #[test]
-    fn alpha_engine_output_tracks_both_signal_paths() {
+    fn alpha_engine_output_tracks_open_candidates() {
         let mut output = AlphaEngineOutput::default();
         assert!(output.is_empty());
 
@@ -202,22 +149,24 @@ mod tests {
             ask_qty: PolyShares(Decimal::new(10, 0)),
             updated_at_ms: 1_716_000_000_000,
         });
-        output.push_arb_signal(ArbSignalEvent {
-            signal_id: "sig-1".to_owned(),
+        output.push_open_candidate(OpenCandidate {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            candidate_id: "cand-1".to_owned(),
             correlation_id: "corr-1".to_owned(),
             symbol: Symbol::new("btc-100k-mar-2026"),
-            action: ArbSignalAction::ClosePosition {
-                reason: "basis normalized".to_owned(),
-            },
+            token_side: TokenSide::Yes,
+            direction: "long".to_owned(),
+            fair_value: 0.49,
+            raw_mispricing: 0.03,
+            delta_estimate: 0.12,
+            risk_budget_usd: 200.0,
             strength: SignalStrength::Normal,
-            basis_value: None,
-            z_score: None,
-            expected_pnl: UsdNotional(Decimal::ZERO),
+            z_score: Some(2.4),
             timestamp_ms: 1_716_000_000_000,
         });
 
         assert_eq!(output.dmm_updates.len(), 1);
-        assert_eq!(output.arb_signals.len(), 1);
+        assert_eq!(output.open_candidates.len(), 1);
         assert!(!output.is_empty());
     }
 

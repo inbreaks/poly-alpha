@@ -1,3 +1,9 @@
+//! Core type exports intentionally exclude the legacy executable signal surface.
+//!
+//! ```compile_fail
+//! use polyalpha_core::LegacyExecutableSignalSurface;
+//! ```
+
 pub mod decimal;
 pub mod engine;
 pub mod fill;
@@ -5,6 +11,7 @@ pub mod hedge;
 pub mod market;
 pub mod order;
 pub mod orderbook;
+pub mod planning;
 pub mod position;
 pub mod position_tracker;
 pub mod risk;
@@ -20,13 +27,17 @@ pub use market::{
 };
 pub use order::{
     CexOrderRequest, ClientOrderId, OrderId, OrderRequest, OrderResponse, OrderSide, OrderStatus,
-    OrderType, PolyOrderRequest, TimeInForce,
+    OrderType, PolyOrderRequest, PolySizingInstruction, TimeInForce,
 };
 pub use orderbook::{InstrumentKind, OrderBookSnapshot, PriceLevel, Side};
+pub use planning::{
+    ExecutionResult, OpenCandidate, OrderLedgerEntry, PlanRejectionReason, PlanningIntent,
+    RecoveryDecisionReason, ResidualSnapshot, RevalidationFailureReason, TradePlan,
+    PLANNING_SCHEMA_VERSION,
+};
 pub use position::{Position, PositionKey, PositionSide};
 pub use position_tracker::{FillEffect, PositionTracker};
 pub use risk::{CircuitBreakerStatus, PersistenceLag, RiskRejection};
 pub use signal::{
-    AlphaEngineOutput, ArbLeg, ArbSignalAction, ArbSignalEvent, DmmQuoteSlot, DmmQuoteState,
-    DmmQuoteUpdate, EngineWarning, SignalStrength,
+    AlphaEngineOutput, DmmQuoteSlot, DmmQuoteState, DmmQuoteUpdate, EngineWarning, SignalStrength,
 };

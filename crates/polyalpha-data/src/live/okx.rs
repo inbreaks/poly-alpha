@@ -10,8 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use polyalpha_core::{
-    CexBaseQty, ConnectionStatus, CoreError, Exchange, MarketDataEvent, MarketDataSource,
-    OrderSide, Symbol,
+    CexBaseQty, ConnectionStatus, CoreError, Exchange, MarketDataSource, OrderSide, Symbol,
 };
 
 use crate::error::{DataError, Result};
@@ -30,21 +29,12 @@ pub struct OkxMarketDataSource {
 }
 
 impl OkxMarketDataSource {
-    fn publish_connection_event(&self, status: ConnectionStatus) {
-        let _ = self.manager.publish(MarketDataEvent::ConnectionEvent {
-            exchange: Exchange::Okx,
-            status,
-        });
-    }
-
     fn set_status_if_changed(&self, new_status: ConnectionStatus) {
         let mut guard = self.status.lock().expect("okx status lock poisoned");
         if *guard == new_status {
             return;
         }
         *guard = new_status;
-        drop(guard);
-        self.publish_connection_event(new_status);
     }
 
     fn mark_connected(&self) {
@@ -67,8 +57,6 @@ impl OkxMarketDataSource {
             return;
         }
         *guard = next;
-        drop(guard);
-        self.publish_connection_event(next);
     }
     pub fn new(manager: DataManager, rest_url: impl Into<String>) -> Self {
         Self {
@@ -230,6 +218,21 @@ impl OkxMarketDataSource {
         }
 
         let ws: OkxWsBooksEvent = serde_json::from_value(value)?;
+        let expected_inst_id = okx_inst_id(venue_symbol);
+        let actual_inst_id = ws
+            .arg
+            .as_ref()
+            .and_then(|arg| arg.inst_id.as_deref())
+            .filter(|inst_id| !inst_id.is_empty())
+            .ok_or_else(|| {
+                DataError::InvalidResponse("okx ws books payload missing instId".to_owned())
+            })?;
+        if actual_inst_id != expected_inst_id {
+            return Err(DataError::InvalidResponse(format!(
+                "okx ws instId mismatch: expected {}, got {}",
+                expected_inst_id, actual_inst_id
+            )));
+        }
         let first = ws
             .data
             .first()
@@ -372,7 +375,14 @@ struct OkxMarkPriceData {
 }
 
 #[derive(Debug, Deserialize)]
+struct OkxWsArg {
+    #[serde(rename = "instId")]
+    inst_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct OkxWsBooksEvent {
+    arg: Option<OkxWsArg>,
     data: Vec<OkxBooksData>,
 }
 
@@ -420,7 +430,37 @@ fn okx_inst_id(venue_symbol: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    use polyalpha_core::{
+        create_channels, ConnectionStatus, Exchange, MarketConfig, PolymarketIds, Price, Symbol,
+        SymbolRegistry,
+    };
+
     use super::*;
+    use crate::{DataManager, MarketDataNormalizer};
+
+    fn sample_registry() -> SymbolRegistry {
+        SymbolRegistry::new(vec![MarketConfig {
+            symbol: Symbol::new("btc-100k-mar-2026"),
+            poly_ids: PolymarketIds {
+                condition_id: "condition-1".to_owned(),
+                yes_token_id: "yes-1".to_owned(),
+                no_token_id: "no-1".to_owned(),
+            },
+            market_question: None,
+            market_rule: None,
+            cex_symbol: "BTCUSDT".to_owned(),
+            hedge_exchange: Exchange::Binance,
+            strike_price: Some(Price(Decimal::new(100_000, 0))),
+            settlement_timestamp: 1_775_001_600,
+            min_tick_size: Price(Decimal::new(1, 2)),
+            neg_risk: false,
+            cex_price_tick: Decimal::new(1, 1),
+            cex_qty_step: Decimal::new(1, 3),
+            cex_contract_multiplier: Decimal::ONE,
+        }])
+    }
 
     #[test]
     fn parse_okx_books_payload() {
@@ -482,5 +522,51 @@ mod tests {
         let result = OkxMarketDataSource::parse_orderbook_ws_message(payload, "BTC-USDT-SWAP")
             .expect("parse ok");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_okx_ws_orderbook_rejects_missing_inst_id() {
+        let payload = r#"{
+            "arg":{"channel":"books5"},
+            "data":[{"bids":[["100.1","2.3","0","1"]],"asks":[["100.2","1.8","0","1"]],"ts":"1715000001000"}]
+        }"#;
+
+        let err = OkxMarketDataSource::parse_orderbook_ws_message(payload, "BTC-USDT-SWAP")
+            .expect_err("payload without instId must be rejected");
+        assert!(matches!(err, DataError::InvalidResponse(message) if message.contains("instId")));
+    }
+
+    #[test]
+    fn parse_okx_ws_orderbook_rejects_mismatched_inst_id() {
+        let payload = r#"{
+            "arg":{"channel":"books5","instId":"ETH-USDT-SWAP"},
+            "data":[{"bids":[["100.1","2.3","0","1"]],"asks":[["100.2","1.8","0","1"]],"ts":"1715000001000"}]
+        }"#;
+
+        let err = OkxMarketDataSource::parse_orderbook_ws_message(payload, "BTC-USDT-SWAP")
+            .expect_err("payload with mismatched instId must be rejected");
+        assert!(
+            matches!(err, DataError::InvalidResponse(message) if message.contains("instId mismatch"))
+        );
+    }
+
+    #[test]
+    fn rest_status_changes_do_not_publish_connection_events() {
+        let symbol = Symbol::new("btc-100k-mar-2026");
+        let channels = create_channels(std::slice::from_ref(&symbol));
+        let manager = DataManager::new(
+            MarketDataNormalizer::new(sample_registry()),
+            channels.market_data_tx.clone(),
+        );
+        let source = OkxMarketDataSource::new(manager, "https://www.okx.com");
+        let mut rx = channels.market_data_tx.subscribe();
+
+        source.mark_connected();
+        assert_eq!(source.connection_status(), ConnectionStatus::Connected);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+
+        source.mark_failure();
+        assert_eq!(source.connection_status(), ConnectionStatus::Reconnecting);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 }

@@ -1,7 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::str::FromStr;
+
+use polyalpha_core::BandPolicyMode;
 
 use crate::args::BacktestCommand;
 use crate::backtest_rust::{
@@ -10,6 +14,116 @@ use crate::backtest_rust::{
 
 const BUILD_DB_SCRIPT: &str = "scripts/build_btc_basis_backtest_db.py";
 const REPORT_SCRIPT: &str = "scripts/btc_basis_backtest_report.py";
+const DEFAULT_SHARED_FEE_BPS: f64 = 2.0;
+const DEFAULT_CEX_HEDGE_RATIO: f64 = 1.0;
+const DEFAULT_CEX_MARGIN_RATIO: f64 = 0.10;
+
+#[derive(Clone, Debug, PartialEq)]
+struct RuntimeBacktestDefaults {
+    initial_capital: f64,
+    rolling_window: usize,
+    entry_z: f64,
+    exit_z: f64,
+    position_notional_usd: f64,
+    max_capital_usage: f64,
+    cex_hedge_ratio: f64,
+    cex_margin_ratio: f64,
+    poly_fee_bps: f64,
+    poly_slippage_bps: f64,
+    cex_fee_bps: f64,
+    cex_slippage_bps: f64,
+    planner_depth_levels: usize,
+    band_policy: BandPolicyMode,
+    min_poly_price: Option<f64>,
+    max_poly_price: Option<f64>,
+}
+
+fn load_runtime_backtest_defaults() -> Result<RuntimeBacktestDefaults> {
+    let config_path = workspace_root()?.join("config/default.toml");
+    let raw = fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let root: toml::Value = toml::from_str(&raw)
+        .context("failed to parse backtest defaults from config/default.toml")?;
+    let initial_capital = toml_f64(&root, &["paper", "initial_capital"], 10_000.0);
+    let max_total_exposure_usd =
+        toml_f64(&root, &["risk", "max_total_exposure_usd"], initial_capital);
+    let max_capital_usage = if initial_capital.abs() <= f64::EPSILON {
+        0.0
+    } else {
+        (max_total_exposure_usd / initial_capital).max(0.0)
+    };
+
+    Ok(RuntimeBacktestDefaults {
+        initial_capital,
+        rolling_window: (toml_usize(&root, &["strategy", "basis", "rolling_window_secs"], 36_000)
+            / 60)
+            .max(2),
+        entry_z: toml_f64(
+            &root,
+            &["strategy", "basis", "entry_z_score_threshold"],
+            4.0,
+        ),
+        exit_z: toml_f64(&root, &["strategy", "basis", "exit_z_score_threshold"], 0.5),
+        position_notional_usd: toml_f64(&root, &["strategy", "basis", "max_position_usd"], 200.0),
+        max_capital_usage,
+        cex_hedge_ratio: DEFAULT_CEX_HEDGE_RATIO,
+        cex_margin_ratio: DEFAULT_CEX_MARGIN_RATIO,
+        poly_fee_bps: DEFAULT_SHARED_FEE_BPS,
+        poly_slippage_bps: toml_f64(&root, &["paper_slippage", "poly_slippage_bps"], 50.0),
+        cex_fee_bps: DEFAULT_SHARED_FEE_BPS,
+        cex_slippage_bps: toml_f64(&root, &["paper_slippage", "cex_slippage_bps"], 2.0),
+        planner_depth_levels: toml_usize(
+            &root,
+            &["strategy", "market_data", "planner_depth_levels"],
+            5,
+        ),
+        band_policy: toml_band_policy(
+            &root,
+            &["strategy", "basis", "band_policy"],
+            BandPolicyMode::ConfiguredBand,
+        ),
+        min_poly_price: toml_optional_f64(&root, &["strategy", "basis", "min_poly_price"]),
+        max_poly_price: toml_optional_f64(&root, &["strategy", "basis", "max_poly_price"]),
+    })
+}
+
+fn toml_path<'a>(root: &'a toml::Value, path: &[&str]) -> Option<&'a toml::Value> {
+    let mut current = root;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    Some(current)
+}
+
+fn toml_optional_f64(root: &toml::Value, path: &[&str]) -> Option<f64> {
+    let value = toml_path(root, path)?;
+    value
+        .as_float()
+        .or_else(|| value.as_integer().map(|item| item as f64))
+        .or_else(|| value.as_str().and_then(|item| item.parse::<f64>().ok()))
+}
+
+fn toml_band_policy(root: &toml::Value, path: &[&str], default: BandPolicyMode) -> BandPolicyMode {
+    toml_path(root, path)
+        .and_then(|value| value.as_str())
+        .and_then(|value| BandPolicyMode::from_str(value).ok())
+        .unwrap_or(default)
+}
+
+fn toml_f64(root: &toml::Value, path: &[&str], default: f64) -> f64 {
+    toml_optional_f64(root, path).unwrap_or(default)
+}
+
+fn toml_usize(root: &toml::Value, path: &[&str], default: usize) -> usize {
+    toml_path(root, path)
+        .and_then(|value| {
+            value
+                .as_integer()
+                .and_then(|item| usize::try_from(item).ok())
+                .or_else(|| value.as_str().and_then(|item| item.parse::<usize>().ok()))
+        })
+        .unwrap_or(default)
+}
 
 pub async fn run_backtest_command(command: BacktestCommand) -> Result<()> {
     match command {
@@ -139,36 +253,50 @@ pub async fn run_backtest_command(command: BacktestCommand) -> Result<()> {
             cex_fee_bps,
             cex_slippage_bps,
             entry_fill_ratio,
+            planner_depth_levels,
+            band_policy,
             min_poly_price,
             max_poly_price,
             max_holding_bars,
             report_json,
+            anomaly_report_json,
+            fail_on_anomaly,
             equity_csv,
             trades_csv,
             snapshots_csv,
         } => {
+            let defaults = load_runtime_backtest_defaults()?;
             run_rust_replay_command(RustReplayCommandArgs {
                 db_path,
                 market_id,
                 start,
                 end,
-                initial_capital,
-                rolling_window,
-                entry_z,
-                exit_z,
-                position_notional_usd,
-                max_capital_usage,
-                cex_hedge_ratio,
-                cex_margin_ratio,
-                poly_fee_bps,
-                poly_slippage_bps,
-                cex_fee_bps,
-                cex_slippage_bps,
+                initial_capital: initial_capital.unwrap_or(defaults.initial_capital),
+                rolling_window: rolling_window.unwrap_or(defaults.rolling_window),
+                entry_z: entry_z.unwrap_or(defaults.entry_z),
+                exit_z: exit_z.unwrap_or(defaults.exit_z),
+                position_notional_usd: Some(
+                    position_notional_usd.unwrap_or(defaults.position_notional_usd),
+                ),
+                max_capital_usage: max_capital_usage.unwrap_or(defaults.max_capital_usage),
+                cex_hedge_ratio: cex_hedge_ratio.unwrap_or(defaults.cex_hedge_ratio),
+                cex_margin_ratio: cex_margin_ratio.unwrap_or(defaults.cex_margin_ratio),
+                poly_fee_bps: poly_fee_bps.unwrap_or(defaults.poly_fee_bps),
+                poly_slippage_bps: poly_slippage_bps.unwrap_or(defaults.poly_slippage_bps),
+                cex_fee_bps: cex_fee_bps.unwrap_or(defaults.cex_fee_bps),
+                cex_slippage_bps: cex_slippage_bps.unwrap_or(defaults.cex_slippage_bps),
                 entry_fill_ratio,
-                min_poly_price,
-                max_poly_price,
+                planner_depth_levels: planner_depth_levels.unwrap_or(defaults.planner_depth_levels),
+                band_policy: band_policy
+                    .as_deref()
+                    .and_then(|value| BandPolicyMode::from_str(value).ok())
+                    .unwrap_or(defaults.band_policy),
+                min_poly_price: min_poly_price.or(defaults.min_poly_price),
+                max_poly_price: max_poly_price.or(defaults.max_poly_price),
                 max_holding_bars,
                 report_json,
+                anomaly_report_json,
+                fail_on_anomaly,
                 equity_csv,
                 trades_csv,
                 snapshots_csv,
@@ -188,22 +316,27 @@ pub async fn run_backtest_command(command: BacktestCommand) -> Result<()> {
             max_capital_usage,
             cex_hedge_ratio,
             cex_margin_ratio,
+            planner_depth_levels,
             preset,
             report_json,
         } => {
+            let defaults = load_runtime_backtest_defaults()?;
             run_rust_stress_command(RustStressCommandArgs {
                 db_path,
                 market_id,
                 start,
                 end,
-                initial_capital,
-                rolling_window,
-                entry_z,
-                exit_z,
-                position_notional_usd,
-                max_capital_usage,
-                cex_hedge_ratio,
-                cex_margin_ratio,
+                initial_capital: initial_capital.unwrap_or(defaults.initial_capital),
+                rolling_window: rolling_window.unwrap_or(defaults.rolling_window),
+                entry_z: entry_z.unwrap_or(defaults.entry_z),
+                exit_z: exit_z.unwrap_or(defaults.exit_z),
+                position_notional_usd: Some(
+                    position_notional_usd.unwrap_or(defaults.position_notional_usd),
+                ),
+                max_capital_usage: max_capital_usage.unwrap_or(defaults.max_capital_usage),
+                cex_hedge_ratio: cex_hedge_ratio.unwrap_or(defaults.cex_hedge_ratio),
+                cex_margin_ratio: cex_margin_ratio.unwrap_or(defaults.cex_margin_ratio),
+                planner_depth_levels: planner_depth_levels.unwrap_or(defaults.planner_depth_levels),
                 preset,
                 report_json,
             })
@@ -418,6 +551,32 @@ fn resolve_python() -> Result<PathBuf> {
     Err(anyhow!(
         "python runtime not found; expected `.venv/bin/python` or `/usr/bin/python3`"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use polyalpha_core::BandPolicyMode;
+
+    use super::load_runtime_backtest_defaults;
+
+    #[test]
+    fn runtime_backtest_defaults_match_config_default_toml() {
+        let defaults = load_runtime_backtest_defaults()
+            .expect("runtime defaults should load from config/default.toml");
+
+        assert_eq!(defaults.initial_capital, 10_000.0);
+        assert_eq!(defaults.rolling_window, 600);
+        assert_eq!(defaults.entry_z, 4.0);
+        assert_eq!(defaults.exit_z, 0.5);
+        assert_eq!(defaults.position_notional_usd, 200.0);
+        assert_eq!(defaults.max_capital_usage, 1.0);
+        assert_eq!(defaults.poly_slippage_bps, 50.0);
+        assert_eq!(defaults.cex_slippage_bps, 2.0);
+        assert_eq!(defaults.band_policy, BandPolicyMode::ConfiguredBand);
+        assert_eq!(defaults.min_poly_price, Some(0.2));
+        assert_eq!(defaults.max_poly_price, Some(0.5));
+        assert_eq!(defaults.planner_depth_levels, 5);
+    }
 }
 
 fn script_path(script: &str) -> Result<String> {

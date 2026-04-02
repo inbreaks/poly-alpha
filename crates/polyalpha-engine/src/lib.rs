@@ -6,10 +6,10 @@ use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 
 use polyalpha_core::{
-    AlphaEngine, AlphaEngineOutput, ArbSignalAction, ArbSignalEvent, ConnectionStatus,
-    DmmQuoteState, EngineParams, EngineWarning, Exchange, InstrumentKind, MarketConfig,
-    MarketDataEvent, MarketPhase, MarketRule, MarketRuleKind, OrderBookSnapshot, OrderSide,
-    PolyShares, Price, SignalStrength, Symbol, TokenSide, UsdNotional,
+    AlphaEngine, AlphaEngineOutput, ConnectionStatus, DmmQuoteState, EngineParams, EngineWarning,
+    Exchange, InstrumentKind, MarketConfig, MarketDataEvent, MarketPhase, MarketRule,
+    MarketRuleKind, OpenCandidate, OrderBookSnapshot, PolyShares, Price, SignalStrength, Symbol,
+    TokenSide, UsdNotional, PLANNING_SCHEMA_VERSION,
 };
 
 const ONE_MINUTE_MS: u64 = 60_000;
@@ -17,6 +17,7 @@ const MIN_MINUTES_TO_EXPIRY: f64 = 1.0;
 const MIN_VOLATILITY: f64 = 1e-6;
 const DELTA_BUMP_PCT: f64 = 1e-4;
 const SQRT_TWO: f64 = std::f64::consts::SQRT_2;
+const DEFAULT_ANNUALIZED_VOLATILITY: f64 = 0.5;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BasisStrategySnapshot {
@@ -230,12 +231,10 @@ impl SymbolState {
     }
 
     fn mark_poly_update(&mut self, ts_ms: u64) {
-        self.poly_connected = true;
         self.last_poly_update_ms = ts_ms;
     }
 
     fn mark_cex_update(&mut self, ts_ms: u64) {
-        self.cex_connected = true;
         self.last_cex_update_ms = ts_ms;
     }
 
@@ -402,6 +401,25 @@ impl SimpleAlphaEngine {
             .and_then(|state| state.last_basis_snapshot.clone())
     }
 
+    pub fn close_reason(&self, symbol: &Symbol) -> Option<String> {
+        let state = self.states.get(symbol)?;
+        state.active_token_side?;
+
+        if !state.market_phase.allows_new_positions() {
+            return Some("market phase blocks new exposure".to_owned());
+        }
+
+        let snapshot = state.last_basis_snapshot.as_ref()?;
+        let z_score = snapshot.z_score?;
+        let entry_z = self.get_entry_z(symbol);
+        let exit_z = self.get_exit_z(symbol);
+        if z_score.abs() <= exit_z || z_score >= entry_z {
+            return Some("signal basis reverted inside exit band".to_owned());
+        }
+
+        None
+    }
+
     /// Manually flush pending observations for a specific symbol.
     /// This is useful when you want to process pending data even without a CEX event.
     pub fn flush_symbol(&mut self, symbol: &Symbol) -> AlphaEngineOutput {
@@ -490,10 +508,9 @@ impl SimpleAlphaEngine {
         // Calculate sigma from CEX returns if available
         let sigma = if state.cex_minutes.returns_window.len() >= 30 {
             let returns: Vec<f64> = state.cex_minutes.returns_window.iter().copied().collect();
-            calculate_sigma(&returns)
+            effective_sigma(calculate_sigma(&returns))
         } else {
-            // Default annualized volatility ~50%
-            Some(0.5 / (252.0_f64).sqrt() / (1440.0_f64).sqrt())
+            Some(default_minute_sigma())
         };
 
         let settlement_ts_ms = market.settlement_timestamp.saturating_mul(1000);
@@ -687,17 +704,14 @@ impl SimpleAlphaEngine {
                     match snapshot.instrument {
                         InstrumentKind::PolyYes => {
                             state.mark_poly_update(snapshot.received_at_ms);
-                            self.poly_connected = true;
                             state.yes.update_mid(snapshot.received_at_ms, mid);
                         }
                         InstrumentKind::PolyNo => {
                             state.mark_poly_update(snapshot.received_at_ms);
-                            self.poly_connected = true;
                             state.no.update_mid(snapshot.received_at_ms, mid);
                         }
                         InstrumentKind::CexPerp => {
                             state.mark_cex_update(snapshot.received_at_ms);
-                            self.cex_connections.insert(snapshot.exchange, true);
                             state.cex_mid = Some(mid.max(Decimal::ZERO));
                             if let Some(price) = state.cex_mid.and_then(|value| value.to_f64()) {
                                 let _ = state.cex_minutes.ingest_price(
@@ -713,7 +727,7 @@ impl SimpleAlphaEngine {
                 Some(symbol)
             }
             MarketDataEvent::TradeUpdate {
-                exchange,
+                exchange: _,
                 symbol,
                 instrument,
                 price,
@@ -729,17 +743,14 @@ impl SimpleAlphaEngine {
                 match instrument {
                     InstrumentKind::PolyYes => {
                         state.mark_poly_update(*timestamp_ms);
-                        self.poly_connected = true;
                         state.yes.update_mid(*timestamp_ms, price.0);
                     }
                     InstrumentKind::PolyNo => {
                         state.mark_poly_update(*timestamp_ms);
-                        self.poly_connected = true;
                         state.no.update_mid(*timestamp_ms, price.0);
                     }
                     InstrumentKind::CexPerp => {
                         state.mark_cex_update(*timestamp_ms);
-                        self.cex_connections.insert(*exchange, true);
                         state.cex_mid = Some(price.0.max(Decimal::ZERO));
                         if let Some(value) = state.cex_mid.and_then(|item| item.to_f64()) {
                             let _ = state.cex_minutes.ingest_price(
@@ -754,7 +765,7 @@ impl SimpleAlphaEngine {
                 Some(symbol)
             }
             MarketDataEvent::FundingRate {
-                exchange,
+                exchange: _,
                 symbol,
                 next_funding_time_ms,
                 ..
@@ -765,8 +776,6 @@ impl SimpleAlphaEngine {
                     .remove(&symbol)
                     .unwrap_or_else(|| self.state_for_symbol(&symbol));
                 state.last_update_ms = *next_funding_time_ms;
-                state.cex_connected = true;
-                self.cex_connections.insert(*exchange, true);
                 self.states.insert(symbol.clone(), state);
                 Some(symbol)
             }
@@ -810,13 +819,6 @@ impl SimpleAlphaEngine {
         self.update_dmm_state(symbol, &mut state, &mut output);
 
         if force_phase_check && !state.market_phase.allows_new_positions() {
-            if state.active_token_side.take().is_some() {
-                output.push_arb_signal(self.close_signal_at(
-                    symbol,
-                    "market phase blocks new exposure",
-                    state.last_update_ms,
-                ));
-            }
             self.states.insert(symbol.clone(), state);
             return output;
         }
@@ -950,7 +952,7 @@ impl SimpleAlphaEngine {
             }
         };
 
-        let sigma = state.cex_minutes.sigma();
+        let sigma = effective_sigma(state.cex_minutes.sigma());
         let yes_evaluation = self.evaluate_token_pending(
             symbol,
             &rule,
@@ -1025,52 +1027,23 @@ impl SimpleAlphaEngine {
         };
         state.set_basis_snapshot(preferred_snapshot.clone());
 
-        if !state.market_phase.allows_new_positions() {
-            if state.active_token_side.take().is_some() {
-                output.push_arb_signal(self.close_signal_at(
-                    symbol,
-                    "market phase blocks new exposure",
-                    state.last_update_ms,
-                ));
-            }
-        } else if let Some(active_side) = state.active_token_side {
-            let maybe_snapshot = match active_side {
-                TokenSide::Yes => yes_evaluation
-                    .as_ref()
-                    .and_then(|evaluation| evaluation.snapshot.as_ref()),
-                TokenSide::No => no_evaluation
-                    .as_ref()
-                    .and_then(|evaluation| evaluation.snapshot.as_ref()),
-            };
-
-            if let Some(snapshot) = maybe_snapshot {
-                if let Some(z_score) = snapshot.z_score {
-                    let entry_z = self.get_entry_z(symbol);
-                    let exit_z = self.get_exit_z(symbol);
-                    if z_score.abs() <= exit_z || z_score >= entry_z {
-                        state.active_token_side = None;
-                        output.push_arb_signal(self.close_signal_at(
-                            symbol,
-                            "signal basis reverted inside exit band",
-                            state.last_update_ms,
-                        ));
-                    }
+        if state.market_phase.allows_new_positions() && state.active_token_side.is_none() {
+            if let Some(snapshot) = choose_entry_snapshot(
+                [
+                    yes_evaluation
+                        .as_ref()
+                        .and_then(|item| item.snapshot.clone()),
+                    no_evaluation
+                        .as_ref()
+                        .and_then(|item| item.snapshot.clone()),
+                ],
+                self.get_entry_z(symbol),
+            ) {
+                if let Some(candidate) =
+                    self.build_open_candidate(symbol, &snapshot, state.last_update_ms)
+                {
+                    output.push_open_candidate(candidate);
                 }
-            }
-        } else if let Some(snapshot) = choose_entry_snapshot(
-            [
-                yes_evaluation
-                    .as_ref()
-                    .and_then(|item| item.snapshot.clone()),
-                no_evaluation
-                    .as_ref()
-                    .and_then(|item| item.snapshot.clone()),
-            ],
-            self.get_entry_z(symbol),
-        ) {
-            if let Some(signal) = self.build_basis_signal(symbol, &snapshot) {
-                state.active_token_side = Some(snapshot.token_side);
-                output.push_arb_signal(signal);
             }
         }
 
@@ -1162,99 +1135,35 @@ impl SimpleAlphaEngine {
         })
     }
 
-    fn build_basis_signal(
+    fn build_open_candidate(
         &mut self,
         symbol: &Symbol,
         snapshot: &BasisStrategySnapshot,
-    ) -> Option<ArbSignalEvent> {
-        let poly_price = Decimal::from_f64(snapshot.poly_price)?;
-        if poly_price <= Decimal::ZERO {
-            return None;
-        }
-
-        let mut target_notional = self.config.position_notional_usd;
-        if let Some(max_position_usd) = self.max_position_usd {
-            target_notional = UsdNotional(target_notional.0.min(max_position_usd.0));
-        }
-        if target_notional.0 <= Decimal::ZERO {
-            return None;
-        }
-
-        let target_shares = PolyShares(target_notional.0 / poly_price);
-        if target_shares.0 <= Decimal::ZERO {
-            return None;
-        }
-
-        let hedge_qty_signed = -(target_shares.0.to_f64().unwrap_or(0.0))
-            * snapshot.delta
-            * self.config.cex_hedge_ratio.max(0.0);
-        let cex_side = if hedge_qty_signed >= 0.0 {
-            OrderSide::Buy
-        } else {
-            OrderSide::Sell
-        };
-        let mut cex_hedge_qty = polyalpha_core::CexBaseQty(
-            Decimal::from_f64(hedge_qty_signed.abs()).unwrap_or_default(),
-        );
-        if let Some(market) = self.markets.get(symbol) {
-            cex_hedge_qty = cex_hedge_qty.floor_to_step(market.cex_qty_step);
-        }
-        if cex_hedge_qty.0 <= Decimal::ZERO {
-            return None;
-        }
-        let poly_target_notional = UsdNotional::from_poly(target_shares, Price(poly_price));
-        let expected_pnl = UsdNotional(
-            poly_target_notional.0
-                * Decimal::from_f64(snapshot.signal_basis.abs()).unwrap_or(Decimal::ZERO),
-        );
-
-        Some(ArbSignalEvent {
-            signal_id: self.next_signal_id(symbol, snapshot.token_side),
-            correlation_id: self.generate_correlation_id(),
-            symbol: symbol.clone(),
-            action: ArbSignalAction::BasisLong {
-                token_side: snapshot.token_side,
-                poly_side: OrderSide::Buy,
-                poly_target_shares: target_shares,
-                poly_target_notional,
-                cex_side,
-                cex_hedge_qty,
-                delta: snapshot.delta,
-            },
-            strength: self.signal_strength(symbol, snapshot.z_score),
-            basis_value: Some(Decimal::from_f64(snapshot.signal_basis).unwrap_or(Decimal::ZERO)),
-            z_score: snapshot
-                .z_score
-                .and_then(Decimal::from_f64)
-                .or(Some(Decimal::ZERO)),
-            expected_pnl,
-            timestamp_ms: self
-                .states
-                .get(symbol)
-                .map(|state| state.last_update_ms)
-                .unwrap_or_default(),
-        })
-    }
-
-    fn close_signal_at(
-        &mut self,
-        symbol: &Symbol,
-        reason: &str,
         timestamp_ms: u64,
-    ) -> ArbSignalEvent {
-        ArbSignalEvent {
-            signal_id: self.next_signal_id(symbol, TokenSide::Yes),
+    ) -> Option<OpenCandidate> {
+        let mut risk_budget = self.get_position_notional_usd(symbol);
+        if let Some(max_position_usd) = self.max_position_usd {
+            risk_budget = UsdNotional(risk_budget.0.min(max_position_usd.0));
+        }
+        if risk_budget.0 <= Decimal::ZERO {
+            return None;
+        }
+
+        Some(OpenCandidate {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            candidate_id: self.next_candidate_id(symbol, snapshot.token_side),
             correlation_id: self.generate_correlation_id(),
             symbol: symbol.clone(),
-            action: ArbSignalAction::ClosePosition {
-                reason: reason.to_owned(),
-            },
-            strength: SignalStrength::Normal,
-            basis_value: None,
-            z_score: None,
-            expected_pnl: UsdNotional::ZERO,
+            token_side: snapshot.token_side,
+            direction: "long".to_owned(),
+            fair_value: snapshot.fair_value,
+            raw_mispricing: snapshot.signal_basis,
+            delta_estimate: snapshot.delta,
+            risk_budget_usd: risk_budget.0.to_f64().unwrap_or_default(),
+            strength: self.signal_strength(symbol, snapshot.z_score),
+            z_score: snapshot.z_score,
             timestamp_ms,
-        }
+        })
     }
 
     fn signal_strength(&self, symbol: &Symbol, z_score: Option<f64>) -> SignalStrength {
@@ -1269,9 +1178,12 @@ impl SimpleAlphaEngine {
         }
     }
 
-    fn next_signal_id(&mut self, symbol: &Symbol, token_side: TokenSide) -> String {
+    fn next_candidate_id(&mut self, symbol: &Symbol, token_side: TokenSide) -> String {
         self.next_signal_seq += 1;
-        format!("sig-{}-{:?}-{}", symbol.0, token_side, self.next_signal_seq)
+        format!(
+            "cand-{}-{:?}-{}",
+            symbol.0, token_side, self.next_signal_seq
+        )
     }
 
     fn generate_correlation_id(&mut self) -> String {
@@ -1438,6 +1350,16 @@ fn token_fair_value(
         TokenSide::Yes => yes_probability.clamp(0.0, 1.0),
         TokenSide::No => (1.0 - yes_probability).clamp(0.0, 1.0),
     }
+}
+
+fn default_minute_sigma() -> f64 {
+    DEFAULT_ANNUALIZED_VOLATILITY / (252.0_f64).sqrt() / (1440.0_f64).sqrt()
+}
+
+fn effective_sigma(sigma: Option<f64>) -> Option<f64> {
+    sigma
+        .filter(|value| *value >= MIN_VOLATILITY)
+        .or(Some(default_minute_sigma()))
 }
 
 fn token_delta(
@@ -1700,7 +1622,7 @@ mod tests {
         )
     }
 
-    async fn seed_basis_long_yes_signal(engine: &mut SimpleAlphaEngine) -> ArbSignalEvent {
+    async fn seed_basis_long_yes_output(engine: &mut SimpleAlphaEngine) -> AlphaEngineOutput {
         let _ = engine
             .on_market_data(&cex_orderbook_event(
                 Decimal::new(100_000, 0),
@@ -1709,10 +1631,12 @@ mod tests {
             ))
             .await;
 
+        // Keep the warmup path slightly volatile so sigma stays above the minimum
+        // and the resulting basis candidate remains hedgeable under current rules.
         for (offset, yes_bid, yes_ask, no_bid, no_ask, cex_price) in [
-            (60_100, 51, 53, 47, 49, 100_100),
-            (120_100, 50, 52, 48, 50, 100_200),
-            (180_100, 35, 37, 63, 65, 100_300),
+            (60_100, 51, 53, 47, 49, 100_150),
+            (120_100, 50, 52, 48, 50, 100_300),
+            (180_100, 35, 37, 63, 65, 100_450),
         ] {
             let _ = engine
                 .on_market_data(&poly_orderbook_event(
@@ -1737,12 +1661,21 @@ mod tests {
                     offset + 100,
                 ))
                 .await;
-            if let Some(signal) = output.arb_signals.into_iter().next() {
-                return signal;
+            if !output.open_candidates.is_empty() {
+                return output;
             }
         }
 
-        panic!("expected a BasisLong signal during warmup sequence");
+        panic!("expected an open candidate during warmup sequence");
+    }
+
+    async fn seed_basis_long_yes_candidate(engine: &mut SimpleAlphaEngine) -> OpenCandidate {
+        let output = seed_basis_long_yes_output(engine).await;
+        output
+            .open_candidates
+            .into_iter()
+            .next()
+            .expect("expected an open candidate during warmup sequence")
     }
 
     #[tokio::test]
@@ -1834,20 +1767,159 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emits_basis_long_yes_when_yes_token_is_more_underpriced() {
+    async fn emits_open_candidate_for_yes_when_yes_token_is_more_underpriced() {
         let mut engine = test_engine();
-        let signal = seed_basis_long_yes_signal(&mut engine).await;
+        let candidate = seed_basis_long_yes_candidate(&mut engine).await;
 
-        match signal.action {
-            ArbSignalAction::BasisLong { token_side, .. } => {
-                assert_eq!(token_side, TokenSide::Yes);
-            }
-            other => panic!("unexpected action: {other:?}"),
-        }
+        assert_eq!(candidate.token_side, TokenSide::Yes);
     }
 
     #[tokio::test]
-    async fn does_not_emit_basis_signal_when_cex_hedge_qty_is_zero() {
+    async fn emits_open_candidate_without_execution_fields() {
+        let mut engine = test_engine();
+        let output = seed_basis_long_yes_output(&mut engine).await;
+
+        assert_eq!(output.open_candidates.len(), 1);
+        let candidate = &output.open_candidates[0];
+        assert_eq!(candidate.schema_version, PLANNING_SCHEMA_VERSION);
+        assert_eq!(candidate.symbol, Symbol::new("btc-price-only"));
+        assert_eq!(candidate.token_side, TokenSide::Yes);
+        assert_eq!(candidate.direction, "long");
+        assert_eq!(candidate.risk_budget_usd, 1_000.0);
+        assert!(candidate.raw_mispricing.abs() > 0.0);
+        assert!(candidate.delta_estimate.abs() > 0.0);
+    }
+
+    #[tokio::test]
+    async fn open_candidate_timestamp_matches_triggering_cex_event() {
+        let mut engine = test_engine();
+
+        let _ = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(100_000, 0),
+                Decimal::new(100_000, 0),
+                0,
+            ))
+            .await;
+
+        for (offset, yes_bid, yes_ask, no_bid, no_ask, cex_price) in [
+            (60_100, 51, 53, 47, 49, 100_150),
+            (120_100, 50, 52, 48, 50, 100_300),
+            (180_100, 35, 37, 63, 65, 100_450),
+        ] {
+            let _ = engine
+                .on_market_data(&poly_orderbook_event(
+                    InstrumentKind::PolyYes,
+                    Decimal::new(yes_bid, 2),
+                    Decimal::new(yes_ask, 2),
+                    offset,
+                ))
+                .await;
+            let _ = engine
+                .on_market_data(&poly_orderbook_event(
+                    InstrumentKind::PolyNo,
+                    Decimal::new(no_bid, 2),
+                    Decimal::new(no_ask, 2),
+                    offset + 20,
+                ))
+                .await;
+
+            let cex_timestamp_ms = offset + 100;
+            let output = engine
+                .on_market_data(&cex_orderbook_event(
+                    Decimal::new(cex_price, 0),
+                    Decimal::new(cex_price, 0),
+                    cex_timestamp_ms,
+                ))
+                .await;
+
+            if let Some(candidate) = output.open_candidates.first() {
+                assert_eq!(candidate.timestamp_ms, cex_timestamp_ms);
+                return;
+            }
+        }
+
+        panic!("expected an open candidate during warmup sequence");
+    }
+
+    #[tokio::test]
+    async fn sigma_warmup_keeps_future_market_delta_non_zero() {
+        let mut engine = test_engine();
+
+        let _ = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(100_000, 0),
+                Decimal::new(100_000, 0),
+                0,
+            ))
+            .await;
+
+        for (offset, yes_bid, yes_ask, no_bid, no_ask) in [
+            (60_100, 51, 53, 47, 49),
+            (120_100, 50, 52, 48, 50),
+            (180_100, 35, 37, 63, 65),
+        ] {
+            let _ = engine
+                .on_market_data(&poly_orderbook_event(
+                    InstrumentKind::PolyYes,
+                    Decimal::new(yes_bid, 2),
+                    Decimal::new(yes_ask, 2),
+                    offset,
+                ))
+                .await;
+            let _ = engine
+                .on_market_data(&poly_orderbook_event(
+                    InstrumentKind::PolyNo,
+                    Decimal::new(no_bid, 2),
+                    Decimal::new(no_ask, 2),
+                    offset + 20,
+                ))
+                .await;
+
+            let output = engine
+                .on_market_data(&cex_orderbook_event(
+                    Decimal::new(100_000, 0),
+                    Decimal::new(100_000, 0),
+                    offset + 100,
+                ))
+                .await;
+
+            if let Some(candidate) = output.open_candidates.first() {
+                assert!(
+                    candidate.fair_value < 1.0,
+                    "future market should not collapse to deterministic payout during sigma warmup"
+                );
+                assert!(
+                    candidate.delta_estimate.abs() > 0.0,
+                    "future market should remain hedgeable during sigma warmup"
+                );
+                return;
+            }
+        }
+
+        panic!("expected an open candidate during sigma warmup sequence");
+    }
+
+    #[tokio::test]
+    async fn emitting_open_candidate_does_not_mark_position_active() {
+        let mut engine = test_engine();
+        let _ = seed_basis_long_yes_output(&mut engine).await;
+        let symbol = Symbol::new("btc-price-only");
+
+        let _ = engine
+            .on_market_data(&lifecycle_event(
+                MarketPhase::CloseOnly {
+                    hours_remaining: 0.5,
+                },
+                180_300,
+            ))
+            .await;
+
+        assert_eq!(engine.close_reason(&symbol), None);
+    }
+
+    #[tokio::test]
+    async fn still_emits_open_candidate_when_cex_hedge_ratio_is_zero() {
         let mut engine = test_engine_with_config(SimpleEngineConfig {
             min_signal_samples: 2,
             rolling_window_minutes: 4,
@@ -1859,6 +1931,7 @@ mod tests {
             dmm_quote_size: PolyShares::ZERO,
             ..SimpleEngineConfig::default()
         });
+        let mut saw_candidate = false;
 
         let _ = engine
             .on_market_data(&cex_orderbook_event(
@@ -1897,18 +1970,24 @@ mod tests {
                 ))
                 .await;
 
-            assert!(
-                output.arb_signals.is_empty(),
-                "zero-hedge open signal must be suppressed"
-            );
+            if !output.open_candidates.is_empty() {
+                saw_candidate = true;
+                break;
+            }
         }
+
+        assert!(
+            saw_candidate,
+            "zero-hedge configuration should still emit a candidate"
+        );
     }
 
     #[tokio::test]
-    async fn close_only_phase_closes_active_position() {
+    async fn close_only_phase_exposes_close_reason_for_synced_position() {
         let mut engine = test_engine();
-        let open = seed_basis_long_yes_signal(&mut engine).await;
-        assert!(matches!(open.action, ArbSignalAction::BasisLong { .. }));
+        let candidate = seed_basis_long_yes_candidate(&mut engine).await;
+        let symbol = Symbol::new("btc-price-only");
+        engine.sync_position_state(&symbol, Some(candidate.token_side));
 
         let close = engine
             .on_market_data(&lifecycle_event(
@@ -1918,11 +1997,12 @@ mod tests {
                 180_300,
             ))
             .await;
-        assert_eq!(close.arb_signals.len(), 1);
-        assert!(matches!(
-            close.arb_signals[0].action,
-            ArbSignalAction::ClosePosition { .. }
-        ));
+
+        assert!(close.open_candidates.is_empty());
+        assert_eq!(
+            engine.close_reason(&symbol).as_deref(),
+            Some("market phase blocks new exposure")
+        );
     }
 
     #[tokio::test]
@@ -1954,12 +2034,13 @@ mod tests {
 
         let output = engine.flush_symbol(&Symbol::new("btc-price-only"));
 
-        assert!(output.arb_signals.is_empty());
+        assert!(output.open_candidates.is_empty());
         assert_eq!(output.warnings.len(), 1);
         assert!(matches!(
             output.warnings[0],
             EngineWarning::CexPriceStale { .. }
         ));
+        assert_eq!(engine.close_reason(&Symbol::new("btc-price-only")), None);
     }
 
     #[tokio::test]
@@ -1996,13 +2077,118 @@ mod tests {
             ))
             .await;
 
-        assert!(output.arb_signals.is_empty());
+        assert!(output.open_candidates.is_empty());
         assert_eq!(output.warnings.len(), 1);
         assert!(matches!(
             output.warnings[0],
             EngineWarning::ConnectionLost {
                 poly_connected: false,
                 cex_connected: true,
+                ..
+            }
+        ));
+        assert_eq!(engine.close_reason(&Symbol::new("btc-price-only")), None);
+    }
+
+    #[tokio::test]
+    async fn quote_updates_do_not_restore_connection_after_reconnecting_event() {
+        let mut engine = test_engine();
+
+        let _ = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(100_000, 0),
+                Decimal::new(100_000, 0),
+                0,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&poly_orderbook_event(
+                InstrumentKind::PolyYes,
+                Decimal::new(52, 2),
+                Decimal::new(54, 2),
+                60_000,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&connection_event(
+                Exchange::Polymarket,
+                ConnectionStatus::Reconnecting,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&connection_event(
+                Exchange::Binance,
+                ConnectionStatus::Reconnecting,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&poly_orderbook_event(
+                InstrumentKind::PolyYes,
+                Decimal::new(53, 2),
+                Decimal::new(55, 2),
+                60_100,
+            ))
+            .await;
+        let output = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(101_000, 0),
+                Decimal::new(101_000, 0),
+                60_200,
+            ))
+            .await;
+        assert!(output.open_candidates.is_empty());
+        assert_eq!(output.warnings.len(), 1);
+        assert!(matches!(
+            output.warnings[0],
+            EngineWarning::ConnectionLost {
+                poly_connected: false,
+                cex_connected: false,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn funding_updates_do_not_restore_cex_connection_after_reconnecting_event() {
+        let mut engine = test_engine();
+
+        let _ = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(100_000, 0),
+                Decimal::new(100_000, 0),
+                0,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&poly_orderbook_event(
+                InstrumentKind::PolyYes,
+                Decimal::new(52, 2),
+                Decimal::new(54, 2),
+                60_000,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&connection_event(
+                Exchange::Binance,
+                ConnectionStatus::Reconnecting,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&MarketDataEvent::FundingRate {
+                exchange: Exchange::Binance,
+                symbol: Symbol::new("btc-price-only"),
+                rate: Decimal::new(1, 4),
+                next_funding_time_ms: 60_100,
+            })
+            .await;
+        let output = engine.flush_symbol(&Symbol::new("btc-price-only"));
+        assert!(output.open_candidates.is_empty());
+        assert_eq!(output.warnings.len(), 1);
+        assert!(matches!(
+            output.warnings[0],
+            EngineWarning::ConnectionLost {
+                poly_connected: true,
+                cex_connected: false,
                 ..
             }
         ));
@@ -2037,12 +2223,13 @@ mod tests {
 
         let output = engine.flush_symbol(&Symbol::new("btc-price-only"));
 
-        assert!(output.arb_signals.is_empty());
+        assert!(output.open_candidates.is_empty());
         assert_eq!(output.warnings.len(), 1);
         assert!(matches!(
             output.warnings[0],
             EngineWarning::DataMisaligned { .. }
         ));
+        assert_eq!(engine.close_reason(&Symbol::new("btc-price-only")), None);
     }
 
     #[tokio::test]
