@@ -90,3 +90,6 @@ config/*.auto.toml
 
 # Local git worktrees
 .worktrees/
+
+# Local diagnostics
+tmp/
