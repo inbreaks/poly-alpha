@@ -25,10 +25,13 @@ impl AuditWarehouse {
         let root = root.as_ref();
         let summary = AuditReader::load_summary(root, session_id)?;
         let events = AuditReader::load_events(root, session_id)?;
-        let conn = self.connect()?;
+        let mut conn = self.connect()?;
         self.ensure_schema(&conn)?;
+        let tx = conn
+            .transaction()
+            .context("开启审计仓库同步事务失败")?;
 
-        let existing_max_seq = conn
+        let existing_max_seq = tx
             .query_row(
                 "SELECT COALESCE(MAX(seq), 0) FROM audit_events WHERE session_id = ?",
                 params![session_id],
@@ -36,14 +39,9 @@ impl AuditWarehouse {
             )
             .with_context(|| format!("查询审计会话 `{session_id}` 已同步序号失败"))?;
 
-        let mut stmt = conn
-            .prepare(
-                "INSERT INTO audit_events (
-                    session_id, env, seq, timestamp_ms, kind, symbol, signal_id, correlation_id,
-                    gate, result, reason, summary, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .context("准备审计事件写入语句失败")?;
+        let mut appender = tx
+            .appender("audit_events")
+            .context("创建审计事件批量写入器失败")?;
 
         for event in events
             .into_iter()
@@ -51,7 +49,8 @@ impl AuditWarehouse {
         {
             let payload_json =
                 serde_json::to_string(&event.payload).context("序列化审计事件负载失败")?;
-            stmt.execute(params![
+            appender
+                .append_row(params![
                 event.session_id,
                 event.env,
                 event.seq as i64,
@@ -66,15 +65,17 @@ impl AuditWarehouse {
                 event.summary,
                 payload_json,
             ])
-            .with_context(|| format!("写入审计事件 seq={} 失败", event.seq))?;
+                .with_context(|| format!("写入审计事件 seq={} 失败", event.seq))?;
         }
+        appender.flush().context("刷新审计事件批量写入器失败")?;
+        drop(appender);
 
-        conn.execute(
+        tx.execute(
             "DELETE FROM audit_sessions WHERE session_id = ?",
             params![summary.session_id.clone()],
         )
         .with_context(|| format!("删除旧审计摘要 `{}` 失败", summary.session_id))?;
-        conn.execute(
+        tx.execute(
             "INSERT INTO audit_sessions (
                 session_id, env, mode, status, started_at_ms, ended_at_ms, updated_at_ms,
                 market_count, markets_json, latest_tick_index, latest_checkpoint_ms,
@@ -105,6 +106,8 @@ impl AuditWarehouse {
             ],
         )
         .with_context(|| format!("写入审计摘要 `{}` 失败", summary.session_id))?;
+        tx.commit()
+            .with_context(|| format!("提交审计会话 `{session_id}` 仓库同步事务失败"))?;
 
         Ok(())
     }
@@ -157,5 +160,122 @@ impl AuditWarehouse {
             ",
         )
         .context("初始化审计仓库 schema 失败")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use anyhow::{Context, Result};
+    use duckdb::Connection;
+    use polyalpha_core::TradingMode;
+    use uuid::Uuid;
+
+    use super::AuditWarehouse;
+    use crate::{
+        AuditAnomalyEvent, AuditEventKind, AuditEventPayload, AuditSessionManifest, AuditSeverity,
+        AuditWriter, NewAuditEvent,
+    };
+
+    #[test]
+    fn sync_session_rolls_back_event_inserts_when_summary_write_fails() {
+        let root = temp_root("polyalpha-audit-sync-session");
+        let session_id = "session-atomicity";
+
+        write_test_session(&root, session_id).expect("write test session");
+
+        let warehouse = AuditWarehouse::new(&root).expect("create warehouse");
+        create_incompatible_summary_schema(warehouse.db_path())
+            .expect("create incompatible summary schema");
+
+        let err = warehouse
+            .sync_session(&root, session_id)
+            .expect_err("sync should fail with incompatible audit_sessions schema");
+        assert!(
+            err.to_string().contains("写入审计摘要"),
+            "unexpected error: {err:#}"
+        );
+
+        let conn = Connection::open(warehouse.db_path()).expect("open warehouse db");
+        let inserted_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE session_id = ?",
+                duckdb::params![session_id],
+                |row| row.get(0),
+            )
+            .expect("query inserted events");
+        assert_eq!(
+            inserted_events, 0,
+            "failed sync should not leave partially inserted events"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn temp_root(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()))
+    }
+
+    fn write_test_session(root: &Path, session_id: &str) -> Result<()> {
+        let manifest = AuditSessionManifest {
+            version: 1,
+            session_id: session_id.to_owned(),
+            env: "test".to_owned(),
+            mode: TradingMode::Paper,
+            started_at_ms: 1_717_171_717_000,
+            market_count: 1,
+            markets: vec!["test-market".to_owned()],
+        };
+        let mut writer = AuditWriter::create(root, manifest, 1_024 * 1_024)?;
+        writer.append_event(NewAuditEvent {
+            timestamp_ms: 1_717_171_717_001,
+            kind: AuditEventKind::Anomaly,
+            symbol: Some("test-market".to_owned()),
+            signal_id: None,
+            correlation_id: None,
+            gate: None,
+            result: None,
+            reason: Some("test_failure".to_owned()),
+            summary: "test anomaly".to_owned(),
+            payload: AuditEventPayload::Anomaly(AuditAnomalyEvent {
+                severity: AuditSeverity::Warning,
+                code: "test_failure".to_owned(),
+                message: "test anomaly".to_owned(),
+                symbol: Some("test-market".to_owned()),
+                signal_id: None,
+                correlation_id: None,
+            }),
+        })?;
+        Ok(())
+    }
+
+    fn create_incompatible_summary_schema(db_path: &Path) -> Result<()> {
+        let conn = Connection::open(db_path)?;
+        conn.execute_batch(
+            "
+            CREATE TABLE audit_events (
+                session_id VARCHAR NOT NULL,
+                env VARCHAR NOT NULL,
+                seq BIGINT NOT NULL,
+                timestamp_ms BIGINT NOT NULL,
+                kind VARCHAR NOT NULL,
+                symbol VARCHAR,
+                signal_id VARCHAR,
+                correlation_id VARCHAR,
+                gate VARCHAR,
+                result VARCHAR,
+                reason VARCHAR,
+                summary VARCHAR NOT NULL,
+                payload_json VARCHAR NOT NULL
+            );
+
+            CREATE TABLE audit_sessions (
+                session_id VARCHAR PRIMARY KEY
+            );
+            ",
+        )
+        .context("prepare incompatible warehouse schema")
     }
 }
