@@ -129,7 +129,23 @@ fn open_cooldown_policy(base_stale_ms: u64, reason: &str) -> Option<CooldownPoli
             repeat_window_ms: Some(10 * 60 * 1_000),
             max_duration_ms: 15 * 60 * 1_000,
         }),
-        "missing_poly_book"
+        "below_min_poly_price" | "above_or_equal_max_poly_price" | "missing_poly_quote" => {
+            Some(CooldownPolicy {
+                family: CooldownFamily::Edge,
+                base_duration_ms: base_ms.saturating_mul(6).max(3 * 60 * 1_000),
+                repeat_window_ms: Some(10 * 60 * 1_000),
+                max_duration_ms: 15 * 60 * 1_000,
+            })
+        }
+        "missing_poly"
+        | "missing_cex"
+        | "missing_observed_state"
+        | "poly_stale"
+        | "cex_stale"
+        | "misaligned"
+        | "connection_impaired"
+        | "poly_lag_borderline"
+        | "missing_poly_book"
         | "missing_cex_book"
         | "one_sided_poly_book"
         | "one_sided_cex_book"
@@ -233,6 +249,33 @@ mod tests {
         assert_eq!(state.last_tradeable_at_ms, Some(2_000));
         assert_eq!(state.open_cooldown_until_ms, None);
         assert_eq!(state.open_cooldown_reason, None);
+    }
+
+    #[test]
+    fn maybe_start_open_cooldown_accepts_ws_stale_and_price_band_reasons() {
+        let mut stale_state = MarketPoolState::default();
+        assert!(maybe_start_open_cooldown(
+            &mut stale_state,
+            5_000,
+            "cex_stale",
+            1_000,
+        ));
+        assert_eq!(
+            active_open_cooldown_reason(&stale_state, 1_001),
+            Some("cex_stale")
+        );
+
+        let mut band_state = MarketPoolState::default();
+        assert!(maybe_start_open_cooldown(
+            &mut band_state,
+            5_000,
+            "above_or_equal_max_poly_price",
+            2_000,
+        ));
+        assert_eq!(
+            active_open_cooldown_reason(&band_state, 2_001),
+            Some("above_or_equal_max_poly_price")
+        );
     }
 
     #[test]

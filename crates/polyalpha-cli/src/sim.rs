@@ -1980,15 +1980,22 @@ mod tests {
                     .is_some_and(|z_score| z_score <= -0.5)
                     && snapshot
                         .current_delta
-                        .is_some_and(|delta| delta.abs() >= 0.05)
+                        .is_some_and(|delta| delta.abs() > 0.0 && delta.abs() < 0.05)
             }),
-            "scenario should produce an entry-quality basis snapshot before hedge floor is applied"
+            "scenario should produce an entry-quality basis snapshot with a tiny hedge delta before step rounding blocks entry"
         );
         assert_eq!(artifact.final_snapshot.signals_seen, 1);
         assert_eq!(artifact.final_snapshot.signals_rejected, 1);
         assert_eq!(artifact.final_snapshot.order_submitted, 0);
         assert_eq!(artifact.final_snapshot.fills, 0);
         assert!(snapshot_positions_are_flat(&artifact.final_snapshot));
+        assert!(
+            artifact
+                .recent_events
+                .iter()
+                .any(|event| { event.summary.contains("zero_cex_hedge_qty") }),
+            "zero-hedge rejection should stay visible in the sim event log"
+        );
         assert!(
             artifact
                 .recent_events

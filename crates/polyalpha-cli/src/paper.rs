@@ -92,6 +92,7 @@ const MULTI_MARKET_WARMUP_MAX_CONCURRENCY: usize = 8;
 const MULTI_MARKET_FUNDING_MAX_CONCURRENCY: usize = 8;
 const MULTI_MARKET_SYNC_WARMUP_THRESHOLD: usize = 16;
 const WS_CONNECT_TIMEOUT_MS: u64 = 10_000;
+const WS_CONNECTED_STATUS_REFRESH_MS: u64 = 1_000;
 const MARKET_TRADEABLE_GRACE_MULTIPLIER: u64 = 3;
 const MARKET_FOCUS_GRACE_MULTIPLIER: u64 = 12;
 const MARKET_NEAR_OPPORTUNITY_FRACTION: f64 = 0.75;
@@ -223,6 +224,7 @@ struct ExchangeConnectionTracker {
     manager: DataManager,
     status: Arc<Mutex<ConnectionStatus>>,
     active_streams: Arc<Mutex<HashSet<String>>>,
+    last_connected_publish_ms: Arc<Mutex<Option<u64>>>,
 }
 
 impl ExchangeConnectionTracker {
@@ -232,10 +234,19 @@ impl ExchangeConnectionTracker {
             manager,
             status: Arc::new(Mutex::new(ConnectionStatus::Disconnected)),
             active_streams: Arc::new(Mutex::new(HashSet::new())),
+            last_connected_publish_ms: Arc::new(Mutex::new(None)),
         }
     }
 
     fn mark_connecting(&self) {
+        if self
+            .active_streams
+            .lock()
+            .map(|guard| !guard.is_empty())
+            .unwrap_or(false)
+        {
+            return;
+        }
         self.set_status(ConnectionStatus::Connecting);
     }
 
@@ -259,6 +270,51 @@ impl ExchangeConnectionTracker {
         }
     }
 
+    fn reaffirm_connected(&self) {
+        self.reaffirm_connected_at(now_millis());
+    }
+
+    fn reaffirm_connected_at(&self, now_ms: u64) {
+        if !self
+            .active_streams
+            .lock()
+            .map(|guard| !guard.is_empty())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        if self
+            .status
+            .lock()
+            .map(|guard| *guard != ConnectionStatus::Connected)
+            .unwrap_or(true)
+        {
+            return;
+        }
+
+        let should_publish = match self.last_connected_publish_ms.lock() {
+            Ok(mut guard) => {
+                if guard.is_some_and(|last_ms| {
+                    now_ms.saturating_sub(last_ms) < WS_CONNECTED_STATUS_REFRESH_MS
+                }) {
+                    false
+                } else {
+                    *guard = Some(now_ms);
+                    true
+                }
+            }
+            Err(_) => false,
+        };
+
+        if should_publish {
+            let _ = self.manager.publish(MarketDataEvent::ConnectionEvent {
+                exchange: self.exchange,
+                status: ConnectionStatus::Connected,
+            });
+        }
+    }
+
     fn set_status(&self, new_status: ConnectionStatus) {
         let mut guard = match self.status.lock() {
             Ok(guard) => guard,
@@ -269,6 +325,9 @@ impl ExchangeConnectionTracker {
         }
         *guard = new_status;
         drop(guard);
+        if let Ok(mut publish_guard) = self.last_connected_publish_ms.lock() {
+            *publish_guard = (new_status == ConnectionStatus::Connected).then_some(now_millis());
+        }
         eprintln!("ws status {:?} -> {:?}", self.exchange, new_status);
         tracing::info!("ws status {:?} -> {:?}", self.exchange, new_status);
         let _ = self.manager.publish(MarketDataEvent::ConnectionEvent {
@@ -4907,6 +4966,7 @@ async fn run_runtime_multi(
                             &paused,
                             &emergency,
                             false,
+                            false,
                             &mut audit,
                         )
                         .await?;
@@ -5763,6 +5823,7 @@ fn spawn_polymarket_ws_task(
                             message = reader.next() => {
                                 match message {
                                     Some(Ok(Message::Text(text))) => {
+                                        tracker.reaffirm_connected();
                                         if text == "PONG" {
                                             continue;
                                         }
@@ -5771,9 +5832,13 @@ fn spawn_polymarket_ws_task(
                                         }
                                     }
                                     Some(Ok(Message::Ping(payload))) => {
+                                        tracker.reaffirm_connected();
                                         if writer.send(Message::Pong(payload)).await.is_err() {
                                             break;
                                         }
+                                    }
+                                    Some(Ok(Message::Pong(_))) => {
+                                        tracker.reaffirm_connected();
                                     }
                                     Some(Ok(Message::Close(frame))) => {
                                         log_ws_warning(format!(
@@ -5857,6 +5922,7 @@ fn spawn_binance_ws_task(
                     while let Some(message) = reader.next().await {
                         match message {
                             Ok(Message::Text(text)) => {
+                                tracker.reaffirm_connected();
                                 match BinanceFuturesDataSource::parse_partial_depth_ws_payload(
                                     &text,
                                     &venue_symbol,
@@ -5983,6 +6049,7 @@ fn spawn_okx_ws_task(
                             message = reader.next() => {
                                 match message {
                                     Some(Ok(Message::Text(text))) => {
+                                        tracker.reaffirm_connected();
                                         if text.eq_ignore_ascii_case("pong") {
                                             continue;
                                         }
@@ -6003,9 +6070,13 @@ fn spawn_okx_ws_task(
                                         }
                                     }
                                     Some(Ok(Message::Ping(payload))) => {
+                                        tracker.reaffirm_connected();
                                         if writer.send(Message::Pong(payload)).await.is_err() {
                                             break;
                                         }
+                                    }
+                                    Some(Ok(Message::Pong(_))) => {
+                                        tracker.reaffirm_connected();
                                     }
                                     Some(Ok(Message::Close(frame))) => {
                                         log_ws_warning(format!(
@@ -6267,6 +6338,7 @@ fn ws_candidate_stale_reason(
 
 fn format_ws_freshness_reason(reason: &str) -> &'static str {
     match reason {
+        "bootstrap_in_progress" => "WS 启动补齐尚未完成",
         "missing_cex" => "缺少交易所最新行情",
         "cex_stale" => "交易所行情已超时",
         "missing_poly" => "缺少 Polymarket 最新行情",
@@ -6293,6 +6365,20 @@ fn ws_signal_gate_reason(observed: &AuditObservedMarket) -> Option<&'static str>
         EvaluableStatus::PolyQuoteStale => Some("poly_stale"),
         EvaluableStatus::CexQuoteStale => Some("cex_stale"),
     }
+}
+
+fn ws_bootstrap_gate_reason(
+    bootstrap_in_flight: bool,
+    observed: Option<&AuditObservedMarket>,
+) -> Option<&'static str> {
+    if !bootstrap_in_flight {
+        return None;
+    }
+
+    observed
+        .filter(|snapshot| !audit_observed_is_tradeable(snapshot))
+        .map(|_| "bootstrap_in_progress")
+        .or_else(|| observed.is_none().then_some("bootstrap_in_progress"))
 }
 
 fn open_market_pool_gate_decision(
@@ -6470,6 +6556,12 @@ async fn process_signal_single(
 
     if ws_mode {
         if let Some(reason) = observed_snapshot.as_ref().and_then(ws_signal_gate_reason) {
+            let _ = maybe_start_market_pool_cooldown(
+                observed,
+                settings,
+                candidate.timestamp_ms,
+                reason,
+            );
             let summary = format!(
                 "候选被拒绝：WS 行情新鲜度检查未通过 {}（{}）",
                 candidate.candidate_id,
@@ -6511,6 +6603,12 @@ async fn process_signal_single(
             );
             return Ok(());
         } else if observed_snapshot.is_none() {
+            let _ = maybe_start_market_pool_cooldown(
+                observed,
+                settings,
+                candidate.timestamp_ms,
+                "missing_observed_state",
+            );
             let summary = format!(
                 "候选被拒绝：WS 行情新鲜度检查未通过 {}（{}）",
                 candidate.candidate_id,
@@ -6631,6 +6729,93 @@ async fn process_signal_single(
         );
         return Ok(());
     }
+
+    if let Some(filter_reason) =
+        candidate_price_filter_rejection_reason(&candidate, observed, settings)
+    {
+        let _ = maybe_start_market_pool_cooldown(
+            observed,
+            settings,
+            candidate.timestamp_ms,
+            filter_reason,
+        );
+        let filter_price = observed_snapshot
+            .as_ref()
+            .and_then(|observed| candidate_price_for_audit_observed(&candidate, observed))
+            .map(format_detail_f64)
+            .unwrap_or_else(|| "无可用价格".to_owned());
+        let summary = format!(
+            "候选被拒绝：{} {}（价格 {}，区间 {}）",
+            gate_reason_label_zh("price_filter", filter_reason),
+            candidate.candidate_id,
+            filter_price,
+            price_filter_window_text(settings)
+        );
+        if let Some(audit) = audit.as_mut() {
+            audit.record_gate_decision(
+                &candidate,
+                "price_filter",
+                AuditGateResult::Rejected,
+                filter_reason,
+                summary.clone(),
+                observed_snapshot.clone(),
+            )?;
+        }
+        reject_signal(
+            stats,
+            recent_events,
+            &candidate,
+            "price_filter",
+            filter_reason,
+            summary,
+            build_gate_event_details(
+                &candidate,
+                observed_snapshot.as_ref(),
+                settings,
+                "price_filter",
+                AuditGateResult::Rejected,
+                filter_reason,
+                None,
+            ),
+        );
+        sync_engine_position_state_from_runtime(
+            engine,
+            risk,
+            trade_book,
+            &candidate.symbol,
+            fallback_token_side,
+        );
+        return Ok(());
+    }
+    let (price_filter_result, price_filter_reason, price_filter_summary) = (
+        AuditGateResult::Passed,
+        "ok",
+        format!("候选通过价格过滤 {}", candidate.candidate_id),
+    );
+    if let Some(audit) = audit.as_mut() {
+        audit.record_gate_decision(
+            &candidate,
+            "price_filter",
+            price_filter_result,
+            price_filter_reason,
+            price_filter_summary.clone(),
+            observed_snapshot.clone(),
+        )?;
+    }
+    push_gate_event(
+        recent_events,
+        &candidate,
+        price_filter_summary,
+        build_gate_event_details(
+            &candidate,
+            observed_snapshot.as_ref(),
+            settings,
+            "price_filter",
+            price_filter_result,
+            price_filter_reason,
+            None,
+        ),
+    );
 
     let plan = match preview_open_plan(execution, &candidate) {
         Ok(plan) => plan,
@@ -6757,87 +6942,6 @@ async fn process_signal_single(
         ),
     );
 
-    if let Some(filter_reason) =
-        candidate_price_filter_rejection_reason(&candidate, observed, settings)
-    {
-        let filter_price = observed_snapshot
-            .as_ref()
-            .and_then(|observed| candidate_price_for_audit_observed(&candidate, observed))
-            .map(format_detail_f64)
-            .unwrap_or_else(|| "无可用价格".to_owned());
-        let summary = format!(
-            "候选被拒绝：{} {}（价格 {}，区间 {}）",
-            gate_reason_label_zh("price_filter", filter_reason),
-            candidate.candidate_id,
-            filter_price,
-            price_filter_window_text(settings)
-        );
-        if let Some(audit) = audit.as_mut() {
-            audit.record_gate_decision(
-                &candidate,
-                "price_filter",
-                AuditGateResult::Rejected,
-                filter_reason,
-                summary.clone(),
-                observed_snapshot.clone(),
-            )?;
-        }
-        reject_signal(
-            stats,
-            recent_events,
-            &candidate,
-            "price_filter",
-            filter_reason,
-            summary,
-            build_gate_event_details(
-                &candidate,
-                observed_snapshot.as_ref(),
-                settings,
-                "price_filter",
-                AuditGateResult::Rejected,
-                filter_reason,
-                None,
-            ),
-        );
-        sync_engine_position_state_from_runtime(
-            engine,
-            risk,
-            trade_book,
-            &candidate.symbol,
-            fallback_token_side,
-        );
-        return Ok(());
-    }
-    let (result, reason, price_summary) = (
-        AuditGateResult::Passed,
-        "ok",
-        format!("候选通过价格过滤 {}", candidate.candidate_id),
-    );
-    if let Some(audit) = audit.as_mut() {
-        audit.record_gate_decision(
-            &candidate,
-            "price_filter",
-            result,
-            reason,
-            price_summary.clone(),
-            observed_snapshot.clone(),
-        )?;
-    }
-    push_gate_event(
-        recent_events,
-        &candidate,
-        price_summary,
-        build_gate_event_details(
-            &candidate,
-            observed_snapshot.as_ref(),
-            settings,
-            "price_filter",
-            result,
-            reason,
-            None,
-        ),
-    );
-
     register_open_trade_from_candidate(trade_book, &candidate, engine);
     let trigger = RuntimeTrigger::Candidate(candidate.clone());
     let events = match execution.process_plan(plan).await {
@@ -6938,6 +7042,7 @@ async fn process_signal_multi(
     paused: &Arc<AtomicBool>,
     emergency: &Arc<AtomicBool>,
     ws_mode: bool,
+    bootstrap_in_flight: bool,
     audit: &mut Option<PaperAudit>,
 ) -> Result<()> {
     let fallback_token_side = Some(candidate.token_side);
@@ -7038,18 +7143,20 @@ async fn process_signal_multi(
     }
 
     if ws_mode {
-        if let Some(reason) = observed_snapshot.as_ref().and_then(ws_signal_gate_reason) {
+        if let Some(reason) =
+            ws_bootstrap_gate_reason(bootstrap_in_flight, observed_snapshot.as_ref())
+        {
             let summary = format!(
-                "候选被拒绝：WS 行情新鲜度检查未通过 {}（{}）",
+                "候选被拒绝：WS 行情启动补齐尚未完成 {}（{}）",
                 candidate.candidate_id,
-                format_ws_freshness_reason(&reason)
+                format_ws_freshness_reason(reason)
             );
             if let Some(audit) = audit.as_mut() {
                 audit.record_gate_decision(
                     &candidate,
                     "ws_freshness",
                     AuditGateResult::Rejected,
-                    &reason,
+                    reason,
                     summary.clone(),
                     observed_snapshot.clone(),
                 )?;
@@ -7067,7 +7174,56 @@ async fn process_signal_multi(
                     settings,
                     "ws_freshness",
                     AuditGateResult::Rejected,
-                    &reason,
+                    reason,
+                    None,
+                ),
+            );
+            sync_engine_position_state_from_runtime(
+                engine,
+                risk,
+                trade_book,
+                &candidate.symbol,
+                fallback_token_side,
+            );
+            return Ok(());
+        } else if let Some(reason) = observed_snapshot.as_ref().and_then(ws_signal_gate_reason) {
+            if let Some(observed) = observed_map.get_mut(&candidate.symbol) {
+                let _ = maybe_start_market_pool_cooldown(
+                    observed,
+                    settings,
+                    candidate.timestamp_ms,
+                    reason,
+                );
+            }
+            let summary = format!(
+                "候选被拒绝：WS 行情新鲜度检查未通过 {}（{}）",
+                candidate.candidate_id,
+                format_ws_freshness_reason(reason)
+            );
+            if let Some(audit) = audit.as_mut() {
+                audit.record_gate_decision(
+                    &candidate,
+                    "ws_freshness",
+                    AuditGateResult::Rejected,
+                    reason,
+                    summary.clone(),
+                    observed_snapshot.clone(),
+                )?;
+            }
+            reject_signal(
+                stats,
+                recent_events,
+                &candidate,
+                "stale",
+                reason,
+                summary,
+                build_gate_event_details(
+                    &candidate,
+                    observed_snapshot.as_ref(),
+                    settings,
+                    "ws_freshness",
+                    AuditGateResult::Rejected,
+                    reason,
                     None,
                 ),
             );
@@ -7080,6 +7236,14 @@ async fn process_signal_multi(
             );
             return Ok(());
         } else if observed_snapshot.is_none() {
+            if let Some(observed) = observed_map.get_mut(&candidate.symbol) {
+                let _ = maybe_start_market_pool_cooldown(
+                    observed,
+                    settings,
+                    candidate.timestamp_ms,
+                    "missing_observed_state",
+                );
+            }
             let summary = format!(
                 "候选被拒绝：WS 行情新鲜度检查未通过 {}（{}）",
                 candidate.candidate_id,
@@ -7206,6 +7370,95 @@ async fn process_signal_multi(
         return Ok(());
     }
 
+    if let Some(filter_reason) =
+        candidate_price_filter_rejection_reason_multi(&candidate, observed_map, settings)
+    {
+        if let Some(observed) = observed_map.get_mut(&candidate.symbol) {
+            let _ = maybe_start_market_pool_cooldown(
+                observed,
+                settings,
+                candidate.timestamp_ms,
+                filter_reason,
+            );
+        }
+        let filter_price = observed_snapshot
+            .as_ref()
+            .and_then(|observed| candidate_price_for_audit_observed(&candidate, observed))
+            .map(format_detail_f64)
+            .unwrap_or_else(|| "无可用价格".to_owned());
+        let summary = format!(
+            "候选被拒绝：{} {}（价格 {}，区间 {}）",
+            gate_reason_label_zh("price_filter", filter_reason),
+            candidate.candidate_id,
+            filter_price,
+            price_filter_window_text(settings)
+        );
+        if let Some(audit) = audit.as_mut() {
+            audit.record_gate_decision(
+                &candidate,
+                "price_filter",
+                AuditGateResult::Rejected,
+                filter_reason,
+                summary.clone(),
+                observed_snapshot.clone(),
+            )?;
+        }
+        reject_signal(
+            stats,
+            recent_events,
+            &candidate,
+            "price_filter",
+            filter_reason,
+            summary,
+            build_gate_event_details(
+                &candidate,
+                observed_snapshot.as_ref(),
+                settings,
+                "price_filter",
+                AuditGateResult::Rejected,
+                filter_reason,
+                None,
+            ),
+        );
+        sync_engine_position_state_from_runtime(
+            engine,
+            risk,
+            trade_book,
+            &candidate.symbol,
+            fallback_token_side,
+        );
+        return Ok(());
+    }
+    let (price_filter_result, price_filter_reason, price_filter_summary) = (
+        AuditGateResult::Passed,
+        "ok",
+        format!("候选通过价格过滤 {}", candidate.candidate_id),
+    );
+    if let Some(audit) = audit.as_mut() {
+        audit.record_gate_decision(
+            &candidate,
+            "price_filter",
+            price_filter_result,
+            price_filter_reason,
+            price_filter_summary.clone(),
+            observed_snapshot.clone(),
+        )?;
+    }
+    push_gate_event(
+        recent_events,
+        &candidate,
+        price_filter_summary,
+        build_gate_event_details(
+            &candidate,
+            observed_snapshot.as_ref(),
+            settings,
+            "price_filter",
+            price_filter_result,
+            price_filter_reason,
+            None,
+        ),
+    );
+
     let plan = match preview_open_plan(execution, &candidate) {
         Ok(plan) => plan,
         Err(err) => {
@@ -7330,87 +7583,6 @@ async fn process_signal_multi(
             AuditGateResult::Passed,
             "ok",
             Some(risk),
-        ),
-    );
-
-    if let Some(filter_reason) =
-        candidate_price_filter_rejection_reason_multi(&candidate, observed_map, settings)
-    {
-        let filter_price = observed_snapshot
-            .as_ref()
-            .and_then(|observed| candidate_price_for_audit_observed(&candidate, observed))
-            .map(format_detail_f64)
-            .unwrap_or_else(|| "无可用价格".to_owned());
-        let summary = format!(
-            "候选被拒绝：{} {}（价格 {}，区间 {}）",
-            gate_reason_label_zh("price_filter", filter_reason),
-            candidate.candidate_id,
-            filter_price,
-            price_filter_window_text(settings)
-        );
-        if let Some(audit) = audit.as_mut() {
-            audit.record_gate_decision(
-                &candidate,
-                "price_filter",
-                AuditGateResult::Rejected,
-                filter_reason,
-                summary.clone(),
-                observed_snapshot.clone(),
-            )?;
-        }
-        reject_signal(
-            stats,
-            recent_events,
-            &candidate,
-            "price_filter",
-            filter_reason,
-            summary,
-            build_gate_event_details(
-                &candidate,
-                observed_snapshot.as_ref(),
-                settings,
-                "price_filter",
-                AuditGateResult::Rejected,
-                filter_reason,
-                None,
-            ),
-        );
-        sync_engine_position_state_from_runtime(
-            engine,
-            risk,
-            trade_book,
-            &candidate.symbol,
-            fallback_token_side,
-        );
-        return Ok(());
-    }
-    let (result, reason, price_summary) = (
-        AuditGateResult::Passed,
-        "ok",
-        format!("候选通过价格过滤 {}", candidate.candidate_id),
-    );
-    if let Some(audit) = audit.as_mut() {
-        audit.record_gate_decision(
-            &candidate,
-            "price_filter",
-            result,
-            reason,
-            price_summary.clone(),
-            observed_snapshot.clone(),
-        )?;
-    }
-    push_gate_event(
-        recent_events,
-        &candidate,
-        price_summary,
-        build_gate_event_details(
-            &candidate,
-            observed_snapshot.as_ref(),
-            settings,
-            "price_filter",
-            result,
-            reason,
-            None,
         ),
     );
 
@@ -7673,6 +7845,7 @@ async fn handle_multi_market_event(
     trade_book: &mut TradeBook,
     paused: &Arc<AtomicBool>,
     emergency: &Arc<AtomicBool>,
+    bootstrap_in_flight: bool,
     audit: &mut Option<PaperAudit>,
 ) -> Result<()> {
     stats.market_events += 1;
@@ -7680,6 +7853,12 @@ async fn handle_multi_market_event(
         MarketDataEvent::MarketLifecycle { symbol, .. } => observed
             .get(symbol)
             .and_then(|obs| obs.market_phase.clone()),
+        _ => None,
+    };
+    let previous_connection_status = match &event {
+        MarketDataEvent::ConnectionEvent { exchange, .. } => observed
+            .values()
+            .find_map(|obs| obs.connections.get(&format!("{exchange:?}")).copied()),
         _ => None,
     };
 
@@ -7707,22 +7886,24 @@ async fn handle_multi_market_event(
 
     match &event {
         MarketDataEvent::ConnectionEvent { exchange, status } => {
-            let exchange_name = format!("{exchange:?}");
-            let connections = aggregate_connections(observed, now_millis());
-            push_event_with_context(
-                recent_events,
-                "connection",
-                summarize_market_event(&event),
-                None,
-                None,
-                None,
-                build_connection_event_details(
-                    &exchange_name,
-                    *status,
-                    connections.get(&exchange_name),
-                    observed.len(),
-                ),
-            );
+            if previous_connection_status != Some(*status) {
+                let exchange_name = format!("{exchange:?}");
+                let connections = aggregate_connections(observed, now_millis());
+                push_event_with_context(
+                    recent_events,
+                    "connection",
+                    summarize_market_event(&event),
+                    None,
+                    None,
+                    None,
+                    build_connection_event_details(
+                        &exchange_name,
+                        *status,
+                        connections.get(&exchange_name),
+                        observed.len(),
+                    ),
+                );
+            }
         }
         MarketDataEvent::MarketLifecycle {
             symbol,
@@ -7794,6 +7975,7 @@ async fn handle_multi_market_event(
             paused,
             emergency,
             matches!(settings.strategy.market_data.mode, MarketDataMode::Ws),
+            bootstrap_in_flight,
             audit,
         )
         .await?;
@@ -8653,6 +8835,7 @@ async fn run_paper_multi_ws_mode(
                             &mut trade_book,
                             &paused,
                             &emergency,
+                            bootstrap_in_flight,
                             &mut audit,
                         ).await?;
                         state_dirty = true;
@@ -8983,6 +9166,14 @@ fn update_connection_state(
     updated_at_ms: u64,
 ) {
     let name = format!("{exchange:?}");
+    if status == ConnectionStatus::Connecting
+        && observed
+            .connections
+            .get(&name)
+            .is_some_and(|current| *current != ConnectionStatus::Connecting)
+    {
+        return;
+    }
     record_connection_status(observed, name, status, updated_at_ms);
 }
 
@@ -13586,6 +13777,216 @@ mod tests {
             .is_some_and(|until_ms| until_ms > 1));
     }
 
+    #[tokio::test]
+    async fn process_signal_single_applies_price_band_before_trade_plan() {
+        let settings =
+            test_settings_with_price_filter(Some(Decimal::new(2, 1)), Some(Decimal::new(5, 1)));
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let (provider, _executor, mut execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
+        seed_runtime_books(&provider, &registry, 1);
+
+        let mut observed = ObservedState {
+            poly_yes_mid: Some(Decimal::new(9, 1)),
+            ..ObservedState::default()
+        };
+        let mut candidate = open_candidate(TokenSide::Yes);
+        candidate.delta_estimate = 0.0;
+
+        let mut stats = PaperStats::default();
+        let mut recent_events = VecDeque::new();
+        let mut engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
+        let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        let mut trade_book = TradeBook::default();
+        let paused = Arc::new(AtomicBool::new(false));
+        let emergency = Arc::new(AtomicBool::new(false));
+        let mut no_audit = None;
+
+        process_signal_single(
+            candidate,
+            &settings,
+            &registry,
+            &mut observed,
+            &mut stats,
+            &mut recent_events,
+            &mut engine,
+            &mut execution,
+            &mut risk,
+            &mut trade_book,
+            &paused,
+            &emergency,
+            false,
+            &mut no_audit,
+        )
+        .await
+        .expect("signal should reject cleanly");
+
+        assert_eq!(
+            observed.market_pool.open_cooldown_reason.as_deref(),
+            Some("above_or_equal_max_poly_price")
+        );
+        assert!(recent_events
+            .iter()
+            .any(|event| { event.summary.contains("高于或等于最大 Poly 价格带") }));
+        assert!(!recent_events
+            .iter()
+            .any(|event| { event.summary.contains("CEX 对冲量为 0") }));
+    }
+
+    #[tokio::test]
+    async fn process_signal_multi_applies_price_band_before_trade_plan() {
+        let settings =
+            test_settings_with_price_filter(Some(Decimal::new(2, 1)), Some(Decimal::new(5, 1)));
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let (provider, _executor, mut execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
+        seed_runtime_books(&provider, &registry, 1);
+
+        let symbol = Symbol::new("btc-test");
+        let mut observed_map = HashMap::from([(
+            symbol.clone(),
+            ObservedState {
+                poly_yes_mid: Some(Decimal::new(9, 1)),
+                ..ObservedState::default()
+            },
+        )]);
+        let mut candidate = open_candidate(TokenSide::Yes);
+        candidate.delta_estimate = 0.0;
+
+        let mut stats = PaperStats::default();
+        let mut recent_events = VecDeque::new();
+        let mut engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
+        let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        let mut trade_book = TradeBook::default();
+        let paused = Arc::new(AtomicBool::new(false));
+        let emergency = Arc::new(AtomicBool::new(false));
+        let mut no_audit = None;
+
+        process_signal_multi(
+            candidate,
+            &settings,
+            &registry,
+            &mut observed_map,
+            &mut stats,
+            &mut recent_events,
+            &mut engine,
+            &mut execution,
+            &mut risk,
+            &mut trade_book,
+            &paused,
+            &emergency,
+            false,
+            false,
+            &mut no_audit,
+        )
+        .await
+        .expect("signal should reject cleanly");
+
+        let observed = observed_map.get(&symbol).expect("observed state");
+        assert_eq!(
+            observed.market_pool.open_cooldown_reason.as_deref(),
+            Some("above_or_equal_max_poly_price")
+        );
+        assert!(recent_events
+            .iter()
+            .any(|event| { event.summary.contains("高于或等于最大 Poly 价格带") }));
+        assert!(!recent_events
+            .iter()
+            .any(|event| { event.summary.contains("CEX 对冲量为 0") }));
+    }
+
+    #[tokio::test]
+    async fn process_signal_single_cools_market_after_ws_freshness_rejection() {
+        let settings = test_settings_with_price_filter(None, None);
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let (_provider, _executor, mut execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
+
+        let now_ms = now_millis();
+        let mut observed = ObservedState {
+            poly_yes_mid: Some(Decimal::new(45, 2)),
+            cex_mid: Some(Decimal::new(100_000, 0)),
+            poly_yes_updated_at_ms: Some(now_ms.saturating_sub(100)),
+            cex_updated_at_ms: Some(now_ms.saturating_sub(10_000)),
+            ..ObservedState::default()
+        };
+        record_connection_status(
+            &mut observed,
+            "Polymarket".to_owned(),
+            ConnectionStatus::Connected,
+            now_ms.saturating_sub(100),
+        );
+        record_connection_status(
+            &mut observed,
+            "Binance".to_owned(),
+            ConnectionStatus::Connected,
+            now_ms.saturating_sub(100),
+        );
+
+        let mut stats = PaperStats::default();
+        let mut recent_events = VecDeque::new();
+        let mut engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
+        let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        let mut trade_book = TradeBook::default();
+        let paused = Arc::new(AtomicBool::new(false));
+        let emergency = Arc::new(AtomicBool::new(false));
+        let mut no_audit = None;
+
+        process_signal_single(
+            open_candidate(TokenSide::Yes),
+            &settings,
+            &registry,
+            &mut observed,
+            &mut stats,
+            &mut recent_events,
+            &mut engine,
+            &mut execution,
+            &mut risk,
+            &mut trade_book,
+            &paused,
+            &emergency,
+            true,
+            &mut no_audit,
+        )
+        .await
+        .expect("signal should reject cleanly");
+
+        assert_eq!(
+            observed.market_pool.open_cooldown_reason.as_deref(),
+            Some("cex_stale")
+        );
+    }
+
     #[test]
     fn execution_events_include_trade_plan_created_only_when_plan_exists() {
         assert!(!execution_events_include_trade_plan_created(&[
@@ -14496,6 +14897,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ws_bootstrap_gate_marks_non_tradeable_market_as_bootstrapping() {
+        let observed = AuditObservedMarket {
+            symbol: "btc-test".to_owned(),
+            evaluable_status: EvaluableStatus::CexQuoteStale,
+            async_classification: AsyncClassification::CexQuoteStale,
+            ..AuditObservedMarket::default()
+        };
+
+        assert_eq!(
+            ws_bootstrap_gate_reason(true, Some(&observed)),
+            Some("bootstrap_in_progress")
+        );
+    }
+
+    #[test]
+    fn ws_bootstrap_gate_allows_tradeable_market_during_bootstrap() {
+        let observed = AuditObservedMarket {
+            symbol: "btc-test".to_owned(),
+            evaluable_status: EvaluableStatus::Evaluable,
+            async_classification: AsyncClassification::BalancedFresh,
+            ..AuditObservedMarket::default()
+        };
+
+        assert_eq!(ws_bootstrap_gate_reason(true, Some(&observed)), None);
+        assert_eq!(ws_bootstrap_gate_reason(false, Some(&observed)), None);
+    }
+
     #[tokio::test]
     async fn build_monitor_state_keeps_realized_pnl_after_position_is_flat() {
         let settings = test_settings_with_price_filter(None, None);
@@ -14737,6 +15166,30 @@ mod tests {
     }
 
     #[test]
+    fn housekeeping_connection_refresh_does_not_downgrade_connected_ws_state() {
+        let mut observed = ObservedState::default();
+
+        record_connection_status(
+            &mut observed,
+            "Binance".to_owned(),
+            ConnectionStatus::Connected,
+            1_000,
+        );
+
+        update_connection_state(
+            &mut observed,
+            Exchange::Binance,
+            ConnectionStatus::Connecting,
+            2_000,
+        );
+
+        assert_eq!(
+            observed.connections.get("Binance"),
+            Some(&ConnectionStatus::Connected)
+        );
+    }
+
+    #[test]
     fn aggregate_connections_keeps_highest_runtime_counters() {
         let mut left = ObservedState::default();
         record_connection_status(
@@ -14878,6 +15331,64 @@ mod tests {
                 assert_eq!(status, ConnectionStatus::Connecting);
             }
             other => panic!("unexpected tracker event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exchange_connection_tracker_does_not_downgrade_when_other_stream_is_active() {
+        let settings = test_settings_with_price_filter(None, None);
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let symbol = settings.markets[0].symbol.clone();
+        let channels = create_channels(std::slice::from_ref(&symbol));
+        let manager = build_data_manager(&registry, channels.market_data_tx.clone());
+        let tracker = ExchangeConnectionTracker::new(Exchange::Binance, manager);
+        let mut rx = channels.market_data_tx.subscribe();
+
+        tracker.mark_connected("btcusdt");
+        match rx.try_recv() {
+            Ok(MarketDataEvent::ConnectionEvent { exchange, status }) => {
+                assert_eq!(exchange, Exchange::Binance);
+                assert_eq!(status, ConnectionStatus::Connected);
+            }
+            other => panic!("unexpected tracker event after connect: {other:?}"),
+        }
+
+        tracker.mark_connecting();
+
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn exchange_connection_tracker_reaffirms_connected_state_after_interval() {
+        let settings = test_settings_with_price_filter(None, None);
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let symbol = settings.markets[0].symbol.clone();
+        let channels = create_channels(std::slice::from_ref(&symbol));
+        let manager = build_data_manager(&registry, channels.market_data_tx.clone());
+        let tracker = ExchangeConnectionTracker::new(Exchange::Polymarket, manager);
+        let mut rx = channels.market_data_tx.subscribe();
+
+        tracker.mark_connected("market");
+        match rx.try_recv() {
+            Ok(MarketDataEvent::ConnectionEvent { exchange, status }) => {
+                assert_eq!(exchange, Exchange::Polymarket);
+                assert_eq!(status, ConnectionStatus::Connected);
+            }
+            other => panic!("unexpected tracker event after initial connect: {other:?}"),
+        }
+
+        tokio::time::sleep(Duration::from_millis(
+            WS_CONNECTED_STATUS_REFRESH_MS.saturating_add(50),
+        ))
+        .await;
+        tracker.reaffirm_connected();
+
+        match rx.try_recv() {
+            Ok(MarketDataEvent::ConnectionEvent { exchange, status }) => {
+                assert_eq!(exchange, Exchange::Polymarket);
+                assert_eq!(status, ConnectionStatus::Connected);
+            }
+            other => panic!("unexpected tracker event after reaffirm: {other:?}"),
         }
     }
 

@@ -54,6 +54,7 @@ MIN_MINUTES_TO_EXPIRY = 1.0
 MIN_VOLATILITY = 1e-6
 DELTA_BUMP_PCT = 1e-4
 SQRT_TWO = math.sqrt(2.0)
+DEFAULT_ANNUALIZED_VOLATILITY = 0.5
 MIN_WALK_FORWARD_SLICES = 1
 RESOLUTION_EPSILON = 1e-4
 MONEY_LITERAL_RE = r"([0-9][0-9,]*(?:\.\d+)?(?:[kmb])?)\b"
@@ -1180,6 +1181,16 @@ def normal_cdf(value: float) -> float:
     return 0.5 * (1.0 + math.erf(value / SQRT_TWO))
 
 
+def default_minute_sigma() -> float:
+    return DEFAULT_ANNUALIZED_VOLATILITY / math.sqrt(252.0) / math.sqrt(1440.0)
+
+
+def effective_sigma(sigma: float | None) -> float:
+    if sigma is not None and sigma >= MIN_VOLATILITY:
+        return sigma
+    return default_minute_sigma()
+
+
 def yes_probability_from_rule(
     rule: MarketRule,
     spot_price: float,
@@ -1187,8 +1198,9 @@ def yes_probability_from_rule(
     minutes_to_expiry: float,
 ) -> float:
     spot = max(float(spot_price), 1e-9)
-    if sigma is None or sigma < MIN_VOLATILITY or minutes_to_expiry <= MIN_MINUTES_TO_EXPIRY:
+    if minutes_to_expiry <= MIN_MINUTES_TO_EXPIRY:
         return realized_yes_payout(rule, spot)
+    sigma = effective_sigma(sigma)
 
     variance = max((sigma**2) * minutes_to_expiry, MIN_VOLATILITY**2)
     stdev = math.sqrt(variance)

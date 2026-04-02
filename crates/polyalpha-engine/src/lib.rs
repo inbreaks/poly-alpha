@@ -17,6 +17,7 @@ const MIN_MINUTES_TO_EXPIRY: f64 = 1.0;
 const MIN_VOLATILITY: f64 = 1e-6;
 const DELTA_BUMP_PCT: f64 = 1e-4;
 const SQRT_TWO: f64 = std::f64::consts::SQRT_2;
+const DEFAULT_ANNUALIZED_VOLATILITY: f64 = 0.5;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BasisStrategySnapshot {
@@ -507,10 +508,9 @@ impl SimpleAlphaEngine {
         // Calculate sigma from CEX returns if available
         let sigma = if state.cex_minutes.returns_window.len() >= 30 {
             let returns: Vec<f64> = state.cex_minutes.returns_window.iter().copied().collect();
-            calculate_sigma(&returns)
+            effective_sigma(calculate_sigma(&returns))
         } else {
-            // Default annualized volatility ~50%
-            Some(0.5 / (252.0_f64).sqrt() / (1440.0_f64).sqrt())
+            Some(default_minute_sigma())
         };
 
         let settlement_ts_ms = market.settlement_timestamp.saturating_mul(1000);
@@ -952,7 +952,7 @@ impl SimpleAlphaEngine {
             }
         };
 
-        let sigma = state.cex_minutes.sigma();
+        let sigma = effective_sigma(state.cex_minutes.sigma());
         let yes_evaluation = self.evaluate_token_pending(
             symbol,
             &rule,
@@ -1039,7 +1039,9 @@ impl SimpleAlphaEngine {
                 ],
                 self.get_entry_z(symbol),
             ) {
-                if let Some(candidate) = self.build_open_candidate(symbol, &snapshot) {
+                if let Some(candidate) =
+                    self.build_open_candidate(symbol, &snapshot, state.last_update_ms)
+                {
                     output.push_open_candidate(candidate);
                 }
             }
@@ -1137,6 +1139,7 @@ impl SimpleAlphaEngine {
         &mut self,
         symbol: &Symbol,
         snapshot: &BasisStrategySnapshot,
+        timestamp_ms: u64,
     ) -> Option<OpenCandidate> {
         let mut risk_budget = self.get_position_notional_usd(symbol);
         if let Some(max_position_usd) = self.max_position_usd {
@@ -1159,11 +1162,7 @@ impl SimpleAlphaEngine {
             risk_budget_usd: risk_budget.0.to_f64().unwrap_or_default(),
             strength: self.signal_strength(symbol, snapshot.z_score),
             z_score: snapshot.z_score,
-            timestamp_ms: self
-                .states
-                .get(symbol)
-                .map(|state| state.last_update_ms)
-                .unwrap_or_default(),
+            timestamp_ms,
         })
     }
 
@@ -1351,6 +1350,16 @@ fn token_fair_value(
         TokenSide::Yes => yes_probability.clamp(0.0, 1.0),
         TokenSide::No => (1.0 - yes_probability).clamp(0.0, 1.0),
     }
+}
+
+fn default_minute_sigma() -> f64 {
+    DEFAULT_ANNUALIZED_VOLATILITY / (252.0_f64).sqrt() / (1440.0_f64).sqrt()
+}
+
+fn effective_sigma(sigma: Option<f64>) -> Option<f64> {
+    sigma
+        .filter(|value| *value >= MIN_VOLATILITY)
+        .or(Some(default_minute_sigma()))
 }
 
 fn token_delta(
@@ -1779,6 +1788,116 @@ mod tests {
         assert_eq!(candidate.risk_budget_usd, 1_000.0);
         assert!(candidate.raw_mispricing.abs() > 0.0);
         assert!(candidate.delta_estimate.abs() > 0.0);
+    }
+
+    #[tokio::test]
+    async fn open_candidate_timestamp_matches_triggering_cex_event() {
+        let mut engine = test_engine();
+
+        let _ = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(100_000, 0),
+                Decimal::new(100_000, 0),
+                0,
+            ))
+            .await;
+
+        for (offset, yes_bid, yes_ask, no_bid, no_ask, cex_price) in [
+            (60_100, 51, 53, 47, 49, 100_150),
+            (120_100, 50, 52, 48, 50, 100_300),
+            (180_100, 35, 37, 63, 65, 100_450),
+        ] {
+            let _ = engine
+                .on_market_data(&poly_orderbook_event(
+                    InstrumentKind::PolyYes,
+                    Decimal::new(yes_bid, 2),
+                    Decimal::new(yes_ask, 2),
+                    offset,
+                ))
+                .await;
+            let _ = engine
+                .on_market_data(&poly_orderbook_event(
+                    InstrumentKind::PolyNo,
+                    Decimal::new(no_bid, 2),
+                    Decimal::new(no_ask, 2),
+                    offset + 20,
+                ))
+                .await;
+
+            let cex_timestamp_ms = offset + 100;
+            let output = engine
+                .on_market_data(&cex_orderbook_event(
+                    Decimal::new(cex_price, 0),
+                    Decimal::new(cex_price, 0),
+                    cex_timestamp_ms,
+                ))
+                .await;
+
+            if let Some(candidate) = output.open_candidates.first() {
+                assert_eq!(candidate.timestamp_ms, cex_timestamp_ms);
+                return;
+            }
+        }
+
+        panic!("expected an open candidate during warmup sequence");
+    }
+
+    #[tokio::test]
+    async fn sigma_warmup_keeps_future_market_delta_non_zero() {
+        let mut engine = test_engine();
+
+        let _ = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(100_000, 0),
+                Decimal::new(100_000, 0),
+                0,
+            ))
+            .await;
+
+        for (offset, yes_bid, yes_ask, no_bid, no_ask) in [
+            (60_100, 51, 53, 47, 49),
+            (120_100, 50, 52, 48, 50),
+            (180_100, 35, 37, 63, 65),
+        ] {
+            let _ = engine
+                .on_market_data(&poly_orderbook_event(
+                    InstrumentKind::PolyYes,
+                    Decimal::new(yes_bid, 2),
+                    Decimal::new(yes_ask, 2),
+                    offset,
+                ))
+                .await;
+            let _ = engine
+                .on_market_data(&poly_orderbook_event(
+                    InstrumentKind::PolyNo,
+                    Decimal::new(no_bid, 2),
+                    Decimal::new(no_ask, 2),
+                    offset + 20,
+                ))
+                .await;
+
+            let output = engine
+                .on_market_data(&cex_orderbook_event(
+                    Decimal::new(100_000, 0),
+                    Decimal::new(100_000, 0),
+                    offset + 100,
+                ))
+                .await;
+
+            if let Some(candidate) = output.open_candidates.first() {
+                assert!(
+                    candidate.fair_value < 1.0,
+                    "future market should not collapse to deterministic payout during sigma warmup"
+                );
+                assert!(
+                    candidate.delta_estimate.abs() > 0.0,
+                    "future market should remain hedgeable during sigma warmup"
+                );
+                return;
+            }
+        }
+
+        panic!("expected an open candidate during sigma warmup sequence");
     }
 
     #[tokio::test]

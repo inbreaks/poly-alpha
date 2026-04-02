@@ -93,11 +93,55 @@
 - 一部分“明知大概率做不了还反复送进 planner”的噪声已被前置挡掉
 - 市场池开始具备真正的“自动踢出坏市场”能力，而不是只在末端重复报错
 
+### 7. 两个会污染判断的时间语义问题已收口
+
+- engine 之前会在 `build_open_candidate` 时回头从 `self.states` 取 `last_update_ms`
+- 但 `generate_output` 正在临时把当前 symbol 的 state 从 map 里拿出来计算
+- 结果就是 candidate 可能稳定带着 `timestamp_ms = 0`
+
+这个问题现在已经修掉：
+
+- `OpenCandidate.timestamp_ms` 直接绑定本次计算上下文里的 `state.last_update_ms`
+- 已有回归测试锁住 “candidate 时间必须等于触发它的那笔 CEX 事件时间”
+
+同时，多市场 WS 启动补齐阶段的拒绝语义也做了收口：
+
+- 在启动补齐尚未完成、市场当前还没进入可交易状态时
+- 系统不再把这类拒绝误记成 `cex_stale`
+- 而是明确记为 `bootstrap_in_progress`
+
+意义：
+
+- 候选时间、事件时间、市场池时间不再混成一团
+- 启动期“还没补齐”和运行中“真实 stale”终于被拆成两个不同原因码
+
+### 8. WS 连接真相链路已重新收敛
+
+之前多市场 WS runtime 还存在一个关键工程 bug：
+
+- 某个交易所只要已有活跃 WS stream
+- 后续新 stream 启动时，`mark_connecting()` 仍会把全局状态重新打回 `Connecting`
+- 结果就是“数据已经在流动，但 runtime / engine 仍判定连接异常”
+
+这个问题现在已经锁住：
+
+- `ExchangeConnectionTracker` 在已有活跃 stream 时不再降级全局状态
+- 活跃 WS stream 在持续收消息时，会低频重申一次 `Connected`
+- 所以即使启动洪峰下初始 `Connected` 事件被消费者错过，runtime 也会重新收敛
+- 已补失败测试，验证 `Connected -> Connecting` 的错误回退不再发生
+- 最新 live-mock 也已确认最终 monitor 连接状态稳定收敛到
+  `Binance=已连接, Polymarket=已连接`
+
+意义：
+
+- WS 数据、runtime 连接状态、engine 连接判断重新回到同一套事实
+- “明明已经连上并持续收行情，却被卡在 `connection_impaired`” 这条 blocker 已关闭
+
 ## 最新验证证据
 
 ### 全量 Rust 验证
 
-已跑：
+历史已跑：
 
 ```bash
 cargo test -p polyalpha-core -p polyalpha-data -p polyalpha-risk -p polyalpha-executor -p polyalpha-cli -- --nocapture
@@ -111,9 +155,19 @@ cargo test -p polyalpha-core -p polyalpha-data -p polyalpha-risk -p polyalpha-ex
 - `polyalpha-executor`: `59 passed, 0 failed`
 - `polyalpha-risk`: `8 passed, 0 failed`
 
+针对 2026-04-02 这轮 WS 连接状态修复，最新补跑：
+
+```bash
+cargo test -p polyalpha-cli -- --nocapture
+```
+
+最新结果：
+
+- `polyalpha-cli`: `148 passed, 0 failed, 4 ignored`
+
 ### live-mock 运行证据
 
-已跑：
+历史长跑样本：
 
 ```bash
 ./target/debug/polyalpha-cli live run-multi \
@@ -159,6 +213,38 @@ cargo test -p polyalpha-core -p polyalpha-data -p polyalpha-risk -p polyalpha-ex
 - 也不是“有成交就会中途崩”
 - 当前真正的问题已经变成“机会质量和实时可交易性”
 
+针对 2026-04-02 这轮 WS 连接状态和实时准入修复，最新补跑：
+
+```bash
+cargo run -p polyalpha-cli -- live run-multi \
+  --env multi-market-active.fresh \
+  --poll-interval-ms 1000 \
+  --max-ticks 60 \
+  --print-every 60 \
+  --executor-mode mock
+```
+
+对应产物：
+
+- artifact: `data/live/multi-market-active.fresh-last-run.json`
+- audit summary: `data/audit/sessions/83015550-f319-4c9d-a8ce-c42f2d28cf19/summary.json`
+
+最新一轮结果：
+
+- 最终 monitor 连接状态：`Binance=已连接, Polymarket=已连接`
+- `signals_seen = 95`
+- `signals_rejected = 139`
+- `signal_emitted = 95`
+- `gate_decision = 150`
+- `order_submitted / fills = 0 / 0`
+
+补充判断：
+
+- 这轮没有成交，不是因为连接状态仍然坏掉
+- 主要拒绝已经变成 `zero_cex_hedge_qty`、`residual_delta_too_large`、`poly_stale`、`bootstrap_in_progress`
+- `cex_stale` 已压到 `2` 次，且价格带误入场已经能进入 `cooldown_above_or_equal_max_poly_price`
+- 启动早期仍有少量 `connection_lost`，但最后一次出现在启动后约 4 秒内，已经不再是持续性 blocker
+
 ## 当前 live-ready 阻塞
 
 ### 1. 交易池治理已经起效，但还没过线
@@ -176,13 +262,20 @@ cargo test -p polyalpha-core -p polyalpha-data -p polyalpha-risk -p polyalpha-ex
 
 ### 2. 实时可交易性质量仍然不够稳定
 
-最近一轮里：
+最近一轮历史证据里：
 
-- `cex_stale` 已经抬头
+- 启动早期 `cex_stale` 有一部分其实是启动补齐阶段的误分类
+- 这部分现在已被单独归因为 `bootstrap_in_progress`
 - 高价带市场仍然频繁卡在价格过滤
 - `poly_stale` 虽然下降，但还不能说明实时质量问题已经彻底解决
 
 这说明问题不是系统不会交易，而是“进入漏斗的市场质量”和“实时双腿数据质量”还没有同时过线。
+
+补充说明：
+
+- 2026-04-02 本地已经重跑到新的 live-mock session，确认 WS 连接状态最终能收敛到 `已连接`
+- 当前残留的连接异常只出现在启动早期几秒内，不再是主要工程 blocker
+- 现在更需要处理的是“哪些市场应该进交易池”和“哪些报价其实不该进 planner”
 
 ### 3. planner 末端拒绝仍然偏多
 

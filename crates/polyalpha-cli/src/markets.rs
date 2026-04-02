@@ -2866,9 +2866,9 @@ mod tests {
     fn derive_refresh_report_path_uses_report_suffix() {
         assert_eq!(
             derive_refresh_report_path(std::path::Path::new(
-                "config/multi-market-active.generated.toml"
+                "config/multi-market-active.fresh.toml"
             )),
-            "config/multi-market-active.generated.report.json"
+            "config/multi-market-active.fresh.report.json"
         );
         assert_eq!(
             derive_refresh_report_path(std::path::Path::new("multi-market-active.toml")),
