@@ -1133,6 +1133,38 @@ impl PaperAudit {
         })
     }
 
+    fn record_intent_rejected(
+        &mut self,
+        trigger: &RuntimeTrigger,
+        reason_code: &str,
+        message: &str,
+    ) -> Result<()> {
+        self.record_event(NewAuditEvent {
+            timestamp_ms: trigger.timestamp_ms(),
+            kind: AuditEventKind::Anomaly,
+            symbol: Some(trigger.symbol().0.clone()),
+            signal_id: Some(trigger.id().to_owned()),
+            correlation_id: Some(trigger.correlation_id().to_owned()),
+            gate: Some("trade_plan".to_owned()),
+            result: Some("rejected".to_owned()),
+            reason: Some(reason_code.to_owned()),
+            summary: format!(
+                "{} {}未执行（{}）",
+                trigger.symbol().0,
+                trigger_action_label_zh(trigger),
+                translate_trade_plan_rejection(reason_code)
+            ),
+            payload: AuditEventPayload::Anomaly(AuditAnomalyEvent {
+                severity: AuditSeverity::Warning,
+                code: "intent_rejected".to_owned(),
+                message: message.to_owned(),
+                symbol: Some(trigger.symbol().0.clone()),
+                signal_id: Some(trigger.id().to_owned()),
+                correlation_id: Some(trigger.correlation_id().to_owned()),
+            }),
+        })
+    }
+
     fn maybe_record_runtime_state(
         &mut self,
         stats: &PaperStats,
@@ -3004,6 +3036,7 @@ async fn close_symbol_position(
     stats: &mut PaperStats,
     recent_events: &mut VecDeque<PaperEventLog>,
     trade_book: &mut TradeBook,
+    audit: &mut Option<PaperAudit>,
     now_ms: u64,
 ) -> Result<()> {
     let intent = close_intent_for_symbol(
@@ -3021,6 +3054,7 @@ async fn close_symbol_position(
         stats,
         recent_events,
         trade_book,
+        audit,
     )
     .await?;
     Ok(())
@@ -3036,6 +3070,7 @@ async fn force_exit_symbol_position(
     stats: &mut PaperStats,
     recent_events: &mut VecDeque<PaperEventLog>,
     trade_book: &mut TradeBook,
+    audit: &mut Option<PaperAudit>,
     now_ms: u64,
 ) -> Result<()> {
     let intent = force_exit_intent_for_symbol(
@@ -3054,6 +3089,7 @@ async fn force_exit_symbol_position(
         stats,
         recent_events,
         trade_book,
+        audit,
     )
     .await?;
     Ok(())
@@ -3138,6 +3174,7 @@ async fn maybe_execute_delta_rebalance(
     stats: &mut PaperStats,
     recent_events: &mut VecDeque<PaperEventLog>,
     trade_book: &mut TradeBook,
+    audit: &mut Option<PaperAudit>,
     now_ms: u64,
 ) -> Result<()> {
     let threshold = settings
@@ -3182,6 +3219,7 @@ async fn maybe_execute_delta_rebalance(
         stats,
         recent_events,
         trade_book,
+        audit,
     )
     .await?;
     stats
@@ -3199,6 +3237,7 @@ async fn execute_intent_trigger(
     stats: &mut PaperStats,
     recent_events: &mut VecDeque<PaperEventLog>,
     trade_book: &mut TradeBook,
+    audit: &mut Option<PaperAudit>,
 ) -> Result<()> {
     let symbol = intent.symbol().clone();
     let fallback_token_side = None;
@@ -3206,10 +3245,31 @@ async fn execute_intent_trigger(
         intent,
         timestamp_ms,
     };
-    let events = execution
+    let events = match execution
         .process_intent(trigger.intent().cloned().expect("intent trigger"))
-        .await?;
-    let mut no_audit = None;
+        .await
+    {
+        Ok(events) => events,
+        Err(err)
+            if track_intent_execution_rejection(
+                stats,
+                recent_events,
+                &trigger,
+                &err.to_string(),
+                audit,
+            )? =>
+        {
+            sync_engine_position_state_from_runtime(
+                engine,
+                risk,
+                trade_book,
+                &symbol,
+                fallback_token_side,
+            );
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
     apply_execution_events(
         risk,
         stats,
@@ -3217,7 +3277,7 @@ async fn execute_intent_trigger(
         trade_book,
         Some(&trigger),
         events,
-        &mut no_audit,
+        audit,
     )
     .await?;
     sync_engine_position_state_from_runtime(engine, risk, trade_book, &symbol, fallback_token_side);
@@ -3366,6 +3426,7 @@ async fn process_pending_command_single(
     stats: &mut PaperStats,
     recent_events: &mut VecDeque<PaperEventLog>,
     trade_book: &mut TradeBook,
+    audit: &mut Option<PaperAudit>,
     now_ms: u64,
 ) -> Result<()> {
     loop {
@@ -3413,6 +3474,7 @@ async fn process_pending_command_single(
                         stats,
                         recent_events,
                         trade_book,
+                        audit,
                         now_ms,
                     )
                     .await
@@ -3463,6 +3525,7 @@ async fn process_pending_command_single(
                             stats,
                             recent_events,
                             trade_book,
+                            audit,
                             now_ms,
                         )
                         .await
@@ -3495,6 +3558,7 @@ async fn process_pending_command_single(
                         stats,
                         recent_events,
                         trade_book,
+                        audit,
                         now_ms,
                     )
                     .await
@@ -3559,6 +3623,7 @@ async fn process_pending_command_multi(
     stats: &mut PaperStats,
     recent_events: &mut VecDeque<PaperEventLog>,
     trade_book: &mut TradeBook,
+    audit: &mut Option<PaperAudit>,
     now_ms: u64,
 ) -> Result<()> {
     loop {
@@ -3614,6 +3679,7 @@ async fn process_pending_command_multi(
                         stats,
                         recent_events,
                         trade_book,
+                        audit,
                         now_ms,
                     )
                     .await
@@ -3664,6 +3730,7 @@ async fn process_pending_command_multi(
                             stats,
                             recent_events,
                             trade_book,
+                            audit,
                             now_ms,
                         )
                         .await
@@ -3709,6 +3776,7 @@ async fn process_pending_command_multi(
                             stats,
                             recent_events,
                             trade_book,
+                            audit,
                             now_ms,
                         )
                         .await
@@ -4073,288 +4141,286 @@ async fn run_runtime_single(
         }
     }
 
-    loop {
-        stats.ticks_processed += 1;
-        let tick_index = stats.ticks_processed;
-        let now_ms = now_millis();
-        let now_secs = now_ms / 1000;
+    let loop_result: Result<()> = async {
+        loop {
+            stats.ticks_processed += 1;
+            let tick_index = stats.ticks_processed;
+            let now_ms = now_millis();
+            let now_secs = now_ms / 1000;
 
-        drain_command_events(&command_center, &mut recent_events);
-        process_pending_command_single(
-            &command_center,
-            &paused,
-            &emergency,
-            &pre_emergency_paused,
-            &mut settings,
-            &market,
-            &mut engine,
-            &mut execution,
-            &mut risk,
-            &mut stats,
-            &mut recent_events,
-            &mut trade_book,
-            now_ms,
-        )
-        .await?;
-        drain_command_events(&command_center, &mut recent_events);
-
-        if let Err(err) = manager.publish_market_lifecycle(
-            &market.symbol,
-            now_secs,
-            now_ms,
-            &settings.strategy.settlement,
-        ) {
-            stats.poll_errors += 1;
-            push_event_simple(
+            drain_command_events(&command_center, &mut recent_events);
+            process_pending_command_single(
+                &command_center,
+                &paused,
+                &emergency,
+                &pre_emergency_paused,
+                &mut settings,
+                &market,
+                &mut engine,
+                &mut execution,
+                &mut risk,
+                &mut stats,
                 &mut recent_events,
-                "poll_error",
-                format!("市场生命周期发布失败：{err}"),
-            );
-        }
+                &mut trade_book,
+                &mut audit,
+                now_ms,
+            )
+            .await?;
+            drain_command_events(&command_center, &mut recent_events);
 
-        if looks_like_placeholder_id(&market.poly_ids.yes_token_id)
-            || looks_like_placeholder_id(&market.poly_ids.no_token_id)
-        {
-            if !printed_placeholder_warning {
-                printed_placeholder_warning = true;
+            if let Err(err) = manager.publish_market_lifecycle(
+                &market.symbol,
+                now_secs,
+                now_ms,
+                &settings.strategy.settlement,
+            ) {
+                stats.poll_errors += 1;
                 push_event_simple(
                     &mut recent_events,
-                    "warning",
-                    "Polymarket token_id 仍是占位值，已跳过双边拉取；请先执行 markets discover-btc 生成 live overlay"
-                        .to_owned(),
+                    "poll_error",
+                    format!("市场生命周期发布失败：{err}"),
                 );
             }
-        } else {
-            for token_side in [TokenSide::Yes, TokenSide::No] {
-                if let Err(err) = poly_source
-                    .fetch_and_publish_orderbook_by_symbol(&market.symbol, token_side)
-                    .await
-                {
-                    // Check if this is a 404 (market closed/settled) - don't count as error
-                    let err_str = err.to_string();
-                    if err_str.contains("404") || err_str.contains("No orderbook exists") {
-                        // Market is likely closed/settled - log once per market
-                        if token_side == TokenSide::Yes {
+
+            if looks_like_placeholder_id(&market.poly_ids.yes_token_id)
+                || looks_like_placeholder_id(&market.poly_ids.no_token_id)
+            {
+                if !printed_placeholder_warning {
+                    printed_placeholder_warning = true;
+                    push_event_simple(
+                        &mut recent_events,
+                        "warning",
+                        "Polymarket token_id 仍是占位值，已跳过双边拉取；请先执行 markets discover-btc 生成 live overlay"
+                            .to_owned(),
+                    );
+                }
+            } else {
+                for token_side in [TokenSide::Yes, TokenSide::No] {
+                    if let Err(err) = poly_source
+                        .fetch_and_publish_orderbook_by_symbol(&market.symbol, token_side)
+                        .await
+                    {
+                        let err_str = err.to_string();
+                        if err_str.contains("404") || err_str.contains("No orderbook exists") {
+                            if token_side == TokenSide::Yes {
+                                push_event_simple(
+                                    &mut recent_events,
+                                    "market_closed",
+                                    format!("{} 疑似已关闭或已结算", market.symbol.0),
+                                );
+                            }
+                        } else {
+                            stats.poll_errors += 1;
                             push_event_simple(
                                 &mut recent_events,
-                                "market_closed",
-                                format!("{} 疑似已关闭或已结算", market.symbol.0),
+                                "poll_error",
+                                format!(
+                                    "Polymarket {} 盘口轮询失败：{err}",
+                                    format_token_side_label(token_side)
+                                ),
                             );
                         }
-                    } else {
-                        stats.poll_errors += 1;
+                    }
+                }
+            }
+
+            if let Err(err) = cex_source
+                .poll_symbol(&market.symbol, depth, include_funding)
+                .await
+            {
+                stats.poll_errors += 1;
+                push_event_simple(
+                    &mut recent_events,
+                    "poll_error",
+                    format!("交易所行情轮询失败：{err}"),
+                );
+            }
+
+            let connection_checked_at_ms = now_millis();
+            update_connection_state(
+                &mut observed,
+                Exchange::Polymarket,
+                poly_source.connection_status(),
+                connection_checked_at_ms,
+            );
+            update_connection_state(
+                &mut observed,
+                market.hedge_exchange,
+                cex_source.connection_status(),
+                connection_checked_at_ms,
+            );
+
+            loop {
+                match market_data_rx.try_recv() {
+                    Ok(event) => {
+                        stats.market_events += 1;
+                        if let MarketDataEvent::OrderBookUpdate { snapshot } = &event {
+                            update_paper_orderbook(&orderbook_provider, &registry, snapshot);
+                        }
+                        observe_market_event(&mut observed, &event);
                         push_event_simple(
                             &mut recent_events,
-                            "poll_error",
-                            format!(
-                                "Polymarket {} 盘口轮询失败：{err}",
-                                format_token_side_label(token_side)
-                            ),
+                            "market_data",
+                            summarize_market_event(&event),
+                        );
+
+                        if let MarketDataEvent::MarketLifecycle { symbol, phase, .. } = &event {
+                            risk.update_market_phase(symbol.clone(), phase.clone());
+                        }
+
+                        let evaluation_observed = build_audit_observed_market(
+                            now_millis(),
+                            &market,
+                            &observed,
+                            &settings,
+                            None,
+                            false,
+                            require_connected_inputs(&settings),
+                        );
+                        let output = engine.on_market_data(&event).await;
+                        record_evaluation_attempt(
+                            &mut stats,
+                            &mut recent_events,
+                            &event,
+                            &output.warnings,
+                            Some(&evaluation_observed),
+                            &mut audit,
+                        )?;
+                        for update in output.dmm_updates {
+                            let events = execution.apply_dmm_quote_update(update).await?;
+                            apply_execution_events(
+                                &mut risk,
+                                &mut stats,
+                                &mut recent_events,
+                                &mut trade_book,
+                                None,
+                                events,
+                                &mut audit,
+                            )
+                            .await?;
+                        }
+
+                        for candidate in output.open_candidates {
+                            process_signal_single(
+                                candidate,
+                                &settings,
+                                &registry,
+                                &mut observed,
+                                &mut stats,
+                                &mut recent_events,
+                                &mut engine,
+                                &mut execution,
+                                &mut risk,
+                                &mut trade_book,
+                                &paused,
+                                &emergency,
+                                false,
+                                &mut audit,
+                            )
+                            .await?;
+                        }
+
+                        if let Some(reason) = engine.close_reason(&market.symbol) {
+                            execute_intent_trigger(
+                                close_intent_for_symbol(
+                                    &market.symbol,
+                                    &reason,
+                                    &format!("corr-close-{}-{}", market.symbol.0, now_millis()),
+                                    now_millis(),
+                                ),
+                                now_millis(),
+                                &mut engine,
+                                &mut execution,
+                                &mut risk,
+                                &mut stats,
+                                &mut recent_events,
+                                &mut trade_book,
+                                &mut audit,
+                            )
+                            .await?;
+                        } else {
+                            maybe_execute_delta_rebalance(
+                                &settings,
+                                &HashMap::from([(market.symbol.clone(), observed.clone())]),
+                                &market.symbol,
+                                &mut engine,
+                                &mut execution,
+                                &mut risk,
+                                &mut stats,
+                                &mut recent_events,
+                                &mut trade_book,
+                                &mut audit,
+                                now_millis(),
+                            )
+                            .await?;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Lagged(_)) => continue,
+                    Err(TryRecvError::Closed) => break,
+                }
+            }
+
+            let snapshot = build_snapshot(
+                &market, tick_index, &engine, &observed, &stats, &risk, &execution, &executor,
+            )?;
+            if tick_index % print_every.max(1) == 0 {
+                print_snapshot(&snapshot, json);
+                if !json {
+                    if let Some(last_event) = recent_events.back() {
+                        println!(
+                            "最近事件=[{}] {}",
+                            display_event_kind_text(&last_event.kind),
+                            last_event.summary
                         );
                     }
                 }
             }
-        }
+            snapshots.push(snapshot.clone());
 
-        if let Err(err) = cex_source
-            .poll_symbol(&market.symbol, depth, include_funding)
-            .await
-        {
-            stats.poll_errors += 1;
-            push_event_simple(
-                &mut recent_events,
-                "poll_error",
-                format!("交易所行情轮询失败：{err}"),
+            let monitor_events = build_monitor_events(&recent_events);
+            let monitor_state = build_monitor_state(
+                &settings,
+                &market,
+                &engine,
+                &observed,
+                &stats,
+                &risk,
+                &execution,
+                &mut trade_book,
+                &command_center,
+                paused.load(Ordering::SeqCst),
+                emergency.load(Ordering::SeqCst),
+                start_time_ms,
+                now_ms,
+                &monitor_events,
+                trading_mode,
             );
-        }
 
-        let connection_checked_at_ms = now_millis();
-        update_connection_state(
-            &mut observed,
-            Exchange::Polymarket,
-            poly_source.connection_status(),
-            connection_checked_at_ms,
-        );
-        update_connection_state(
-            &mut observed,
-            market.hedge_exchange,
-            cex_source.connection_status(),
-            connection_checked_at_ms,
-        );
+            if let Ok(mut guard) = current_state.write() {
+                *guard = Some(monitor_state.clone());
+            }
+            broadcast_monitor_events_since(
+                &recent_events,
+                &mut last_event_seq_sent,
+                &event_broadcaster,
+            );
+            if let Some(audit) = audit.as_mut() {
+                audit.maybe_record_runtime_state(&stats, &monitor_state, tick_index, now_ms)?;
+            }
+            let _ = state_broadcaster.send(monitor_state);
 
-        loop {
-            match market_data_rx.try_recv() {
-                Ok(event) => {
-                    stats.market_events += 1;
-                    if let MarketDataEvent::OrderBookUpdate { snapshot } = &event {
-                        update_paper_orderbook(&orderbook_provider, &registry, snapshot);
-                    }
-                    observe_market_event(&mut observed, &event);
-                    push_event_simple(
-                        &mut recent_events,
-                        "market_data",
-                        summarize_market_event(&event),
-                    );
-
-                    if let MarketDataEvent::MarketLifecycle { symbol, phase, .. } = &event {
-                        risk.update_market_phase(symbol.clone(), phase.clone());
-                    }
-
-                    let evaluation_observed = build_audit_observed_market(
-                        now_millis(),
-                        &market,
-                        &observed,
-                        &settings,
-                        None,
-                        false,
-                        require_connected_inputs(&settings),
-                    );
-                    let output = engine.on_market_data(&event).await;
-                    record_evaluation_attempt(
-                        &mut stats,
-                        &mut recent_events,
-                        &event,
-                        &output.warnings,
-                        Some(&evaluation_observed),
-                        &mut audit,
-                    )?;
-                    for update in output.dmm_updates {
-                        let events = execution.apply_dmm_quote_update(update).await?;
-                        apply_execution_events(
-                            &mut risk,
-                            &mut stats,
-                            &mut recent_events,
-                            &mut trade_book,
-                            None,
-                            events,
-                            &mut audit,
-                        )
-                        .await?;
-                    }
-
-                    for candidate in output.open_candidates {
-                        process_signal_single(
-                            candidate,
-                            &settings,
-                            &registry,
-                            &mut observed,
-                            &mut stats,
-                            &mut recent_events,
-                            &mut engine,
-                            &mut execution,
-                            &mut risk,
-                            &mut trade_book,
-                            &paused,
-                            &emergency,
-                            false,
-                            &mut audit,
-                        )
-                        .await?;
-                    }
-
-                    if let Some(reason) = engine.close_reason(&market.symbol) {
-                        execute_intent_trigger(
-                            close_intent_for_symbol(
-                                &market.symbol,
-                                &reason,
-                                &format!("corr-close-{}-{}", market.symbol.0, now_millis()),
-                                now_millis(),
-                            ),
-                            now_millis(),
-                            &mut engine,
-                            &mut execution,
-                            &mut risk,
-                            &mut stats,
-                            &mut recent_events,
-                            &mut trade_book,
-                        )
-                        .await?;
-                    } else {
-                        maybe_execute_delta_rebalance(
-                            &settings,
-                            &HashMap::from([(market.symbol.clone(), observed.clone())]),
-                            &market.symbol,
-                            &mut engine,
-                            &mut execution,
-                            &mut risk,
-                            &mut stats,
-                            &mut recent_events,
-                            &mut trade_book,
-                            now_millis(),
-                        )
-                        .await?;
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Lagged(_)) => continue,
-                Err(TryRecvError::Closed) => break,
+            if max_ticks > 0 && tick_index >= max_ticks {
+                break;
+            }
+            if poll_interval_ms > 0 {
+                sleep(Duration::from_millis(poll_interval_ms)).await;
             }
         }
-
-        let snapshot = build_snapshot(
-            &market, tick_index, &engine, &observed, &stats, &risk, &execution, &executor,
-        )?;
-        if tick_index % print_every.max(1) == 0 {
-            print_snapshot(&snapshot, json);
-            if !json {
-                if let Some(last_event) = recent_events.back() {
-                    println!(
-                        "最近事件=[{}] {}",
-                        display_event_kind_text(&last_event.kind),
-                        last_event.summary
-                    );
-                }
-            }
-        }
-        snapshots.push(snapshot.clone());
-
-        // Broadcast monitor state
-        let monitor_events = build_monitor_events(&recent_events);
-
-        let monitor_state = build_monitor_state(
-            &settings,
-            &market,
-            &engine,
-            &observed,
-            &stats,
-            &risk,
-            &execution,
-            &mut trade_book,
-            &command_center,
-            paused.load(Ordering::SeqCst),
-            emergency.load(Ordering::SeqCst),
-            start_time_ms,
-            now_ms,
-            &monitor_events,
-            trading_mode,
-        );
-
-        // Update current state and broadcast
-        if let Ok(mut guard) = current_state.write() {
-            *guard = Some(monitor_state.clone());
-        }
-        broadcast_monitor_events_since(
-            &recent_events,
-            &mut last_event_seq_sent,
-            &event_broadcaster,
-        );
-        if let Some(audit) = audit.as_mut() {
-            audit.maybe_record_runtime_state(&stats, &monitor_state, tick_index, now_ms)?;
-        }
-        let _ = state_broadcaster.send(monitor_state);
-
-        if max_ticks > 0 && tick_index >= max_ticks {
-            break;
-        }
-        if poll_interval_ms > 0 {
-            sleep(Duration::from_millis(poll_interval_ms)).await;
-        }
+        Ok(())
     }
+    .await;
 
-    let final_snapshot = snapshots
-        .last()
-        .cloned()
-        .ok_or_else(|| anyhow!("纸面盘会话未生成任何快照"))?;
     let final_monitor_state = current_state
         .read()
         .ok()
@@ -4382,40 +4448,54 @@ async fn run_runtime_single(
     if let Ok(mut guard) = current_state.write() {
         *guard = Some(final_monitor_state.clone());
     }
-    let open_orders = executor
-        .open_order_snapshots()?
-        .into_iter()
-        .map(order_view_from_snapshot)
-        .collect();
-    let artifact = PaperArtifact {
-        schema_version: PAPER_ARTIFACT_SCHEMA_VERSION,
-        trading_mode,
-        env: env.to_owned(),
-        market_index,
-        market: market.symbol.0.clone(),
-        hedge_exchange: format!("{:?}", market.hedge_exchange),
-        market_data_mode: Some("poll".to_owned()),
-        poll_interval_ms,
-        depth,
-        include_funding,
-        ticks_processed: stats.ticks_processed,
-        final_snapshot,
-        open_orders,
-        recent_events: recent_events.into_iter().collect(),
-        snapshots,
-    };
-    let artifact_path = artifact_path(&settings, env, trading_mode)?;
-    persist_artifact(&artifact_path, &artifact)?;
-    println!(
-        "{}结果已写入：{}",
-        artifact_runtime_label(trading_mode),
-        artifact_path.display()
-    );
-    if let Some(audit) = audit.as_mut() {
-        if let Some(monitor_state) = current_state.read().ok().and_then(|guard| guard.clone()) {
-            audit.finalize(&stats, &monitor_state, stats.ticks_processed, now_millis())?;
-            println!("审计会话已完成：{}", audit.session_dir().display());
-        }
+    let runtime_result: Result<()> = async {
+        loop_result?;
+        let final_snapshot = snapshots
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow!("纸面盘会话未生成任何快照"))?;
+        let open_orders = executor
+            .open_order_snapshots()?
+            .into_iter()
+            .map(order_view_from_snapshot)
+            .collect();
+        let artifact = PaperArtifact {
+            schema_version: PAPER_ARTIFACT_SCHEMA_VERSION,
+            trading_mode,
+            env: env.to_owned(),
+            market_index,
+            market: market.symbol.0.clone(),
+            hedge_exchange: format!("{:?}", market.hedge_exchange),
+            market_data_mode: Some("poll".to_owned()),
+            poll_interval_ms,
+            depth,
+            include_funding,
+            ticks_processed: stats.ticks_processed,
+            final_snapshot,
+            open_orders,
+            recent_events: recent_events.into_iter().collect(),
+            snapshots,
+        };
+        let artifact_path = artifact_path(&settings, env, trading_mode)?;
+        persist_artifact(&artifact_path, &artifact)?;
+        println!(
+            "{}结果已写入：{}",
+            artifact_runtime_label(trading_mode),
+            artifact_path.display()
+        );
+        Ok(())
+    }
+    .await;
+    finish_runtime_with_audit(
+        runtime_result,
+        &mut audit,
+        &stats,
+        &final_monitor_state,
+        stats.ticks_processed,
+        now_millis(),
+    )?;
+    if let Some(audit) = audit.as_ref() {
+        println!("审计会话已完成：{}", audit.session_dir().display());
     }
 
     Ok(())
@@ -4718,6 +4798,7 @@ async fn run_runtime_multi(
             &mut stats,
             &mut recent_events,
             &mut trade_book,
+            &mut audit,
             now_ms,
         )
         .await?;
@@ -4989,6 +5070,7 @@ async fn run_runtime_multi(
                                 &mut stats,
                                 &mut recent_events,
                                 &mut trade_book,
+                                &mut audit,
                             )
                             .await?;
                         } else {
@@ -5002,6 +5084,7 @@ async fn run_runtime_multi(
                                 &mut stats,
                                 &mut recent_events,
                                 &mut trade_book,
+                                &mut audit,
                                 now_millis(),
                             )
                             .await?;
@@ -5075,14 +5158,6 @@ async fn run_runtime_multi(
         }
     }
 
-    println!(
-        "多市场模拟盘已完成，共处理 {} 个轮次。",
-        stats.ticks_processed
-    );
-    let final_snapshot = snapshots
-        .last()
-        .cloned()
-        .ok_or_else(|| anyhow!("纸面盘会话未生成任何快照"))?;
     let final_monitor_state = current_state
         .read()
         .ok()
@@ -5106,50 +5181,64 @@ async fn run_runtime_multi(
                 &monitor_events,
                 trading_mode,
             )
-        });
+    });
     if let Ok(mut guard) = current_state.write() {
         *guard = Some(final_monitor_state.clone());
     }
-    let open_orders = executor
-        .open_order_snapshots()?
-        .into_iter()
-        .map(order_view_from_snapshot)
-        .collect();
-    let hedge_exchange = markets
-        .first()
-        .map(|market| format!("{:?}", market.hedge_exchange))
-        .unwrap_or_else(|| "Unknown".to_owned());
-    let artifact = PaperArtifact {
-        schema_version: PAPER_ARTIFACT_SCHEMA_VERSION,
-        trading_mode,
-        env: env.to_owned(),
-        market_index: 0,
-        market: format!("multi:{}", markets.len()),
-        hedge_exchange,
-        market_data_mode: Some("poll".to_owned()),
-        poll_interval_ms,
-        depth,
-        include_funding,
-        ticks_processed: stats.ticks_processed,
-        final_snapshot,
-        open_orders,
-        recent_events: recent_events.into_iter().collect(),
-        snapshots,
-    };
-    let artifact_path = artifact_path(&settings, env, trading_mode)?;
-    persist_artifact(&artifact_path, &artifact)?;
-    println!(
-        "{}结果已写入：{}",
-        artifact_runtime_label(trading_mode),
-        artifact_path.display()
-    );
-    if let Some(audit) = audit.as_mut() {
-        audit.finalize(
-            &stats,
-            &final_monitor_state,
-            stats.ticks_processed,
-            now_millis(),
-        )?;
+    let runtime_result: Result<()> = async {
+        println!(
+            "多市场模拟盘已完成，共处理 {} 个轮次。",
+            stats.ticks_processed
+        );
+        let final_snapshot = snapshots
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow!("纸面盘会话未生成任何快照"))?;
+        let open_orders = executor
+            .open_order_snapshots()?
+            .into_iter()
+            .map(order_view_from_snapshot)
+            .collect();
+        let hedge_exchange = markets
+            .first()
+            .map(|market| format!("{:?}", market.hedge_exchange))
+            .unwrap_or_else(|| "Unknown".to_owned());
+        let artifact = PaperArtifact {
+            schema_version: PAPER_ARTIFACT_SCHEMA_VERSION,
+            trading_mode,
+            env: env.to_owned(),
+            market_index: 0,
+            market: format!("multi:{}", markets.len()),
+            hedge_exchange,
+            market_data_mode: Some("poll".to_owned()),
+            poll_interval_ms,
+            depth,
+            include_funding,
+            ticks_processed: stats.ticks_processed,
+            final_snapshot,
+            open_orders,
+            recent_events: recent_events.into_iter().collect(),
+            snapshots,
+        };
+        let artifact_path = artifact_path(&settings, env, trading_mode)?;
+        persist_artifact(&artifact_path, &artifact)?;
+        println!(
+            "{}结果已写入：{}",
+            artifact_runtime_label(trading_mode),
+            artifact_path.display()
+        );
+        Ok(())
+    }
+    .await;
+    finish_runtime_with_audit(
+        runtime_result,
+        &mut audit,
+        &stats,
+        &final_monitor_state,
+        stats.ticks_processed,
+        now_millis(),
+    )?;
+    if let Some(audit) = audit.as_ref() {
         println!("审计会话已完成：{}", audit.session_dir().display());
     }
     Ok(())
@@ -7809,6 +7898,7 @@ async fn handle_single_market_event(
             stats,
             recent_events,
             trade_book,
+            audit,
         )
         .await?;
     } else {
@@ -7822,6 +7912,7 @@ async fn handle_single_market_event(
             stats,
             recent_events,
             trade_book,
+            audit,
             now_millis(),
         )
         .await?;
@@ -7998,6 +8089,7 @@ async fn handle_multi_market_event(
                 stats,
                 recent_events,
                 trade_book,
+                audit,
             )
             .await?;
         } else {
@@ -8011,6 +8103,7 @@ async fn handle_multi_market_event(
                 stats,
                 recent_events,
                 trade_book,
+                audit,
                 now_millis(),
             )
             .await?;
@@ -8195,8 +8288,9 @@ async fn run_paper_ws_mode(
     funding_poll.tick().await;
     let mut state_dirty = true;
 
-    loop {
-        tokio::select! {
+    let loop_result: Result<()> = async {
+        loop {
+            tokio::select! {
             Some(result) = funding_refresh_rx.recv() => {
                 funding_refresh_task = None;
                 handle_funding_refresh_result(&mut stats, &mut recent_events, result);
@@ -8248,6 +8342,7 @@ async fn run_paper_ws_mode(
                     &mut stats,
                     &mut recent_events,
                     &mut trade_book,
+                    &mut audit,
                     now_ms,
                 ).await?;
                 drain_command_events(&command_center, &mut recent_events);
@@ -8364,15 +8459,14 @@ async fn run_paper_ws_mode(
                 state_dirty = true;
             }
         }
+        }
+        Ok(())
     }
+    .await;
 
     abort_join_handles(&mut ws_tasks).await;
     abort_optional_join_handle(&mut funding_refresh_task).await;
 
-    let final_snapshot = snapshots
-        .last()
-        .cloned()
-        .ok_or_else(|| anyhow!("纸面盘会话未生成任何快照"))?;
     let final_monitor_state = current_state
         .read()
         .ok()
@@ -8400,42 +8494,53 @@ async fn run_paper_ws_mode(
     if let Ok(mut guard) = current_state.write() {
         *guard = Some(final_monitor_state.clone());
     }
-    let open_orders = executor
-        .open_order_snapshots()?
-        .into_iter()
-        .map(order_view_from_snapshot)
-        .collect();
-    let artifact = PaperArtifact {
-        schema_version: PAPER_ARTIFACT_SCHEMA_VERSION,
-        trading_mode,
-        env: env.to_owned(),
-        market_index,
-        market: market.symbol.0.clone(),
-        hedge_exchange: format!("{:?}", market.hedge_exchange),
-        market_data_mode: Some("ws".to_owned()),
-        poll_interval_ms,
-        depth,
-        include_funding,
-        ticks_processed: stats.ticks_processed,
-        final_snapshot,
-        open_orders,
-        recent_events: recent_events.into_iter().collect(),
-        snapshots,
-    };
-    let artifact_path = artifact_path(&settings, env, trading_mode)?;
-    persist_artifact(&artifact_path, &artifact)?;
-    println!(
-        "{}结果已写入：{}",
-        artifact_runtime_label(trading_mode),
-        artifact_path.display()
-    );
-    if let Some(audit) = audit.as_mut() {
-        audit.finalize(
-            &stats,
-            &final_monitor_state,
-            stats.ticks_processed,
-            now_millis(),
-        )?;
+    let runtime_result: Result<()> = async {
+        loop_result?;
+        let final_snapshot = snapshots
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow!("纸面盘会话未生成任何快照"))?;
+        let open_orders = executor
+            .open_order_snapshots()?
+            .into_iter()
+            .map(order_view_from_snapshot)
+            .collect();
+        let artifact = PaperArtifact {
+            schema_version: PAPER_ARTIFACT_SCHEMA_VERSION,
+            trading_mode,
+            env: env.to_owned(),
+            market_index,
+            market: market.symbol.0.clone(),
+            hedge_exchange: format!("{:?}", market.hedge_exchange),
+            market_data_mode: Some("ws".to_owned()),
+            poll_interval_ms,
+            depth,
+            include_funding,
+            ticks_processed: stats.ticks_processed,
+            final_snapshot,
+            open_orders,
+            recent_events: recent_events.into_iter().collect(),
+            snapshots,
+        };
+        let artifact_path = artifact_path(&settings, env, trading_mode)?;
+        persist_artifact(&artifact_path, &artifact)?;
+        println!(
+            "{}结果已写入：{}",
+            artifact_runtime_label(trading_mode),
+            artifact_path.display()
+        );
+        Ok(())
+    }
+    .await;
+    finish_runtime_with_audit(
+        runtime_result,
+        &mut audit,
+        &stats,
+        &final_monitor_state,
+        stats.ticks_processed,
+        now_millis(),
+    )?;
+    if let Some(audit) = audit.as_ref() {
         println!("审计会话已完成：{}", audit.session_dir().display());
     }
 
@@ -8697,8 +8802,9 @@ async fn run_paper_multi_ws_mode(
     funding_poll.tick().await;
     let mut state_dirty = true;
 
-    loop {
-        tokio::select! {
+    let loop_result: Result<()> = async {
+        loop {
+            tokio::select! {
             Some(result) = funding_refresh_rx.recv() => {
                 funding_refresh_task = None;
                 handle_funding_refresh_result(&mut stats, &mut recent_events, result);
@@ -8864,6 +8970,7 @@ async fn run_paper_multi_ws_mode(
                     &mut stats,
                     &mut recent_events,
                     &mut trade_book,
+                    &mut audit,
                     now_ms,
                 ).await?;
                 drain_command_events(&command_center, &mut recent_events);
@@ -8986,7 +9093,10 @@ async fn run_paper_multi_ws_mode(
                 state_dirty = true;
             }
         }
+        }
+        Ok(())
     }
+    .await;
 
     abort_join_handles(&mut ws_tasks).await;
     abort_optional_join_handle(&mut bootstrap_task).await;
@@ -8997,10 +9107,6 @@ async fn run_paper_multi_ws_mode(
         "多市场模拟盘已完成，共处理 {} 个轮次。",
         stats.ticks_processed
     );
-    let final_snapshot = snapshots
-        .last()
-        .cloned()
-        .ok_or_else(|| anyhow!("纸面盘会话未生成任何快照"))?;
     let final_monitor_state = current_state
         .read()
         .ok()
@@ -9028,46 +9134,57 @@ async fn run_paper_multi_ws_mode(
     if let Ok(mut guard) = current_state.write() {
         *guard = Some(final_monitor_state.clone());
     }
-    let open_orders = executor
-        .open_order_snapshots()?
-        .into_iter()
-        .map(order_view_from_snapshot)
-        .collect();
-    let hedge_exchange = markets
-        .first()
-        .map(|market| format!("{:?}", market.hedge_exchange))
-        .unwrap_or_else(|| "Unknown".to_owned());
-    let artifact = PaperArtifact {
-        schema_version: PAPER_ARTIFACT_SCHEMA_VERSION,
-        trading_mode,
-        env: env.to_owned(),
-        market_index: 0,
-        market: format!("multi:{}", markets.len()),
-        hedge_exchange,
-        market_data_mode: Some("ws".to_owned()),
-        poll_interval_ms,
-        depth,
-        include_funding,
-        ticks_processed: stats.ticks_processed,
-        final_snapshot,
-        open_orders,
-        recent_events: recent_events.into_iter().collect(),
-        snapshots,
-    };
-    let artifact_path = artifact_path(&settings, env, trading_mode)?;
-    persist_artifact(&artifact_path, &artifact)?;
-    println!(
-        "{}结果已写入：{}",
-        artifact_runtime_label(trading_mode),
-        artifact_path.display()
-    );
-    if let Some(audit) = audit.as_mut() {
-        audit.finalize(
-            &stats,
-            &final_monitor_state,
-            stats.ticks_processed,
-            now_millis(),
-        )?;
+    let runtime_result: Result<()> = async {
+        loop_result?;
+        let final_snapshot = snapshots
+            .last()
+            .cloned()
+            .ok_or_else(|| anyhow!("纸面盘会话未生成任何快照"))?;
+        let open_orders = executor
+            .open_order_snapshots()?
+            .into_iter()
+            .map(order_view_from_snapshot)
+            .collect();
+        let hedge_exchange = markets
+            .first()
+            .map(|market| format!("{:?}", market.hedge_exchange))
+            .unwrap_or_else(|| "Unknown".to_owned());
+        let artifact = PaperArtifact {
+            schema_version: PAPER_ARTIFACT_SCHEMA_VERSION,
+            trading_mode,
+            env: env.to_owned(),
+            market_index: 0,
+            market: format!("multi:{}", markets.len()),
+            hedge_exchange,
+            market_data_mode: Some("ws".to_owned()),
+            poll_interval_ms,
+            depth,
+            include_funding,
+            ticks_processed: stats.ticks_processed,
+            final_snapshot,
+            open_orders,
+            recent_events: recent_events.into_iter().collect(),
+            snapshots,
+        };
+        let artifact_path = artifact_path(&settings, env, trading_mode)?;
+        persist_artifact(&artifact_path, &artifact)?;
+        println!(
+            "{}结果已写入：{}",
+            artifact_runtime_label(trading_mode),
+            artifact_path.display()
+        );
+        Ok(())
+    }
+    .await;
+    finish_runtime_with_audit(
+        runtime_result,
+        &mut audit,
+        &stats,
+        &final_monitor_state,
+        stats.ticks_processed,
+        now_millis(),
+    )?;
+    if let Some(audit) = audit.as_ref() {
         println!("审计会话已完成：{}", audit.session_dir().display());
     }
     Ok(())
@@ -9906,6 +10023,18 @@ fn post_submit_rejection_payload(
         None,
         plan_rejection_reason,
         revalidation_failure_reason,
+        None,
+    )
+}
+
+fn intent_rejection_payload(trigger: &RuntimeTrigger, message: &str) -> MonitorEventPayload {
+    execution_pipeline_payload(
+        None,
+        trigger.intent().cloned(),
+        None,
+        None,
+        extract_direct_plan_rejection_reason(message),
+        extract_revalidation_failure_reason(message),
         None,
     )
 }
@@ -11020,6 +11149,25 @@ fn build_post_submit_rejection_details(
             .iter()
             .find_map(|reason| extract_plan_rejection_reason(reason)),
     );
+    maybe_details(details)
+}
+
+fn build_intent_rejection_details(
+    trigger: &RuntimeTrigger,
+    reason_code: &str,
+    message: &str,
+) -> Option<EventDetails> {
+    let mut details = EventDetails::new();
+    add_trigger_details(&mut details, trigger);
+    insert_detail(&mut details, "闸门", gate_label_zh("trade_plan"));
+    insert_detail(&mut details, "闸门结果", "拒绝");
+    insert_detail(
+        &mut details,
+        "原因",
+        translate_trade_plan_rejection(reason_code),
+    );
+    insert_detail(&mut details, "计划拒绝代码", reason_code.to_owned());
+    insert_detail(&mut details, "原始错误", message.to_owned());
     maybe_details(details)
 }
 
@@ -12632,6 +12780,75 @@ fn track_open_signal_execution_outcome(
     Ok(())
 }
 
+fn track_intent_execution_rejection(
+    stats: &mut PaperStats,
+    recent_events: &mut VecDeque<PaperEventLog>,
+    trigger: &RuntimeTrigger,
+    message: &str,
+    audit: &mut Option<PaperAudit>,
+) -> Result<bool> {
+    let reason_code = match extract_plan_rejection_reason(message) {
+        Some(reason) => reason,
+        None => return Ok(false),
+    };
+
+    stats.execution_rejected += 1;
+    record_signal_rejection(stats, reason_code.clone());
+    push_event_with_context_and_payload(
+        recent_events,
+        "risk",
+        format!(
+            "{} {}未执行（{}）",
+            trigger.symbol().0,
+            trigger_action_label_zh(trigger),
+            translate_trade_plan_rejection(&reason_code)
+        ),
+        Some(trigger.symbol().0.clone()),
+        Some(trigger.id().to_owned()),
+        Some(trigger.correlation_id().to_owned()),
+        build_intent_rejection_details(trigger, &reason_code, message),
+        Some(intent_rejection_payload(trigger, message)),
+    );
+    if let Some(audit) = audit.as_mut() {
+        audit.record_intent_rejected(trigger, &reason_code, message)?;
+    }
+    Ok(true)
+}
+
+fn finalize_audit_on_runtime_exit(
+    audit: &mut Option<PaperAudit>,
+    stats: &PaperStats,
+    monitor_state: &MonitorState,
+    tick_index: usize,
+    now_ms: u64,
+) -> Result<()> {
+    if let Some(audit) = audit.as_mut() {
+        audit.finalize(stats, monitor_state, tick_index, now_ms)?;
+    }
+    Ok(())
+}
+
+fn finish_runtime_with_audit(
+    runtime_result: Result<()>,
+    audit: &mut Option<PaperAudit>,
+    stats: &PaperStats,
+    monitor_state: &MonitorState,
+    tick_index: usize,
+    now_ms: u64,
+) -> Result<()> {
+    let finalize_result =
+        finalize_audit_on_runtime_exit(audit, stats, monitor_state, tick_index, now_ms);
+    match (runtime_result, finalize_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(runtime_err), Ok(())) => Err(runtime_err),
+        (Ok(()), Err(finalize_err)) => Err(finalize_err),
+        (Err(runtime_err), Err(finalize_err)) => {
+            tracing::error!("审计收口失败（主错误保留）：{finalize_err}");
+            Err(runtime_err.context(format!("审计收口也失败：{finalize_err}")))
+        }
+    }
+}
+
 fn local_day_key(timestamp_ms: u64) -> String {
     Local
         .timestamp_millis_opt(timestamp_ms as i64)
@@ -14152,6 +14369,7 @@ mod tests {
             &mut stats,
             &mut recent_events,
             &mut trade_book,
+            &mut no_audit,
             10_000,
         )
         .await
@@ -14207,6 +14425,7 @@ mod tests {
         let mut stats = PaperStats::default();
         let mut recent_events = VecDeque::new();
         let mut trade_book = TradeBook::default();
+        let mut no_audit = None;
         trade_book.register_open_signal(&open_candidate(TokenSide::Yes), 0, 1.0, 0.25);
         let observed_map = HashMap::from([(
             market.symbol.clone(),
@@ -14227,6 +14446,7 @@ mod tests {
             &mut stats,
             &mut recent_events,
             &mut trade_book,
+            &mut no_audit,
             now_ms,
         )
         .await
@@ -14246,6 +14466,298 @@ mod tests {
                 .and_then(|details| details.get("动作"))
                 .is_some_and(|action| action == "Delta 再平衡意图")
         }));
+    }
+
+    #[tokio::test]
+    async fn execute_intent_trigger_keeps_runtime_alive_on_close_rejection() {
+        let settings = test_settings_with_price_filter(None, None);
+        let market = settings.markets[0].clone();
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let (provider, _executor, mut execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
+        seed_runtime_books(&provider, &registry, 1);
+
+        let mut engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
+        let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        let mut stats = PaperStats::default();
+        let mut recent_events = VecDeque::new();
+        let mut trade_book = TradeBook::default();
+        let mut candidate = open_candidate(TokenSide::Yes);
+        candidate.fair_value = 0.70;
+        candidate.raw_mispricing = 0.24;
+        candidate.delta_estimate = 0.0005;
+        let open_trigger = RuntimeTrigger::Candidate(candidate.clone());
+        let open_events = execution
+            .process_intent(open_intent_from_candidate(&candidate))
+            .await
+            .expect("seed open position");
+        let mut no_audit = None;
+        apply_execution_events(
+            &mut risk,
+            &mut stats,
+            &mut recent_events,
+            &mut trade_book,
+            Some(&open_trigger),
+            open_events,
+            &mut no_audit,
+        )
+        .await
+        .expect("apply open execution events");
+        sync_engine_position_state_from_runtime(
+            &mut engine,
+            &risk,
+            &trade_book,
+            &market.symbol,
+            Some(TokenSide::Yes),
+        );
+
+        update_paper_orderbook(
+            &provider,
+            &registry,
+            &polyalpha_core::OrderBookSnapshot {
+                exchange: Exchange::Polymarket,
+                symbol: market.symbol.clone(),
+                instrument: InstrumentKind::PolyYes,
+                bids: vec![polyalpha_core::PriceLevel {
+                    price: Price(Decimal::new(44, 2)),
+                    quantity: VenueQuantity::PolyShares(PolyShares(Decimal::ONE)),
+                }],
+                asks: vec![polyalpha_core::PriceLevel {
+                    price: Price(Decimal::new(46, 2)),
+                    quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(500, 0))),
+                }],
+                exchange_timestamp_ms: 2_000,
+                received_at_ms: 2_100,
+                sequence: 2,
+                last_trade_price: None,
+            },
+        );
+        recent_events.clear();
+        let mut no_audit = None;
+
+        let result = execute_intent_trigger(
+            close_intent_for_symbol(&market.symbol, "test_close", "corr-close", 10_000),
+            10_000,
+            &mut engine,
+            &mut execution,
+            &mut risk,
+            &mut stats,
+            &mut recent_events,
+            &mut trade_book,
+            &mut no_audit,
+        )
+        .await;
+
+        assert!(result.is_ok(), "close rejection should not abort runtime: {result:?}");
+        assert!(recent_events.iter().any(|event| {
+            event.summary.contains("Poly 深度不足") || event.summary.contains("insufficient_poly_depth")
+        }));
+    }
+
+    #[tokio::test]
+    async fn execute_intent_trigger_records_close_rejection_into_audit() {
+        let data_dir = unique_test_data_dir("intent-rejection-audit");
+        let settings = test_settings_with_audit_data_dir(data_dir.clone());
+        let market = settings.markets[0].clone();
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let (provider, _executor, mut execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
+        seed_runtime_books(&provider, &registry, 1);
+
+        let mut engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
+        let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        let mut stats = PaperStats::default();
+        let mut recent_events = VecDeque::new();
+        let mut trade_book = TradeBook::default();
+        let mut candidate = open_candidate(TokenSide::Yes);
+        candidate.fair_value = 0.70;
+        candidate.raw_mispricing = 0.24;
+        candidate.delta_estimate = 0.0005;
+        let open_trigger = RuntimeTrigger::Candidate(candidate.clone());
+        let mut audit = Some(
+            PaperAudit::start(
+                &settings,
+                "test-env",
+                &settings.markets,
+                1_000,
+                polyalpha_core::TradingMode::Live,
+            )
+            .expect("start audit"),
+        );
+        let session_id = audit
+            .as_ref()
+            .expect("audit session")
+            .session_id()
+            .to_owned();
+
+        let open_events = execution
+            .process_intent(open_intent_from_candidate(&candidate))
+            .await
+            .expect("seed open position");
+        apply_execution_events(
+            &mut risk,
+            &mut stats,
+            &mut recent_events,
+            &mut trade_book,
+            Some(&open_trigger),
+            open_events,
+            &mut audit,
+        )
+        .await
+        .expect("apply open execution events");
+        sync_engine_position_state_from_runtime(
+            &mut engine,
+            &risk,
+            &trade_book,
+            &market.symbol,
+            Some(TokenSide::Yes),
+        );
+
+        update_paper_orderbook(
+            &provider,
+            &registry,
+            &polyalpha_core::OrderBookSnapshot {
+                exchange: Exchange::Polymarket,
+                symbol: market.symbol.clone(),
+                instrument: InstrumentKind::PolyYes,
+                bids: vec![polyalpha_core::PriceLevel {
+                    price: Price(Decimal::new(44, 2)),
+                    quantity: VenueQuantity::PolyShares(PolyShares(Decimal::ONE)),
+                }],
+                asks: vec![polyalpha_core::PriceLevel {
+                    price: Price(Decimal::new(46, 2)),
+                    quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(500, 0))),
+                }],
+                exchange_timestamp_ms: 2_000,
+                received_at_ms: 2_100,
+                sequence: 2,
+                last_trade_price: None,
+            },
+        );
+        recent_events.clear();
+
+        execute_intent_trigger(
+            close_intent_for_symbol(&market.symbol, "test_close", "corr-close", 10_000),
+            10_000,
+            &mut engine,
+            &mut execution,
+            &mut risk,
+            &mut stats,
+            &mut recent_events,
+            &mut trade_book,
+            &mut audit,
+        )
+        .await
+        .expect("close rejection should be downgraded");
+
+        let events = polyalpha_audit::AuditReader::load_events(&data_dir, &session_id)
+            .expect("load audit events");
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                AuditEventPayload::Anomaly(anomaly)
+                    if anomaly.code == "intent_rejected"
+                        && anomaly.message.contains("insufficient_poly_depth")
+            )
+        }));
+
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn finalize_audit_on_runtime_exit_marks_summary_completed() {
+        let data_dir = unique_test_data_dir("runtime-exit-finalize");
+        let settings = test_settings_with_audit_data_dir(data_dir.clone());
+        let mut audit = Some(
+            PaperAudit::start(
+                &settings,
+                "test-env",
+                &settings.markets,
+                1_000,
+                polyalpha_core::TradingMode::Live,
+            )
+            .expect("start audit"),
+        );
+        let session_id = audit
+            .as_ref()
+            .expect("audit session")
+            .session_id()
+            .to_owned();
+
+        finalize_audit_on_runtime_exit(
+            &mut audit,
+            &PaperStats::default(),
+            &MonitorState::default(),
+            3,
+            5_000,
+        )
+        .expect("finalize audit");
+
+        let summary = polyalpha_audit::AuditReader::load_summary(&data_dir, &session_id)
+            .expect("load summary");
+        assert_eq!(summary.status, AuditSessionStatus::Completed);
+        assert_eq!(summary.ended_at_ms, Some(5_000));
+
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn finish_runtime_with_audit_preserves_runtime_error_and_marks_summary_completed() {
+        let data_dir = unique_test_data_dir("runtime-exit-finish-error");
+        let settings = test_settings_with_audit_data_dir(data_dir.clone());
+        let mut audit = Some(
+            PaperAudit::start(
+                &settings,
+                "test-env",
+                &settings.markets,
+                1_000,
+                polyalpha_core::TradingMode::Live,
+            )
+            .expect("start audit"),
+        );
+        let session_id = audit
+            .as_ref()
+            .expect("audit session")
+            .session_id()
+            .to_owned();
+
+        let err = finish_runtime_with_audit(
+            Err(anyhow!("tail failed")),
+            &mut audit,
+            &PaperStats::default(),
+            &MonitorState::default(),
+            3,
+            5_000,
+        )
+        .expect_err("should preserve runtime error");
+
+        assert!(err.to_string().contains("tail failed"));
+        let summary = polyalpha_audit::AuditReader::load_summary(&data_dir, &session_id)
+            .expect("load summary");
+        assert_eq!(summary.status, AuditSessionStatus::Completed);
+        assert_eq!(summary.ended_at_ms, Some(5_000));
+
+        let _ = fs::remove_dir_all(&data_dir);
     }
 
     #[tokio::test]
@@ -14273,6 +14785,7 @@ mod tests {
         let mut stats = PaperStats::default();
         let mut recent_events = VecDeque::new();
         let mut trade_book = TradeBook::default();
+        let mut no_audit = None;
         trade_book.register_open_signal(&open_candidate(TokenSide::Yes), 0, 1.0, 0.25);
         let last_ms = 10_000;
         stats
@@ -14296,6 +14809,7 @@ mod tests {
             &mut stats,
             &mut recent_events,
             &mut trade_book,
+            &mut no_audit,
             last_ms + 1_000,
         )
         .await
