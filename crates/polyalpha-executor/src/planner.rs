@@ -875,6 +875,17 @@ impl ExecutionPlanner {
                 plan.priority = "delta_rebalance".to_owned();
                 Ok(plan)
             }
+            Err(rejection)
+                if matches!(
+                    rejection.reason,
+                    PlanRejectionReason::ResidualDeltaTooLarge
+                        | PlanRejectionReason::MissingCexBook
+                        | PlanRejectionReason::InsufficientCexDepth
+                        | PlanRejectionReason::AdapterCannotPreserveConstraints
+                ) =>
+            {
+                Err(rejection)
+            }
             Err(_) => self.plan_flatten(intent, context, "delta_rebalance", "sell_exact_shares"),
         }
     }
@@ -1852,6 +1863,36 @@ mod tests {
         assert_eq!(plan.poly_planned_shares, PolyShares::ZERO);
         assert_eq!(plan.cex_side, OrderSide::Sell);
         assert!(plan.cex_planned_qty.0 > Decimal::ZERO);
+    }
+
+    #[test]
+    fn delta_rebalance_rejects_tiny_untradeable_residual_without_flattening() {
+        let planner = ExecutionPlanner::default();
+        let mut context = sample_context();
+        context.current_poly_yes_shares = Decimal::new(25, 0);
+        context.current_cex_net_qty = Decimal::new(-3, 1);
+
+        let intent = PlanningIntent::DeltaRebalance {
+            schema_version: 1,
+            intent_id: "intent-delta-2".to_owned(),
+            correlation_id: "corr-delta-2".to_owned(),
+            symbol: Symbol::new("btc-price-only"),
+            residual_snapshot: ResidualSnapshot {
+                schema_version: 1,
+                residual_delta: 0.0004,
+                planned_cex_qty: CexBaseQty(Decimal::new(25, 2)),
+                current_poly_yes_shares: PolyShares(Decimal::new(25, 0)),
+                current_poly_no_shares: PolyShares::ZERO,
+                preferred_cex_side: OrderSide::Sell,
+            },
+            target_residual_delta_max: 0.05,
+            target_shock_loss_max: 50.0,
+        };
+
+        let rejection = planner.plan(&intent, &context).unwrap_err();
+
+        assert_eq!(rejection.reason, PlanRejectionReason::ResidualDeltaTooLarge);
+        assert!(rejection.detail.contains("floors to zero"));
     }
 
     #[test]
