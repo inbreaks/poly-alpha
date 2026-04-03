@@ -286,10 +286,12 @@ impl PolymarketLiveDataSource {
 
         let bids = parse_poly_levels(root.get("bids"))?;
         let asks = parse_poly_levels(root.get("asks"))?;
-        let exchange_timestamp_ms =
-            parse_ts_millis(root.get("timestamp").or_else(|| root.get("ts")));
-        let sequence =
-            parse_u64_any(root.get("sequence").or_else(|| root.get("hash"))).unwrap_or(0);
+        let received_at_ms = now_millis();
+        let exchange_timestamp_ms = parse_u64_any(root.get("timestamp").or_else(|| root.get("ts")))
+            .unwrap_or(received_at_ms);
+        let sequence = parse_u64_any(root.get("sequence"))
+            .filter(|sequence| *sequence > 0)
+            .unwrap_or(exchange_timestamp_ms.max(1));
 
         // Extract last_trade_price from the API response
         let last_trade_price = value
@@ -306,7 +308,7 @@ impl PolymarketLiveDataSource {
             bids,
             asks,
             exchange_timestamp_ms,
-            received_at_ms: now_millis(),
+            received_at_ms,
             sequence,
             last_trade_price,
         })
@@ -408,10 +410,6 @@ fn parse_u64_any(value: Option<&Value>) -> Option<u64> {
     }
 }
 
-fn parse_ts_millis(value: Option<&Value>) -> u64 {
-    parse_u64_any(value).unwrap_or_else(now_millis)
-}
-
 fn now_millis() -> u64 {
     let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
         return 0;
@@ -494,7 +492,28 @@ mod tests {
         assert_eq!(update.bids.len(), 1);
         assert_eq!(update.asks.len(), 1);
         assert_eq!(update.exchange_timestamp_ms, 1_715_000_000_123);
-        assert_eq!(update.sequence, 9);
+        assert_eq!(update.sequence, 1_715_000_000_123);
+    }
+
+    #[test]
+    fn parse_polymarket_orderbook_uses_timestamp_when_hash_is_not_numeric() {
+        let payload = r#"
+        {
+          "book": {
+            "token_id": "no-1",
+            "ts": "1715000000123",
+            "hash": "0xabc123",
+            "bids": [["0.61", "8"]],
+            "asks": [["0.62", "7"]]
+          }
+        }
+        "#;
+
+        let update = PolymarketLiveDataSource::parse_orderbook_payload(payload, "fallback")
+            .expect("payload should parse");
+        assert_eq!(update.asset_id, "no-1");
+        assert_eq!(update.exchange_timestamp_ms, 1_715_000_000_123);
+        assert_eq!(update.sequence, 1_715_000_000_123);
     }
 
     #[test]
