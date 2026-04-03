@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use polyalpha_core::{
     cex_venue_symbol, CoreError, Exchange, MarketConfig, MarketDataEvent, OpenCandidate,
     OrderBookSnapshot, OrderExecutor, OrderId, OrderRequest, OrderResponse, OrderStatus,
-    PlanningIntent, Settings, Symbol, SymbolRegistry, PLANNING_SCHEMA_VERSION,
+    PlanningIntent, ResidualSnapshot, Settings, Symbol, SymbolRegistry,
+    PLANNING_SCHEMA_VERSION,
 };
 use polyalpha_data::{DataManager, MarketDataNormalizer};
 use polyalpha_executor::{
@@ -492,6 +493,7 @@ pub fn delta_rebalance_intent_for_symbol(
     symbol: &Symbol,
     correlation_id: &str,
     now_ms: u64,
+    residual_snapshot: ResidualSnapshot,
     target_residual_delta_max: f64,
     target_shock_loss_max: f64,
 ) -> PlanningIntent {
@@ -500,6 +502,7 @@ pub fn delta_rebalance_intent_for_symbol(
         intent_id: format!("intent-delta-rebalance-{}-{now_ms}", symbol.0),
         correlation_id: correlation_id.to_owned(),
         symbol: symbol.clone(),
+        residual_snapshot,
         target_residual_delta_max,
         target_shock_loss_max,
     }
@@ -885,6 +888,16 @@ mod tests {
             &candidate.symbol,
             "corr-rebalance-1",
             100,
+            ResidualSnapshot {
+                schema_version: PLANNING_SCHEMA_VERSION,
+                residual_delta: 0.12,
+                planned_cex_qty: polyalpha_core::CexBaseQty(rust_decimal::Decimal::new(12, 2)),
+                current_poly_yes_shares: polyalpha_core::PolyShares(
+                    rust_decimal::Decimal::new(10, 0),
+                ),
+                current_poly_no_shares: polyalpha_core::PolyShares::ZERO,
+                preferred_cex_side: polyalpha_core::OrderSide::Sell,
+            },
             0.02,
             5.0,
         );
@@ -911,11 +924,13 @@ mod tests {
         match delta {
             PlanningIntent::DeltaRebalance {
                 correlation_id,
+                residual_snapshot,
                 target_residual_delta_max,
                 target_shock_loss_max,
                 ..
             } => {
                 assert_eq!(correlation_id, "corr-rebalance-1");
+                assert_eq!(residual_snapshot.residual_delta, 0.12);
                 assert_eq!(target_residual_delta_max, 0.02);
                 assert_eq!(target_shock_loss_max, 5.0);
             }

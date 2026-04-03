@@ -187,6 +187,7 @@ pub enum PlanningIntent {
         intent_id: String,
         correlation_id: String,
         symbol: Symbol,
+        residual_snapshot: ResidualSnapshot,
         target_residual_delta_max: f64,
         target_shock_loss_max: f64,
     },
@@ -508,6 +509,33 @@ mod tests {
                 preferred_cex_side: crate::OrderSide::Buy,
             },
             recovery_reason: RecoveryDecisionReason::CexTopUpFaster,
+        };
+        let mut raw = serde_json::to_value(intent).unwrap();
+        raw["residual_snapshot"]["schema_version"] = json!(PLANNING_SCHEMA_VERSION + 1);
+
+        let err = serde_json::from_value::<PlanningIntent>(raw).expect_err("schema mismatch");
+        assert!(err
+            .to_string()
+            .contains("incompatible planning schema_version"));
+    }
+
+    #[test]
+    fn delta_rebalance_requires_compatible_nested_snapshot_schema_version() {
+        let intent = PlanningIntent::DeltaRebalance {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            intent_id: "intent-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            symbol: Symbol::new("btc-price-only"),
+            residual_snapshot: ResidualSnapshot {
+                schema_version: PLANNING_SCHEMA_VERSION,
+                residual_delta: 0.12,
+                planned_cex_qty: crate::CexBaseQty(rust_decimal::Decimal::new(1, 0)),
+                current_poly_yes_shares: crate::PolyShares(rust_decimal::Decimal::new(3, 0)),
+                current_poly_no_shares: crate::PolyShares(rust_decimal::Decimal::new(1, 0)),
+                preferred_cex_side: crate::OrderSide::Buy,
+            },
+            target_residual_delta_max: 0.05,
+            target_shock_loss_max: 10.0,
         };
         let mut raw = serde_json::to_value(intent).unwrap();
         raw["residual_snapshot"]["schema_version"] = json!(PLANNING_SCHEMA_VERSION + 1);

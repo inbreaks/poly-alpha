@@ -130,9 +130,7 @@ impl ExecutionPlanner {
             PlanningIntent::ClosePosition { .. } => {
                 self.plan_flatten(intent, &context, "close_position", "sell_exact_shares")
             }
-            PlanningIntent::DeltaRebalance { .. } => {
-                self.plan_flatten(intent, &context, "delta_rebalance", "sell_exact_shares")
-            }
+            PlanningIntent::DeltaRebalance { .. } => self.plan_delta_rebalance(intent, &context),
             PlanningIntent::ResidualRecovery { .. } => {
                 self.plan_residual_recovery(intent, &context)
             }
@@ -857,6 +855,27 @@ impl ExecutionPlanner {
                 self.plan_cex_top_up(intent, context, residual_snapshot)
             }
             _ => self.plan_flatten(intent, context, "residual_recovery", "sell_exact_shares"),
+        }
+    }
+
+    fn plan_delta_rebalance(
+        &self,
+        intent: &PlanningIntent,
+        context: &CanonicalPlanningContext,
+    ) -> Result<TradePlan, PlanRejection> {
+        let PlanningIntent::DeltaRebalance {
+            residual_snapshot, ..
+        } = intent
+        else {
+            unreachable!("plan_delta_rebalance only accepts delta rebalance intents");
+        };
+
+        match self.plan_cex_top_up(intent, context, residual_snapshot) {
+            Ok(mut plan) => {
+                plan.priority = "delta_rebalance".to_owned();
+                Ok(plan)
+            }
+            Err(_) => self.plan_flatten(intent, context, "delta_rebalance", "sell_exact_shares"),
         }
     }
 
@@ -1603,7 +1622,8 @@ mod tests {
     use polyalpha_core::{
         CexBaseQty, Exchange, Fill, InstrumentKind, OpenCandidate, OrderBookSnapshot, OrderId,
         OrderSide, PlanRejectionReason, PlanningIntent, PolyShares, Price, PriceLevel,
-        RevalidationFailureReason, SignalStrength, Symbol, TokenSide, UsdNotional, VenueQuantity,
+        ResidualSnapshot, RevalidationFailureReason, SignalStrength, Symbol, TokenSide,
+        UsdNotional, VenueQuantity,
     };
 
     use super::{CanonicalPlanningContext, ExecutionPlanner};
@@ -1799,6 +1819,39 @@ mod tests {
         assert_eq!(plan.cex_side, OrderSide::Buy);
         assert_eq!(plan.cex_planned_qty, CexBaseQty(Decimal::new(3, 1)));
         assert!(plan.poly_min_avg_price.0 > Decimal::ZERO);
+    }
+
+    #[test]
+    fn delta_rebalance_prefers_cex_top_up_without_touching_poly() {
+        let planner = ExecutionPlanner::default();
+        let mut context = sample_context();
+        context.current_poly_yes_shares = Decimal::new(800, 0);
+        context.current_cex_net_qty = Decimal::new(-990, 2);
+
+        let intent = PlanningIntent::DeltaRebalance {
+            schema_version: 1,
+            intent_id: "intent-delta-1".to_owned(),
+            correlation_id: "corr-delta-1".to_owned(),
+            symbol: Symbol::new("btc-price-only"),
+            residual_snapshot: ResidualSnapshot {
+                schema_version: 1,
+                residual_delta: 0.08,
+                planned_cex_qty: CexBaseQty(Decimal::new(998, 2)),
+                current_poly_yes_shares: PolyShares(Decimal::new(800, 0)),
+                current_poly_no_shares: PolyShares::ZERO,
+                preferred_cex_side: OrderSide::Sell,
+            },
+            target_residual_delta_max: 0.05,
+            target_shock_loss_max: 50.0,
+        };
+
+        let plan = planner.plan(&intent, &context).unwrap();
+
+        assert_eq!(plan.intent_type, "delta_rebalance");
+        assert_eq!(plan.priority, "delta_rebalance");
+        assert_eq!(plan.poly_planned_shares, PolyShares::ZERO);
+        assert_eq!(plan.cex_side, OrderSide::Sell);
+        assert!(plan.cex_planned_qty.0 > Decimal::ZERO);
     }
 
     #[test]

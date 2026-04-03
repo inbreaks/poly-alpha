@@ -44,9 +44,10 @@ use polyalpha_core::{
     ExecutionResult, Fill, HedgeState, InstrumentKind, MarketConfig, MarketDataEvent,
     MarketDataMode, MarketDataSource, MarketPhase, MarketRetentionReason, MarketTier, MarketView,
     MonitorEvent, MonitorEventPayload, MonitorRuntimeStats, MonitorSocketServer, MonitorState,
-    MonitorStrategyConfig, OpenCandidate, OrderStatus, PerformanceMetrics, PlanningIntent,
-    PolyShares, Position, Price, RiskManager, Settings, SignalStrength, Symbol, SymbolRegistry,
-    TokenSide, TradePlan, TradeView, UsdNotional, VenueQuantity, PLANNING_SCHEMA_VERSION,
+    MonitorStrategyConfig, OpenCandidate, OrderSide, OrderStatus, PerformanceMetrics,
+    PlanningIntent, PolyShares, Position, Price, ResidualSnapshot, RiskManager, Settings,
+    SignalStrength, Symbol, SymbolRegistry, TokenSide, TradePlan, TradeView, UsdNotional,
+    VenueQuantity, PLANNING_SCHEMA_VERSION,
 };
 use polyalpha_data::{
     BinanceFuturesDataSource, DataManager, OkxMarketDataSource, PolyBookLevel, PolyBookUpdate,
@@ -3073,6 +3074,7 @@ fn delta_rebalance_intent_for_symbol(
     symbol: &Symbol,
     correlation_id: &str,
     now_ms: u64,
+    residual_snapshot: ResidualSnapshot,
     target_residual_delta_max: f64,
     target_shock_loss_max: f64,
 ) -> PlanningIntent {
@@ -3080,6 +3082,7 @@ fn delta_rebalance_intent_for_symbol(
         symbol,
         correlation_id,
         now_ms,
+        residual_snapshot,
         target_residual_delta_max,
         target_shock_loss_max,
     )
@@ -3180,20 +3183,18 @@ fn rebalance_reference_delta(
         .or_else(|| trade_book.open.get(symbol).map(|open| open.delta))
 }
 
-fn current_rebalance_residual_delta(
+fn current_rebalance_snapshot(
     risk: &InMemoryRiskManager,
     trade_book: &TradeBook,
     engine: &SimpleAlphaEngine,
     symbol: &Symbol,
-) -> Option<f64> {
+) -> Option<ResidualSnapshot> {
     let tracker = risk.position_tracker();
     if !tracker.symbol_has_open_position(symbol) {
         return None;
     }
 
-    let poly_yes_qty = tracker
-        .net_symbol_qty(symbol, InstrumentKind::PolyYes)
-        .abs();
+    let poly_yes_qty = tracker.net_symbol_qty(symbol, InstrumentKind::PolyYes).abs();
     let poly_no_qty = tracker.net_symbol_qty(symbol, InstrumentKind::PolyNo).abs();
     let poly_qty = match (poly_yes_qty.is_zero(), poly_no_qty.is_zero()) {
         (false, true) => poly_yes_qty,
@@ -3213,12 +3214,29 @@ fn current_rebalance_residual_delta(
     let delta = rebalance_reference_delta(trade_book, engine, symbol)?;
     let desired_cex_qty = PolyShares(poly_qty).to_cex_base_qty(delta).0
         * Decimal::from_f64(hedge_ratio).unwrap_or(Decimal::ONE);
-    let actual_cex_qty = risk.cex_position_qty(symbol).abs();
+    let target_cex_net_qty = if delta >= 0.0 {
+        Decimal::ZERO - desired_cex_qty
+    } else {
+        desired_cex_qty
+    };
+    let actual_cex_net_qty = risk.cex_position_qty(symbol);
+    let residual_cex_net_qty = target_cex_net_qty - actual_cex_net_qty;
+    let preferred_cex_side = if residual_cex_net_qty >= Decimal::ZERO {
+        OrderSide::Buy
+    } else {
+        OrderSide::Sell
+    };
+    let residual_qty = residual_cex_net_qty.abs();
+    let residual_delta = residual_qty.to_f64().filter(|value| value.is_finite())?;
 
-    (desired_cex_qty - actual_cex_qty)
-        .abs()
-        .to_f64()
-        .filter(|value| value.is_finite())
+    Some(ResidualSnapshot {
+        schema_version: PLANNING_SCHEMA_VERSION,
+        residual_delta,
+        planned_cex_qty: polyalpha_core::CexBaseQty(desired_cex_qty),
+        current_poly_yes_shares: PolyShares(poly_yes_qty),
+        current_poly_no_shares: PolyShares(poly_no_qty),
+        preferred_cex_side,
+    })
 }
 
 fn rebalance_shock_loss_max(
@@ -3261,9 +3279,11 @@ async fn maybe_execute_delta_rebalance(
         return Ok(());
     }
 
-    let residual_delta =
-        current_rebalance_residual_delta(risk, trade_book, engine, symbol).unwrap_or_default();
-    if residual_delta <= threshold {
+    let Some(residual_snapshot) = current_rebalance_snapshot(risk, trade_book, engine, symbol)
+    else {
+        return Ok(());
+    };
+    if residual_snapshot.residual_delta <= threshold {
         return Ok(());
     }
 
@@ -3281,8 +3301,9 @@ async fn maybe_execute_delta_rebalance(
         symbol,
         &format!("corr-delta-rebalance-{}-{now_ms}", symbol.0),
         now_ms,
+        residual_snapshot.clone(),
         threshold,
-        rebalance_shock_loss_max(observed_map, symbol, residual_delta),
+        rebalance_shock_loss_max(observed_map, symbol, residual_snapshot.residual_delta),
     );
     execute_intent_trigger(
         intent,
@@ -10535,10 +10556,16 @@ fn add_trigger_details(details: &mut EventDetails, trigger: &RuntimeTrigger) {
                 insert_detail(details, "平仓比例", format_detail_f64(*target_close_ratio));
             }
             PlanningIntent::DeltaRebalance {
+                residual_snapshot,
                 target_residual_delta_max,
                 target_shock_loss_max,
                 ..
             } => {
+                insert_detail(
+                    details,
+                    "残余快照",
+                    format_residual_snapshot_detail(residual_snapshot),
+                );
                 insert_detail(
                     details,
                     "残余Delta阈值",
@@ -14664,6 +14691,117 @@ mod tests {
                 .and_then(|details| details.get("动作"))
                 .is_some_and(|action| action == "Delta 再平衡意图")
         }));
+    }
+
+    #[tokio::test]
+    async fn delta_rebalance_keeps_symbol_open_when_cex_only_top_up_is_viable() {
+        let settings = test_settings_with_price_filter(None, None);
+        let market = settings.markets[0].clone();
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let (provider, _executor, mut execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
+        seed_runtime_books(&provider, &registry, 2);
+
+        let mut engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
+        let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        risk.on_fill(&poly_fill(TokenSide::Yes))
+            .await
+            .expect("seed poly fill");
+        let mut stats = PaperStats::default();
+        let mut recent_events = VecDeque::new();
+        let mut trade_book = TradeBook::default();
+        let mut no_audit = None;
+        trade_book.register_open_signal(&open_candidate(TokenSide::Yes), 0, 1.0, 0.25);
+
+        maybe_execute_delta_rebalance(
+            &settings,
+            &HashMap::from([(
+                market.symbol.clone(),
+                ObservedState {
+                    cex_mid: Some(Decimal::new(100_000, 0)),
+                    ..ObservedState::default()
+                },
+            )]),
+            &market.symbol,
+            &mut engine,
+            &mut execution,
+            &mut risk,
+            &mut stats,
+            &mut recent_events,
+            &mut trade_book,
+            &mut no_audit,
+            70_000,
+        )
+        .await
+        .expect("delta rebalance should execute");
+
+        let plan_event = recent_events
+            .iter()
+            .find(|event| {
+                event.details.as_ref().is_some_and(|details| {
+                    details
+                        .get("意图")
+                        .is_some_and(|intent| intent == "delta_rebalance")
+                })
+            })
+            .expect("delta rebalance trade plan");
+        let details = plan_event.details.as_ref().expect("plan details");
+
+        assert!(risk.position_tracker().symbol_has_open_position(&market.symbol));
+        assert!(!recent_events
+            .iter()
+            .any(|event| event.summary.contains("已平仓")));
+        assert_eq!(
+            details.get("Poly计划股数").map(String::as_str),
+            Some("0")
+        );
+        assert!(details
+            .get("CEX计划数量")
+            .and_then(|qty| Decimal::from_str(qty).ok())
+            .is_some_and(|qty| qty > Decimal::ZERO));
+    }
+
+    #[tokio::test]
+    async fn current_rebalance_snapshot_prefers_cex_buy_when_short_overshoots_target() {
+        let settings = test_settings_with_price_filter(None, None);
+        let symbol = settings.markets[0].symbol.clone();
+        let engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
+        let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        let mut trade_book = TradeBook::default();
+
+        risk.on_fill(&poly_fill(TokenSide::Yes))
+            .await
+            .expect("seed poly fill");
+        risk.on_fill(&Fill {
+            quantity: VenueQuantity::CexBaseQty(polyalpha_core::CexBaseQty(Decimal::new(30, 1))),
+            ..cex_fill(polyalpha_core::OrderSide::Sell)
+        })
+        .await
+        .expect("seed oversized short");
+        trade_book.register_open_signal(&open_candidate(TokenSide::Yes), 0, 1.0, 0.25);
+
+        let snapshot = current_rebalance_snapshot(&risk, &trade_book, &engine, &symbol)
+            .expect("rebalance snapshot should exist");
+
+        assert_eq!(snapshot.preferred_cex_side, OrderSide::Buy);
+        assert_eq!(
+            snapshot.planned_cex_qty,
+            polyalpha_core::CexBaseQty(Decimal::new(25, 1))
+        );
+        assert_eq!(snapshot.residual_delta, 0.5);
     }
 
     #[tokio::test]
