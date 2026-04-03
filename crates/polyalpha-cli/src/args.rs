@@ -185,6 +185,21 @@ pub enum AuditCommand {
         #[arg(long, value_enum, default_value_t = AuditOutputFormat::Table)]
         format: AuditOutputFormat,
     },
+    /// 复盘已平仓交易时间线
+    TradeTimeline {
+        #[arg(long, default_value = "default")]
+        env: String,
+        #[arg(long, help = "指定审计会话；默认读取该环境最近一轮")]
+        session_id: Option<String>,
+        #[arg(long, help = "仅复盘指定市场的已平仓交易")]
+        symbol: Option<String>,
+        #[arg(long, conflicts_with = "trade", help = "直接定位某一笔平仓链")]
+        correlation_id: Option<String>,
+        #[arg(long, conflicts_with = "correlation_id", help = "按列表编号查看单笔详情（从 1 开始）")]
+        trade: Option<usize>,
+        #[arg(long, value_enum, default_value_t = AuditOutputFormat::Table)]
+        format: AuditOutputFormat,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Default)]
@@ -996,5 +1011,26 @@ mod tests {
             .expect_err("monitor args should reject multiple output modes");
 
         assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn parses_audit_trade_timeline_subcommand() {
+        let cli = Cli::try_parse_from([
+            "polyalpha-cli",
+            "audit",
+            "trade-timeline",
+            "--env",
+            "prod",
+            "--session-id",
+            "session-1",
+            "--trade",
+            "2",
+        ])
+        .expect("audit trade-timeline command should parse");
+
+        match cli.command {
+            Command::Audit { .. } => {}
+            other => panic!("expected audit command, got {other:?}"),
+        }
     }
 }

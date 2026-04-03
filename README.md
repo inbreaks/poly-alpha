@@ -149,6 +149,21 @@ cargo test -p polyalpha-core -p polyalpha-data -p polyalpha-risk -p polyalpha-ex
 ./target/debug/polyalpha-cli live inspect --env multi-market-active.fresh --format table
 ```
 
+按审计日志复盘已平仓交易：
+
+```bash
+./target/debug/polyalpha-cli audit trade-timeline \
+  --env multi-market-active.fresh
+```
+
+查看单笔完整平仓时间线：
+
+```bash
+./target/debug/polyalpha-cli audit trade-timeline \
+  --env multi-market-active.fresh \
+  --trade 1
+```
+
 ### 5. 准备和运行回测
 
 准备数据库：
