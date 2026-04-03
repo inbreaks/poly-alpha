@@ -1618,6 +1618,7 @@ fn replay_execution_planner(config: &ResolvedReplayConfig) -> ExecutionPlanner {
         fallback_funding_bps_per_day: 0,
         poly_slippage_bps: rounded_bps(config.stress.poly_slippage_bps),
         cex_slippage_bps: rounded_bps(config.stress.cex_slippage_bps),
+        max_open_instant_loss_pct_of_budget: Decimal::new(4, 2),
     }
 }
 
