@@ -200,6 +200,21 @@ pub enum AuditCommand {
         #[arg(long, value_enum, default_value_t = AuditOutputFormat::Table)]
         format: AuditOutputFormat,
     },
+    /// 复盘单笔开仓决策链
+    OpenDecision {
+        #[arg(long, default_value = "default")]
+        env: String,
+        #[arg(long, help = "指定审计会话；默认读取该环境最近一轮")]
+        session_id: Option<String>,
+        #[arg(long, help = "仅查看指定市场的开仓决策")]
+        symbol: Option<String>,
+        #[arg(long, conflicts_with = "entry", help = "直接定位某一笔开仓链")]
+        correlation_id: Option<String>,
+        #[arg(long, conflicts_with = "correlation_id", help = "按列表编号查看单笔详情（从 1 开始）")]
+        entry: Option<usize>,
+        #[arg(long, value_enum, default_value_t = AuditOutputFormat::Table)]
+        format: AuditOutputFormat,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Default)]
@@ -1027,6 +1042,27 @@ mod tests {
             "2",
         ])
         .expect("audit trade-timeline command should parse");
+
+        match cli.command {
+            Command::Audit { .. } => {}
+            other => panic!("expected audit command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_audit_open_decision_subcommand() {
+        let cli = Cli::try_parse_from([
+            "polyalpha-cli",
+            "audit",
+            "open-decision",
+            "--env",
+            "prod",
+            "--session-id",
+            "session-1",
+            "--entry",
+            "2",
+        ])
+        .expect("audit open-decision command should parse");
 
         match cli.command {
             Command::Audit { .. } => {}

@@ -1,13 +1,15 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{Local, TimeZone};
+use libm::erf;
 use polyalpha_audit::{
     AuditEvent, AuditEventPayload, AuditReader, AuditSessionSummary, AuditWarehouse,
     MarketMarkEvent, PositionMarkEvent, SignalEmittedEvent,
 };
 use polyalpha_core::{
-    ExecutionEvent, Exchange, OrderSide, RecoveryDecisionReason, Settings, TokenSide, TradePlan,
-    TradeView, VenueQuantity,
+    ExecutionEvent, Exchange, MarketConfig, MarketRule, MarketRuleKind, OrderSide,
+    RecoveryDecisionReason, Settings, TokenSide, TradePlan, TradeView, VenueQuantity,
 };
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -137,6 +139,124 @@ struct TradeTimelineDetailReport {
     attribution: Option<TradeTimelineAttributionView>,
 }
 
+#[derive(Clone, Serialize)]
+struct OpenDecisionListItem {
+    entry: usize,
+    seq: u64,
+    timestamp_ms: u64,
+    time: String,
+    symbol: String,
+    token_side: String,
+    signal_price: Option<f64>,
+    fair_value: f64,
+    raw_mispricing: f64,
+    delta_estimate: f64,
+    planned_edge_usd: String,
+    correlation_id: String,
+}
+
+#[derive(Serialize)]
+struct OpenDecisionListReport {
+    summary: AuditSessionSummary,
+    symbol_filter: Option<String>,
+    entries: Vec<OpenDecisionListItem>,
+}
+
+#[derive(Serialize)]
+struct OpenDecisionMarketView {
+    question: Option<String>,
+    rule_kind: String,
+    lower_strike: Option<String>,
+    upper_strike: Option<String>,
+    settlement_timestamp_ms: u64,
+    settlement_time: String,
+}
+
+#[derive(Serialize)]
+struct OpenDecisionSignalView {
+    signal_id: String,
+    time: String,
+    token_side: String,
+    direction: String,
+    candidate_price: Option<f64>,
+    fair_value: f64,
+    raw_mispricing: f64,
+    delta_estimate: f64,
+    z_score: Option<f64>,
+    cex_reference_price: Option<f64>,
+    minutes_to_expiry: Option<f64>,
+    implied_sigma_annualized: Option<f64>,
+    evaluable_status: String,
+    async_classification: String,
+    poly_quote_age_ms: Option<u64>,
+    cex_quote_age_ms: Option<u64>,
+    cross_leg_skew_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct OpenDecisionLatestMarketView {
+    seq: u64,
+    tick_index: u64,
+    time: String,
+    active_token_side: Option<String>,
+    poly_price: Option<f64>,
+    cex_price: Option<f64>,
+    fair_value: Option<f64>,
+    minutes_to_expiry: Option<f64>,
+    implied_sigma_annualized: Option<f64>,
+    evaluable_status: String,
+    async_classification: String,
+}
+
+#[derive(Serialize)]
+struct OpenDecisionPlanView {
+    seq: u64,
+    time: String,
+    stage: String,
+    plan_id: String,
+    parent_plan_id: Option<String>,
+    poly_side: String,
+    poly_token_side: String,
+    poly_planned_shares: String,
+    poly_executable_price: String,
+    cex_side: String,
+    cex_planned_qty: String,
+    cex_executable_price: String,
+    planned_edge_usd: String,
+    instant_open_loss_usd: String,
+    poly_avg_vs_signal_price_bps: Option<f64>,
+    post_rounding_residual_delta: f64,
+    shock_loss_up_2pct: String,
+    max_residual_delta: f64,
+    max_shock_loss_usd: String,
+}
+
+#[derive(Serialize)]
+struct OpenDecisionExecutionView {
+    seq: u64,
+    time: String,
+    stage: String,
+    plan_id: String,
+    status: String,
+    realized_edge_usd: String,
+    actual_residual_delta: f64,
+    recovery_required: bool,
+    poly_filled_qty: String,
+    cex_filled_qty: String,
+}
+
+#[derive(Serialize)]
+struct OpenDecisionDetailReport {
+    summary: AuditSessionSummary,
+    entry: OpenDecisionListItem,
+    market: OpenDecisionMarketView,
+    signal: Option<OpenDecisionSignalView>,
+    latest_market_snapshot: Option<OpenDecisionLatestMarketView>,
+    gate_chain: Vec<AuditEventView>,
+    plans: Vec<OpenDecisionPlanView>,
+    executions: Vec<OpenDecisionExecutionView>,
+}
+
 pub fn run_audit_command(command: AuditCommand) -> Result<()> {
     match command {
         AuditCommand::Events {
@@ -199,6 +319,21 @@ pub fn run_audit_command(command: AuditCommand) -> Result<()> {
             trade,
             format,
         ),
+        AuditCommand::OpenDecision {
+            env,
+            session_id,
+            symbol,
+            correlation_id,
+            entry,
+            format,
+        } => run_open_decision(
+            &env,
+            session_id.as_deref(),
+            symbol.as_deref(),
+            correlation_id.as_deref(),
+            entry,
+            format,
+        ),
     }
 }
 
@@ -246,6 +381,49 @@ fn run_trade_timeline(
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 }
                 AuditOutputFormat::Table => print_trade_timeline_list(&report),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn run_open_decision(
+    env: &str,
+    session_id: Option<&str>,
+    symbol: Option<&str>,
+    correlation_id: Option<&str>,
+    entry: Option<usize>,
+    format: AuditOutputFormat,
+) -> Result<()> {
+    let (settings, summary) = resolve_session(env, session_id)?;
+    let _warehouse_path =
+        sync_warehouse_best_effort(&settings.general.data_dir, &summary.session_id);
+    let events = AuditReader::load_events(&settings.general.data_dir, &summary.session_id)?;
+    let entries = collect_open_decision_items(&events, symbol);
+
+    match select_open_decision(&entries, correlation_id, entry)? {
+        Some(selected_entry) => {
+            let report = build_open_decision_detail(&events, &settings.markets, selected_entry)?;
+            match format {
+                AuditOutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&OpenDecisionDetailReport { summary, ..report })?
+                ),
+                AuditOutputFormat::Table => {
+                    print_open_decision_detail(&OpenDecisionDetailReport { summary, ..report })
+                }
+            }
+        }
+        None => {
+            let report = OpenDecisionListReport {
+                summary,
+                symbol_filter: symbol.map(str::to_owned),
+                entries,
+            };
+            match format {
+                AuditOutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+                AuditOutputFormat::Table => print_open_decision_list(&report),
             }
         }
     }
@@ -487,6 +665,527 @@ fn build_trade_timeline_detail(
         rows,
         attribution,
     })
+}
+
+fn collect_open_decision_items(
+    events: &[AuditEvent],
+    symbol_filter: Option<&str>,
+) -> Vec<OpenDecisionListItem> {
+    let mut entries = Vec::new();
+
+    for event in events {
+        let Some(ExecutionEvent::TradePlanCreated { plan }) = execution_event(event) else {
+            continue;
+        };
+        if plan.intent_type != "open_position" {
+            continue;
+        }
+        if symbol_filter.is_some_and(|filter| !symbol_matches(&plan.symbol.0, filter)) {
+            continue;
+        }
+
+        let signal = events.iter().find_map(|candidate_event| {
+            (candidate_event.correlation_id.as_deref() == Some(plan.correlation_id.as_str()))
+                .then_some(candidate_event)
+                .and_then(signal_event)
+        });
+        let (token_side, signal_price, fair_value, raw_mispricing, delta_estimate) =
+            if let Some(signal) = signal {
+                (
+                    format_token_side_label(signal.candidate.token_side).to_owned(),
+                    observed_candidate_price(signal),
+                    signal.candidate.fair_value,
+                    signal.candidate.raw_mispricing,
+                    signal.candidate.delta_estimate,
+                )
+            } else {
+                (
+                    format_token_side_label(plan.poly_token_side).to_owned(),
+                    None,
+                    0.0,
+                    0.0,
+                    0.0,
+                )
+            };
+
+        entries.push(OpenDecisionListItem {
+            entry: entries.len() + 1,
+            seq: event.seq,
+            timestamp_ms: event.timestamp_ms,
+            time: format_timestamp_ms(event.timestamp_ms),
+            symbol: plan.symbol.0.clone(),
+            token_side,
+            signal_price,
+            fair_value,
+            raw_mispricing,
+            delta_estimate,
+            planned_edge_usd: format_decimal(plan.planned_edge_usd.0),
+            correlation_id: plan.correlation_id.clone(),
+        });
+    }
+
+    entries
+}
+
+fn select_open_decision<'a>(
+    entries: &'a [OpenDecisionListItem],
+    correlation_id: Option<&str>,
+    entry: Option<usize>,
+) -> Result<Option<&'a OpenDecisionListItem>> {
+    if correlation_id.is_none() && entry.is_none() {
+        return Ok(None);
+    }
+
+    if let Some(correlation_id) = correlation_id {
+        return entries
+            .iter()
+            .find(|item| item.correlation_id == correlation_id)
+            .map(Some)
+            .ok_or_else(|| anyhow!("未找到 correlation_id=`{correlation_id}` 对应的开仓链"));
+    }
+
+    let entry = entry.expect("entry checked above");
+    if entry == 0 {
+        return Err(anyhow!("`--entry` 从 1 开始计数"));
+    }
+
+    entries
+        .iter()
+        .find(|item| item.entry == entry)
+        .map(Some)
+        .ok_or_else(|| anyhow!("未找到第 {entry} 笔开仓链"))
+}
+
+fn build_open_decision_detail(
+    events: &[AuditEvent],
+    markets: &[MarketConfig],
+    selected_entry: &OpenDecisionListItem,
+) -> Result<OpenDecisionDetailReport> {
+    let market = markets
+        .iter()
+        .find(|market| market.symbol.0 == selected_entry.symbol)
+        .ok_or_else(|| anyhow!("未找到市场 `{}` 的配置", selected_entry.symbol))?;
+    let signal = events.iter().find_map(|event| {
+        (event.correlation_id.as_deref() == Some(selected_entry.correlation_id.as_str()))
+            .then_some(event)
+            .and_then(signal_event)
+    });
+    let signal_id = signal.map(|item| item.candidate.candidate_id.as_str());
+    let gate_chain = events
+        .iter()
+        .filter(|event| {
+            matches!(event.payload, AuditEventPayload::GateDecision(_))
+                && signal_id.is_some_and(|id| event.signal_id.as_deref() == Some(id))
+        })
+        .map(event_view)
+        .collect::<Vec<_>>();
+
+    let latest_market_snapshot = events.iter().rev().find(|event| {
+        event.symbol.as_deref() == Some(selected_entry.symbol.as_str())
+            && matches!(event.payload, AuditEventPayload::MarketMark(_))
+    });
+    let latest_market_snapshot =
+        latest_market_snapshot.and_then(|event| latest_open_decision_market_view(event, market));
+
+    let mut plans = Vec::new();
+    let mut executions = Vec::new();
+    let mut stage_by_plan_id = HashMap::new();
+    for event in events.iter().filter(|event| {
+        event.correlation_id.as_deref() == Some(selected_entry.correlation_id.as_str())
+            && matches!(event.kind, polyalpha_audit::AuditEventKind::Execution)
+    }) {
+        let Some(execution) = execution_event(event) else {
+            continue;
+        };
+        match execution {
+            ExecutionEvent::TradePlanCreated { plan } => {
+                let stage = open_plan_stage_label(plan).to_owned();
+                stage_by_plan_id.insert(plan.plan_id.clone(), stage.clone());
+                plans.push(open_decision_plan_view(event, plan, signal));
+            }
+            ExecutionEvent::ExecutionResultRecorded { result } => {
+                let stage = stage_by_plan_id
+                    .get(&result.plan_id)
+                    .cloned()
+                    .unwrap_or_else(|| "执行结果".to_owned());
+                executions.push(open_decision_execution_view(event, &stage, result));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(OpenDecisionDetailReport {
+        summary: empty_summary_stub(),
+        entry: selected_entry.clone(),
+        market: open_decision_market_view(market),
+        signal: signal.map(|signal| open_decision_signal_view(signal, market)),
+        latest_market_snapshot,
+        gate_chain,
+        plans,
+        executions,
+    })
+}
+
+fn open_decision_market_view(market: &MarketConfig) -> OpenDecisionMarketView {
+    let rule = market.resolved_market_rule();
+    OpenDecisionMarketView {
+        question: market.market_question.clone(),
+        rule_kind: rule
+            .as_ref()
+            .map(|rule| open_rule_kind_label(rule.kind).to_owned())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        lower_strike: rule
+            .as_ref()
+            .and_then(|rule| rule.lower_strike)
+            .map(|price| format_decimal(price.0)),
+        upper_strike: rule
+            .as_ref()
+            .and_then(|rule| rule.upper_strike)
+            .map(|price| format_decimal(price.0)),
+        settlement_timestamp_ms: market.settlement_timestamp.saturating_mul(1000),
+        settlement_time: format_timestamp_ms(market.settlement_timestamp.saturating_mul(1000)),
+    }
+}
+
+fn open_decision_signal_view(
+    signal: &SignalEmittedEvent,
+    market: &MarketConfig,
+) -> OpenDecisionSignalView {
+    let observed = signal.observed.as_ref();
+    let cex_reference_price = observed.and_then(|item| item.cex_mid);
+    let minutes_to_expiry = minutes_to_expiry(signal.candidate.timestamp_ms, market);
+    let implied_sigma_annualized = implied_sigma_annualized(
+        market.resolved_market_rule().as_ref(),
+        signal.candidate.token_side,
+        cex_reference_price,
+        signal.candidate.fair_value,
+        minutes_to_expiry,
+    );
+    OpenDecisionSignalView {
+        signal_id: signal.candidate.candidate_id.clone(),
+        time: format_timestamp_ms(signal.candidate.timestamp_ms),
+        token_side: format_token_side_label(signal.candidate.token_side).to_owned(),
+        direction: signal.candidate.direction.clone(),
+        candidate_price: observed_candidate_price(signal),
+        fair_value: signal.candidate.fair_value,
+        raw_mispricing: signal.candidate.raw_mispricing,
+        delta_estimate: signal.candidate.delta_estimate,
+        z_score: signal.candidate.z_score,
+        cex_reference_price,
+        minutes_to_expiry,
+        implied_sigma_annualized,
+        evaluable_status: observed
+            .map(|item| item.evaluable_status.label_zh().to_owned())
+            .unwrap_or_else(|| "无".to_owned()),
+        async_classification: observed
+            .map(|item| item.async_classification.label_zh().to_owned())
+            .unwrap_or_else(|| "无".to_owned()),
+        poly_quote_age_ms: observed.and_then(|item| item.poly_quote_age_ms),
+        cex_quote_age_ms: observed.and_then(|item| item.cex_quote_age_ms),
+        cross_leg_skew_ms: observed.and_then(|item| item.cross_leg_skew_ms),
+    }
+}
+
+fn latest_open_decision_market_view(
+    event: &AuditEvent,
+    market: &MarketConfig,
+) -> Option<OpenDecisionLatestMarketView> {
+    let AuditEventPayload::MarketMark(mark) = &event.payload else {
+        return None;
+    };
+    let token_side = mark
+        .market
+        .active_token_side
+        .as_deref()
+        .and_then(parse_token_side);
+    let implied_sigma_annualized = token_side.and_then(|token_side| {
+        implied_sigma_annualized(
+            market.resolved_market_rule().as_ref(),
+            token_side,
+            mark.market.cex_price,
+            mark.market.fair_value.unwrap_or_default(),
+            mark.market.minutes_to_expiry,
+        )
+    });
+
+    Some(OpenDecisionLatestMarketView {
+        seq: event.seq,
+        tick_index: mark.tick_index,
+        time: format_timestamp_ms(event.timestamp_ms),
+        active_token_side: mark.market.active_token_side.clone(),
+        poly_price: mark.market.poly_price,
+        cex_price: mark.market.cex_price,
+        fair_value: mark.market.fair_value,
+        minutes_to_expiry: mark.market.minutes_to_expiry,
+        implied_sigma_annualized,
+        evaluable_status: mark.market.evaluable_status.label_zh().to_owned(),
+        async_classification: mark.market.async_classification.label_zh().to_owned(),
+    })
+}
+
+fn open_decision_plan_view(
+    event: &AuditEvent,
+    plan: &TradePlan,
+    signal: Option<&SignalEmittedEvent>,
+) -> OpenDecisionPlanView {
+    let signal_price = signal.and_then(observed_candidate_price);
+    OpenDecisionPlanView {
+        seq: event.seq,
+        time: format_timestamp_ms(event.timestamp_ms),
+        stage: open_plan_stage_label(plan).to_owned(),
+        plan_id: plan.plan_id.clone(),
+        parent_plan_id: plan.parent_plan_id.clone(),
+        poly_side: format_order_side_label(plan.poly_side).to_owned(),
+        poly_token_side: format_token_side_label(plan.poly_token_side).to_owned(),
+        poly_planned_shares: format_decimal(plan.poly_planned_shares.0),
+        poly_executable_price: format_decimal(plan.poly_executable_price.0),
+        cex_side: format_order_side_label(plan.cex_side).to_owned(),
+        cex_planned_qty: format_decimal(plan.cex_planned_qty.0),
+        cex_executable_price: format_decimal(plan.cex_executable_price.0),
+        planned_edge_usd: format_decimal(plan.planned_edge_usd.0),
+        instant_open_loss_usd: format_decimal(instant_open_loss_usd(plan)),
+        poly_avg_vs_signal_price_bps: poly_avg_vs_signal_price_bps(plan, signal_price),
+        post_rounding_residual_delta: plan.post_rounding_residual_delta,
+        shock_loss_up_2pct: format_decimal(plan.shock_loss_up_2pct.0),
+        max_residual_delta: plan.max_residual_delta,
+        max_shock_loss_usd: format_decimal(plan.max_shock_loss_usd.0),
+    }
+}
+
+fn open_decision_execution_view(
+    event: &AuditEvent,
+    stage: &str,
+    result: &polyalpha_core::ExecutionResult,
+) -> OpenDecisionExecutionView {
+    OpenDecisionExecutionView {
+        seq: event.seq,
+        time: format_timestamp_ms(event.timestamp_ms),
+        stage: stage.to_owned(),
+        plan_id: result.plan_id.clone(),
+        status: result.status.clone(),
+        realized_edge_usd: format_decimal(result.realized_edge_usd.0),
+        actual_residual_delta: result.actual_residual_delta,
+        recovery_required: result.recovery_required,
+        poly_filled_qty: aggregate_filled_qty(&result.poly_order_ledger),
+        cex_filled_qty: aggregate_filled_qty(&result.cex_order_ledger),
+    }
+}
+
+fn empty_summary_stub() -> AuditSessionSummary {
+    AuditSessionSummary {
+        session_id: String::new(),
+        env: String::new(),
+        mode: Default::default(),
+        status: Default::default(),
+        started_at_ms: 0,
+        ended_at_ms: None,
+        updated_at_ms: 0,
+        market_count: 0,
+        markets: Vec::new(),
+        counters: Default::default(),
+        latest_tick_index: 0,
+        latest_checkpoint_ms: None,
+        latest_equity: None,
+        latest_total_pnl_usd: None,
+        latest_today_pnl_usd: None,
+        latest_total_exposure_usd: None,
+        rejection_reasons: HashMap::new(),
+        skip_reasons: HashMap::new(),
+        evaluable_status_counts: HashMap::new(),
+        async_classification_counts: HashMap::new(),
+    }
+}
+
+fn signal_event(event: &AuditEvent) -> Option<&SignalEmittedEvent> {
+    match &event.payload {
+        AuditEventPayload::SignalEmitted(signal) => Some(signal),
+        _ => None,
+    }
+}
+
+fn observed_candidate_price(signal: &SignalEmittedEvent) -> Option<f64> {
+    signal.observed.as_ref().and_then(|observed| {
+        match signal.candidate.token_side {
+            TokenSide::Yes => observed.poly_yes_mid,
+            TokenSide::No => observed.poly_no_mid,
+        }
+    })
+}
+
+fn minutes_to_expiry(timestamp_ms: u64, market: &MarketConfig) -> Option<f64> {
+    let settlement_ms = market.settlement_timestamp.saturating_mul(1000);
+    (settlement_ms > timestamp_ms)
+        .then_some((settlement_ms.saturating_sub(timestamp_ms) as f64) / 60_000.0)
+}
+
+fn open_rule_kind_label(kind: MarketRuleKind) -> &'static str {
+    match kind {
+        MarketRuleKind::Above => "above",
+        MarketRuleKind::Below => "below",
+        MarketRuleKind::Between => "between",
+    }
+}
+
+fn open_plan_stage_label(plan: &TradePlan) -> &'static str {
+    match plan.intent_type.as_str() {
+        "open_position" => "开仓计划",
+        "delta_rebalance" if plan.parent_plan_id.is_some() => "开仓后补对冲",
+        "delta_rebalance" => "补 CEX 对冲",
+        _ => "执行计划",
+    }
+}
+
+fn parse_token_side(value: &str) -> Option<TokenSide> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "yes" => Some(TokenSide::Yes),
+        "no" => Some(TokenSide::No),
+        _ => None,
+    }
+}
+
+fn instant_open_loss_usd(plan: &TradePlan) -> Decimal {
+    plan.poly_friction_cost_usd.0
+        + plan.poly_fee_usd.0
+        + plan.cex_friction_cost_usd.0
+        + plan.cex_fee_usd.0
+}
+
+fn poly_avg_vs_signal_price_bps(plan: &TradePlan, signal_price: Option<f64>) -> Option<f64> {
+    let signal_price = signal_price?;
+    if signal_price <= 0.0 {
+        return None;
+    }
+    let executable_price = plan.poly_executable_price.0.to_f64()?;
+    Some((executable_price - signal_price) / signal_price * 10_000.0)
+}
+
+fn aggregate_filled_qty(entries: &[polyalpha_core::OrderLedgerEntry]) -> String {
+    if entries.is_empty() {
+        return "-".to_owned();
+    }
+    let total = entries.iter().fold(Decimal::ZERO, |acc, entry| {
+        acc + entry
+            .filled_qty
+            .parse::<Decimal>()
+            .unwrap_or(Decimal::ZERO)
+    });
+    format_decimal(total)
+}
+
+const SQRT_TWO: f64 = std::f64::consts::SQRT_2;
+const TRADING_DAYS_PER_YEAR: f64 = 252.0;
+const MINUTES_PER_DAY: f64 = 1440.0;
+
+fn implied_sigma_annualized(
+    rule: Option<&MarketRule>,
+    token_side: TokenSide,
+    spot_price: Option<f64>,
+    fair_value: f64,
+    minutes_to_expiry: Option<f64>,
+) -> Option<f64> {
+    let rule = rule?;
+    let spot_price = spot_price?;
+    let minutes_to_expiry = minutes_to_expiry?;
+    if !(0.0..=1.0).contains(&fair_value) || minutes_to_expiry <= 1.0 || spot_price <= 0.0 {
+        return None;
+    }
+
+    let mut best_sigma = None;
+    let mut best_error = f64::MAX;
+    let mut sigma = 0.01;
+    while sigma <= 3.0 {
+        let minute_sigma = annualized_to_minute_sigma(sigma);
+        let predicted = token_fair_value(rule, token_side, spot_price, minute_sigma, minutes_to_expiry);
+        let error = (predicted - fair_value).abs();
+        if error < best_error {
+            best_error = error;
+            best_sigma = Some(sigma);
+        }
+        sigma += 0.001;
+    }
+
+    best_sigma
+}
+
+fn annualized_to_minute_sigma(value: f64) -> f64 {
+    value / TRADING_DAYS_PER_YEAR.sqrt() / MINUTES_PER_DAY.sqrt()
+}
+
+fn token_fair_value(
+    rule: &MarketRule,
+    token_side: TokenSide,
+    spot_price: f64,
+    minute_sigma: f64,
+    minutes_to_expiry: f64,
+) -> f64 {
+    let yes_probability = yes_probability_from_rule(rule, spot_price, minute_sigma, minutes_to_expiry);
+    match token_side {
+        TokenSide::Yes => yes_probability.clamp(0.0, 1.0),
+        TokenSide::No => (1.0 - yes_probability).clamp(0.0, 1.0),
+    }
+}
+
+fn yes_probability_from_rule(
+    rule: &MarketRule,
+    spot_price: f64,
+    minute_sigma: f64,
+    minutes_to_expiry: f64,
+) -> f64 {
+    if minute_sigma <= 1e-6 || minutes_to_expiry <= 1.0 {
+        return realized_yes_payout(rule, spot_price.max(1e-9));
+    }
+
+    let variance = (minute_sigma * minute_sigma * minutes_to_expiry).max(1e-12);
+    let stdev = variance.sqrt();
+    let mu = spot_price.max(1e-9).ln() - 0.5 * variance;
+    let above_probability = |strike: f64| -> f64 {
+        let z_value = ((strike.max(1e-9)).ln() - mu) / stdev;
+        1.0 - normal_cdf(z_value)
+    };
+
+    match rule.kind {
+        MarketRuleKind::Above => above_probability(rule.lower_strike.map(|price| price.0.to_f64().unwrap_or_default()).unwrap_or_default()),
+        MarketRuleKind::Below => {
+            1.0 - above_probability(rule.upper_strike.map(|price| price.0.to_f64().unwrap_or_default()).unwrap_or_default())
+        }
+        MarketRuleKind::Between => {
+            let lower = rule.lower_strike.map(|price| price.0.to_f64().unwrap_or_default()).unwrap_or_default();
+            let upper = rule.upper_strike.map(|price| price.0.to_f64().unwrap_or_default()).unwrap_or_default();
+            (above_probability(lower) - above_probability(upper)).clamp(0.0, 1.0)
+        }
+    }
+}
+
+fn realized_yes_payout(rule: &MarketRule, terminal_price: f64) -> f64 {
+    match rule.kind {
+        MarketRuleKind::Above => {
+            if terminal_price > rule.lower_strike.map(|price| price.0.to_f64().unwrap_or_default()).unwrap_or_default() {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        MarketRuleKind::Below => {
+            if terminal_price < rule.upper_strike.map(|price| price.0.to_f64().unwrap_or_default()).unwrap_or_default() {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        MarketRuleKind::Between => {
+            let lower = rule.lower_strike.map(|price| price.0.to_f64().unwrap_or_default()).unwrap_or_default();
+            let upper = rule.upper_strike.map(|price| price.0.to_f64().unwrap_or_default()).unwrap_or_default();
+            if terminal_price >= lower && terminal_price < upper {
+                1.0
+            } else {
+                0.0
+            }
+        }
+    }
+}
+
+fn normal_cdf(value: f64) -> f64 {
+    0.5 * (1.0 + erf(value / SQRT_TWO))
 }
 
 fn pre_close_snapshot_view(event: &AuditEvent) -> Option<TradeTimelinePreCloseView> {
@@ -827,6 +1526,151 @@ fn print_trade_timeline_detail(report: &TradeTimelineDetailReport) {
             "- 平仓前浮亏兑现: {} USD",
             attribution.pre_close_floating_loss_realized_usd
         );
+    }
+}
+
+fn print_open_decision_list(report: &OpenDecisionListReport) {
+    println!("开仓决策复盘: {}", report.summary.session_id);
+    if let Some(symbol) = report.symbol_filter.as_deref() {
+        println!("市场过滤: {symbol}");
+    }
+    println!("已开仓机会: {}", report.entries.len());
+    if report.entries.is_empty() {
+        println!("  （无）");
+        return;
+    }
+    for entry in &report.entries {
+        println!(
+            "  [{}] {} {} {} 价={} FV={:.6} edge={} corr={}",
+            entry.entry,
+            entry.time,
+            entry.symbol,
+            entry.token_side,
+            format_option_f64(entry.signal_price),
+            entry.fair_value,
+            entry.planned_edge_usd,
+            entry.correlation_id
+        );
+    }
+}
+
+fn print_open_decision_detail(report: &OpenDecisionDetailReport) {
+    println!(
+        "开仓决策详情: {} / [{}] {}",
+        report.summary.session_id, report.entry.entry, report.entry.symbol
+    );
+    println!(
+        "市场规则: kind={} lower={} upper={} settlement={}",
+        report.market.rule_kind,
+        format_option_text(report.market.lower_strike.as_deref()),
+        format_option_text(report.market.upper_strike.as_deref()),
+        report.market.settlement_time
+    );
+    if let Some(question) = report.market.question.as_deref() {
+        println!("题面: {question}");
+    }
+    if let Some(signal) = &report.signal {
+        println!(
+            "信号: {} {} {} 价={} FV={:.6} mispricing={:.6} delta={:.12} z={}",
+            signal.time,
+            signal.direction,
+            signal.token_side,
+            format_option_f64(signal.candidate_price),
+            signal.fair_value,
+            signal.raw_mispricing,
+            signal.delta_estimate,
+            format_option_f64(signal.z_score)
+        );
+        println!(
+            "信号观测: CEX={} 到期剩余={} implied_sigma={} 状态={} / {}",
+            format_option_f64(signal.cex_reference_price),
+            format_option_f64(signal.minutes_to_expiry),
+            format_option_f64(signal.implied_sigma_annualized),
+            signal.evaluable_status,
+            signal.async_classification
+        );
+        println!(
+            "报价龄: Poly={} CEX={} 时差={}",
+            signal
+                .poly_quote_age_ms
+                .map(format_duration_ms)
+                .unwrap_or_else(|| "无".to_owned()),
+            signal
+                .cex_quote_age_ms
+                .map(format_duration_ms)
+                .unwrap_or_else(|| "无".to_owned()),
+            signal
+                .cross_leg_skew_ms
+                .map(format_duration_ms)
+                .unwrap_or_else(|| "无".to_owned())
+        );
+    }
+    if let Some(mark) = &report.latest_market_snapshot {
+        println!(
+            "最新市场快照: tick={} token={} Poly={} CEX={} FV={} mins={} implied_sigma={} 状态={} / {}",
+            mark.tick_index,
+            format_option_text(mark.active_token_side.as_deref()),
+            format_option_f64(mark.poly_price),
+            format_option_f64(mark.cex_price),
+            format_option_f64(mark.fair_value),
+            format_option_f64(mark.minutes_to_expiry),
+            format_option_f64(mark.implied_sigma_annualized),
+            mark.evaluable_status,
+            mark.async_classification
+        );
+    }
+    println!("Gate 链:");
+    if report.gate_chain.is_empty() {
+        println!("  （无）");
+    } else {
+        for event in &report.gate_chain {
+            println!(
+                "  {} [{}] {}",
+                event.time,
+                event.kind,
+                format_event_table_summary(event)
+            );
+        }
+    }
+    println!("计划链:");
+    if report.plans.is_empty() {
+        println!("  （无）");
+    } else {
+        for plan in &report.plans {
+            println!(
+                "  {} [{}] Poly {} {} @ {} / CEX {} {} @ {} / edge={} / instant_loss={} / residual={} / avg_vs_signal_bps={}",
+                plan.time,
+                plan.stage,
+                plan.poly_side,
+                plan.poly_planned_shares,
+                plan.poly_executable_price,
+                plan.cex_side,
+                plan.cex_planned_qty,
+                plan.cex_executable_price,
+                plan.planned_edge_usd,
+                plan.instant_open_loss_usd,
+                format_f64_compact(plan.post_rounding_residual_delta),
+                format_option_f64(plan.poly_avg_vs_signal_price_bps)
+            );
+        }
+    }
+    println!("执行结果:");
+    if report.executions.is_empty() {
+        println!("  （无）");
+    } else {
+        for execution in &report.executions {
+            println!(
+                "  {} [{}] status={} realized_edge={} residual={} recovery_required={} poly_fill={} cex_fill={}",
+                execution.time,
+                execution.stage,
+                execution.status,
+                execution.realized_edge_usd,
+                format_f64_compact(execution.actual_residual_delta),
+                execution.recovery_required,
+                execution.poly_filled_qty,
+                execution.cex_filled_qty
+            );
+        }
     }
 }
 
@@ -1571,12 +2415,16 @@ fn candidate_direction_text(direction: &str) -> &str {
 mod tests {
     use super::*;
     use polyalpha_audit::{
-        AuditEventKind, AuditEventPayload, ExecutionAuditEvent, PositionMarkEvent,
+        AuditEventKind, AuditEventPayload, AuditGateResult, AuditObservedMarket,
+        ExecutionAuditEvent, GateDecisionEvent, MarketMarkEvent, PositionMarkEvent,
+        SignalEmittedEvent,
     };
     use polyalpha_core::{
-        CexBaseQty, Exchange, ExecutionEvent, ExecutionResult, Fill, InstrumentKind,
-        OrderLedgerEntry, OrderSide, PolyShares, PositionView, Price, RecoveryDecisionReason,
-        TokenSide, TradePlan, UsdNotional, VenueQuantity, PLANNING_SCHEMA_VERSION,
+        AsyncClassification, CexBaseQty, EvaluableStatus, Exchange, ExecutionEvent,
+        ExecutionResult, Fill, InstrumentKind, MarketConfig, MarketRule, MarketRuleKind,
+        MarketTier, OrderLedgerEntry, OrderSide, PolyShares, PolymarketIds, PositionView, Price,
+        RecoveryDecisionReason, TokenSide, TradePlan, UsdNotional, VenueQuantity,
+        PLANNING_SCHEMA_VERSION,
     };
     use rust_decimal::Decimal;
 
@@ -1608,6 +2456,67 @@ mod tests {
         assert_eq!(detail.rows[1].edge_usd, "-0.0957528456");
         assert_eq!(detail.rows[1].residual_delta, "0.090730227607943");
         assert_eq!(detail.rows.last().expect("last row").stage, "平仓完成");
+    }
+
+    #[test]
+    fn open_decision_list_collects_open_position_entries() {
+        let events = sample_open_decision_events();
+
+        let entries = collect_open_decision_items(&events, None);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].symbol,
+            "will-ethereum-dip-to-1500-by-december-31-2026"
+        );
+        assert_eq!(entries[0].token_side, "NO");
+        assert_eq!(entries[0].planned_edge_usd, "96.44812734271181406215571349");
+        assert_eq!(entries[0].correlation_id, "corr-open-1");
+    }
+
+    #[test]
+    fn open_decision_detail_reports_rule_pricing_and_sigma_context() {
+        let events = sample_open_decision_events();
+        let entries = collect_open_decision_items(&events, None);
+
+        let detail = build_open_decision_detail(
+            &events,
+            &sample_open_decision_markets(),
+            entries.first().expect("open decision entry"),
+        )
+        .expect("open decision detail");
+
+        assert_eq!(detail.market.rule_kind, "below");
+        assert_eq!(detail.market.lower_strike.as_deref(), None);
+        assert_eq!(detail.market.upper_strike.as_deref(), Some("1500"));
+        assert_eq!(
+            detail.signal.as_ref().expect("signal").token_side,
+            "NO"
+        );
+        assert_eq!(
+            detail.signal.as_ref().expect("signal").candidate_price,
+            Some(0.335)
+        );
+        assert_eq!(
+            detail.plans.first().expect("open plan").instant_open_loss_usd,
+            format_decimal(dec("7.9939577799514333655105618889"))
+        );
+        assert!(
+            detail
+                .signal
+                .as_ref()
+                .expect("signal")
+                .implied_sigma_annualized
+                .is_some()
+        );
+        assert!(
+            detail
+                .latest_market_snapshot
+                .as_ref()
+                .expect("latest mark")
+                .implied_sigma_annualized
+                .is_some()
+        );
     }
 
     fn sample_trade_timeline_events() -> Vec<AuditEvent> {
@@ -1771,6 +2680,162 @@ mod tests {
         ]
     }
 
+    fn sample_open_decision_events() -> Vec<AuditEvent> {
+        let symbol = "will-ethereum-dip-to-1500-by-december-31-2026";
+        let corr = "corr-open-1";
+        let signal_id = "cand-will-ethereum-dip-to-1500-by-december-31-2026-No-22";
+
+        vec![
+            signal_event(
+                10,
+                1_000,
+                symbol,
+                signal_id,
+                corr,
+                sample_open_candidate(symbol, signal_id, corr),
+                observed_market(symbol, 0.665, 0.335, 2045.995, EvaluableStatus::Evaluable),
+            ),
+            gate_event(
+                11,
+                1_001,
+                symbol,
+                signal_id,
+                corr,
+                "ws_freshness",
+                AuditGateResult::Passed,
+                "ok",
+            ),
+            gate_event(
+                12,
+                1_002,
+                symbol,
+                signal_id,
+                corr,
+                "price_filter",
+                AuditGateResult::Passed,
+                "ok",
+            ),
+            gate_event(
+                13,
+                1_003,
+                symbol,
+                signal_id,
+                corr,
+                "risk_guard",
+                AuditGateResult::Passed,
+                "ok",
+            ),
+            market_mark_event(
+                14,
+                1_004,
+                symbol,
+                45,
+                0.335,
+                2045.995,
+                0.6313247925172116,
+            ),
+            execution_event(
+                15,
+                1_005,
+                symbol,
+                corr,
+                ExecutionEvent::TradePlanCreated {
+                    plan: sample_open_trade_plan(symbol, corr),
+                },
+            ),
+            execution_event(
+                16,
+                1_006,
+                symbol,
+                corr,
+                ExecutionEvent::OrderFilled(sample_fill(
+                    corr,
+                    symbol,
+                    Exchange::Polymarket,
+                    InstrumentKind::PolyNo,
+                    OrderSide::Buy,
+                    "469.13423075173636433572673052",
+                    "0.3510629823430630054020721700",
+                    "164.69566216692326888021857945",
+                    "0.3293913243338465377604371589",
+                    1_006,
+                )),
+            ),
+            execution_event(
+                17,
+                1_007,
+                symbol,
+                corr,
+                ExecutionEvent::TradePlanCreated {
+                    plan: sample_open_child_rebalance_plan(symbol, corr),
+                },
+            ),
+            execution_event(
+                18,
+                1_008,
+                symbol,
+                corr,
+                ExecutionEvent::OrderFilled(sample_fill(
+                    corr,
+                    symbol,
+                    Exchange::Binance,
+                    InstrumentKind::CexPerp,
+                    OrderSide::Sell,
+                    "0.09",
+                    "2045.580802",
+                    "184.10227218",
+                    "0.09205113609",
+                    1_008,
+                )),
+            ),
+            execution_event(
+                19,
+                1_009,
+                symbol,
+                corr,
+                ExecutionEvent::ExecutionResultRecorded {
+                    result: sample_execution_result(
+                        "plan-open-rebalance",
+                        corr,
+                        symbol,
+                        vec![sample_order_ledger_entry("0.09", "2045.580802", 1_008)],
+                        vec![],
+                        "96.44812734271181406215571349",
+                        0.009999999984869123,
+                        false,
+                        1_009,
+                    ),
+                },
+            ),
+        ]
+    }
+
+    fn sample_open_decision_markets() -> Vec<MarketConfig> {
+        vec![MarketConfig {
+            symbol: polyalpha_core::Symbol::new("will-ethereum-dip-to-1500-by-december-31-2026"),
+            poly_ids: PolymarketIds {
+                condition_id: "condition-1".to_owned(),
+                yes_token_id: "yes-1".to_owned(),
+                no_token_id: "no-1".to_owned(),
+            },
+            market_question: Some("Will Ethereum dip to $1,500 by December 31, 2026?".to_owned()),
+            market_rule: Some(MarketRule {
+                kind: MarketRuleKind::Below,
+                lower_strike: None,
+                upper_strike: Some(price("1500")),
+            }),
+            cex_symbol: "ETHUSDT".to_owned(),
+            hedge_exchange: Exchange::Binance,
+            strike_price: None,
+            settlement_timestamp: 23_537_320,
+            min_tick_size: price("0.001"),
+            neg_risk: false,
+            cex_price_tick: dec("0.01"),
+            cex_qty_step: dec("0.01"),
+            cex_contract_multiplier: dec("1"),
+        }]
+    }
+
     fn position_mark_event(seq: u64, timestamp_ms: u64, symbol: &str) -> AuditEvent {
         AuditEvent {
             session_id: "session-1".to_owned(),
@@ -1837,6 +2902,246 @@ mod tests {
             summary: "执行事件".to_owned(),
             payload: AuditEventPayload::Execution(ExecutionAuditEvent { event }),
         }
+    }
+
+    fn signal_event(
+        seq: u64,
+        timestamp_ms: u64,
+        symbol: &str,
+        signal_id: &str,
+        correlation_id: &str,
+        candidate: polyalpha_core::OpenCandidate,
+        observed: AuditObservedMarket,
+    ) -> AuditEvent {
+        AuditEvent {
+            session_id: "session-1".to_owned(),
+            env: "test".to_owned(),
+            seq,
+            timestamp_ms,
+            kind: AuditEventKind::SignalEmitted,
+            symbol: Some(symbol.to_owned()),
+            signal_id: Some(signal_id.to_owned()),
+            correlation_id: Some(correlation_id.to_owned()),
+            gate: None,
+            result: None,
+            reason: None,
+            summary: "开仓候选".to_owned(),
+            payload: AuditEventPayload::SignalEmitted(SignalEmittedEvent {
+                candidate,
+                observed: Some(observed),
+            }),
+        }
+    }
+
+    fn gate_event(
+        seq: u64,
+        timestamp_ms: u64,
+        symbol: &str,
+        signal_id: &str,
+        correlation_id: &str,
+        gate: &str,
+        result: AuditGateResult,
+        reason: &str,
+    ) -> AuditEvent {
+        let candidate = sample_open_candidate(symbol, signal_id, correlation_id);
+        AuditEvent {
+            session_id: "session-1".to_owned(),
+            env: "test".to_owned(),
+            seq,
+            timestamp_ms,
+            kind: AuditEventKind::GateDecision,
+            symbol: Some(symbol.to_owned()),
+            signal_id: Some(signal_id.to_owned()),
+            correlation_id: Some(correlation_id.to_owned()),
+            gate: Some(gate.to_owned()),
+            result: Some(result.as_str().to_owned()),
+            reason: Some(reason.to_owned()),
+            summary: format!("{gate} {reason}"),
+            payload: AuditEventPayload::GateDecision(GateDecisionEvent {
+                gate: gate.to_owned(),
+                result,
+                reason: reason.to_owned(),
+                candidate,
+                observed: Some(observed_market(
+                    symbol,
+                    0.665,
+                    0.335,
+                    2045.995,
+                    EvaluableStatus::Evaluable,
+                )),
+            }),
+        }
+    }
+
+    fn market_mark_event(
+        seq: u64,
+        timestamp_ms: u64,
+        symbol: &str,
+        tick_index: u64,
+        poly_price: f64,
+        cex_price: f64,
+        fair_value: f64,
+    ) -> AuditEvent {
+        AuditEvent {
+            session_id: "session-1".to_owned(),
+            env: "test".to_owned(),
+            seq,
+            timestamp_ms,
+            kind: AuditEventKind::MarketMark,
+            symbol: Some(symbol.to_owned()),
+            signal_id: None,
+            correlation_id: None,
+            gate: None,
+            result: None,
+            reason: None,
+            summary: "市场快照".to_owned(),
+            payload: AuditEventPayload::MarketMark(MarketMarkEvent {
+                tick_index,
+                market: polyalpha_core::MarketView {
+                    symbol: symbol.to_owned(),
+                    z_score: Some(-12.0),
+                    basis_pct: Some(-29.63247925172116),
+                    poly_price: Some(poly_price),
+                    poly_yes_price: Some(1.0 - poly_price),
+                    poly_no_price: Some(poly_price),
+                    cex_price: Some(cex_price),
+                    fair_value: Some(fair_value),
+                    has_position: true,
+                    minutes_to_expiry: Some(392_622.2166666667),
+                    active_token_side: Some("NO".to_owned()),
+                    poly_updated_at_ms: Some(995),
+                    cex_updated_at_ms: Some(999),
+                    poly_quote_age_ms: Some(20),
+                    cex_quote_age_ms: Some(5),
+                    cross_leg_skew_ms: Some(15),
+                    evaluable_status: EvaluableStatus::Evaluable,
+                    async_classification: AsyncClassification::PolyLagAcceptable,
+                    market_tier: MarketTier::Tradeable,
+                    retention_reason: Default::default(),
+                    last_focus_at_ms: None,
+                    last_tradeable_at_ms: None,
+                },
+            }),
+        }
+    }
+
+    fn sample_open_candidate(
+        symbol: &str,
+        signal_id: &str,
+        correlation_id: &str,
+    ) -> polyalpha_core::OpenCandidate {
+        polyalpha_core::OpenCandidate {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            candidate_id: signal_id.to_owned(),
+            correlation_id: correlation_id.to_owned(),
+            symbol: polyalpha_core::Symbol::new(symbol),
+            token_side: TokenSide::No,
+            direction: "long".to_owned(),
+            fair_value: 0.9692637928375303,
+            raw_mispricing: -0.6342637928375303,
+            delta_estimate: 0.00021315860883702742,
+            risk_budget_usd: 200.0,
+            strength: polyalpha_core::SignalStrength::Strong,
+            z_score: Some(-78.25764036163268),
+            timestamp_ms: 1_000,
+        }
+    }
+
+    fn observed_market(
+        symbol: &str,
+        poly_yes_mid: f64,
+        poly_no_mid: f64,
+        cex_mid: f64,
+        evaluable_status: EvaluableStatus,
+    ) -> AuditObservedMarket {
+        AuditObservedMarket {
+            symbol: symbol.to_owned(),
+            poly_yes_mid: Some(poly_yes_mid),
+            poly_no_mid: Some(poly_no_mid),
+            cex_mid: Some(cex_mid),
+            poly_updated_at_ms: Some(900),
+            cex_updated_at_ms: Some(950),
+            poly_quote_age_ms: Some(91),
+            cex_quote_age_ms: Some(8),
+            cross_leg_skew_ms: Some(83),
+            market_phase: Some("Trading".to_owned()),
+            connections: HashMap::new(),
+            transport_idle_ms_by_connection: HashMap::new(),
+            evaluable_status,
+            async_classification: AsyncClassification::PolyLagAcceptable,
+        }
+    }
+
+    fn sample_open_trade_plan(symbol: &str, correlation_id: &str) -> TradePlan {
+        TradePlan {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            plan_id: "plan-open-root".to_owned(),
+            parent_plan_id: None,
+            supersedes_plan_id: None,
+            idempotency_key: "idem-open-root".to_owned(),
+            correlation_id: correlation_id.to_owned(),
+            symbol: polyalpha_core::Symbol::new(symbol),
+            intent_type: "open_position".to_owned(),
+            priority: "open_position".to_owned(),
+            recovery_decision_reason: None,
+            created_at_ms: 1_005,
+            poly_exchange_timestamp_ms: 990,
+            poly_received_at_ms: 995,
+            poly_sequence: 4,
+            cex_exchange_timestamp_ms: 998,
+            cex_received_at_ms: 999,
+            cex_sequence: 42,
+            plan_hash: "hash-open-root".to_owned(),
+            poly_side: OrderSide::Buy,
+            poly_token_side: TokenSide::No,
+            poly_sizing_mode: "buy_budget_cap".to_owned(),
+            poly_requested_shares: shares("484.39900637330377803129308365"),
+            poly_planned_shares: shares("469.13423075173636433572673052"),
+            poly_max_cost_usd: usd("164.69566216692328453063964844"),
+            poly_max_avg_price: price("0.3510629823430630054020721700"),
+            poly_max_shares: shares("484.39900637330377803129308365"),
+            poly_min_avg_price: price("0"),
+            poly_min_proceeds_usd: usd("0"),
+            poly_book_avg_price: price("0.3493164003413562242806688259"),
+            poly_executable_price: price("0.3510629823430630054020721700"),
+            poly_friction_cost_usd: usd("7.53569486509158682775012473"),
+            poly_fee_usd: usd("0.3293913243338465377604371589"),
+            cex_side: OrderSide::Sell,
+            cex_planned_qty: cex_qty("0.09"),
+            cex_book_avg_price: price("2045.99"),
+            cex_executable_price: price("2045.580802"),
+            cex_friction_cost_usd: usd("0.036820454436"),
+            cex_fee_usd: usd("0.09205113609"),
+            raw_edge_usd: usd("104.46049534988124742766627538"),
+            planned_edge_usd: usd("96.44812734271181406215571349"),
+            expected_funding_cost_usd: usd("0.018410227218"),
+            residual_risk_penalty_usd: usd("0"),
+            post_rounding_residual_delta: 0.009999999984869123,
+            shock_loss_up_1pct: usd("0.2045580798904856730884743155"),
+            shock_loss_down_1pct: usd("0.2045580798904856730884743155"),
+            shock_loss_up_2pct: usd("0.409116159780971346176948631"),
+            shock_loss_down_2pct: usd("0.409116159780971346176948631"),
+            plan_ttl_ms: 1_000,
+            max_poly_sequence_drift: 2,
+            max_cex_sequence_drift: 2,
+            max_poly_price_move: price("0.02"),
+            max_cex_price_move: price("50"),
+            min_planned_edge_usd: usd("0.01"),
+            max_residual_delta: 0.05,
+            max_shock_loss_usd: usd("200"),
+            max_plan_vs_fill_deviation_usd: usd("5"),
+        }
+    }
+
+    fn sample_open_child_rebalance_plan(symbol: &str, correlation_id: &str) -> TradePlan {
+        let mut plan = sample_open_trade_plan(symbol, correlation_id);
+        plan.plan_id = "plan-open-rebalance".to_owned();
+        plan.parent_plan_id = Some("plan-open-root".to_owned());
+        plan.intent_type = "delta_rebalance".to_owned();
+        plan.priority = "delta_rebalance".to_owned();
+        plan.idempotency_key = "idem-open-rebalance".to_owned();
+        plan.plan_hash = "hash-open-rebalance".to_owned();
+        plan
     }
 
     fn sample_trade_plan(
