@@ -135,6 +135,10 @@ fn default_execution_cost_fallback_funding_bps_per_day() -> u32 {
     1
 }
 
+fn default_max_open_instant_loss_pct_of_budget() -> Decimal {
+    Decimal::new(4, 2)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GeneralConfig {
     pub log_level: String,
@@ -322,6 +326,8 @@ pub struct BasisStrategyConfig {
     pub min_warmup_samples: usize,
     pub min_basis_bps: Decimal,
     pub max_position_usd: UsdNotional,
+    #[serde(default = "default_max_open_instant_loss_pct_of_budget")]
+    pub max_open_instant_loss_pct_of_budget: Decimal,
     pub delta_rebalance_threshold: Decimal,
     pub delta_rebalance_interval_secs: u64,
     #[serde(default)]
@@ -507,6 +513,26 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn basis_strategy_config_defaults_open_instant_loss_pct() {
+        let config: BasisStrategyConfig = serde_json::from_value(serde_json::json!({
+            "entry_z_score_threshold": "4.0",
+            "exit_z_score_threshold": "0.5",
+            "rolling_window_secs": 36000,
+            "min_warmup_samples": 600,
+            "min_basis_bps": "50.0",
+            "max_position_usd": "200",
+            "delta_rebalance_threshold": "0.05",
+            "delta_rebalance_interval_secs": 60
+        }))
+        .expect("config should deserialize");
+
+        assert_eq!(
+            config.max_open_instant_loss_pct_of_budget,
+            Decimal::new(4, 2)
+        );
+    }
 
     #[test]
     fn polymarket_config_deserializes_optional_live_auth_fields() {

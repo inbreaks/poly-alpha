@@ -109,6 +109,8 @@ fn build_runtime_execution_planner(settings: &Settings) -> ExecutionPlanner {
     let mut planner = ExecutionPlanner::from_execution_costs(&settings.execution_costs);
     planner.poly_slippage_bps = settings.paper_slippage.poly_slippage_bps as u32;
     planner.cex_slippage_bps = settings.paper_slippage.cex_slippage_bps as u32;
+    planner.max_open_instant_loss_pct_of_budget =
+        settings.strategy.basis.max_open_instant_loss_pct_of_budget;
     planner
 }
 
@@ -626,6 +628,7 @@ mod tests {
                     min_warmup_samples: 10,
                     min_basis_bps: Decimal::new(10, 0),
                     max_position_usd: UsdNotional(Decimal::new(200, 0)),
+                    max_open_instant_loss_pct_of_budget: Decimal::new(4, 2),
                     delta_rebalance_threshold: Decimal::new(5, 2),
                     delta_rebalance_interval_secs: 30,
                     band_policy: BandPolicyMode::ConfiguredBand,

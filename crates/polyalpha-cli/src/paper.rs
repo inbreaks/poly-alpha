@@ -13686,6 +13686,7 @@ mod tests {
                     min_warmup_samples: 100,
                     min_basis_bps: Decimal::new(50, 0),
                     max_position_usd: UsdNotional(Decimal::new(100, 0)),
+                    max_open_instant_loss_pct_of_budget: Decimal::new(4, 2),
                     delta_rebalance_threshold: Decimal::new(5, 2),
                     delta_rebalance_interval_secs: 60,
                     band_policy: polyalpha_core::BandPolicyMode::ConfiguredBand,

@@ -51,6 +51,7 @@ pub enum PlanRejectionReason {
     NonPositivePlannedEdge,
     InsufficientPolyDepth,
     InsufficientCexDepth,
+    OpenInstantLossTooLarge,
     PolyMaxPriceExceeded,
     PolyMinProceedsNotMet,
     ZeroCexHedgeQty,
@@ -73,6 +74,7 @@ impl PlanRejectionReason {
             Self::NonPositivePlannedEdge => "non_positive_planned_edge",
             Self::InsufficientPolyDepth => "insufficient_poly_depth",
             Self::InsufficientCexDepth => "insufficient_cex_depth",
+            Self::OpenInstantLossTooLarge => "open_instant_loss_too_large",
             Self::PolyMaxPriceExceeded => "poly_max_price_exceeded",
             Self::PolyMinProceedsNotMet => "poly_min_proceeds_not_met",
             Self::ZeroCexHedgeQty => "zero_cex_hedge_qty",
@@ -442,6 +444,14 @@ mod tests {
         assert_eq!(
             PlanRejectionReason::ZeroCexHedgeQty.code(),
             "zero_cex_hedge_qty"
+        );
+    }
+
+    #[test]
+    fn plan_rejection_reason_exposes_open_instant_loss_too_large_code() {
+        assert_eq!(
+            PlanRejectionReason::OpenInstantLossTooLarge.code(),
+            "open_instant_loss_too_large"
         );
     }
 
