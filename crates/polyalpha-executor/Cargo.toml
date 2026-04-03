@@ -17,6 +17,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 chrono = { version = "0.4", default-features = true, features = ["clock"] }
 hex = "0.4"

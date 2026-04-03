@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use tracing::info;
 use uuid::Uuid;
 
 use polyalpha_core::{
@@ -108,6 +109,34 @@ fn recovery_reason_from_intent(intent: &PlanningIntent) -> Option<RecoveryDecisi
             recovery_reason, ..
         } => Some(recovery_reason.clone()),
         _ => None,
+    }
+}
+
+fn max_usd(left: UsdNotional, right: UsdNotional) -> UsdNotional {
+    UsdNotional(left.0.max(right.0))
+}
+
+fn cex_top_up_limits(
+    intent: &PlanningIntent,
+    post_rounding_residual_delta: f64,
+    shock_loss_up_2pct: UsdNotional,
+    shock_loss_down_2pct: UsdNotional,
+) -> (f64, UsdNotional) {
+    match intent {
+        PlanningIntent::DeltaRebalance {
+            target_residual_delta_max,
+            target_shock_loss_max,
+            ..
+        } => (
+            (*target_residual_delta_max).max(0.0),
+            UsdNotional(
+                Decimal::from_f64(*target_shock_loss_max).unwrap_or(Decimal::ZERO),
+            ),
+        ),
+        _ => (
+            post_rounding_residual_delta.max(0.0),
+            max_usd(shock_loss_up_2pct, shock_loss_down_2pct),
+        ),
     }
 }
 
@@ -236,6 +265,30 @@ impl ExecutionPlanner {
         let context = context.clone().canonicalize();
         if result.actual_residual_delta <= plan.max_residual_delta {
             return None;
+        }
+
+        if context.cex_qty_step > Decimal::ZERO {
+            let residual_qty = Decimal::from_f64(result.actual_residual_delta)
+                .unwrap_or(Decimal::ZERO)
+                .max(Decimal::ZERO);
+            let max_actual_shock_loss = result
+                .actual_shock_loss_up_2pct
+                .0
+                .max(result.actual_shock_loss_down_2pct.0);
+            if residual_qty < context.cex_qty_step
+                && max_actual_shock_loss <= plan.max_shock_loss_usd.0
+            {
+                info!(
+                    symbol = %result.symbol.0,
+                    intent_type = %plan.intent_type,
+                    residual_delta = result.actual_residual_delta,
+                    cex_qty_step = %context.cex_qty_step,
+                    shock_loss_2pct_usd = %max_actual_shock_loss,
+                    max_shock_loss_usd = %plan.max_shock_loss_usd.0,
+                    "accepting sub-step cex residual and skipping recovery"
+                );
+                return None;
+            }
         }
 
         let residual_qty = CexBaseQty(
@@ -1002,6 +1055,30 @@ impl ExecutionPlanner {
                 - cex_fee_usd.0
                 - funding_cost.0,
         );
+        let shock_reference_price =
+            best_level_price(&context.cex_book, snapshot.preferred_cex_side);
+        let [shock_loss_up_1pct, shock_loss_down_1pct, shock_loss_up_2pct, shock_loss_down_2pct] =
+            shock_losses_for_residual_delta(residual_after_rounding, shock_reference_price);
+        let (max_residual_delta, max_shock_loss_usd) = cex_top_up_limits(
+            intent,
+            residual_after_rounding,
+            shock_loss_up_2pct,
+            shock_loss_down_2pct,
+        );
+        if residual_after_rounding > max_residual_delta {
+            return Err(PlanRejection {
+                reason: PlanRejectionReason::ResidualDeltaTooLarge,
+                detail: "post-rounding residual delta exceeds intent threshold".to_owned(),
+            });
+        }
+        if shock_loss_up_2pct.0 > max_shock_loss_usd.0
+            || shock_loss_down_2pct.0 > max_shock_loss_usd.0
+        {
+            return Err(PlanRejection {
+                reason: PlanRejectionReason::ShockLossTooLarge,
+                detail: "shock loss exceeds intent threshold".to_owned(),
+            });
+        }
         let poly_token_side = if snapshot.current_poly_yes_shares.0 > Decimal::ZERO {
             TokenSide::Yes
         } else {
@@ -1057,42 +1134,18 @@ impl ExecutionPlanner {
             expected_funding_cost_usd: funding_cost,
             residual_risk_penalty_usd: UsdNotional::ZERO,
             post_rounding_residual_delta: residual_after_rounding,
-            shock_loss_up_1pct: bps_fee(
-                UsdNotional(
-                    cex_planned_qty.0
-                        * best_level_price(&context.cex_book, snapshot.preferred_cex_side).0,
-                ),
-                100,
-            ),
-            shock_loss_down_1pct: bps_fee(
-                UsdNotional(
-                    cex_planned_qty.0
-                        * best_level_price(&context.cex_book, snapshot.preferred_cex_side).0,
-                ),
-                100,
-            ),
-            shock_loss_up_2pct: bps_fee(
-                UsdNotional(
-                    cex_planned_qty.0
-                        * best_level_price(&context.cex_book, snapshot.preferred_cex_side).0,
-                ),
-                200,
-            ),
-            shock_loss_down_2pct: bps_fee(
-                UsdNotional(
-                    cex_planned_qty.0
-                        * best_level_price(&context.cex_book, snapshot.preferred_cex_side).0,
-                ),
-                200,
-            ),
+            shock_loss_up_1pct,
+            shock_loss_down_1pct,
+            shock_loss_up_2pct,
+            shock_loss_down_2pct,
             plan_ttl_ms: DEFAULT_PLAN_TTL_MS,
             max_poly_sequence_drift: DEFAULT_MAX_SEQUENCE_DRIFT,
             max_cex_sequence_drift: DEFAULT_MAX_SEQUENCE_DRIFT,
             max_poly_price_move: default_max_poly_price_move(),
             max_cex_price_move: default_max_cex_price_move(),
             min_planned_edge_usd: UsdNotional::ZERO,
-            max_residual_delta: 0.0,
-            max_shock_loss_usd: UsdNotional::ZERO,
+            max_residual_delta,
+            max_shock_loss_usd,
             max_plan_vs_fill_deviation_usd: UsdNotional::ZERO,
         })
     }
@@ -1827,10 +1880,11 @@ mod tests {
     use rust_decimal::Decimal;
 
     use polyalpha_core::{
-        CexBaseQty, Exchange, Fill, InstrumentKind, OpenCandidate, OrderBookSnapshot, OrderId,
-        OrderSide, PlanRejectionReason, PlanningIntent, PolyShares, Price, PriceLevel,
-        ResidualSnapshot, RevalidationFailureReason, SignalStrength, Symbol, TokenSide,
-        UsdNotional, VenueQuantity,
+        CexBaseQty, Exchange, ExecutionResult, Fill, InstrumentKind, OpenCandidate,
+        OrderBookSnapshot, OrderId, OrderSide, PlanRejectionReason, PlanningIntent, PolyShares,
+        Price, PriceLevel, RecoveryDecisionReason, ResidualSnapshot,
+        RevalidationFailureReason, SignalStrength, Symbol, TokenSide, UsdNotional, VenueQuantity,
+        PLANNING_SCHEMA_VERSION,
     };
 
     use super::{CanonicalPlanningContext, ExecutionPlanner};
@@ -1923,6 +1977,60 @@ mod tests {
             current_poly_no_shares: Decimal::ZERO,
             current_cex_net_qty: Decimal::ZERO,
             now_ms: 1_716_000_000_100,
+        }
+    }
+
+    fn sample_delta_rebalance_intent(
+        residual_delta: f64,
+        target_residual_delta_max: f64,
+        target_shock_loss_max: f64,
+        preferred_cex_side: OrderSide,
+    ) -> PlanningIntent {
+        PlanningIntent::DeltaRebalance {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            intent_id: "intent-delta-sample".to_owned(),
+            correlation_id: "corr-delta-sample".to_owned(),
+            symbol: Symbol::new("btc-price-only"),
+            residual_snapshot: ResidualSnapshot {
+                schema_version: PLANNING_SCHEMA_VERSION,
+                residual_delta,
+                planned_cex_qty: CexBaseQty(Decimal::new(998, 2)),
+                current_poly_yes_shares: PolyShares(Decimal::new(800, 0)),
+                current_poly_no_shares: PolyShares::ZERO,
+                preferred_cex_side,
+            },
+            target_residual_delta_max,
+            target_shock_loss_max,
+        }
+    }
+
+    fn sample_execution_result(
+        plan: &polyalpha_core::TradePlan,
+        actual_residual_delta: f64,
+        actual_shock_loss_2pct: UsdNotional,
+    ) -> ExecutionResult {
+        ExecutionResult {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            plan_id: plan.plan_id.clone(),
+            correlation_id: plan.correlation_id.clone(),
+            symbol: plan.symbol.clone(),
+            status: "completed".to_owned(),
+            poly_order_ledger: Vec::new(),
+            cex_order_ledger: Vec::new(),
+            actual_poly_cost_usd: UsdNotional::ZERO,
+            actual_cex_cost_usd: UsdNotional::ZERO,
+            actual_poly_fee_usd: UsdNotional::ZERO,
+            actual_cex_fee_usd: UsdNotional::ZERO,
+            actual_funding_cost_usd: UsdNotional::ZERO,
+            realized_edge_usd: UsdNotional::ZERO,
+            plan_vs_fill_deviation_usd: UsdNotional::ZERO,
+            actual_residual_delta,
+            actual_shock_loss_up_1pct: UsdNotional(actual_shock_loss_2pct.0 / Decimal::from(2)),
+            actual_shock_loss_down_1pct: UsdNotional(actual_shock_loss_2pct.0 / Decimal::from(2)),
+            actual_shock_loss_up_2pct: actual_shock_loss_2pct,
+            actual_shock_loss_down_2pct: actual_shock_loss_2pct,
+            recovery_required: actual_residual_delta > plan.max_residual_delta,
+            timestamp_ms: plan.created_at_ms,
         }
     }
 
@@ -2164,6 +2272,99 @@ mod tests {
         assert_eq!(plan.poly_planned_shares, PolyShares::ZERO);
         assert_eq!(plan.cex_side, OrderSide::Sell);
         assert!(plan.cex_planned_qty.0 > Decimal::ZERO);
+    }
+
+    #[test]
+    fn delta_rebalance_top_up_plan_consumes_target_risk_limits() {
+        let planner = ExecutionPlanner::default();
+        let mut context = sample_context();
+        context.cex_qty_step = Decimal::new(1, 1);
+        context.current_poly_yes_shares = Decimal::new(800, 0);
+        context.current_cex_net_qty = Decimal::new(-990, 2);
+        context.cex_book.bids[0].price = Price(Decimal::new(100, 0));
+        context.cex_book.asks[0].price = Price(Decimal::new(101, 0));
+
+        let intent = sample_delta_rebalance_intent(0.14, 0.05, 1.0, OrderSide::Sell);
+
+        let plan = planner.plan(&intent, &context).unwrap();
+
+        assert_eq!(plan.max_residual_delta, 0.05);
+        assert_eq!(plan.max_shock_loss_usd, UsdNotional(Decimal::ONE));
+        assert!((plan.post_rounding_residual_delta - 0.04).abs() < 1e-12);
+        assert!(
+            (plan.shock_loss_up_2pct.0 - Decimal::new(8, 2)).abs() < Decimal::new(1, 12)
+        );
+        assert!(
+            (plan.shock_loss_down_2pct.0 - Decimal::new(8, 2)).abs() < Decimal::new(1, 12)
+        );
+    }
+
+    #[test]
+    fn recovery_intent_skips_sub_step_residual_when_shock_is_within_limit() {
+        let planner = ExecutionPlanner::default();
+        let mut context = sample_context();
+        context.cex_qty_step = Decimal::new(1, 1);
+        context.current_poly_yes_shares = Decimal::new(800, 0);
+        context.current_cex_net_qty = Decimal::new(-990, 2);
+        context.cex_book.bids[0].price = Price(Decimal::new(100, 0));
+        context.cex_book.asks[0].price = Price(Decimal::new(101, 0));
+
+        let intent = sample_delta_rebalance_intent(0.14, 0.05, 1.0, OrderSide::Sell);
+        let plan = planner.plan(&intent, &context).unwrap();
+        let result = sample_execution_result(&plan, 0.09, UsdNotional(Decimal::new(18, 2)));
+
+        assert!(planner
+            .recovery_intent_from_result(&plan, &result, &context)
+            .is_none());
+    }
+
+    #[test]
+    fn recovery_intent_does_not_skip_sub_step_residual_when_shock_exceeds_limit() {
+        let planner = ExecutionPlanner::default();
+        let mut context = sample_context();
+        context.cex_qty_step = Decimal::new(1, 1);
+        context.current_poly_yes_shares = Decimal::new(800, 0);
+        context.current_cex_net_qty = Decimal::new(-990, 2);
+        context.cex_book.bids[0].price = Price(Decimal::new(100, 0));
+        context.cex_book.asks[0].price = Price(Decimal::new(101, 0));
+
+        let intent = sample_delta_rebalance_intent(0.14, 0.05, 1.0, OrderSide::Sell);
+        let mut plan = planner.plan(&intent, &context).unwrap();
+        plan.max_shock_loss_usd = UsdNotional(Decimal::new(5, 2));
+        let result = sample_execution_result(&plan, 0.09, UsdNotional(Decimal::new(18, 2)));
+
+        assert!(planner
+            .recovery_intent_from_result(&plan, &result, &context)
+            .is_some());
+    }
+
+    #[test]
+    fn recovery_intent_still_emits_recovery_for_tradeable_residual() {
+        let planner = ExecutionPlanner::default();
+        let mut context = sample_context();
+        context.cex_qty_step = Decimal::new(1, 1);
+        context.current_poly_yes_shares = Decimal::new(800, 0);
+        context.current_cex_net_qty = Decimal::new(-990, 2);
+        context.cex_book.bids[0].price = Price(Decimal::new(100, 0));
+        context.cex_book.asks[0].price = Price(Decimal::new(101, 0));
+
+        let intent = sample_delta_rebalance_intent(0.14, 0.05, 1.0, OrderSide::Sell);
+        let plan = planner.plan(&intent, &context).unwrap();
+        let result = sample_execution_result(&plan, 0.15, UsdNotional(Decimal::new(3, 1)));
+
+        let recovery = planner
+            .recovery_intent_from_result(&plan, &result, &context)
+            .expect("tradeable residual should still create recovery");
+
+        assert!(matches!(
+            recovery,
+            PlanningIntent::ResidualRecovery {
+                recovery_reason: RecoveryDecisionReason::CexTopUpCheaper
+                    | RecoveryDecisionReason::PolyFlattenCheaper
+                    | RecoveryDecisionReason::PolyFlattenOnlySafeRoute,
+                ..
+            }
+        ));
     }
 
     #[test]
