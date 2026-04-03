@@ -2152,6 +2152,7 @@ struct OpenTradeInfo {
     basis_entry_bps: i32,
     delta: f64,
     hedge_ratio: f64,
+    last_planned_cex_qty: Option<Decimal>,
     correlation_id: String,
     poly_entry_price: Option<f64>,
     poly_exit_price: Option<f64>,
@@ -2169,6 +2170,7 @@ impl Default for OpenTradeInfo {
             basis_entry_bps: 0,
             delta: 0.0,
             hedge_ratio: 1.0,
+            last_planned_cex_qty: None,
             correlation_id: String::new(),
             poly_entry_price: None,
             poly_exit_price: None,
@@ -2230,6 +2232,18 @@ impl TradeBook {
 
     fn discard_open_trade(&mut self, symbol: &Symbol) {
         self.open.remove(symbol);
+    }
+
+    fn record_trade_plan(&mut self, plan: &TradePlan) {
+        if !matches!(
+            plan.intent_type.as_str(),
+            "open_position" | "delta_rebalance" | "residual_recovery"
+        ) {
+            return;
+        }
+        if let Some(open) = self.open.get_mut(&plan.symbol) {
+            open.last_planned_cex_qty = Some(plan.cex_planned_qty.0);
+        }
     }
 
     fn record_fill(&mut self, trigger: Option<&RuntimeTrigger>, fill: &Fill) {
@@ -3214,6 +3228,11 @@ fn current_rebalance_snapshot(
     let delta = rebalance_reference_delta(trade_book, engine, symbol)?;
     let desired_cex_qty = PolyShares(poly_qty).to_cex_base_qty(delta).0
         * Decimal::from_f64(hedge_ratio).unwrap_or(Decimal::ONE);
+    let planned_cex_qty = trade_book
+        .open
+        .get(symbol)
+        .and_then(|open| open.last_planned_cex_qty)
+        .unwrap_or(desired_cex_qty);
     let target_cex_net_qty = if delta >= 0.0 {
         Decimal::ZERO - desired_cex_qty
     } else {
@@ -3232,7 +3251,7 @@ fn current_rebalance_snapshot(
     Some(ResidualSnapshot {
         schema_version: PLANNING_SCHEMA_VERSION,
         residual_delta,
-        planned_cex_qty: polyalpha_core::CexBaseQty(desired_cex_qty),
+        planned_cex_qty: polyalpha_core::CexBaseQty(planned_cex_qty),
         current_poly_yes_shares: PolyShares(poly_yes_qty),
         current_poly_no_shares: PolyShares(poly_no_qty),
         preferred_cex_side,
@@ -9700,6 +9719,7 @@ async fn apply_execution_events(
         }
         match &event {
             ExecutionEvent::TradePlanCreated { plan } => {
+                trade_book.record_trade_plan(plan);
                 push_event_with_context_and_payload(
                     recent_events,
                     "plan",
@@ -9724,6 +9744,7 @@ async fn apply_execution_events(
                 );
             }
             ExecutionEvent::RecoveryPlanCreated { plan } => {
+                trade_book.record_trade_plan(plan);
                 push_event_with_context_and_payload(
                     recent_events,
                     "recovery",
@@ -14802,6 +14823,32 @@ mod tests {
             polyalpha_core::CexBaseQty(Decimal::new(25, 1))
         );
         assert_eq!(snapshot.residual_delta, 0.5);
+    }
+
+    #[tokio::test]
+    async fn current_rebalance_snapshot_uses_last_planned_cex_qty_when_available() {
+        let settings = test_settings_with_price_filter(None, None);
+        let symbol = settings.markets[0].symbol.clone();
+        let engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
+        let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        let mut trade_book = TradeBook::default();
+        let mut plan = sample_trade_plan();
+        plan.cex_planned_qty = polyalpha_core::CexBaseQty(Decimal::new(777, 3));
+
+        trade_book.register_open_signal(&open_candidate(TokenSide::Yes), 0, 1.0, 0.25);
+        trade_book.record_trade_plan(&plan);
+        risk.on_fill(&poly_fill(TokenSide::Yes))
+            .await
+            .expect("seed poly fill");
+
+        let snapshot = current_rebalance_snapshot(&risk, &trade_book, &engine, &symbol)
+            .expect("rebalance snapshot should exist");
+
+        assert_eq!(snapshot.planned_cex_qty, plan.cex_planned_qty);
+        assert_eq!(snapshot.preferred_cex_side, OrderSide::Sell);
     }
 
     #[tokio::test]
