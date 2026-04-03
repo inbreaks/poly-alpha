@@ -1823,6 +1823,7 @@ fn apply_linear_slippage(
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal::prelude::FromPrimitive;
     use rust_decimal::Decimal;
 
     use polyalpha_core::{
@@ -2046,12 +2047,25 @@ mod tests {
             price: Price(Decimal::new(485, 3)),
             quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(5_000, 0))),
         }];
+        let (original_budget_cap_usd, delta_abs) = match &intent {
+            PlanningIntent::OpenPosition {
+                candidate,
+                max_budget_usd,
+                ..
+            } => (
+                Decimal::from_f64(*max_budget_usd).expect("budget cap"),
+                Decimal::from_f64(candidate.delta_estimate.abs()).expect("delta"),
+            ),
+            _ => unreachable!("expected open intent"),
+        };
+        let min_executable_budget =
+            (context.cex_qty_step / delta_abs) * context.poly_yes_book.asks[0].price.0;
 
         let plan = planner.plan(&intent, &context).unwrap();
 
-        assert!(plan.poly_max_cost_usd.0 > Decimal::from(100u32));
-        assert!(plan.poly_max_cost_usd.0 < Decimal::from(200u32));
-        assert_eq!(plan.cex_planned_qty.0, Decimal::new(3, 2));
+        assert!(plan.poly_max_cost_usd.0 >= min_executable_budget);
+        assert!(plan.poly_max_cost_usd.0 < original_budget_cap_usd);
+        assert_eq!(plan.cex_planned_qty.0, context.cex_qty_step);
     }
 
     #[test]
