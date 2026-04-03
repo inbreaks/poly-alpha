@@ -54,6 +54,13 @@ struct OpenSizingSelection {
     cex_estimate: OrderExecutionEstimate,
 }
 
+#[derive(Clone, Debug)]
+enum OpenSizingProbe {
+    Candidate(OpenSizingSelection),
+    BelowExecutableFloor,
+    Rejected,
+}
+
 impl CanonicalPlanningContext {
     pub fn canonical_bytes(&self, intent: &PlanningIntent) -> Vec<u8> {
         let canonical = self.clone().canonicalize();
@@ -619,7 +626,6 @@ impl ExecutionPlanner {
                 ),
             })?
         };
-        let was_loss_bounded = selected_open.budget_cap_usd < budget_cap_usd;
         let OpenSizingSelection {
             budget_cap_usd,
             capped_max_shares,
@@ -659,16 +665,8 @@ impl ExecutionPlanner {
         );
         if planned_edge_usd.0 <= Decimal::ZERO {
             return Err(PlanRejection {
-                reason: if was_loss_bounded {
-                    PlanRejectionReason::OpenInstantLossTooLarge
-                } else {
-                    PlanRejectionReason::NonPositivePlannedEdge
-                },
-                detail: if was_loss_bounded {
-                    "no loss-bounded open size retains positive edge".to_owned()
-                } else {
-                    "planned edge is not positive after fees and friction".to_owned()
-                },
+                reason: PlanRejectionReason::NonPositivePlannedEdge,
+                detail: "planned edge is not positive after fees and friction".to_owned(),
             });
         }
 
@@ -1297,27 +1295,34 @@ impl ExecutionPlanner {
                 break;
             }
 
-            let Some(selection) = self.open_selection_for_budget(
+            match self.open_selection_for_budget(
                 candidate,
                 context,
                 poly_best_ask,
                 max_shares_by_cex,
                 cex_side,
                 candidate_budget,
-            ) else {
-                high = candidate_budget;
-                continue;
-            };
-
-            if self
-                .instant_open_loss_usd(&selection.poly_estimate, &selection.cex_estimate)
-                .0
-                <= allowed_instant_loss_usd
-            {
-                low = candidate_budget;
-                best = Some(selection);
-            } else {
-                high = candidate_budget;
+            ) {
+                OpenSizingProbe::BelowExecutableFloor => {
+                    low = candidate_budget;
+                    continue;
+                }
+                OpenSizingProbe::Rejected => {
+                    high = candidate_budget;
+                    continue;
+                }
+                OpenSizingProbe::Candidate(selection) => {
+                    if self
+                        .instant_open_loss_usd(&selection.poly_estimate, &selection.cex_estimate)
+                        .0
+                        <= allowed_instant_loss_usd
+                    {
+                        low = candidate_budget;
+                        best = Some(selection);
+                    } else {
+                        high = candidate_budget;
+                    }
+                }
             }
         }
 
@@ -1332,7 +1337,7 @@ impl ExecutionPlanner {
         max_shares_by_cex: Decimal,
         cex_side: OrderSide,
         budget_cap_usd: Decimal,
-    ) -> Option<OpenSizingSelection> {
+    ) -> OpenSizingProbe {
         let max_shares_by_budget = if poly_best_ask.0 > Decimal::ZERO {
             budget_cap_usd / poly_best_ask.0
         } else {
@@ -1340,13 +1345,13 @@ impl ExecutionPlanner {
         };
         let capped_max_shares = PolyShares(max_shares_by_budget.min(max_shares_by_cex));
         if capped_max_shares.0 <= Decimal::ZERO {
-            return None;
+            return OpenSizingProbe::BelowExecutableFloor;
         }
 
         let poly_estimate =
             self.estimate_poly_open(candidate, context, budget_cap_usd, capped_max_shares);
         if poly_estimate.status == polyalpha_core::OrderStatus::Rejected {
-            return None;
+            return OpenSizingProbe::Rejected;
         }
 
         let poly_planned_shares = match poly_estimate.filled_quantity {
@@ -1354,25 +1359,25 @@ impl ExecutionPlanner {
             polyalpha_core::VenueQuantity::CexBaseQty(_) => PolyShares::ZERO,
         };
         if poly_planned_shares.0 <= Decimal::ZERO {
-            return None;
+            return OpenSizingProbe::BelowExecutableFloor;
         }
 
         let exact_cex_qty = poly_planned_shares.to_cex_base_qty(candidate.delta_estimate);
         if exact_cex_qty.0 <= Decimal::ZERO {
-            return None;
+            return OpenSizingProbe::BelowExecutableFloor;
         }
 
         let cex_planned_qty = exact_cex_qty.floor_to_step(context.cex_qty_step);
         if cex_planned_qty.0 <= Decimal::ZERO {
-            return None;
+            return OpenSizingProbe::BelowExecutableFloor;
         }
 
         let cex_estimate = self.estimate_cex_order(context, cex_side, cex_planned_qty);
         if cex_estimate.status == polyalpha_core::OrderStatus::Rejected {
-            return None;
+            return OpenSizingProbe::Rejected;
         }
 
-        Some(OpenSizingSelection {
+        OpenSizingProbe::Candidate(OpenSizingSelection {
             budget_cap_usd,
             capped_max_shares,
             poly_estimate,
@@ -2028,10 +2033,30 @@ mod tests {
     }
 
     #[test]
+    fn planner_preserves_non_positive_edge_after_loss_bounded_resize() {
+        let planner = ExecutionPlanner::default();
+        let intent = sample_open_intent();
+        let mut context = sample_context();
+        context.poly_yes_book.bids = vec![PriceLevel {
+            price: Price(Decimal::new(10, 2)),
+            quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(1, 0))),
+        }];
+        context.poly_yes_book.asks = vec![PriceLevel {
+            price: Price(Decimal::new(90, 2)),
+            quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(500, 0))),
+        }];
+
+        let rejection = planner.plan(&intent, &context).unwrap_err();
+
+        assert_eq!(rejection.reason, PlanRejectionReason::NonPositivePlannedEdge);
+    }
+
+    #[test]
     fn planner_rejects_open_when_every_executable_size_breaks_instant_loss_cap() {
         let planner = ExecutionPlanner::default();
         let intent = sample_open_intent();
         let mut context = sample_context();
+        context.cex_qty_step = Decimal::new(1, 2);
         context.poly_yes_book.bids = vec![PriceLevel {
             price: Price(Decimal::new(10, 2)),
             quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(1, 0))),
