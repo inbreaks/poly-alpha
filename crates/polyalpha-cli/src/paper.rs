@@ -1611,6 +1611,57 @@ fn format_market_phase_label(phase: &MarketPhase) -> &'static str {
     }
 }
 
+fn market_phase_bucket_matches(left: &MarketPhase, right: &MarketPhase) -> bool {
+    match (left, right) {
+        (MarketPhase::Trading, MarketPhase::Trading)
+        | (MarketPhase::PreSettlement { .. }, MarketPhase::PreSettlement { .. })
+        | (MarketPhase::CloseOnly { .. }, MarketPhase::CloseOnly { .. })
+        | (MarketPhase::SettlementPending, MarketPhase::SettlementPending)
+        | (MarketPhase::Disputed, MarketPhase::Disputed)
+        | (MarketPhase::Resolved, MarketPhase::Resolved) => true,
+        (
+            MarketPhase::ForceReduce {
+                target_ratio: left_ratio,
+                ..
+            },
+            MarketPhase::ForceReduce {
+                target_ratio: right_ratio,
+                ..
+            },
+        ) => left_ratio == right_ratio,
+        _ => false,
+    }
+}
+
+fn current_market_lifecycle_phase(
+    market: &MarketConfig,
+    now_timestamp_secs: u64,
+    rules: &polyalpha_core::SettlementRules,
+) -> MarketPhase {
+    MarketPhase::from_settlement(market.settlement_timestamp, now_timestamp_secs, rules)
+}
+
+fn should_publish_market_lifecycle_phase(
+    previous_phase: Option<&MarketPhase>,
+    next_phase: &MarketPhase,
+) -> bool {
+    previous_phase.is_none_or(|phase| !market_phase_bucket_matches(phase, next_phase))
+}
+
+fn next_market_lifecycle_phase(
+    observed: Option<&ObservedState>,
+    market: &MarketConfig,
+    now_timestamp_secs: u64,
+    rules: &polyalpha_core::SettlementRules,
+) -> Option<MarketPhase> {
+    let next_phase = current_market_lifecycle_phase(market, now_timestamp_secs, rules);
+    should_publish_market_lifecycle_phase(
+        observed.and_then(|state| state.market_phase.as_ref()),
+        &next_phase,
+    )
+    .then_some(next_phase)
+}
+
 fn format_connection_status_label(status: ConnectionStatus) -> &'static str {
     match status {
         ConnectionStatus::Connecting => "连接中",
@@ -4191,18 +4242,33 @@ async fn run_runtime_single(
             .await?;
             drain_command_events(&command_center, &mut recent_events);
 
-            if let Err(err) = manager.publish_market_lifecycle(
-                &market.symbol,
+            if next_market_lifecycle_phase(
+                Some(&observed),
+                &market,
                 now_secs,
-                now_ms,
                 &settings.strategy.settlement,
-            ) {
-                stats.poll_errors += 1;
-                push_event_simple(
-                    &mut recent_events,
-                    "poll_error",
-                    format!("市场生命周期发布失败：{err}"),
-                );
+            )
+            .is_some()
+            {
+                if let Err(err) = manager.publish_market_lifecycle(
+                    &market.symbol,
+                    now_secs,
+                    now_ms,
+                    &settings.strategy.settlement,
+                ) {
+                    stats.poll_errors += 1;
+                    push_event_simple(
+                        &mut recent_events,
+                        "poll_error",
+                        format!("市场生命周期发布失败：{err}"),
+                    );
+                }
+            } else {
+                observed.market_phase = Some(current_market_lifecycle_phase(
+                    &market,
+                    now_secs,
+                    &settings.strategy.settlement,
+                ));
             }
 
             if looks_like_placeholder_id(&market.poly_ids.yes_token_id)
@@ -4830,12 +4896,27 @@ async fn run_runtime_multi(
 
         // Publish lifecycle for all markets
         for market in &markets {
-            let _ = manager.publish_market_lifecycle(
-                &market.symbol,
+            if next_market_lifecycle_phase(
+                observed.get(&market.symbol),
+                market,
                 now_secs,
-                now_ms,
                 &settings.strategy.settlement,
-            );
+            )
+            .is_some()
+            {
+                let _ = manager.publish_market_lifecycle(
+                    &market.symbol,
+                    now_secs,
+                    now_ms,
+                    &settings.strategy.settlement,
+                );
+            } else if let Some(state) = observed.get_mut(&market.symbol) {
+                state.market_phase = Some(current_market_lifecycle_phase(
+                    market,
+                    now_secs,
+                    &settings.strategy.settlement,
+                ));
+            }
         }
 
         // Poll Polymarket for all subscribed markets
@@ -8379,18 +8460,33 @@ async fn run_paper_ws_mode(
                 ).await?;
                 drain_command_events(&command_center, &mut recent_events);
 
-                if let Err(err) = manager.publish_market_lifecycle(
-                    &market.symbol,
+                if next_market_lifecycle_phase(
+                    Some(&observed),
+                    &market,
                     now_secs,
-                    now_ms,
                     &settings.strategy.settlement,
-                ) {
-                    stats.poll_errors += 1;
-                    push_event_simple(
-                        &mut recent_events,
-                        "poll_error",
-                        format!("市场生命周期发布失败：{err}"),
-                    );
+                )
+                .is_some()
+                {
+                    if let Err(err) = manager.publish_market_lifecycle(
+                        &market.symbol,
+                        now_secs,
+                        now_ms,
+                        &settings.strategy.settlement,
+                    ) {
+                        stats.poll_errors += 1;
+                        push_event_simple(
+                            &mut recent_events,
+                            "poll_error",
+                            format!("市场生命周期发布失败：{err}"),
+                        );
+                    }
+                } else {
+                    observed.market_phase = Some(current_market_lifecycle_phase(
+                        &market,
+                        now_secs,
+                        &settings.strategy.settlement,
+                    ));
                 }
 
                 let snapshot = build_snapshot(
@@ -9009,12 +9105,27 @@ async fn run_paper_multi_ws_mode(
                 drain_command_events(&command_center, &mut recent_events);
 
                 for market in &markets {
-                    let _ = manager.publish_market_lifecycle(
-                        &market.symbol,
+                    if next_market_lifecycle_phase(
+                        observed.get(&market.symbol),
+                        market,
                         now_secs,
-                        now_ms,
                         &settings.strategy.settlement,
-                    );
+                    )
+                    .is_some()
+                    {
+                        let _ = manager.publish_market_lifecycle(
+                            &market.symbol,
+                            now_secs,
+                            now_ms,
+                            &settings.strategy.settlement,
+                        );
+                    } else if let Some(state) = observed.get_mut(&market.symbol) {
+                        state.market_phase = Some(current_market_lifecycle_phase(
+                            market,
+                            now_secs,
+                            &settings.strategy.settlement,
+                        ));
+                    }
                 }
 
                 let snapshot = build_multi_snapshot(
@@ -13915,6 +14026,52 @@ mod tests {
             ),
             polyalpha_core::MarketTier::Focus
         );
+    }
+
+    #[test]
+    fn next_market_lifecycle_phase_skips_republish_within_same_phase_bucket() {
+        let settings = test_settings_with_price_filter(None, None);
+        let mut market = settings.markets[0].clone();
+        market.settlement_timestamp = 24 * 3600;
+        let observed = ObservedState {
+            market_phase: Some(MarketPhase::PreSettlement {
+                hours_remaining: 20.0,
+            }),
+            ..ObservedState::default()
+        };
+
+        assert_eq!(
+            next_market_lifecycle_phase(
+                Some(&observed),
+                &market,
+                market.settlement_timestamp - (19 * 3600),
+                &settings.strategy.settlement,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn next_market_lifecycle_phase_publishes_when_phase_bucket_changes() {
+        let settings = test_settings_with_price_filter(None, None);
+        let mut market = settings.markets[0].clone();
+        market.settlement_timestamp = 24 * 3600;
+        let observed = ObservedState {
+            market_phase: Some(MarketPhase::PreSettlement {
+                hours_remaining: 13.0,
+            }),
+            ..ObservedState::default()
+        };
+
+        assert!(matches!(
+            next_market_lifecycle_phase(
+                Some(&observed),
+                &market,
+                market.settlement_timestamp - (11 * 3600),
+                &settings.strategy.settlement,
+            ),
+            Some(MarketPhase::ForceReduce { .. })
+        ));
     }
 
     #[tokio::test]
