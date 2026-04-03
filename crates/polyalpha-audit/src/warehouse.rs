@@ -27,9 +27,7 @@ impl AuditWarehouse {
         let events = AuditReader::load_events(root, session_id)?;
         let mut conn = self.connect()?;
         self.ensure_schema(&conn)?;
-        let tx = conn
-            .transaction()
-            .context("开启审计仓库同步事务失败")?;
+        let tx = conn.transaction().context("开启审计仓库同步事务失败")?;
 
         let existing_max_seq = tx
             .query_row(
@@ -51,20 +49,20 @@ impl AuditWarehouse {
                 serde_json::to_string(&event.payload).context("序列化审计事件负载失败")?;
             appender
                 .append_row(params![
-                event.session_id,
-                event.env,
-                event.seq as i64,
-                event.timestamp_ms as i64,
-                event.kind.as_str(),
-                event.symbol,
-                event.signal_id,
-                event.correlation_id,
-                event.gate,
-                event.result,
-                event.reason,
-                event.summary,
-                payload_json,
-            ])
+                    event.session_id,
+                    event.env,
+                    event.seq as i64,
+                    event.timestamp_ms as i64,
+                    event.kind.as_str(),
+                    event.symbol,
+                    event.signal_id,
+                    event.correlation_id,
+                    event.gate,
+                    event.result,
+                    event.reason,
+                    event.summary,
+                    payload_json,
+                ])
                 .with_context(|| format!("写入审计事件 seq={} 失败", event.seq))?;
         }
         appender.flush().context("刷新审计事件批量写入器失败")?;

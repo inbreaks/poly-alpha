@@ -87,6 +87,7 @@ const MAX_EQUITY_POINTS: usize = 2_048;
 const REPORT_WIDTH: usize = 78;
 const SKIP_EVENT_DEBOUNCE_MS: u64 = 30_000;
 const MONITOR_PUBLISH_THROTTLE_MS: u64 = 200;
+const AUDIT_SUMMARY_WRITE_THROTTLE_MS: u64 = 1_000;
 const MULTI_MARKET_BOOTSTRAP_MAX_CONCURRENCY: usize = 12;
 const MULTI_MARKET_WARMUP_MAX_CONCURRENCY: usize = 8;
 const MULTI_MARKET_FUNDING_MAX_CONCURRENCY: usize = 8;
@@ -938,6 +939,7 @@ struct PaperAudit {
     warehouse_sync_interval_ms: u64,
     last_snapshot_ms: u64,
     last_checkpoint_ms: u64,
+    last_summary_write_ms: u64,
     last_warehouse_sync_attempt_ms: u64,
     warehouse_sync_degraded: bool,
     last_mark_tick_index: Option<u64>,
@@ -963,7 +965,7 @@ impl PaperAudit {
                 .map(|market| market.symbol.0.clone())
                 .collect(),
         };
-        let writer = AuditWriter::create(
+        let mut writer = AuditWriter::create(
             &settings.general.data_dir,
             manifest.clone(),
             settings.audit.raw_segment_max_bytes,
@@ -981,6 +983,7 @@ impl PaperAudit {
             warehouse_sync_interval_ms: settings.audit.warehouse_sync_interval_secs.max(1) * 1_000,
             last_snapshot_ms: now_ms,
             last_checkpoint_ms: now_ms,
+            last_summary_write_ms: now_ms,
             last_warehouse_sync_attempt_ms: now_ms,
             warehouse_sync_degraded: false,
             last_mark_tick_index: None,
@@ -1173,7 +1176,6 @@ impl PaperAudit {
         now_ms: u64,
     ) -> Result<()> {
         self.refresh_summary(stats, monitor_state, tick_index, now_ms);
-        self.writer.write_summary(&self.summary)?;
 
         if now_ms.saturating_sub(self.last_snapshot_ms) >= self.snapshot_interval_ms {
             self.record_marks(monitor_state, tick_index as u64, now_ms)?;
@@ -1192,6 +1194,12 @@ impl PaperAudit {
             self.writer.write_checkpoint(&checkpoint)?;
             self.writer.write_summary(&self.summary)?;
             self.last_checkpoint_ms = now_ms;
+            self.last_summary_write_ms = now_ms;
+        } else if now_ms.saturating_sub(self.last_summary_write_ms)
+            >= AUDIT_SUMMARY_WRITE_THROTTLE_MS
+        {
+            self.writer.write_summary(&self.summary)?;
+            self.last_summary_write_ms = now_ms;
         }
 
         if now_ms.saturating_sub(self.last_warehouse_sync_attempt_ms)
@@ -1202,6 +1210,12 @@ impl PaperAudit {
         }
 
         Ok(())
+    }
+
+    fn needs_runtime_state(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.last_snapshot_ms) >= self.snapshot_interval_ms
+            || now_ms.saturating_sub(self.last_checkpoint_ms) >= self.checkpoint_interval_ms
+            || now_ms.saturating_sub(self.last_summary_write_ms) >= AUDIT_SUMMARY_WRITE_THROTTLE_MS
     }
 
     fn finalize(
@@ -1226,6 +1240,7 @@ impl PaperAudit {
         );
         self.writer.write_checkpoint(&checkpoint)?;
         self.writer.write_summary(&self.summary)?;
+        self.last_summary_write_ms = now_ms;
         self.sync_warehouse_best_effort(now_ms)
     }
 
@@ -1401,6 +1416,14 @@ fn warehouse_sync_warning_message(err: &anyhow::Error) -> String {
     } else {
         format!("审计仓库同步失败，已保留原始审计文件：{err}")
     }
+}
+
+fn should_build_monitor_state(
+    monitor_client_count: usize,
+    audit: Option<&PaperAudit>,
+    now_ms: u64,
+) -> bool {
+    monitor_client_count > 0 || audit.is_some_and(|audit| audit.needs_runtime_state(now_ms))
 }
 
 fn is_warehouse_lock_conflict(err: &anyhow::Error) -> bool {
@@ -4641,6 +4664,7 @@ async fn run_runtime_multi(
         socket_path.clone(),
         Arc::clone(&current_state),
     );
+    let monitor_client_count = socket_server.client_count_handle();
     let state_broadcaster = socket_server.state_broadcaster();
     let event_broadcaster = socket_server.event_broadcaster();
     let command_center_clone = Arc::clone(&command_center);
@@ -5116,39 +5140,47 @@ async fn run_runtime_multi(
         }
         snapshots.push(snapshot.clone());
 
-        // Build and broadcast monitor state
-        let monitor_events = build_monitor_events(&recent_events);
-
-        let monitor_state = build_multi_monitor_state(
-            &settings,
-            &markets,
-            &engine,
-            &observed,
-            &stats,
-            &risk,
-            &execution,
-            &mut trade_book,
-            &command_center,
-            paused.load(Ordering::SeqCst),
-            emergency.load(Ordering::SeqCst),
-            start_time_ms,
-            now_ms,
-            &monitor_events,
-            trading_mode,
-        );
-
-        if let Ok(mut guard) = current_state.write() {
-            *guard = Some(monitor_state.clone());
-        }
         broadcast_monitor_events_since(
             &recent_events,
             &mut last_event_seq_sent,
             &event_broadcaster,
         );
-        if let Some(audit) = audit.as_mut() {
-            audit.maybe_record_runtime_state(&stats, &monitor_state, tick_index, now_ms)?;
+
+        let monitor_client_count = *monitor_client_count.read().await;
+        let has_monitor_clients = monitor_client_count > 0;
+        if should_build_monitor_state(monitor_client_count, audit.as_ref(), now_ms) {
+            let monitor_events = build_monitor_events(&recent_events);
+            let monitor_state = build_multi_monitor_state(
+                &settings,
+                &markets,
+                &engine,
+                &observed,
+                &stats,
+                &risk,
+                &execution,
+                &mut trade_book,
+                &command_center,
+                paused.load(Ordering::SeqCst),
+                emergency.load(Ordering::SeqCst),
+                start_time_ms,
+                now_ms,
+                &monitor_events,
+                trading_mode,
+            );
+
+            if let Some(audit) = audit.as_mut() {
+                audit.maybe_record_runtime_state(&stats, &monitor_state, tick_index, now_ms)?;
+            }
+
+            if has_monitor_clients {
+                if let Ok(mut guard) = current_state.write() {
+                    *guard = Some(monitor_state.clone());
+                }
+                let _ = state_broadcaster.send(monitor_state);
+            } else if let Ok(mut guard) = current_state.write() {
+                *guard = Some(monitor_state);
+            }
         }
-        let _ = state_broadcaster.send(monitor_state);
 
         if max_ticks > 0 && tick_index >= max_ticks {
             break;
@@ -5181,7 +5213,7 @@ async fn run_runtime_multi(
                 &monitor_events,
                 trading_mode,
             )
-    });
+        });
     if let Ok(mut guard) = current_state.write() {
         *guard = Some(final_monitor_state.clone());
     }
@@ -8582,6 +8614,7 @@ async fn run_paper_multi_ws_mode(
         socket_path.clone(),
         Arc::clone(&current_state),
     );
+    let monitor_client_count = socket_server.client_count_handle();
     let state_broadcaster = socket_server.state_broadcaster();
     let event_broadcaster = socket_server.event_broadcaster();
     let command_center_clone = Arc::clone(&command_center);
@@ -9016,37 +9049,45 @@ async fn run_paper_multi_ws_mode(
             _ = monitor_publish.tick(), if state_dirty => {
                 let now_ms = now_millis();
                 let tick_index = stats.ticks_processed;
-                let monitor_events = build_monitor_events(&recent_events);
-
-                let monitor_state = build_multi_monitor_state(
-                    &settings,
-                    &markets,
-                    &engine,
-                    &observed,
-                    &stats,
-                    &risk,
-                    &execution,
-                    &mut trade_book,
-                    &command_center,
-                    paused.load(Ordering::SeqCst),
-                    emergency.load(Ordering::SeqCst),
-                    start_time_ms,
-                    now_ms,
-                    &monitor_events,
-                    trading_mode,
-                );
-                if let Ok(mut guard) = current_state.write() {
-                    *guard = Some(monitor_state.clone());
-                }
                 broadcast_monitor_events_since(
                     &recent_events,
                     &mut last_event_seq_sent,
                     &event_broadcaster,
                 );
-                if let Some(audit) = audit.as_mut() {
-                    audit.maybe_record_runtime_state(&stats, &monitor_state, tick_index, now_ms)?;
+
+                let monitor_client_count = *monitor_client_count.read().await;
+                let has_monitor_clients = monitor_client_count > 0;
+                if should_build_monitor_state(monitor_client_count, audit.as_ref(), now_ms) {
+                    let monitor_events = build_monitor_events(&recent_events);
+                    let monitor_state = build_multi_monitor_state(
+                        &settings,
+                        &markets,
+                        &engine,
+                        &observed,
+                        &stats,
+                        &risk,
+                        &execution,
+                        &mut trade_book,
+                        &command_center,
+                        paused.load(Ordering::SeqCst),
+                        emergency.load(Ordering::SeqCst),
+                        start_time_ms,
+                        now_ms,
+                        &monitor_events,
+                        trading_mode,
+                    );
+                    if let Some(audit) = audit.as_mut() {
+                        audit.maybe_record_runtime_state(&stats, &monitor_state, tick_index, now_ms)?;
+                    }
+                    if has_monitor_clients {
+                        if let Ok(mut guard) = current_state.write() {
+                            *guard = Some(monitor_state.clone());
+                        }
+                        let _ = state_broadcaster.send(monitor_state);
+                    } else if let Ok(mut guard) = current_state.write() {
+                        *guard = Some(monitor_state);
+                    }
                 }
-                let _ = state_broadcaster.send(monitor_state);
                 state_dirty = false;
             }
             _ = snapshot_refresh.tick() => {
@@ -12693,9 +12734,9 @@ fn record_evaluation_attempt(
             None,
             build_skip_event_details(reason, warning, observed),
         );
-    }
-    if let Some(audit) = audit.as_mut() {
-        audit.record_evaluation_skip(event, warnings, observed.cloned())?;
+        if let Some(audit) = audit.as_mut() {
+            audit.record_evaluation_skip(event, warnings, observed.cloned())?;
+        }
     }
     Ok(())
 }
@@ -14558,9 +14599,13 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok(), "close rejection should not abort runtime: {result:?}");
+        assert!(
+            result.is_ok(),
+            "close rejection should not abort runtime: {result:?}"
+        );
         assert!(recent_events.iter().any(|event| {
-            event.summary.contains("Poly 深度不足") || event.summary.contains("insufficient_poly_depth")
+            event.summary.contains("Poly 深度不足")
+                || event.summary.contains("insufficient_poly_depth")
         }));
     }
 
@@ -15275,6 +15320,79 @@ mod tests {
                     if anomaly.code == "warehouse_sync_degraded"
             )
         }));
+
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn paper_audit_runtime_summary_writes_are_throttled() {
+        let data_dir = unique_test_data_dir("paper-audit-summary-throttle");
+        let settings = test_settings_with_audit_data_dir(data_dir.clone());
+        let start_ms = 1_000;
+        let mut audit = PaperAudit::start(
+            &settings,
+            "test-env",
+            &settings.markets,
+            start_ms,
+            polyalpha_core::TradingMode::Paper,
+        )
+        .expect("start paper audit");
+        let session_id = audit.session_id().to_owned();
+
+        audit
+            .maybe_record_runtime_state(
+                &PaperStats::default(),
+                &MonitorState::default(),
+                1,
+                start_ms + 200,
+            )
+            .expect("first runtime state should update in-memory summary");
+
+        let summary = polyalpha_audit::AuditReader::load_summary(&data_dir, &session_id)
+            .expect("load throttled summary");
+        assert_eq!(summary.latest_tick_index, 0);
+
+        audit
+            .maybe_record_runtime_state(
+                &PaperStats::default(),
+                &MonitorState::default(),
+                2,
+                start_ms + 1_200,
+            )
+            .expect("summary write should happen after throttle window");
+
+        let summary = polyalpha_audit::AuditReader::load_summary(&data_dir, &session_id)
+            .expect("load flushed summary");
+        assert_eq!(summary.latest_tick_index, 2);
+
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn should_build_monitor_state_when_monitor_has_clients() {
+        assert!(should_build_monitor_state(1, None, 1_000));
+    }
+
+    #[test]
+    fn should_build_monitor_state_when_audit_runtime_state_is_due() {
+        let data_dir = unique_test_data_dir("paper-audit-needs-runtime-state");
+        let settings = test_settings_with_audit_data_dir(data_dir.clone());
+        let start_ms = 1_000;
+        let audit = PaperAudit::start(
+            &settings,
+            "test-env",
+            &settings.markets,
+            start_ms,
+            polyalpha_core::TradingMode::Paper,
+        )
+        .expect("start paper audit");
+
+        assert!(!should_build_monitor_state(0, Some(&audit), start_ms + 200));
+        assert!(should_build_monitor_state(
+            0,
+            Some(&audit),
+            start_ms + AUDIT_SUMMARY_WRITE_THROTTLE_MS
+        ));
 
         let _ = fs::remove_dir_all(&data_dir);
     }
@@ -16077,6 +16195,64 @@ mod tests {
         assert_eq!(stats.evaluation_skipped, 0);
         assert!(stats.skip_reasons.is_empty());
         assert!(recent_events.is_empty());
+    }
+
+    #[test]
+    fn evaluation_skip_audit_records_follow_recent_event_debounce() {
+        let data_dir = unique_test_data_dir("evaluation-skip-audit-debounce");
+        let settings = test_settings_with_audit_data_dir(data_dir.clone());
+        let mut audit = Some(
+            PaperAudit::start(
+                &settings,
+                "test-env",
+                &settings.markets,
+                1_000,
+                polyalpha_core::TradingMode::Live,
+            )
+            .expect("start audit"),
+        );
+        let session_id = audit
+            .as_ref()
+            .expect("audit session")
+            .session_id()
+            .to_owned();
+        let event = cex_evaluation_event();
+        let mut stats = PaperStats::default();
+        let mut recent_events = VecDeque::new();
+        let warning = EngineWarning::NoPolyData {
+            symbol: Symbol::new("btc-test"),
+        };
+
+        record_evaluation_attempt(
+            &mut stats,
+            &mut recent_events,
+            &event,
+            std::slice::from_ref(&warning),
+            None,
+            &mut audit,
+        )
+        .expect("record first evaluation skip");
+        record_evaluation_attempt(
+            &mut stats,
+            &mut recent_events,
+            &event,
+            std::slice::from_ref(&warning),
+            None,
+            &mut audit,
+        )
+        .expect("record second evaluation skip");
+
+        let events = polyalpha_audit::AuditReader::load_events(&data_dir, &session_id)
+            .expect("load audit events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == AuditEventKind::EvaluationSkip)
+                .count(),
+            1
+        );
+
+        let _ = fs::remove_dir_all(&data_dir);
     }
 
     #[test]

@@ -104,6 +104,11 @@ impl MonitorSocketServer {
         *self.client_count.read().await
     }
 
+    /// 获取客户端计数句柄
+    pub fn client_count_handle(&self) -> Arc<RwLock<usize>> {
+        Arc::clone(&self.client_count)
+    }
+
     /// 广播状态更新（同步方法，可在任何上下文调用）
     pub fn broadcast_state(&self, state: MonitorState) {
         // 保存当前状态用于首包推送

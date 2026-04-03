@@ -44,11 +44,13 @@ impl From<(Exchange, Symbol, InstrumentKind)> for OrderbookKey {
 
 /// In-memory orderbook provider that can be updated with new snapshots.
 pub struct InMemoryOrderbookProvider {
-    /// Orderbooks keyed by (exchange, symbol, instrument)
+    /// Non-CEX orderbooks keyed by (exchange, symbol, instrument)
     orderbooks: Arc<RwLock<HashMap<OrderbookKey, OrderBookSnapshot>>>,
     /// CEX orderbooks keyed by (exchange, venue_symbol)
-    /// This allows looking up CEX orderbook by venue symbol (e.g., "BTCUSDT")
+    /// This is the canonical storage for CEX snapshots.
     cex_orderbooks: Arc<RwLock<HashMap<(Exchange, String), OrderBookSnapshot>>>,
+    /// Maps a symbol-keyed CEX lookup back to the canonical venue symbol.
+    cex_symbol_index: Arc<RwLock<HashMap<(Exchange, Symbol), String>>>,
 }
 
 impl Default for InMemoryOrderbookProvider {
@@ -62,6 +64,7 @@ impl InMemoryOrderbookProvider {
         Self {
             orderbooks: Arc::new(RwLock::new(HashMap::new())),
             cex_orderbooks: Arc::new(RwLock::new(HashMap::new())),
+            cex_symbol_index: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -81,19 +84,14 @@ impl InMemoryOrderbookProvider {
     /// This allows looking up CEX orderbook by venue_symbol (e.g., "BTCUSDT")
     /// which is needed because multiple markets may share the same CEX symbol.
     pub fn update_cex(&self, snapshot: OrderBookSnapshot, venue_symbol: String) {
-        // Store by symbol (for Poly compatibility)
-        let key = OrderbookKey {
-            exchange: snapshot.exchange,
-            symbol: snapshot.symbol.clone(),
-            instrument: snapshot.instrument,
-        };
-        if let Ok(mut map) = self.orderbooks.write() {
-            map.insert(key, snapshot.clone());
+        let exchange = snapshot.exchange;
+        let symbol = snapshot.symbol.clone();
+        if let Ok(mut cex_map) = self.cex_orderbooks.write() {
+            cex_map.insert((exchange, venue_symbol.clone()), snapshot);
         }
 
-        // Also store by venue_symbol for CEX lookup
-        if let Ok(mut cex_map) = self.cex_orderbooks.write() {
-            cex_map.insert((snapshot.exchange, venue_symbol), snapshot);
+        if let Ok(mut symbol_index) = self.cex_symbol_index.write() {
+            symbol_index.insert((exchange, symbol), venue_symbol);
         }
     }
 
@@ -110,6 +108,19 @@ impl OrderbookProvider for InMemoryOrderbookProvider {
         symbol: &Symbol,
         instrument: InstrumentKind,
     ) -> Option<OrderBookSnapshot> {
+        if instrument == InstrumentKind::CexPerp {
+            let venue_symbol = {
+                let index = self.cex_symbol_index.read().ok()?;
+                index.get(&(exchange, symbol.clone())).cloned()?
+            };
+            let mut snapshot = {
+                let cex_books = self.cex_orderbooks.read().ok()?;
+                cex_books.get(&(exchange, venue_symbol)).cloned()?
+            };
+            snapshot.symbol = symbol.clone();
+            return Some(snapshot);
+        }
+
         let key = OrderbookKey {
             exchange,
             symbol: symbol.clone(),
@@ -155,5 +166,55 @@ impl OrderbookProvider for NoOpOrderbookProvider {
         _venue_symbol: &str,
     ) -> Option<OrderBookSnapshot> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rust_decimal::Decimal;
+
+    use super::*;
+    use polyalpha_core::{CexBaseQty, Price, PriceLevel, VenueQuantity};
+
+    fn sample_cex_snapshot(symbol: &str, sequence: u64) -> OrderBookSnapshot {
+        OrderBookSnapshot {
+            exchange: Exchange::Binance,
+            symbol: Symbol::new(symbol),
+            instrument: InstrumentKind::CexPerp,
+            bids: vec![PriceLevel {
+                price: Price(Decimal::new(1000, 1)),
+                quantity: VenueQuantity::CexBaseQty(CexBaseQty(Decimal::new(5, 0))),
+            }],
+            asks: vec![PriceLevel {
+                price: Price(Decimal::new(1010, 1)),
+                quantity: VenueQuantity::CexBaseQty(CexBaseQty(Decimal::new(5, 0))),
+            }],
+            exchange_timestamp_ms: sequence,
+            received_at_ms: sequence,
+            sequence,
+            last_trade_price: None,
+        }
+    }
+
+    #[test]
+    fn cex_symbol_lookup_reads_latest_shared_venue_snapshot() {
+        let provider = InMemoryOrderbookProvider::new();
+        provider.update_cex(sample_cex_snapshot("market-a", 1), "BTCUSDT".to_owned());
+        provider.update_cex(sample_cex_snapshot("market-b", 2), "BTCUSDT".to_owned());
+
+        let symbol_book = provider
+            .get_orderbook(
+                Exchange::Binance,
+                &Symbol::new("market-a"),
+                InstrumentKind::CexPerp,
+            )
+            .expect("symbol lookup should resolve through venue alias");
+        let venue_book = provider
+            .get_cex_orderbook(Exchange::Binance, "BTCUSDT")
+            .expect("venue lookup should return latest canonical CEX snapshot");
+
+        assert_eq!(symbol_book.sequence, 2);
+        assert_eq!(symbol_book.symbol, Symbol::new("market-a"));
+        assert_eq!(venue_book.sequence, 2);
     }
 }

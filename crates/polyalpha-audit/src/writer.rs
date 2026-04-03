@@ -1,5 +1,5 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -77,7 +77,9 @@ pub struct AuditWriter {
     paths: AuditPaths,
     raw_segment_max_bytes: u64,
     current_segment: usize,
+    current_segment_bytes: u64,
     next_seq: u64,
+    raw_writer: Option<BufWriter<File>>,
 }
 
 impl AuditWriter {
@@ -108,7 +110,9 @@ impl AuditWriter {
             paths,
             raw_segment_max_bytes: raw_segment_max_bytes.max(1_024),
             current_segment: 1,
+            current_segment_bytes: 0,
             next_seq: 1,
+            raw_writer: None,
         })
     }
 
@@ -121,7 +125,6 @@ impl AuditWriter {
     }
 
     pub fn append_event(&mut self, event: NewAuditEvent) -> Result<AuditEvent> {
-        self.rotate_if_needed()?;
         let full_event = AuditEvent {
             session_id: self.manifest.session_id.clone(),
             env: self.manifest.env.clone(),
@@ -137,43 +140,152 @@ impl AuditWriter {
             summary: event.summary,
             payload: event.payload,
         };
-        append_jsonl(&self.paths.segment_path(self.current_segment), &full_event)?;
+        let payload = serde_json::to_vec(&full_event).with_context(|| {
+            format!(
+                "序列化审计事件 `{}` 失败",
+                self.paths.segment_path(self.current_segment).display()
+            )
+        })?;
+        self.rotate_if_needed(payload.len() as u64 + 1)?;
+        self.append_jsonl(&payload)?;
         self.next_seq += 1;
         Ok(full_event)
     }
 
-    pub fn write_summary(&self, summary: &AuditSessionSummary) -> Result<()> {
+    pub fn write_summary(&mut self, summary: &AuditSessionSummary) -> Result<()> {
+        self.flush_raw()?;
         write_json(self.paths.summary_path(), summary)
     }
 
-    pub fn write_checkpoint(&self, checkpoint: &AuditCheckpoint) -> Result<()> {
+    pub fn write_checkpoint(&mut self, checkpoint: &AuditCheckpoint) -> Result<()> {
+        self.flush_raw()?;
         write_json(self.paths.checkpoint_path(), checkpoint)
     }
 
-    fn rotate_if_needed(&mut self) -> Result<()> {
-        let current_path = self.paths.segment_path(self.current_segment);
-        if let Ok(metadata) = fs::metadata(&current_path) {
-            if metadata.len() >= self.raw_segment_max_bytes {
-                self.current_segment += 1;
-            }
+    pub fn flush_raw(&mut self) -> Result<()> {
+        if let Some(writer) = self.raw_writer.as_mut() {
+            writer.flush().with_context(|| {
+                format!(
+                    "刷新审计事件文件 `{}` 失败",
+                    self.paths.segment_path(self.current_segment).display()
+                )
+            })?;
         }
+        Ok(())
+    }
+
+    fn rotate_if_needed(&mut self, next_entry_len: u64) -> Result<()> {
+        if self.current_segment_bytes > 0
+            && self.current_segment_bytes.saturating_add(next_entry_len)
+                > self.raw_segment_max_bytes
+        {
+            self.flush_raw()?;
+            self.current_segment += 1;
+            self.current_segment_bytes = 0;
+            self.raw_writer = None;
+        }
+        Ok(())
+    }
+
+    fn append_jsonl(&mut self, payload: &[u8]) -> Result<()> {
+        let path = self.paths.segment_path(self.current_segment);
+        if self.raw_writer.is_none() {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .with_context(|| format!("打开审计事件文件 `{}` 失败", path.display()))?;
+            self.raw_writer = Some(BufWriter::new(file));
+        }
+
+        let writer = self
+            .raw_writer
+            .as_mut()
+            .expect("raw writer should be initialized");
+        writer
+            .write_all(payload)
+            .with_context(|| format!("写入审计事件 `{}` 失败", path.display()))?;
+        writer
+            .write_all(b"\n")
+            .with_context(|| format!("写入审计换行 `{}` 失败", path.display()))?;
+        writer
+            .flush()
+            .with_context(|| format!("刷新审计事件文件 `{}` 失败", path.display()))?;
+        self.current_segment_bytes = self
+            .current_segment_bytes
+            .saturating_add(payload.len() as u64 + 1);
         Ok(())
     }
 }
 
-fn append_jsonl(path: &Path, item: &impl serde::Serialize) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("打开审计事件文件 `{}` 失败", path.display()))?;
-    serde_json::to_writer(&mut file, item)
-        .with_context(|| format!("写入审计事件 `{}` 失败", path.display()))?;
-    file.write_all(b"\n")
-        .with_context(|| format!("写入审计换行 `{}` 失败", path.display()))?;
-    file.flush()
-        .with_context(|| format!("刷新审计事件文件 `{}` 失败", path.display()))?;
-    Ok(())
+impl Drop for AuditWriter {
+    fn drop(&mut self) {
+        let _ = self.flush_raw();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reader::AuditReader;
+    use polyalpha_core::TradingMode;
+
+    fn unique_test_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "polyalpha-audit-writer-{label}-{}",
+            std::process::id()
+        ))
+    }
+
+    fn test_manifest(session_id: &str) -> AuditSessionManifest {
+        AuditSessionManifest {
+            version: 1,
+            session_id: session_id.to_owned(),
+            env: "test".to_owned(),
+            mode: TradingMode::Paper,
+            started_at_ms: 1_000,
+            market_count: 1,
+            markets: vec!["test-market".to_owned()],
+        }
+    }
+
+    #[test]
+    fn append_event_remains_readable_while_writer_is_alive() {
+        let root = unique_test_root("readable");
+        let session_id = "session-readable";
+        let mut writer = AuditWriter::create(&root, test_manifest(session_id), 1_024 * 1_024)
+            .expect("create writer");
+
+        writer
+            .append_event(NewAuditEvent {
+                timestamp_ms: 1_001,
+                kind: crate::model::AuditEventKind::Anomaly,
+                symbol: Some("test-market".to_owned()),
+                signal_id: None,
+                correlation_id: None,
+                gate: None,
+                result: None,
+                reason: Some("test_reason".to_owned()),
+                summary: "test anomaly".to_owned(),
+                payload: crate::model::AuditEventPayload::Anomaly(
+                    crate::model::AuditAnomalyEvent {
+                        severity: crate::model::AuditSeverity::Warning,
+                        code: "test_reason".to_owned(),
+                        message: "test anomaly".to_owned(),
+                        symbol: Some("test-market".to_owned()),
+                        signal_id: None,
+                        correlation_id: None,
+                    },
+                ),
+            })
+            .expect("append event");
+
+        let events = AuditReader::load_events(&root, session_id).expect("load events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].summary, "test anomaly");
+
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 fn write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
