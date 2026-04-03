@@ -2033,6 +2033,28 @@ mod tests {
     }
 
     #[test]
+    fn planner_searches_upward_when_flooring_initially_makes_budget_unexecutable() {
+        let planner = ExecutionPlanner::default();
+        let intent = sample_open_intent();
+        let mut context = sample_context();
+        context.cex_qty_step = Decimal::new(3, 2);
+        context.poly_yes_book.bids = vec![PriceLevel {
+            price: Price(Decimal::new(455, 3)),
+            quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(500, 0))),
+        }];
+        context.poly_yes_book.asks = vec![PriceLevel {
+            price: Price(Decimal::new(485, 3)),
+            quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(5_000, 0))),
+        }];
+
+        let plan = planner.plan(&intent, &context).unwrap();
+
+        assert!(plan.poly_max_cost_usd.0 > Decimal::from(100u32));
+        assert!(plan.poly_max_cost_usd.0 < Decimal::from(200u32));
+        assert_eq!(plan.cex_planned_qty.0, Decimal::new(3, 2));
+    }
+
+    #[test]
     fn planner_preserves_non_positive_edge_after_loss_bounded_resize() {
         let planner = ExecutionPlanner::default();
         let intent = sample_open_intent();
