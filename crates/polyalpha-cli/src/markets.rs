@@ -1061,6 +1061,13 @@ async fn fetch_active_asset_markets(
                         event_id, query, page
                     )
                 })?;
+                let Some(full_event) = full_event else {
+                    warnings.push(format!(
+                        "{}: 跳过缺失详情的事件 {}（query=`{}` page={}）",
+                        asset.display_name, event_id, query, page
+                    ));
+                    continue;
+                };
                 if !is_asset_event(&full_event, asset) {
                     continue;
                 }
@@ -1089,17 +1096,19 @@ async fn fetch_active_asset_markets(
     Ok((out, warnings))
 }
 
-async fn fetch_event_by_id(client: &Client, event_id: &str) -> Result<Value> {
+async fn fetch_event_by_id(client: &Client, event_id: &str) -> Result<Option<Value>> {
     let payload = http_get_json(client, GAMMA_EVENTS_URL, &[("id", event_id.to_owned())])
         .await
         .with_context(|| format!("failed to fetch event {}", event_id))?;
 
-    let event = payload
+    parse_event_lookup_payload(payload, event_id)
+}
+
+fn parse_event_lookup_payload(payload: Value, event_id: &str) -> Result<Option<Value>> {
+    let events = payload
         .as_array()
-        .and_then(|items| items.first())
-        .cloned()
-        .ok_or_else(|| anyhow!("gamma returned no event for id {}", event_id))?;
-    Ok(event)
+        .ok_or_else(|| anyhow!("gamma returned non-array event payload for id {}", event_id))?;
+    Ok(events.first().cloned())
 }
 
 fn extract_markets_from_event(event: &Value, warnings: &mut Vec<String>) -> Vec<DiscoveredMarket> {
@@ -2860,6 +2869,31 @@ mod tests {
         });
         let root = populated.get("book").expect("book");
         assert!(payload_has_nonempty_orderbook(root));
+    }
+
+    #[test]
+    fn parse_event_lookup_payload_returns_none_when_gamma_has_no_event() {
+        let payload = serde_json::json!([]);
+
+        let parsed = parse_event_lookup_payload(payload, "343490").expect("payload should parse");
+
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_event_lookup_payload_rejects_non_array_payloads() {
+        let payload = serde_json::json!({
+            "id": "343490",
+            "title": "unexpected object payload"
+        });
+
+        let err =
+            parse_event_lookup_payload(payload, "343490").expect_err("non-array payload");
+
+        assert!(
+            err.to_string()
+                .contains("gamma returned non-array event payload for id 343490")
+        );
     }
 
     #[test]

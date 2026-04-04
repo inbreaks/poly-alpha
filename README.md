@@ -113,7 +113,19 @@ cargo test -p polyalpha-core -p polyalpha-data -p polyalpha-risk -p polyalpha-ex
 ./target/debug/polyalpha-cli check-config --env multi-market-active.fresh
 ```
 
-### 3. 跑一轮最小 live-mock 烟雾验证
+### 3. 刷新多市场配置
+
+直接覆盖生成最新的 `config/multi-market-active.fresh.toml` 和对应报告：
+
+```bash
+./target/debug/polyalpha-cli markets refresh-active \
+  --base-env multi-market-active.fresh \
+  --catalog-env multi-market-active.fresh \
+  --output config/multi-market-active.fresh.toml \
+  --report-json config/multi-market-active.fresh.report.json
+```
+
+### 4. 跑一轮最小 live-mock 烟雾验证
 
 ```bash
 ./target/debug/polyalpha-cli live run-multi \
@@ -131,7 +143,7 @@ cargo test -p polyalpha-core -p polyalpha-data -p polyalpha-risk -p polyalpha-ex
 ./target/debug/polyalpha-cli live inspect --env live-ready-smoke --format table
 ```
 
-### 4. 跑更接近真实机会分布的多市场 live-mock
+### 5. 跑更接近真实机会分布的多市场 live-mock
 
 ```bash
 ./target/debug/polyalpha-cli live run-multi \
@@ -164,7 +176,7 @@ cargo test -p polyalpha-core -p polyalpha-data -p polyalpha-risk -p polyalpha-ex
   --trade 1
 ```
 
-### 5. 准备和运行回测
+### 6. 准备和运行回测
 
 准备数据库：
 
