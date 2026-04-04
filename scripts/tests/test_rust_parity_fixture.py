@@ -67,7 +67,8 @@ def _compute_expected_steps(case: dict) -> list[dict]:
     for idx, row in enumerate(case["poly_observations"]):
         ts_ms = int(row["ts_ms"])
         cex_reference_price = float(case["cex_closes"][idx])
-        sigma = report.effective_sigma(sigma_by_idx[idx])
+        raw_sigma = sigma_by_idx[idx]
+        sigma = report.sigma_for_live_decision(raw_sigma, idx)
         minutes_to_expiry = max((case["settlement_ts_ms"] - ts_ms) / 60_000.0, 0.0)
 
         snapshots: dict[str, dict] = {}

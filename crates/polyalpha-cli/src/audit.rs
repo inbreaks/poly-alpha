@@ -1031,9 +1031,30 @@ fn minutes_to_expiry(timestamp_ms: u64, market: &MarketConfig) -> Option<f64> {
 
 fn open_rule_kind_label(kind: MarketRuleKind) -> &'static str {
     match kind {
-        MarketRuleKind::Above => "above",
-        MarketRuleKind::Below => "below",
-        MarketRuleKind::Between => "between",
+        MarketRuleKind::Above => "高于",
+        MarketRuleKind::Below => "低于",
+        MarketRuleKind::Between => "区间内",
+    }
+}
+
+fn pricing_state_label(sigma_source: Option<&str>, returns_window_len: usize) -> String {
+    match sigma_source {
+        Some(source) if source.eq_ignore_ascii_case("realized") => {
+            format!("已切换实时波动（样本 {} 笔）", returns_window_len)
+        }
+        _ if returns_window_len > 0 => format!(
+            "参考价预热中（已积累 {} 笔，暂用默认波动）",
+            returns_window_len
+        ),
+        _ => "参考价预热中（暂用默认波动）".to_owned(),
+    }
+}
+
+fn open_signal_direction_label(direction: &str) -> &'static str {
+    match direction {
+        "long" => "开仓机会",
+        "short" => "反向机会",
+        _ => "候选机会",
     }
 }
 
@@ -1613,7 +1634,7 @@ fn print_open_decision_detail(report: &OpenDecisionDetailReport) {
         report.summary.session_id, report.entry.entry, report.entry.symbol
     );
     println!(
-        "市场规则: kind={} lower={} upper={} settlement={}",
+        "题型规则: {} / 下沿={} / 上沿={} / 结算时间={}",
         report.market.rule_kind,
         format_option_text(report.market.lower_strike.as_deref()),
         format_option_text(report.market.upper_strike.as_deref()),
@@ -1624,9 +1645,9 @@ fn print_open_decision_detail(report: &OpenDecisionDetailReport) {
     }
     if let Some(signal) = &report.signal {
         println!(
-            "信号: {} {} {} 价={} FV={:.6} mispricing={:.6} delta={:.12} z={}",
+            "信号: 时间={} 动作={} 买入方向={} 市场价={} 模型参考价={:.6} 模型价差={:.6} 对冲系数={:.12} Z值={}",
             signal.time,
-            signal.direction,
+            open_signal_direction_label(signal.direction.as_str()),
             signal.token_side,
             format_option_f64(signal.candidate_price),
             signal.fair_value,
@@ -1635,13 +1656,11 @@ fn print_open_decision_detail(report: &OpenDecisionDetailReport) {
             format_option_f64(signal.z_score)
         );
         println!(
-            "信号观测: CEX={} 到期剩余={} raw_sigma={} effective_sigma={} source={} window={} implied_sigma={} 状态={} / {}",
+            "信号观测: CEX参考价={} 距结算剩余={} 参考价状态={} 当前参考波动={} 题面反推波动={} 状态={} / {}",
             format_option_f64(signal.cex_reference_price),
             format_option_f64(signal.minutes_to_expiry),
-            format_option_f64(signal.raw_sigma_annualized),
+            pricing_state_label(signal.sigma_source.as_deref(), signal.returns_window_len),
             format_option_f64(signal.effective_sigma_annualized),
-            format_option_text(signal.sigma_source.as_deref()),
-            signal.returns_window_len,
             format_option_f64(signal.implied_sigma_annualized),
             signal.evaluable_status,
             signal.async_classification
@@ -1664,17 +1683,15 @@ fn print_open_decision_detail(report: &OpenDecisionDetailReport) {
     }
     if let Some(mark) = &report.latest_market_snapshot {
         println!(
-            "最新市场快照: tick={} token={} Poly={} CEX={} FV={} mins={} raw_sigma={} effective_sigma={} source={} window={} implied_sigma={} 状态={} / {}",
+            "最新市场快照: tick={} 买入方向={} Poly={} CEX={} 模型参考价={} 距结算剩余={} 参考价状态={} 当前参考波动={} 题面反推波动={} 状态={} / {}",
             mark.tick_index,
             format_option_text(mark.active_token_side.as_deref()),
             format_option_f64(mark.poly_price),
             format_option_f64(mark.cex_price),
             format_option_f64(mark.fair_value),
             format_option_f64(mark.minutes_to_expiry),
-            format_option_f64(mark.raw_sigma_annualized),
+            pricing_state_label(mark.sigma_source.as_deref(), mark.returns_window_len),
             format_option_f64(mark.effective_sigma_annualized),
-            format_option_text(mark.sigma_source.as_deref()),
-            mark.returns_window_len,
             format_option_f64(mark.implied_sigma_annualized),
             mark.evaluable_status,
             mark.async_classification
@@ -2466,8 +2483,8 @@ fn async_classification_label(classification: &str) -> String {
 
 fn candidate_direction_text(direction: &str) -> &str {
     match direction {
-        "long" => "开仓候选",
-        "short" => "反向候选",
+        "long" => "开仓机会",
+        "short" => "反向机会",
         _ => direction,
     }
 }
@@ -2547,7 +2564,7 @@ mod tests {
         )
         .expect("open decision detail");
 
-        assert_eq!(detail.market.rule_kind, "below");
+        assert_eq!(detail.market.rule_kind, "低于");
         assert_eq!(detail.market.lower_strike.as_deref(), None);
         assert_eq!(detail.market.upper_strike.as_deref(), Some("1500"));
         assert_eq!(detail.signal.as_ref().expect("signal").token_side, "NO");
@@ -2590,6 +2607,25 @@ mod tests {
             .expect("latest mark")
             .effective_sigma_annualized
             .is_some());
+    }
+
+    #[test]
+    fn open_rule_kind_label_uses_user_facing_terms() {
+        assert_eq!(open_rule_kind_label(MarketRuleKind::Above), "高于");
+        assert_eq!(open_rule_kind_label(MarketRuleKind::Below), "低于");
+        assert_eq!(open_rule_kind_label(MarketRuleKind::Between), "区间内");
+    }
+
+    #[test]
+    fn pricing_state_label_reports_warmup_and_realized_in_user_terms() {
+        assert_eq!(
+            pricing_state_label(Some("default"), 2),
+            "参考价预热中（已积累 2 笔，暂用默认波动）"
+        );
+        assert_eq!(
+            pricing_state_label(Some("realized"), 64),
+            "已切换实时波动（样本 64 笔）"
+        );
     }
 
     fn sample_trade_timeline_events() -> Vec<AuditEvent> {
@@ -2990,7 +3026,7 @@ mod tests {
             gate: None,
             result: None,
             reason: None,
-            summary: "开仓候选".to_owned(),
+            summary: "开仓机会".to_owned(),
             payload: AuditEventPayload::SignalEmitted(SignalEmittedEvent {
                 candidate,
                 observed: Some(observed),

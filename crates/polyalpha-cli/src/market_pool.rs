@@ -122,6 +122,8 @@ fn open_cooldown_policy(base_stale_ms: u64, reason: &str) -> Option<CooldownPoli
             max_duration_ms: 60 * 60 * 1_000,
         }),
         "non_positive_planned_edge"
+        | "open_instant_loss_too_large"
+        | "poly_price_impact_too_large"
         | "planned_edge_deteriorated"
         | "residual_risk_deteriorated" => Some(CooldownPolicy {
             family: CooldownFamily::Edge,

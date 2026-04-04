@@ -52,6 +52,7 @@ DEFAULT_STEP_DAYS = 7
 LINE_WIDTH = 78
 MIN_MINUTES_TO_EXPIRY = 1.0
 MIN_VOLATILITY = 1e-6
+MIN_REALIZED_SIGMA_SAMPLES = 30
 DELTA_BUMP_PCT = 1e-4
 SQRT_TWO = math.sqrt(2.0)
 DEFAULT_ANNUALIZED_VOLATILITY = 0.5
@@ -1187,6 +1188,12 @@ def default_minute_sigma() -> float:
 
 def effective_sigma(sigma: float | None) -> float:
     if sigma is not None and sigma >= MIN_VOLATILITY:
+        return sigma
+    return default_minute_sigma()
+
+
+def sigma_for_live_decision(sigma: float | None, sample_count: int) -> float:
+    if sample_count >= MIN_REALIZED_SIGMA_SAMPLES and sigma is not None and sigma >= MIN_VOLATILITY:
         return sigma
     return default_minute_sigma()
 

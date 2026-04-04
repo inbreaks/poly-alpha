@@ -24,6 +24,12 @@ const DEFAULT_MAX_SEQUENCE_DRIFT: u64 = 2;
 const DEFAULT_POLY_SLIPPAGE_BPS: u64 = 50;
 const DEFAULT_CEX_SLIPPAGE_BPS: u64 = 2;
 const OPEN_INSTANT_LOSS_BINARY_SEARCH_STEPS: usize = 32;
+const MAX_OPEN_POLY_PRICE_IMPACT_BPS: u64 = 320;
+const MIN_OPEN_POLY_PRICE_IMPACT_BPS_FOR_EDGE_GUARD: u64 = 300;
+
+fn max_open_instant_loss_pct_of_planned_edge() -> Decimal {
+    Decimal::new(5, 2)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanRejection {
@@ -684,6 +690,21 @@ impl ExecutionPlanner {
             post_rounding_residual_qty,
             cex_estimate,
         } = selected_open;
+        let instant_open_loss_usd = self.instant_open_loss_usd(&poly_estimate, &cex_estimate);
+        let poly_executable_price = poly_estimate.executable_price.unwrap_or(poly_best_ask);
+        let poly_price_impact_bps = open_poly_price_impact_bps(poly_book, poly_executable_price);
+        if let Some(poly_price_impact_bps) = poly_price_impact_bps {
+            if poly_price_impact_bps > Decimal::from(MAX_OPEN_POLY_PRICE_IMPACT_BPS) {
+                return Err(PlanRejection {
+                    reason: PlanRejectionReason::PolyPriceImpactTooLarge,
+                    detail: format!(
+                        "poly price impact {} bps exceeds cap of {} bps",
+                        poly_price_impact_bps.round_dp(2),
+                        MAX_OPEN_POLY_PRICE_IMPACT_BPS
+                    ),
+                });
+            }
+        }
         let raw_edge_usd = poly_estimate.executable_notional_usd.0
             * Decimal::from_f64(candidate.raw_mispricing.abs()).unwrap_or(Decimal::ZERO);
         let hedge_notional_proxy = cex_estimate
@@ -716,6 +737,21 @@ impl ExecutionPlanner {
             return Err(PlanRejection {
                 reason: PlanRejectionReason::NonPositivePlannedEdge,
                 detail: "planned edge is not positive after fees and friction".to_owned(),
+            });
+        }
+        let max_instant_loss_vs_edge =
+            planned_edge_usd.0 * max_open_instant_loss_pct_of_planned_edge();
+        if poly_price_impact_bps.is_some_and(|value| {
+            value >= Decimal::from(MIN_OPEN_POLY_PRICE_IMPACT_BPS_FOR_EDGE_GUARD)
+        }) && instant_open_loss_usd.0 > max_instant_loss_vs_edge
+        {
+            return Err(PlanRejection {
+                reason: PlanRejectionReason::OpenInstantLossTooLarge,
+                detail: format!(
+                    "instant open loss {} usd consumes too much planned edge {} usd",
+                    instant_open_loss_usd.0.round_dp(4),
+                    planned_edge_usd.0.round_dp(4)
+                ),
             });
         }
 
@@ -769,12 +805,12 @@ impl ExecutionPlanner {
             poly_requested_shares: capped_max_shares,
             poly_planned_shares,
             poly_max_cost_usd: UsdNotional(budget_cap_usd),
-            poly_max_avg_price: poly_estimate.executable_price.unwrap_or(poly_best_ask),
+            poly_max_avg_price: poly_executable_price,
             poly_max_shares: capped_max_shares,
             poly_min_avg_price: Price::ZERO,
             poly_min_proceeds_usd: UsdNotional::ZERO,
             poly_book_avg_price: poly_estimate.book_average_price.unwrap_or(poly_best_ask),
-            poly_executable_price: poly_estimate.executable_price.unwrap_or(poly_best_ask),
+            poly_executable_price,
             poly_friction_cost_usd: poly_estimate.friction_cost_usd.unwrap_or(UsdNotional::ZERO),
             poly_fee_usd,
             cex_side,
@@ -1856,6 +1892,18 @@ fn mid_price(book: &OrderBookSnapshot) -> Option<Price> {
     ))
 }
 
+fn open_poly_price_impact_bps(
+    book: &OrderBookSnapshot,
+    executable_price: Price,
+) -> Option<Decimal> {
+    let mid = mid_price(book)?;
+    if mid.0 <= Decimal::ZERO || executable_price.0 <= mid.0 {
+        return Some(Decimal::ZERO);
+    }
+
+    Some((executable_price.0 - mid.0) * Decimal::from(10_000u32) / mid.0)
+}
+
 fn apply_linear_slippage(
     price: Price,
     side: OrderSide,
@@ -2133,7 +2181,7 @@ mod tests {
                 quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(50, 0))),
             },
             PriceLevel {
-                price: Price(Decimal::new(25, 2)),
+                price: Price(Decimal::new(215, 3)),
                 quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(5_000, 0))),
             },
         ];
@@ -2151,11 +2199,11 @@ mod tests {
         let mut context = sample_context();
         context.cex_qty_step = Decimal::new(3, 2);
         context.poly_yes_book.bids = vec![PriceLevel {
-            price: Price(Decimal::new(455, 3)),
+            price: Price(Decimal::new(46, 2)),
             quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(500, 0))),
         }];
         context.poly_yes_book.asks = vec![PriceLevel {
-            price: Price(Decimal::new(485, 3)),
+            price: Price(Decimal::new(482, 3)),
             quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(5_000, 0))),
         }];
         let (original_budget_cap_usd, delta_abs) = match &intent {
@@ -2182,16 +2230,12 @@ mod tests {
     #[test]
     fn planner_preserves_non_positive_edge_after_loss_bounded_resize() {
         let planner = ExecutionPlanner::default();
-        let intent = sample_open_intent();
-        let mut context = sample_context();
-        context.poly_yes_book.bids = vec![PriceLevel {
-            price: Price(Decimal::new(10, 2)),
-            quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(1, 0))),
-        }];
-        context.poly_yes_book.asks = vec![PriceLevel {
-            price: Price(Decimal::new(90, 2)),
-            quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(500, 0))),
-        }];
+        let mut intent = sample_open_intent();
+        let PlanningIntent::OpenPosition { candidate, .. } = &mut intent else {
+            panic!("expected open intent");
+        };
+        candidate.raw_mispricing = 0.03;
+        let context = sample_context();
 
         let rejection = planner.plan(&intent, &context).unwrap_err();
 
@@ -2222,6 +2266,61 @@ mod tests {
             rejection.reason,
             PlanRejectionReason::OpenInstantLossTooLarge
         );
+    }
+
+    #[test]
+    fn planner_rejects_open_when_poly_price_impact_exceeds_cap() {
+        let planner = ExecutionPlanner::default();
+        let intent = sample_open_intent();
+        let mut context = sample_context();
+        context.poly_yes_book.asks = vec![
+            PriceLevel {
+                price: Price(Decimal::new(48, 2)),
+                quantity: VenueQuantity::PolyShares(PolyShares(Decimal::ONE)),
+            },
+            PriceLevel {
+                price: Price(Decimal::new(62, 2)),
+                quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(5_000, 0))),
+            },
+        ];
+
+        let rejection = planner.plan(&intent, &context).unwrap_err();
+
+        assert_eq!(
+            rejection.reason,
+            PlanRejectionReason::PolyPriceImpactTooLarge
+        );
+        assert!(rejection.detail.contains("price impact"));
+    }
+
+    #[test]
+    fn planner_rejects_open_when_instant_loss_consumes_too_much_planned_edge() {
+        let mut planner = ExecutionPlanner::default();
+        planner.max_open_instant_loss_pct_of_budget = Decimal::ONE;
+        let mut intent = sample_open_intent();
+        let PlanningIntent::OpenPosition { candidate, .. } = &mut intent else {
+            panic!("expected open intent");
+        };
+        candidate.raw_mispricing = 0.08;
+        let mut context = sample_context();
+        context.poly_yes_book.asks = vec![
+            PriceLevel {
+                price: Price(Decimal::new(47, 2)),
+                quantity: VenueQuantity::PolyShares(PolyShares(Decimal::ONE)),
+            },
+            PriceLevel {
+                price: Price(Decimal::new(472, 3)),
+                quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(5_000, 0))),
+            },
+        ];
+
+        let rejection = planner.plan(&intent, &context).unwrap_err();
+
+        assert_eq!(
+            rejection.reason,
+            PlanRejectionReason::OpenInstantLossTooLarge
+        );
+        assert!(rejection.detail.contains("planned edge"));
     }
 
     #[test]

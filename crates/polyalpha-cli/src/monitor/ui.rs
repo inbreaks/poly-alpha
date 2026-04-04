@@ -2308,6 +2308,9 @@ fn compact_market_condition_label(market: &MarketView, min_warmup_samples: usize
     if market_has_insufficient_warmup(market, min_warmup_samples) {
         return format!("预热{}/{}", market.basis_history_len, min_warmup_samples);
     }
+    if let Some(label) = compact_pricing_warmup_label(market) {
+        return label;
+    }
 
     match market.evaluable_status {
         EvaluableStatus::Evaluable => match market.async_classification {
@@ -2318,6 +2321,14 @@ fn compact_market_condition_label(market: &MarketView, min_warmup_samples: usize
         },
         status => compact_evaluable_status_label(status).to_owned(),
     }
+}
+
+fn compact_pricing_warmup_label(market: &MarketView) -> Option<String> {
+    let source = market.sigma_source.as_deref()?;
+    if source.eq_ignore_ascii_case("realized") || market.returns_window_len == 0 {
+        return None;
+    }
+    Some(format!("估值预热{}笔", market.returns_window_len))
 }
 
 fn format_market_status_compact(market: &MarketView, min_warmup_samples: usize) -> String {
@@ -2335,6 +2346,9 @@ fn format_market_status_compact(market: &MarketView, min_warmup_samples: usize) 
 
 fn market_status_color(market: &MarketView, min_warmup_samples: usize) -> Color {
     if market_has_insufficient_warmup(market, min_warmup_samples) {
+        return Color::Yellow;
+    }
+    if compact_pricing_warmup_label(market).is_some() {
         return Color::Yellow;
     }
 
@@ -3017,6 +3031,17 @@ mod tests {
             format_market_status_compact(&market, 600),
             "交易池/预热128/600"
         );
+    }
+
+    #[test]
+    fn market_table_marks_pricing_warmup_in_status_column() {
+        let mut market = sample_market("pricing-warmup", Some(-1.0));
+        market.sigma_source = Some("default".to_owned());
+        market.returns_window_len = 2;
+
+        let actual = format_market_status_compact(&market, 600);
+        assert_eq!(actual, "交易池/估值预热2笔");
+        assert!(display_width(&actual) <= 18, "{actual}");
     }
 
     #[test]

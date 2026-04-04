@@ -45,9 +45,9 @@ use polyalpha_core::{
     MarketDataMode, MarketDataSource, MarketPhase, MarketRetentionReason, MarketTier, MarketView,
     MonitorEvent, MonitorEventPayload, MonitorRuntimeStats, MonitorSocketServer, MonitorState,
     MonitorStrategyConfig, OpenCandidate, OrderSide, OrderStatus, PerformanceMetrics,
-    PlanningIntent, PolyShares, Position, Price, ResidualSnapshot, RiskManager, Settings,
-    SignalStrength, StrategyHealthView, Symbol, SymbolRegistry, TokenSide, TradePlan, TradeView,
-    UsdNotional, VenueQuantity, PLANNING_SCHEMA_VERSION,
+    PlanningIntent, PolyShares, Position, Price, RecoveryDecisionReason, ResidualSnapshot,
+    RiskManager, Settings, SignalStrength, StrategyHealthView, Symbol, SymbolRegistry, TokenSide,
+    TradePlan, TradeView, UsdNotional, VenueQuantity, PLANNING_SCHEMA_VERSION,
 };
 use polyalpha_data::{
     BinanceFuturesDataSource, DataManager, OkxMarketDataSource, PolyBookLevel, PolyBookUpdate,
@@ -98,6 +98,8 @@ const WS_CONNECTED_STATUS_REFRESH_MS: u64 = 1_000;
 const MARKET_TRADEABLE_GRACE_MULTIPLIER: u64 = 3;
 const MARKET_FOCUS_GRACE_MULTIPLIER: u64 = 12;
 const MARKET_NEAR_OPPORTUNITY_FRACTION: f64 = 0.75;
+const MAX_WARMUP_FETCH_KLINES: u16 = 1_500;
+const MIN_WARMUP_FETCH_HEADROOM: u16 = 60;
 const STRATEGY_READINESS_ALERT_GRACE_MS: u64 = 45_000;
 const STRATEGY_READINESS_ALERT_INTERVAL_MS: u64 = 60_000;
 
@@ -1145,7 +1147,7 @@ impl PaperAudit {
                 severity: AuditSeverity::Warning,
                 code: "post_submit_rejection".to_owned(),
                 message: format!(
-                    "开仓候选提交后被交易执行层拒绝：{}",
+                    "开仓机会提交后被交易执行层拒绝：{}",
                     rejection_reasons.join(", ")
                 ),
                 symbol: Some(candidate.symbol.0.clone()),
@@ -2835,6 +2837,17 @@ fn multi_market_warmup_progress_step(total_markets: usize) -> usize {
     (total_markets / 8).max(25)
 }
 
+fn warmup_history_fetch_limit(warmup_klines: u16) -> u16 {
+    if warmup_klines == 0 {
+        return 0;
+    }
+
+    let proportional_headroom = (warmup_klines / 4).max(MIN_WARMUP_FETCH_HEADROOM);
+    warmup_klines
+        .saturating_add(proportional_headroom)
+        .min(MAX_WARMUP_FETCH_KLINES)
+}
+
 async fn fetch_market_warmup_data(
     market: &MarketConfig,
     cex_source: &CexLiveSource,
@@ -2845,9 +2858,8 @@ async fn fetch_market_warmup_data(
         return Ok(MarketWarmupData::default());
     }
 
-    let cex_klines = cex_source
-        .fetch_klines(&market.symbol, warmup_klines)
-        .await?;
+    let fetch_limit = warmup_history_fetch_limit(warmup_klines);
+    let cex_klines = cex_source.fetch_klines(&market.symbol, fetch_limit).await?;
     if cex_klines.is_empty() {
         return Ok(MarketWarmupData::default());
     }
@@ -4253,11 +4265,53 @@ fn candidate_price_for_filter(candidate: &OpenCandidate, observed: &ObservedStat
     }
 }
 
+fn market_open_semantics_guard_reason(market: &MarketConfig, now_ms: u64) -> Option<&'static str> {
+    let Some(rule) = market.resolved_market_rule() else {
+        return None;
+    };
+    if !matches!(
+        rule.kind,
+        polyalpha_core::MarketRuleKind::Above | polyalpha_core::MarketRuleKind::Below
+    ) {
+        return None;
+    }
+
+    let combined = format!(
+        "{} {}",
+        market
+            .market_question
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+        market.symbol.0.to_ascii_lowercase()
+    );
+    let is_touch_style = combined.contains("reach")
+        || combined.contains("dip to")
+        || combined.contains("dip-to")
+        || combined.contains("fall to")
+        || combined.contains("fall-to")
+        || combined.contains("drop to")
+        || combined.contains("drop-to")
+        || combined.contains("hit")
+        || combined.contains("touch");
+
+    let _ = now_ms;
+    is_touch_style.then_some("path_dependent_market_not_supported")
+}
+
 fn candidate_price_filter_rejection_reason(
     candidate: &OpenCandidate,
     observed: &ObservedState,
     settings: &Settings,
 ) -> Option<&'static str> {
+    if let Some(reason) = settings
+        .markets
+        .iter()
+        .find(|market| market.symbol == candidate.symbol)
+        .and_then(|market| market_open_semantics_guard_reason(market, candidate.timestamp_ms))
+    {
+        return Some(reason);
+    }
     if !settings.strategy.basis.band_policy.uses_configured_band() {
         return None;
     }
@@ -10650,8 +10704,8 @@ fn insert_detail_opt(details: &mut EventDetails, key: &str, value: Option<String
 
 fn candidate_kind_label_zh(direction: &str) -> &'static str {
     match direction {
-        "long" => "开仓候选",
-        "short" => "反向候选",
+        "long" => "开仓机会",
+        "short" => "反向机会",
         _ => "候选机会",
     }
 }
@@ -10670,12 +10724,22 @@ fn trigger_action_label_zh(trigger: &RuntimeTrigger) -> String {
             candidate_kind_label_zh(candidate.direction.as_str()).to_owned()
         }
         RuntimeTrigger::Intent { intent, .. } => match intent {
-            PlanningIntent::OpenPosition { .. } => "开仓意图".to_owned(),
-            PlanningIntent::ClosePosition { .. } => "平仓意图".to_owned(),
-            PlanningIntent::DeltaRebalance { .. } => "Delta 再平衡意图".to_owned(),
-            PlanningIntent::ResidualRecovery { .. } => "残余恢复意图".to_owned(),
-            PlanningIntent::ForceExit { .. } => "强制退出意图".to_owned(),
+            PlanningIntent::OpenPosition { .. } => "准备开仓".to_owned(),
+            PlanningIntent::ClosePosition { .. } => "准备平仓".to_owned(),
+            PlanningIntent::DeltaRebalance { .. } => "补 CEX 对冲".to_owned(),
+            PlanningIntent::ResidualRecovery { .. } => "处理剩余敞口".to_owned(),
+            PlanningIntent::ForceExit { .. } => "强制退出".to_owned(),
         },
+    }
+}
+
+fn intent_stage_label_zh(intent: &PlanningIntent) -> &'static str {
+    match intent {
+        PlanningIntent::OpenPosition { .. } => "准备开仓",
+        PlanningIntent::ClosePosition { .. } => "准备平仓",
+        PlanningIntent::DeltaRebalance { .. } => "补 CEX 对冲",
+        PlanningIntent::ResidualRecovery { .. } => "处理剩余敞口",
+        PlanningIntent::ForceExit { .. } => "强制退出",
     }
 }
 
@@ -10714,9 +10778,9 @@ fn gate_reason_label_zh(gate: &str, reason: &str) -> String {
             if let Some(reason) = reason.strip_prefix("retained_") {
                 return match reason {
                     "force_exit" => "市场当前处于强退流程".to_owned(),
-                    "residual_recovery" => "市场当前处于残腿恢复流程".to_owned(),
+                    "residual_recovery" => "市场当前处于剩余敞口处理流程".to_owned(),
                     "close_in_progress" => "市场当前处于平仓流程".to_owned(),
-                    "delta_rebalance" => "市场当前处于再平衡流程".to_owned(),
+                    "delta_rebalance" => "市场当前处于补对冲流程".to_owned(),
                     "has_position" => "市场已有持仓，禁止重复开仓".to_owned(),
                     _ => "市场当前不允许新开仓".to_owned(),
                 };
@@ -10733,6 +10797,9 @@ fn gate_reason_label_zh(gate: &str, reason: &str) -> String {
             "below_min_poly_price" => "低于最小 Poly 价格带".to_owned(),
             "above_or_equal_max_poly_price" => "高于或等于最大 Poly 价格带".to_owned(),
             "missing_poly_quote" => "缺少 Poly 报价".to_owned(),
+            "path_dependent_market_not_supported" => {
+                "触达类题型暂未纳入主策略，禁止新开仓".to_owned()
+            }
             _ => "价格过滤未通过".to_owned(),
         },
         "risk_guard" => {
@@ -10803,14 +10870,16 @@ fn translate_trade_plan_rejection(reason: &str) -> String {
         "one_sided_cex_book" => "CEX 订单簿单边".to_owned(),
         "stale_book_sequence" => "订单簿序列回退".to_owned(),
         "book_conflict_same_sequence" => "同序列订单簿内容冲突".to_owned(),
-        "non_positive_planned_edge" => "可成交净边际不为正".to_owned(),
+        "non_positive_planned_edge" => "扣除成本后预期收益不足".to_owned(),
         "insufficient_poly_depth" => "Poly 深度不足".to_owned(),
         "insufficient_cex_depth" => "CEX 深度不足".to_owned(),
-        "poly_max_price_exceeded" => "Poly 成交均价超过上限".to_owned(),
+        "open_instant_loss_too_large" => "开仓瞬时亏损过大".to_owned(),
+        "poly_max_price_exceeded" => "Poly 成交均价超出开仓上限".to_owned(),
+        "poly_price_impact_too_large" => "Poly 吃单过深，价格冲击过大".to_owned(),
         "poly_min_proceeds_not_met" => "Poly 平仓回款低于下限".to_owned(),
         "zero_cex_hedge_qty" => "CEX 对冲量为 0，禁止开仓".to_owned(),
-        "residual_delta_too_large" => "残余 Delta 超过阈值".to_owned(),
-        "shock_loss_too_large" => "冲击场景风险超过阈值".to_owned(),
+        "residual_delta_too_large" => "剩余敞口超过上限".to_owned(),
+        "shock_loss_too_large" => "价格冲击风险超过上限".to_owned(),
         "market_phase_disallows_intent" => "当前市场阶段不允许该计划".to_owned(),
         "higher_priority_plan_active" => "已有更高优先级计划在执行".to_owned(),
         "adapter_cannot_preserve_constraints" => "交易适配层无法保留计划约束".to_owned(),
@@ -10922,18 +10991,18 @@ fn add_trigger_details(details: &mut EventDetails, trigger: &RuntimeTrigger) {
         );
         insert_detail(
             details,
-            "Token方向",
+            "买入方向",
             format_token_side_label(candidate.token_side),
         );
-        insert_detail(details, "公允值", format_detail_f64(candidate.fair_value));
+        insert_detail(details, "模型参考价", format_detail_f64(candidate.fair_value));
         insert_detail(
             details,
-            "原始错价",
+            "模型价差",
             format_detail_f64(candidate.raw_mispricing),
         );
         insert_detail(
             details,
-            "Delta估计",
+            "对冲系数",
             format_detail_f64(candidate.delta_estimate),
         );
         insert_detail(
@@ -10942,11 +11011,17 @@ fn add_trigger_details(details: &mut EventDetails, trigger: &RuntimeTrigger) {
             format_detail_f64(candidate.risk_budget_usd),
         );
         insert_detail_opt(details, "Z值", candidate.z_score.map(format_detail_f64));
+        insert_detail(details, "参考价状态", candidate_reference_price_state_label(candidate));
+        insert_detail_opt(
+            details,
+            "当前参考波动",
+            candidate.effective_sigma.map(format_detail_f64),
+        );
         return;
     }
 
     if let Some(intent) = trigger.intent() {
-        insert_detail(details, "意图类型", intent.intent_type_code().to_owned());
+        insert_detail(details, "当前流程", intent_stage_label_zh(intent));
         match intent {
             PlanningIntent::OpenPosition {
                 max_budget_usd,
@@ -10957,12 +11032,12 @@ fn add_trigger_details(details: &mut EventDetails, trigger: &RuntimeTrigger) {
                 insert_detail(details, "预算上限USD", format_detail_f64(*max_budget_usd));
                 insert_detail(
                     details,
-                    "残余Delta阈值",
+                    "剩余敞口上限",
                     format_detail_f64(*max_residual_delta),
                 );
                 insert_detail(
                     details,
-                    "冲击亏损阈值USD",
+                    "冲击亏损上限USD",
                     format_detail_f64(*max_shock_loss_usd),
                 );
             }
@@ -10982,17 +11057,17 @@ fn add_trigger_details(details: &mut EventDetails, trigger: &RuntimeTrigger) {
             } => {
                 insert_detail(
                     details,
-                    "残余快照",
+                    "剩余敞口概况",
                     format_residual_snapshot_detail(residual_snapshot),
                 );
                 insert_detail(
                     details,
-                    "残余Delta阈值",
+                    "剩余敞口上限",
                     format_detail_f64(*target_residual_delta_max),
                 );
                 insert_detail(
                     details,
-                    "冲击亏损阈值",
+                    "冲击亏损上限",
                     format_detail_f64(*target_shock_loss_max),
                 );
             }
@@ -11003,10 +11078,10 @@ fn add_trigger_details(details: &mut EventDetails, trigger: &RuntimeTrigger) {
             } => {
                 insert_detail(
                     details,
-                    "残余快照",
+                    "剩余敞口概况",
                     format_residual_snapshot_detail(residual_snapshot),
                 );
-                insert_detail(details, "恢复原因", recovery_reason.code().to_owned());
+                insert_detail(details, "处理原因", recovery_reason_label_zh(*recovery_reason));
             }
             PlanningIntent::ForceExit {
                 force_reason,
@@ -11020,15 +11095,45 @@ fn add_trigger_details(details: &mut EventDetails, trigger: &RuntimeTrigger) {
     }
 }
 
+fn recovery_reason_label_zh(reason: RecoveryDecisionReason) -> &'static str {
+    match reason {
+        RecoveryDecisionReason::CexTopUpCheaper => "补 CEX 更便宜",
+        RecoveryDecisionReason::PolyFlattenCheaper => "平 Poly 更便宜",
+        RecoveryDecisionReason::CexTopUpFaster => "补 CEX 更快",
+        RecoveryDecisionReason::PolyFlattenOnlySafeRoute => "只剩平 Poly 更安全",
+        RecoveryDecisionReason::GhostOrderGuardBlocksFlatten => "挂单保护阻止平 Poly",
+        RecoveryDecisionReason::MarketPhaseBlocksPoly => "当前阶段不允许平 Poly",
+        RecoveryDecisionReason::CexDepthInsufficient => "CEX 深度不足",
+        RecoveryDecisionReason::PolyDepthInsufficient => "Poly 深度不足",
+        RecoveryDecisionReason::ForceExitRequired => "必须强制退出",
+    }
+}
+
+fn candidate_reference_price_state_label(candidate: &OpenCandidate) -> String {
+    match candidate.sigma_source.as_deref() {
+        Some("realized") => {
+            format!("已切换实时波动（样本 {} 笔）", candidate.returns_window_len)
+        }
+        _ if candidate.returns_window_len > 0 => format!(
+            "参考价预热中（已积累 {} 笔，暂用默认波动）",
+            candidate.returns_window_len
+        ),
+        _ => "参考价预热中（暂用默认波动）".to_owned(),
+    }
+}
+
 fn format_residual_snapshot_detail(snapshot: &polyalpha_core::ResidualSnapshot) -> String {
+    let preferred_side = match snapshot.preferred_cex_side {
+        OrderSide::Buy => "买入",
+        OrderSide::Sell => "卖出",
+    };
     format!(
-        "schema={} delta={} cex_qty={} poly_yes={} poly_no={} preferred_cex_side={:?}",
-        snapshot.schema_version,
+        "剩余敞口={}，当前CEX对冲={}，YES持仓={}，NO持仓={}，优先补对冲方向={}",
         format_detail_f64(snapshot.residual_delta),
         snapshot.planned_cex_qty.0.normalize(),
         snapshot.current_poly_yes_shares.0.normalize(),
         snapshot.current_poly_no_shares.0.normalize(),
-        snapshot.preferred_cex_side
+        preferred_side
     )
 }
 
@@ -12879,13 +12984,16 @@ fn build_market_views(
                 execution.active_plan_priority(&market.symbol),
             );
             let near_opportunity = market_is_near_opportunity(settings, snapshot.as_ref());
+            let semantics_guard_active =
+                market_open_semantics_guard_reason(market, now_ms).is_some();
             let market_tier = determine_market_tier(
                 settings,
-                async_snapshot
-                    .as_ref()
-                    .is_some_and(async_snapshot_is_tradeable),
+                !semantics_guard_active
+                    && async_snapshot
+                        .as_ref()
+                        .is_some_and(async_snapshot_is_tradeable),
                 retention_reason,
-                near_opportunity,
+                !semantics_guard_active && near_opportunity,
                 observed.and_then(|item| item.market_pool.last_focus_at_ms),
                 observed.and_then(|item| item.market_pool.last_tradeable_at_ms),
                 observed
@@ -14925,9 +15033,12 @@ mod tests {
         let mut details = EventDetails::new();
         add_trigger_details(&mut details, &trigger);
 
-        let snapshot_detail = details.get("残余快照").expect("residual snapshot detail");
-        assert!(snapshot_detail.contains("schema=1"));
-        assert!(snapshot_detail.contains("preferred_cex_side=Buy"));
+        let snapshot_detail = details
+            .get("剩余敞口概况")
+            .expect("residual snapshot detail");
+        assert!(snapshot_detail.contains("剩余敞口=0.125"));
+        assert!(snapshot_detail.contains("优先补对冲方向=买入"));
+        assert_eq!(details.get("处理原因").map(String::as_str), Some("补 CEX 更快"));
     }
 
     #[tokio::test]
@@ -15124,7 +15235,7 @@ mod tests {
                 .details
                 .as_ref()
                 .and_then(|details| details.get("动作"))
-                .is_some_and(|action| action == "Delta 再平衡意图")
+                .is_some_and(|action| action == "补 CEX 对冲")
         }));
     }
 
@@ -15826,6 +15937,13 @@ mod tests {
     }
 
     #[test]
+    fn warmup_history_fetch_limit_adds_headroom_for_sparse_poly_history() {
+        assert_eq!(warmup_history_fetch_limit(600), 750);
+        assert_eq!(warmup_history_fetch_limit(100), 160);
+        assert_eq!(warmup_history_fetch_limit(1_490), 1_500);
+    }
+
+    #[test]
     fn build_strategy_health_summary_counts_warmup_and_history_failures() {
         let markets = vec![
             polyalpha_core::MarketView {
@@ -16076,7 +16194,7 @@ mod tests {
     fn summarize_candidate_uses_chinese_labels() {
         assert_eq!(
             summarize_candidate(&open_candidate(TokenSide::Yes)),
-            "开仓候选 cand-1"
+            "开仓机会 cand-1"
         );
     }
 
@@ -16238,6 +16356,57 @@ mod tests {
             gate_reason_label_zh("price_filter", "missing_poly_quote"),
             "缺少 Poly 报价"
         );
+    }
+
+    #[test]
+    fn translate_trade_plan_rejection_uses_user_facing_open_quality_labels() {
+        assert_eq!(
+            translate_trade_plan_rejection("open_instant_loss_too_large"),
+            "开仓瞬时亏损过大"
+        );
+        assert_eq!(
+            translate_trade_plan_rejection("poly_price_impact_too_large"),
+            "Poly 吃单过深，价格冲击过大"
+        );
+    }
+
+    #[test]
+    fn add_trigger_details_uses_user_facing_rebalance_and_residual_labels() {
+        let intent = PlanningIntent::ResidualRecovery {
+            schema_version: PLANNING_SCHEMA_VERSION,
+            intent_id: "intent-2".to_owned(),
+            correlation_id: "corr-2".to_owned(),
+            symbol: Symbol::new("eth-test"),
+            residual_snapshot: polyalpha_core::ResidualSnapshot {
+                schema_version: PLANNING_SCHEMA_VERSION,
+                residual_delta: 0.125,
+                planned_cex_qty: polyalpha_core::CexBaseQty(Decimal::new(15, 3)),
+                current_poly_yes_shares: PolyShares(Decimal::new(30, 1)),
+                current_poly_no_shares: PolyShares(Decimal::new(10, 1)),
+                preferred_cex_side: polyalpha_core::OrderSide::Buy,
+            },
+            recovery_reason: polyalpha_core::RecoveryDecisionReason::CexTopUpFaster,
+        };
+        let trigger = RuntimeTrigger::Intent {
+            intent,
+            timestamp_ms: 1,
+        };
+
+        let mut details = EventDetails::new();
+        add_trigger_details(&mut details, &trigger);
+
+        assert_eq!(details.get("动作").map(String::as_str), Some("处理剩余敞口"));
+        assert_eq!(
+            details.get("当前流程").map(String::as_str),
+            Some("处理剩余敞口")
+        );
+        assert_eq!(
+            details.get("处理原因").map(String::as_str),
+            Some("补 CEX 更快")
+        );
+        let snapshot_detail = details.get("剩余敞口概况").expect("residual snapshot detail");
+        assert!(snapshot_detail.contains("剩余敞口=0.125"));
+        assert!(snapshot_detail.contains("优先补对冲方向=买入"));
     }
 
     #[test]
@@ -16710,6 +16879,95 @@ mod tests {
             &observed,
             &settings
         ));
+    }
+
+    #[test]
+    fn market_open_semantics_guard_rejects_long_horizon_reach_by_date_market() {
+        let mut market = test_market("btc-reach-80k-2026", Exchange::Binance, "BTCUSDT");
+        market.market_question =
+            Some("Will Bitcoin reach $80,000 by December 31, 2026?".to_owned());
+        market.market_rule = Some(polyalpha_core::MarketRule {
+            kind: polyalpha_core::MarketRuleKind::Above,
+            lower_strike: Some(Price(Decimal::new(80_000, 0))),
+            upper_strike: None,
+        });
+        market.settlement_timestamp = (1_700_000_000_000 / 1_000) + (31 * 24 * 60 * 60);
+
+        assert_eq!(
+            market_open_semantics_guard_reason(&market, 1_700_000_000_000),
+            Some("path_dependent_market_not_supported")
+        );
+    }
+
+    #[test]
+    fn market_open_semantics_guard_rejects_short_horizon_reach_market() {
+        let mut market = test_market("btc-reach-80k-apr", Exchange::Binance, "BTCUSDT");
+        market.market_question = Some("Will Bitcoin reach $80,000 March 30-April 5?".to_owned());
+        market.market_rule = Some(polyalpha_core::MarketRule {
+            kind: polyalpha_core::MarketRuleKind::Above,
+            lower_strike: Some(Price(Decimal::new(80_000, 0))),
+            upper_strike: None,
+        });
+        market.settlement_timestamp = (1_700_000_000_000 / 1_000) + (7 * 24 * 60 * 60);
+
+        assert_eq!(
+            market_open_semantics_guard_reason(&market, 1_700_000_000_000),
+            Some("path_dependent_market_not_supported")
+        );
+    }
+
+    #[test]
+    fn candidate_price_filter_rejects_unsupported_long_horizon_touch_market() {
+        let mut settings = test_settings_with_price_filter(None, None);
+        settings.markets[0].symbol = Symbol::new("btc-reach-80k-2026");
+        settings.markets[0].market_question =
+            Some("Will Bitcoin reach $80,000 by December 31, 2026?".to_owned());
+        settings.markets[0].market_rule = Some(polyalpha_core::MarketRule {
+            kind: polyalpha_core::MarketRuleKind::Above,
+            lower_strike: Some(Price(Decimal::new(80_000, 0))),
+            upper_strike: None,
+        });
+        settings.markets[0].settlement_timestamp =
+            (1_700_000_000_000 / 1_000) + (31 * 24 * 60 * 60);
+        let observed = ObservedState {
+            poly_yes_mid: Some(Decimal::new(4, 1)),
+            ..ObservedState::default()
+        };
+        let mut candidate = open_candidate(TokenSide::Yes);
+        candidate.symbol = Symbol::new("btc-reach-80k-2026");
+        candidate.timestamp_ms = 1_700_000_000_000;
+
+        assert_eq!(
+            candidate_price_filter_rejection_reason(&candidate, &observed, &settings),
+            Some("path_dependent_market_not_supported")
+        );
+    }
+
+    #[test]
+    fn candidate_price_filter_rejects_unsupported_short_horizon_touch_market() {
+        let mut settings = test_settings_with_price_filter(None, None);
+        settings.markets[0].symbol = Symbol::new("btc-reach-80k-apr");
+        settings.markets[0].market_question =
+            Some("Will Bitcoin reach $80,000 March 30-April 5?".to_owned());
+        settings.markets[0].market_rule = Some(polyalpha_core::MarketRule {
+            kind: polyalpha_core::MarketRuleKind::Above,
+            lower_strike: Some(Price(Decimal::new(80_000, 0))),
+            upper_strike: None,
+        });
+        settings.markets[0].settlement_timestamp =
+            (1_700_000_000_000 / 1_000) + (7 * 24 * 60 * 60);
+        let observed = ObservedState {
+            poly_yes_mid: Some(Decimal::new(4, 1)),
+            ..ObservedState::default()
+        };
+        let mut candidate = open_candidate(TokenSide::Yes);
+        candidate.symbol = Symbol::new("btc-reach-80k-apr");
+        candidate.timestamp_ms = 1_700_000_000_000;
+
+        assert_eq!(
+            candidate_price_filter_rejection_reason(&candidate, &observed, &settings),
+            Some("path_dependent_market_not_supported")
+        );
     }
 
     #[test]

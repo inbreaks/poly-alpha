@@ -15,6 +15,7 @@ use polyalpha_core::{
 const ONE_MINUTE_MS: u64 = 60_000;
 const MIN_MINUTES_TO_EXPIRY: f64 = 1.0;
 const MIN_VOLATILITY: f64 = 1e-6;
+const MIN_REALIZED_SIGMA_SAMPLES: usize = 30;
 const DELTA_BUMP_PCT: f64 = 1e-4;
 const SQRT_TWO: f64 = std::f64::consts::SQRT_2;
 const DEFAULT_ANNUALIZED_VOLATILITY: f64 = 0.5;
@@ -413,8 +414,13 @@ impl SimpleAlphaEngine {
     }
 
     fn sigma_context_from_raw(raw_sigma: Option<f64>, returns_window_len: usize) -> SigmaContext {
-        let effective_sigma = effective_sigma(raw_sigma);
-        let sigma_source = if raw_sigma.filter(|value| *value >= MIN_VOLATILITY).is_some() {
+        let realized_sigma = if returns_window_len >= MIN_REALIZED_SIGMA_SAMPLES {
+            raw_sigma.filter(|value| *value >= MIN_VOLATILITY)
+        } else {
+            None
+        };
+        let effective_sigma = effective_sigma(realized_sigma);
+        let sigma_source = if realized_sigma.is_some() {
             "realized"
         } else {
             "default"
@@ -531,17 +537,11 @@ impl SimpleAlphaEngine {
             return;
         };
 
-        // Warmup keeps its historical >=30-sample gate, but now preserves whether
-        // we used a realized reading or default fallback for downstream auditability.
-        let sigma_context = if state.cex_minutes.returns_window.len() >= 30 {
-            let returns: Vec<f64> = state.cex_minutes.returns_window.iter().copied().collect();
-            Self::sigma_context_from_raw(
-                calculate_sigma(&returns),
-                state.cex_minutes.returns_window.len(),
-            )
-        } else {
-            Self::sigma_context_from_raw(None, state.cex_minutes.returns_window.len())
-        };
+        let returns: Vec<f64> = state.cex_minutes.returns_window.iter().copied().collect();
+        let sigma_context = Self::sigma_context_from_raw(
+            calculate_sigma(&returns),
+            state.cex_minutes.returns_window.len(),
+        );
         let sigma = sigma_context.effective_sigma;
 
         let settlement_ts_ms = market.settlement_timestamp.saturating_mul(1000);
@@ -1578,6 +1578,23 @@ mod tests {
         }
     }
 
+    fn short_dated_sigma_warmup_market() -> MarketConfig {
+        MarketConfig {
+            settlement_timestamp: 7_200,
+            market_question: Some(
+                "Will the price of Bitcoin be above $101,000 in the next two hours?"
+                    .to_owned(),
+            ),
+            market_rule: Some(MarketRule {
+                kind: MarketRuleKind::Above,
+                lower_strike: Some(Price(Decimal::new(101_000, 0))),
+                upper_strike: None,
+            }),
+            strike_price: Some(Price(Decimal::new(101_000, 0))),
+            ..sample_market()
+        }
+    }
+
     fn poly_orderbook_event(
         instrument: InstrumentKind,
         bid: Decimal,
@@ -1842,10 +1859,77 @@ mod tests {
         assert_eq!(candidate.risk_budget_usd, 1_000.0);
         assert!(candidate.raw_mispricing.abs() > 0.0);
         assert!(candidate.delta_estimate.abs() > 0.0);
-        assert!(candidate.raw_sigma.is_some());
         assert!(candidate.effective_sigma.is_some());
-        assert_eq!(candidate.sigma_source.as_deref(), Some("realized"));
+        assert_eq!(candidate.sigma_source.as_deref(), Some("default"));
         assert!(candidate.returns_window_len >= 2);
+    }
+
+    #[tokio::test]
+    async fn keeps_default_sigma_until_realized_window_is_fully_warmed_up() {
+        let mut engine = SimpleAlphaEngine::with_markets(
+            SimpleEngineConfig {
+                min_signal_samples: 2,
+                rolling_window_minutes: 4,
+                entry_z: 0.5,
+                exit_z: 0.25,
+                position_notional_usd: UsdNotional(Decimal::new(1_000, 0)),
+                cex_hedge_ratio: 1.0,
+                dmm_half_spread: Decimal::new(1, 2),
+                dmm_quote_size: PolyShares::ZERO,
+                ..SimpleEngineConfig::default()
+            },
+            vec![short_dated_sigma_warmup_market()],
+        );
+
+        let _ = engine
+            .on_market_data(&cex_orderbook_event(
+                Decimal::new(100_000, 0),
+                Decimal::new(100_000, 0),
+                0,
+            ))
+            .await;
+
+        let mut final_output = AlphaEngineOutput::default();
+        for (offset, yes_bid, yes_ask, no_bid, no_ask, cex_price) in [
+            (60_100, 14, 16, 84, 86, 100_001),
+            (120_100, 12, 14, 86, 88, 100_002),
+            (180_100, 4, 6, 94, 96, 100_003),
+        ] {
+            let _ = engine
+                .on_market_data(&poly_orderbook_event(
+                    InstrumentKind::PolyYes,
+                    Decimal::new(yes_bid, 2),
+                    Decimal::new(yes_ask, 2),
+                    offset,
+                ))
+                .await;
+            let _ = engine
+                .on_market_data(&poly_orderbook_event(
+                    InstrumentKind::PolyNo,
+                    Decimal::new(no_bid, 2),
+                    Decimal::new(no_ask, 2),
+                    offset + 20,
+                ))
+                .await;
+            final_output = engine
+                .on_market_data(&cex_orderbook_event(
+                    Decimal::new(cex_price, 0),
+                    Decimal::new(cex_price, 0),
+                    offset + 100,
+                ))
+                .await;
+        }
+
+        let candidate = final_output
+            .open_candidates
+            .into_iter()
+            .next()
+            .expect("expected candidate after third aligned observation");
+        assert_eq!(candidate.returns_window_len, 2);
+        assert_eq!(candidate.sigma_source.as_deref(), Some("default"));
+        assert_eq!(candidate.token_side, TokenSide::Yes);
+        assert!(candidate.fair_value < 0.5);
+        assert!(candidate.delta_estimate.abs() > 1e-6);
     }
 
     #[tokio::test]
