@@ -195,7 +195,11 @@ pub enum AuditCommand {
         symbol: Option<String>,
         #[arg(long, conflicts_with = "trade", help = "直接定位某一笔平仓链")]
         correlation_id: Option<String>,
-        #[arg(long, conflicts_with = "correlation_id", help = "按列表编号查看单笔详情（从 1 开始）")]
+        #[arg(
+            long,
+            conflicts_with = "correlation_id",
+            help = "按列表编号查看单笔详情（从 1 开始）"
+        )]
         trade: Option<usize>,
         #[arg(long, value_enum, default_value_t = AuditOutputFormat::Table)]
         format: AuditOutputFormat,
@@ -210,7 +214,11 @@ pub enum AuditCommand {
         symbol: Option<String>,
         #[arg(long, conflicts_with = "entry", help = "直接定位某一笔开仓链")]
         correlation_id: Option<String>,
-        #[arg(long, conflicts_with = "correlation_id", help = "按列表编号查看单笔详情（从 1 开始）")]
+        #[arg(
+            long,
+            conflicts_with = "correlation_id",
+            help = "按列表编号查看单笔详情（从 1 开始）"
+        )]
         entry: Option<usize>,
         #[arg(long, value_enum, default_value_t = AuditOutputFormat::Table)]
         format: AuditOutputFormat,

@@ -5190,6 +5190,7 @@ rolling_window_secs = 36000
 min_warmup_samples = 600
 min_basis_bps = "50"
 max_position_usd = "200"
+max_open_instant_loss_pct_of_budget = "0.01"
 delta_rebalance_threshold = "0.05"
 delta_rebalance_interval_secs = 60
 band_policy = "configured_band"

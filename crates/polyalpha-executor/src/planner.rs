@@ -129,9 +129,7 @@ fn cex_top_up_limits(
             ..
         } => (
             (*target_residual_delta_max).max(0.0),
-            UsdNotional(
-                Decimal::from_f64(*target_shock_loss_max).unwrap_or(Decimal::ZERO),
-            ),
+            UsdNotional(Decimal::from_f64(*target_shock_loss_max).unwrap_or(Decimal::ZERO)),
         ),
         _ => (
             post_rounding_residual_delta.max(0.0),
@@ -648,9 +646,7 @@ impl ExecutionPlanner {
         };
         let allowed_instant_loss_usd =
             budget_cap_usd * self.max_open_instant_loss_pct_of_budget.max(Decimal::ZERO);
-        let selected_open = if self
-            .instant_open_loss_usd(&poly_estimate, &cex_estimate)
-            .0
+        let selected_open = if self.instant_open_loss_usd(&poly_estimate, &cex_estimate).0
             <= allowed_instant_loss_usd
         {
             OpenSizingSelection {
@@ -1324,7 +1320,11 @@ impl ExecutionPlanner {
                     .unwrap_or(UsdNotional::ZERO)
                     .0
                 + bps_fee(poly_estimate.executable_notional_usd, self.poly_fee_bps).0
-                + bps_fee(cex_estimate.executable_notional_usd, self.cex_fee_bps(false)).0,
+                + bps_fee(
+                    cex_estimate.executable_notional_usd,
+                    self.cex_fee_bps(false),
+                )
+                .0,
         )
     }
 
@@ -1882,9 +1882,8 @@ mod tests {
     use polyalpha_core::{
         CexBaseQty, Exchange, ExecutionResult, Fill, InstrumentKind, OpenCandidate,
         OrderBookSnapshot, OrderId, OrderSide, PlanRejectionReason, PlanningIntent, PolyShares,
-        Price, PriceLevel, RecoveryDecisionReason, ResidualSnapshot,
-        RevalidationFailureReason, SignalStrength, Symbol, TokenSide, UsdNotional, VenueQuantity,
-        PLANNING_SCHEMA_VERSION,
+        Price, PriceLevel, RecoveryDecisionReason, ResidualSnapshot, RevalidationFailureReason,
+        SignalStrength, Symbol, TokenSide, UsdNotional, VenueQuantity, PLANNING_SCHEMA_VERSION,
     };
 
     use super::{CanonicalPlanningContext, ExecutionPlanner};
@@ -1903,6 +1902,10 @@ mod tests {
             risk_budget_usd: 200.0,
             strength: SignalStrength::Normal,
             z_score: Some(2.4),
+            raw_sigma: None,
+            effective_sigma: None,
+            sigma_source: None,
+            returns_window_len: 0,
             timestamp_ms: 1_716_000_000_000,
         };
 
@@ -2192,7 +2195,10 @@ mod tests {
 
         let rejection = planner.plan(&intent, &context).unwrap_err();
 
-        assert_eq!(rejection.reason, PlanRejectionReason::NonPositivePlannedEdge);
+        assert_eq!(
+            rejection.reason,
+            PlanRejectionReason::NonPositivePlannedEdge
+        );
     }
 
     #[test]
@@ -2212,7 +2218,10 @@ mod tests {
 
         let rejection = planner.plan(&intent, &context).unwrap_err();
 
-        assert_eq!(rejection.reason, PlanRejectionReason::OpenInstantLossTooLarge);
+        assert_eq!(
+            rejection.reason,
+            PlanRejectionReason::OpenInstantLossTooLarge
+        );
     }
 
     #[test]
@@ -2291,12 +2300,8 @@ mod tests {
         assert_eq!(plan.max_residual_delta, 0.05);
         assert_eq!(plan.max_shock_loss_usd, UsdNotional(Decimal::ONE));
         assert!((plan.post_rounding_residual_delta - 0.04).abs() < 1e-12);
-        assert!(
-            (plan.shock_loss_up_2pct.0 - Decimal::new(8, 2)).abs() < Decimal::new(1, 12)
-        );
-        assert!(
-            (plan.shock_loss_down_2pct.0 - Decimal::new(8, 2)).abs() < Decimal::new(1, 12)
-        );
+        assert!((plan.shock_loss_up_2pct.0 - Decimal::new(8, 2)).abs() < Decimal::new(1, 12));
+        assert!((plan.shock_loss_down_2pct.0 - Decimal::new(8, 2)).abs() < Decimal::new(1, 12));
     }
 
     #[test]

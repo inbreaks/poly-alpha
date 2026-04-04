@@ -46,8 +46,8 @@ use polyalpha_core::{
     MonitorEvent, MonitorEventPayload, MonitorRuntimeStats, MonitorSocketServer, MonitorState,
     MonitorStrategyConfig, OpenCandidate, OrderSide, OrderStatus, PerformanceMetrics,
     PlanningIntent, PolyShares, Position, Price, ResidualSnapshot, RiskManager, Settings,
-    SignalStrength, Symbol, SymbolRegistry, TokenSide, TradePlan, TradeView, UsdNotional,
-    VenueQuantity, PLANNING_SCHEMA_VERSION,
+    SignalStrength, StrategyHealthView, Symbol, SymbolRegistry, TokenSide, TradePlan, TradeView,
+    UsdNotional, VenueQuantity, PLANNING_SCHEMA_VERSION,
 };
 use polyalpha_data::{
     BinanceFuturesDataSource, DataManager, OkxMarketDataSource, PolyBookLevel, PolyBookUpdate,
@@ -98,6 +98,8 @@ const WS_CONNECTED_STATUS_REFRESH_MS: u64 = 1_000;
 const MARKET_TRADEABLE_GRACE_MULTIPLIER: u64 = 3;
 const MARKET_FOCUS_GRACE_MULTIPLIER: u64 = 12;
 const MARKET_NEAR_OPPORTUNITY_FRACTION: f64 = 0.75;
+const STRATEGY_READINESS_ALERT_GRACE_MS: u64 = 45_000;
+const STRATEGY_READINESS_ALERT_INTERVAL_MS: u64 = 60_000;
 
 type EventDetails = HashMap<String, String>;
 const PAPER_ARTIFACT_SCHEMA_VERSION: u32 = PLANNING_SCHEMA_VERSION;
@@ -456,6 +458,22 @@ struct PaperStats {
     total_pnl_usd: f64,
     last_skip_event_ms: HashMap<String, u64>,
     last_delta_rebalance_at_ms: HashMap<Symbol, u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MarketWarmupStatus {
+    cex_klines: usize,
+    yes_history_len: usize,
+    no_history_len: usize,
+    cex_fetch_error: Option<String>,
+    poly_history_errors: Vec<(TokenSide, String)>,
+}
+
+#[derive(Clone, Debug)]
+struct StrategyReadinessAlert {
+    kind: &'static str,
+    summary: String,
+    details: Option<EventDetails>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2783,6 +2801,7 @@ async fn warmup_market_engine(
 struct MarketWarmupData {
     cex_klines: Vec<(u64, f64)>,
     poly_histories: Vec<(TokenSide, Vec<(u64, f64)>)>,
+    poly_history_errors: Vec<(TokenSide, String)>,
 }
 
 #[derive(Debug)]
@@ -2839,6 +2858,7 @@ async fn fetch_market_warmup_data(
         return Ok(MarketWarmupData {
             cex_klines,
             poly_histories: Vec::new(),
+            poly_history_errors: Vec::new(),
         });
     }
 
@@ -2852,25 +2872,90 @@ async fn fetch_market_warmup_data(
         .unwrap_or(start_ts);
 
     let mut poly_histories = Vec::new();
+    let mut poly_history_errors = Vec::new();
     for token_side in [TokenSide::Yes, TokenSide::No] {
-        let history = poly_source
+        match poly_source
             .fetch_price_history_by_symbol(&market.symbol, token_side, start_ts, end_ts)
             .await
-            .unwrap_or_default();
-        if history.is_empty() {
-            continue;
+        {
+            Ok(history) => {
+                if history.is_empty() {
+                    continue;
+                }
+                let prices = history
+                    .into_iter()
+                    .map(|point| (point.ts_ms, point.price))
+                    .collect::<Vec<_>>();
+                poly_histories.push((token_side, prices));
+            }
+            Err(error) => poly_history_errors.push((token_side, error.to_string())),
         }
-        let prices = history
-            .into_iter()
-            .map(|point| (point.ts_ms, point.price))
-            .collect::<Vec<_>>();
-        poly_histories.push((token_side, prices));
     }
 
     Ok(MarketWarmupData {
         cex_klines,
         poly_histories,
+        poly_history_errors,
     })
+}
+
+fn warmup_token_history_len(data: &MarketWarmupData, token_side: TokenSide) -> usize {
+    data.poly_histories
+        .iter()
+        .find_map(|(side, prices)| (*side == token_side).then_some(prices.len()))
+        .unwrap_or(0)
+}
+
+fn market_warmup_diagnostic_message(
+    market: &MarketConfig,
+    data: &MarketWarmupData,
+) -> Option<String> {
+    if data.cex_klines.is_empty() {
+        return None;
+    }
+    if looks_like_placeholder_id(&market.poly_ids.yes_token_id)
+        || looks_like_placeholder_id(&market.poly_ids.no_token_id)
+    {
+        return None;
+    }
+
+    let yes_history_len = warmup_token_history_len(data, TokenSide::Yes);
+    let no_history_len = warmup_token_history_len(data, TokenSide::No);
+    let has_missing_side = yes_history_len == 0 || no_history_len == 0;
+    let has_errors = !data.poly_history_errors.is_empty();
+    if !has_missing_side && !has_errors {
+        return None;
+    }
+
+    let mut message = format!(
+        "{} warmup 异常：cex={} yes={} no={}",
+        market.symbol.0,
+        data.cex_klines.len(),
+        yes_history_len,
+        no_history_len,
+    );
+    if has_errors {
+        let errors = data
+            .poly_history_errors
+            .iter()
+            .map(|(token_side, error)| {
+                format!("{}={}", format_token_side_label(*token_side), error)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        message.push_str(&format!(" errors: {errors}"));
+    }
+    Some(message)
+}
+
+fn market_warmup_status(data: &MarketWarmupData) -> MarketWarmupStatus {
+    MarketWarmupStatus {
+        cex_klines: data.cex_klines.len(),
+        yes_history_len: warmup_token_history_len(data, TokenSide::Yes),
+        no_history_len: warmup_token_history_len(data, TokenSide::No),
+        cex_fetch_error: None,
+        poly_history_errors: data.poly_history_errors.clone(),
+    }
 }
 
 fn apply_market_warmup_data(
@@ -2895,6 +2980,218 @@ fn apply_market_warmup_data(
     for (token_side, prices) in &data.poly_histories {
         engine.warmup_poly_prices(&market.symbol, *token_side, market, &cex_prices, prices);
     }
+}
+
+fn build_strategy_health_summary(
+    markets: &[MarketView],
+    warmup_status: &HashMap<Symbol, MarketWarmupStatus>,
+    min_warmup_samples: usize,
+    warmup_total_markets: usize,
+    warmup_completed_markets: usize,
+    warmup_failed_markets: usize,
+) -> StrategyHealthView {
+    let mut summary = StrategyHealthView {
+        total_markets: markets.len() as u64,
+        min_warmup_samples: min_warmup_samples as u64,
+        warmup_total_markets: warmup_total_markets as u64,
+        warmup_completed_markets: warmup_completed_markets as u64,
+        warmup_failed_markets: warmup_failed_markets as u64,
+        ..StrategyHealthView::default()
+    };
+
+    for market in markets {
+        if market.fair_value.is_some() {
+            summary.fair_value_ready_markets += 1;
+        }
+        if market.z_score.is_some() {
+            summary.z_score_ready_markets += 1;
+        }
+        if market.basis_history_len >= min_warmup_samples && market.basis_history_len > 0 {
+            summary.warmup_ready_markets += 1;
+        } else if market.fair_value.is_some() || market.basis_history_len > 0 {
+            summary.insufficient_warmup_markets += 1;
+        }
+        if matches!(
+            market.evaluable_status,
+            EvaluableStatus::PolyQuoteStale | EvaluableStatus::CexQuoteStale
+        ) {
+            summary.stale_markets += 1;
+        }
+        if matches!(market.evaluable_status, EvaluableStatus::NotEvaluableNoPoly)
+            || matches!(
+                market.async_classification,
+                AsyncClassification::NoPolySample
+            )
+        {
+            summary.no_poly_markets += 1;
+        }
+    }
+
+    summary.cex_history_failed_markets = warmup_status
+        .values()
+        .filter(|status| status.cex_fetch_error.is_some())
+        .count() as u64;
+    summary.poly_history_failed_markets = warmup_status
+        .values()
+        .filter(|status| !status.poly_history_errors.is_empty())
+        .count() as u64;
+
+    summary
+}
+
+fn strategy_health_event_details(summary: &StrategyHealthView) -> EventDetails {
+    let mut details = EventDetails::new();
+    insert_detail(&mut details, "市场总数", summary.total_markets.to_string());
+    insert_detail(
+        &mut details,
+        "公允值就绪市场数",
+        summary.fair_value_ready_markets.to_string(),
+    );
+    insert_detail(
+        &mut details,
+        "Z值就绪市场数",
+        summary.z_score_ready_markets.to_string(),
+    );
+    insert_detail(
+        &mut details,
+        "历史预热完成市场数",
+        summary.warmup_ready_markets.to_string(),
+    );
+    insert_detail(
+        &mut details,
+        "预热不足市场数",
+        summary.insufficient_warmup_markets.to_string(),
+    );
+    insert_detail(
+        &mut details,
+        "Stale市场数",
+        summary.stale_markets.to_string(),
+    );
+    insert_detail(
+        &mut details,
+        "NoPoly市场数",
+        summary.no_poly_markets.to_string(),
+    );
+    insert_detail(
+        &mut details,
+        "CEX历史失败市场数",
+        summary.cex_history_failed_markets.to_string(),
+    );
+    insert_detail(
+        &mut details,
+        "Poly历史失败市场数",
+        summary.poly_history_failed_markets.to_string(),
+    );
+    insert_detail(
+        &mut details,
+        "预热门槛样本数",
+        summary.min_warmup_samples.to_string(),
+    );
+    insert_detail(
+        &mut details,
+        "后台预热进度",
+        format!(
+            "{}/{}",
+            summary.warmup_completed_markets, summary.warmup_total_markets
+        ),
+    );
+    insert_detail(
+        &mut details,
+        "后台预热失败市场数",
+        summary.warmup_failed_markets.to_string(),
+    );
+    details
+}
+
+fn market_warmup_event_details(symbol: &str, status: &MarketWarmupStatus) -> EventDetails {
+    let mut details = EventDetails::new();
+    insert_detail(&mut details, "市场", symbol.to_owned());
+    insert_detail(&mut details, "CEX历史样本数", status.cex_klines.to_string());
+    insert_detail(
+        &mut details,
+        "YES历史样本数",
+        status.yes_history_len.to_string(),
+    );
+    insert_detail(
+        &mut details,
+        "NO历史样本数",
+        status.no_history_len.to_string(),
+    );
+    if let Some(error) = status.cex_fetch_error.as_ref() {
+        insert_detail(&mut details, "CEX历史抓取错误", error.clone());
+    }
+    if !status.poly_history_errors.is_empty() {
+        let errors = status
+            .poly_history_errors
+            .iter()
+            .map(|(token_side, error)| format!("{}={error}", format_token_side_label(*token_side)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        insert_detail(&mut details, "Poly历史抓取错误", errors);
+    }
+    details
+}
+
+fn strategy_readiness_alert(
+    summary: &StrategyHealthView,
+    uptime_ms: u64,
+    signals_seen: usize,
+) -> Option<StrategyReadinessAlert> {
+    if summary.total_markets == 0
+        || signals_seen > 0
+        || uptime_ms < STRATEGY_READINESS_ALERT_GRACE_MS
+    {
+        return None;
+    }
+
+    if summary.cex_history_failed_markets > 0 || summary.poly_history_failed_markets > 0 {
+        return Some(StrategyReadinessAlert {
+            kind: "error",
+            summary: format!(
+                "策略预热异常：CEX历史失败 {} 个，Poly历史失败 {} 个，Z值就绪 {}/{}",
+                summary.cex_history_failed_markets,
+                summary.poly_history_failed_markets,
+                summary.z_score_ready_markets,
+                summary.total_markets
+            ),
+            details: Some(strategy_health_event_details(summary)),
+        });
+    }
+
+    if summary.z_score_ready_markets == 0 {
+        return Some(StrategyReadinessAlert {
+            kind: "risk",
+            summary: format!(
+                "策略未就绪：0/{} 市场具备 Z 值，预热完成 {}/{}，预热不足 {} 个，门槛 {}",
+                summary.total_markets,
+                summary.warmup_ready_markets,
+                summary.total_markets,
+                summary.insufficient_warmup_markets,
+                summary.min_warmup_samples
+            ),
+            details: Some(strategy_health_event_details(summary)),
+        });
+    }
+
+    None
+}
+
+fn apply_strategy_health_to_monitor_state(
+    monitor_state: &mut MonitorState,
+    warmup_status: &HashMap<Symbol, MarketWarmupStatus>,
+    min_warmup_samples: usize,
+    warmup_total_markets: usize,
+    warmup_completed_markets: usize,
+    warmup_failed_markets: usize,
+) {
+    monitor_state.runtime.strategy_health = build_strategy_health_summary(
+        &monitor_state.markets,
+        warmup_status,
+        min_warmup_samples,
+        warmup_total_markets,
+        warmup_completed_markets,
+        warmup_failed_markets,
+    );
 }
 
 fn spawn_multi_market_warmup_fetch(
@@ -3208,7 +3505,9 @@ fn current_rebalance_snapshot(
         return None;
     }
 
-    let poly_yes_qty = tracker.net_symbol_qty(symbol, InstrumentKind::PolyYes).abs();
+    let poly_yes_qty = tracker
+        .net_symbol_qty(symbol, InstrumentKind::PolyYes)
+        .abs();
     let poly_no_qty = tracker.net_symbol_qty(symbol, InstrumentKind::PolyNo).abs();
     let poly_qty = match (poly_yes_qty.is_zero(), poly_no_qty.is_zero()) {
         (false, true) => poly_yes_qty,
@@ -8854,6 +9153,9 @@ async fn run_paper_multi_ws_mode(
     let (funding_refresh_tx, mut funding_refresh_rx) =
         mpsc::unbounded_channel::<FundingRefreshResult>();
     let mut funding_refresh_task: Option<JoinHandle<()>> = None;
+    let min_warmup_samples = settings.strategy.basis.min_warmup_samples.max(2);
+    let mut warmup_status_by_symbol: HashMap<Symbol, MarketWarmupStatus> = HashMap::new();
+    let mut last_strategy_readiness_event_ms: Option<u64> = None;
 
     push_event_simple(
         &mut recent_events,
@@ -8875,7 +9177,7 @@ async fn run_paper_multi_ws_mode(
         );
     }
     let initial_monitor_events = build_monitor_events(&recent_events);
-    let initial_monitor_state = build_multi_monitor_state(
+    let mut initial_monitor_state = build_multi_monitor_state(
         &settings,
         &markets,
         &engine,
@@ -8892,6 +9194,14 @@ async fn run_paper_multi_ws_mode(
         &initial_monitor_events,
         trading_mode,
     );
+    apply_strategy_health_to_monitor_state(
+        &mut initial_monitor_state,
+        &warmup_status_by_symbol,
+        min_warmup_samples,
+        0,
+        0,
+        0,
+    );
     if let Ok(mut guard) = current_state.write() {
         *guard = Some(initial_monitor_state.clone());
     }
@@ -8905,22 +9215,50 @@ async fn run_paper_multi_ws_mode(
     let mut warmup_total_markets = 0usize;
     if warmup_klines > 0 {
         if markets.len() <= MULTI_MARKET_SYNC_WARMUP_THRESHOLD {
+            warmup_total_markets = markets.len();
             for market in &markets {
                 if let Some(source) = cex_sources.get(&market.hedge_exchange) {
-                    if let Err(err) = warmup_market_engine(
-                        market,
-                        &mut engine,
-                        source,
-                        &poly_source,
-                        warmup_klines,
-                    )
-                    .await
+                    match fetch_market_warmup_data(market, source, &poly_source, warmup_klines)
+                        .await
                     {
-                        push_event_simple(
-                            &mut recent_events,
-                            "warmup",
-                            format!("{} 预热失败：{}", market.symbol.0, err),
-                        );
+                        Ok(data) => {
+                            let status = market_warmup_status(&data);
+                            if !status.poly_history_errors.is_empty() {
+                                push_event_with_context(
+                                    &mut recent_events,
+                                    "error",
+                                    format!(
+                                        "{} 历史预热异常：Poly history 抓取失败",
+                                        market.symbol.0
+                                    ),
+                                    Some(market.symbol.0.clone()),
+                                    None,
+                                    None,
+                                    Some(market_warmup_event_details(&market.symbol.0, &status)),
+                                );
+                            }
+                            warmup_status_by_symbol.insert(market.symbol.clone(), status);
+                            apply_market_warmup_data(market, &mut engine, &data);
+                            warmup_completed_markets += 1;
+                        }
+                        Err(err) => {
+                            warmup_completed_markets += 1;
+                            warmup_failed_markets += 1;
+                            let status = MarketWarmupStatus {
+                                cex_fetch_error: Some(err.to_string()),
+                                ..MarketWarmupStatus::default()
+                            };
+                            warmup_status_by_symbol.insert(market.symbol.clone(), status.clone());
+                            push_event_with_context(
+                                &mut recent_events,
+                                "error",
+                                format!("{} 历史预热失败：CEX history 抓取失败", market.symbol.0),
+                                Some(market.symbol.0.clone()),
+                                None,
+                                None,
+                                Some(market_warmup_event_details(&market.symbol.0, &status)),
+                            );
+                        }
                     }
                 }
             }
@@ -8996,7 +9334,24 @@ async fn run_paper_multi_ws_mode(
                         );
                     }
                     MultiMarketWarmupEvent::MarketData { market, data } => {
+                        let status = market_warmup_status(&data);
+                        if !status.poly_history_errors.is_empty() {
+                            push_event_with_context(
+                                &mut recent_events,
+                                "error",
+                                format!("{} 历史预热异常：Poly history 抓取失败", market.symbol.0),
+                                Some(market.symbol.0.clone()),
+                                None,
+                                None,
+                                Some(market_warmup_event_details(&market.symbol.0, &status)),
+                            );
+                        }
+                        warmup_status_by_symbol.insert(market.symbol.clone(), status);
                         apply_market_warmup_data(&market, &mut engine, &data);
+                        if let Some(message) = market_warmup_diagnostic_message(&market, &data) {
+                            println!("{message}");
+                            push_event_simple(&mut recent_events, "warmup", message);
+                        }
                         warmup_completed_markets += 1;
                         if warmup_completed_markets == warmup_total_markets
                             || warmup_completed_markets
@@ -9018,10 +9373,19 @@ async fn run_paper_multi_ws_mode(
                     MultiMarketWarmupEvent::MarketFailed { symbol, error } => {
                         warmup_completed_markets += 1;
                         warmup_failed_markets += 1;
-                        push_event_simple(
+                        let status = MarketWarmupStatus {
+                            cex_fetch_error: Some(error.clone()),
+                            ..MarketWarmupStatus::default()
+                        };
+                        warmup_status_by_symbol.insert(Symbol::new(&symbol), status.clone());
+                        push_event_with_context(
                             &mut recent_events,
-                            "warmup",
-                            format!("{} 历史预热失败：{}", symbol, error),
+                            "error",
+                            format!("{symbol} 历史预热失败：CEX history 抓取失败"),
+                            Some(symbol.clone()),
+                            None,
+                            None,
+                            Some(market_warmup_event_details(&symbol, &status)),
                         );
                     }
                     MultiMarketWarmupEvent::Finished {
@@ -9209,8 +9573,8 @@ async fn run_paper_multi_ws_mode(
                 let monitor_client_count = *monitor_client_count.read().await;
                 let has_monitor_clients = monitor_client_count > 0;
                 if should_build_monitor_state(monitor_client_count, audit.as_ref(), now_ms) {
-                    let monitor_events = build_monitor_events(&recent_events);
-                    let monitor_state = build_multi_monitor_state(
+                    let mut monitor_events = build_monitor_events(&recent_events);
+                    let mut monitor_state = build_multi_monitor_state(
                         &settings,
                         &markets,
                         &engine,
@@ -9227,6 +9591,40 @@ async fn run_paper_multi_ws_mode(
                         &monitor_events,
                         trading_mode,
                     );
+                    apply_strategy_health_to_monitor_state(
+                        &mut monitor_state,
+                        &warmup_status_by_symbol,
+                        min_warmup_samples,
+                        warmup_total_markets,
+                        warmup_completed_markets,
+                        warmup_failed_markets,
+                    );
+                    if last_strategy_readiness_event_ms
+                        .map(|last_seen_ms| {
+                            now_ms.saturating_sub(last_seen_ms)
+                                >= STRATEGY_READINESS_ALERT_INTERVAL_MS
+                        })
+                        .unwrap_or(true)
+                    {
+                        if let Some(alert) = strategy_readiness_alert(
+                            &monitor_state.runtime.strategy_health,
+                            now_ms.saturating_sub(start_time_ms),
+                            stats.signals_seen,
+                        ) {
+                            push_event_with_context(
+                                &mut recent_events,
+                                alert.kind,
+                                alert.summary,
+                                None,
+                                None,
+                                None,
+                                alert.details,
+                            );
+                            last_strategy_readiness_event_ms = Some(now_ms);
+                            monitor_events = build_monitor_events(&recent_events);
+                            monitor_state.recent_events = monitor_events.clone();
+                        }
+                    }
                     if let Some(audit) = audit.as_mut() {
                         audit.maybe_record_runtime_state(&stats, &monitor_state, tick_index, now_ms)?;
                     }
@@ -12335,6 +12733,7 @@ fn build_monitor_state_common(
         runtime: MonitorRuntimeStats {
             snapshot_resync_count: stats.snapshot_resync_count as u64,
             funding_refresh_count: stats.funding_refresh_count as u64,
+            strategy_health: StrategyHealthView::default(),
         },
         connections,
         recent_events: recent_events.to_vec(),
@@ -12446,6 +12845,8 @@ fn build_market_views(
         .map(|market| {
             let observed = observed_map.get(&market.symbol);
             let snapshot = engine.basis_snapshot(&market.symbol);
+            let (yes_basis_history_len, no_basis_history_len) =
+                engine.basis_history_lengths(&market.symbol);
             let active_token_side_value = snapshot.as_ref().map(|item| item.token_side);
             let active_token_side = snapshot
                 .as_ref()
@@ -12503,6 +12904,14 @@ fn build_market_views(
                 fair_value: snapshot.as_ref().map(|item| item.fair_value),
                 has_position,
                 minutes_to_expiry: snapshot.as_ref().map(|item| item.minutes_to_expiry),
+                basis_history_len: yes_basis_history_len.max(no_basis_history_len),
+                raw_sigma: snapshot.as_ref().and_then(|item| item.raw_sigma),
+                effective_sigma: snapshot.as_ref().and_then(|item| item.sigma),
+                sigma_source: snapshot.as_ref().map(|item| item.sigma_source.clone()),
+                returns_window_len: snapshot
+                    .as_ref()
+                    .map(|item| item.returns_window_len)
+                    .unwrap_or_default(),
                 active_token_side,
                 poly_updated_at_ms: async_snapshot
                     .as_ref()
@@ -13354,6 +13763,10 @@ mod tests {
             risk_budget_usd: 100.0,
             strength: SignalStrength::Normal,
             z_score: Some(2.1),
+            raw_sigma: None,
+            effective_sigma: None,
+            sigma_source: None,
+            returns_window_len: 0,
             timestamp_ms: 1,
         }
     }
@@ -14779,14 +15192,13 @@ mod tests {
             .expect("delta rebalance trade plan");
         let details = plan_event.details.as_ref().expect("plan details");
 
-        assert!(risk.position_tracker().symbol_has_open_position(&market.symbol));
+        assert!(risk
+            .position_tracker()
+            .symbol_has_open_position(&market.symbol));
         assert!(!recent_events
             .iter()
             .any(|event| event.summary.contains("已平仓")));
-        assert_eq!(
-            details.get("Poly计划股数").map(String::as_str),
-            Some("0")
-        );
+        assert_eq!(details.get("Poly计划股数").map(String::as_str), Some("0"));
         assert!(details
             .get("CEX计划数量")
             .and_then(|qty| Decimal::from_str(qty).ok())
@@ -15393,6 +15805,206 @@ mod tests {
             !events.iter().any(|event| event.summary == "生命周期噪声"),
             "低优先级噪声不应挤掉高价值事件"
         );
+    }
+
+    #[test]
+    fn market_warmup_diagnostic_message_reports_missing_poly_side_and_errors() {
+        let market = test_settings_with_price_filter(None, None).markets[0].clone();
+        let data = MarketWarmupData {
+            cex_klines: vec![(1, 100.0), (2, 101.0), (3, 102.0)],
+            poly_histories: vec![(TokenSide::No, vec![(1, 0.36), (2, 0.365)])],
+            poly_history_errors: vec![(TokenSide::Yes, "timeout".to_owned())],
+        };
+
+        let message = market_warmup_diagnostic_message(&market, &data).expect("diagnostic");
+
+        assert!(message.contains(&market.symbol.0));
+        assert!(message.contains("cex=3"));
+        assert!(message.contains("yes=0"));
+        assert!(message.contains("no=2"));
+        assert!(message.contains("YES=timeout"));
+    }
+
+    #[test]
+    fn build_strategy_health_summary_counts_warmup_and_history_failures() {
+        let markets = vec![
+            polyalpha_core::MarketView {
+                symbol: "btc-ready".to_owned(),
+                z_score: Some(-4.2),
+                basis_pct: Some(-1.5),
+                poly_price: Some(0.41),
+                poly_yes_price: Some(0.41),
+                poly_no_price: Some(0.59),
+                cex_price: Some(82_000.0),
+                fair_value: Some(0.48),
+                has_position: false,
+                minutes_to_expiry: Some(120.0),
+                basis_history_len: 640,
+                raw_sigma: None,
+                effective_sigma: None,
+                sigma_source: None,
+                returns_window_len: 0,
+                active_token_side: Some("NO".to_owned()),
+                poly_updated_at_ms: Some(1),
+                cex_updated_at_ms: Some(1),
+                poly_quote_age_ms: Some(100),
+                cex_quote_age_ms: Some(10),
+                cross_leg_skew_ms: Some(90),
+                evaluable_status: EvaluableStatus::Evaluable,
+                async_classification: AsyncClassification::BalancedFresh,
+                market_tier: MarketTier::Tradeable,
+                retention_reason: MarketRetentionReason::None,
+                last_focus_at_ms: None,
+                last_tradeable_at_ms: None,
+            },
+            polyalpha_core::MarketView {
+                symbol: "btc-warmup".to_owned(),
+                z_score: None,
+                basis_pct: Some(-0.8),
+                poly_price: Some(0.33),
+                poly_yes_price: Some(0.33),
+                poly_no_price: Some(0.67),
+                cex_price: Some(82_000.0),
+                fair_value: Some(0.41),
+                has_position: false,
+                minutes_to_expiry: Some(240.0),
+                basis_history_len: 128,
+                raw_sigma: None,
+                effective_sigma: None,
+                sigma_source: None,
+                returns_window_len: 0,
+                active_token_side: Some("NO".to_owned()),
+                poly_updated_at_ms: Some(1),
+                cex_updated_at_ms: Some(1),
+                poly_quote_age_ms: Some(100),
+                cex_quote_age_ms: Some(10),
+                cross_leg_skew_ms: Some(90),
+                evaluable_status: EvaluableStatus::Evaluable,
+                async_classification: AsyncClassification::BalancedFresh,
+                market_tier: MarketTier::Focus,
+                retention_reason: MarketRetentionReason::None,
+                last_focus_at_ms: None,
+                last_tradeable_at_ms: None,
+            },
+            polyalpha_core::MarketView {
+                symbol: "btc-stale".to_owned(),
+                z_score: None,
+                basis_pct: Some(-0.3),
+                poly_price: Some(0.71),
+                poly_yes_price: Some(0.29),
+                poly_no_price: Some(0.71),
+                cex_price: Some(82_000.0),
+                fair_value: Some(0.74),
+                has_position: false,
+                minutes_to_expiry: Some(300.0),
+                basis_history_len: 24,
+                raw_sigma: None,
+                effective_sigma: None,
+                sigma_source: None,
+                returns_window_len: 0,
+                active_token_side: Some("NO".to_owned()),
+                poly_updated_at_ms: Some(1),
+                cex_updated_at_ms: Some(1),
+                poly_quote_age_ms: Some(8_000),
+                cex_quote_age_ms: Some(10),
+                cross_leg_skew_ms: Some(7_990),
+                evaluable_status: EvaluableStatus::PolyQuoteStale,
+                async_classification: AsyncClassification::PolyQuoteStale,
+                market_tier: MarketTier::Focus,
+                retention_reason: MarketRetentionReason::None,
+                last_focus_at_ms: None,
+                last_tradeable_at_ms: None,
+            },
+            polyalpha_core::MarketView {
+                symbol: "btc-no-poly".to_owned(),
+                z_score: None,
+                basis_pct: None,
+                poly_price: None,
+                poly_yes_price: None,
+                poly_no_price: None,
+                cex_price: Some(82_000.0),
+                fair_value: None,
+                has_position: false,
+                minutes_to_expiry: None,
+                basis_history_len: 0,
+                raw_sigma: None,
+                effective_sigma: None,
+                sigma_source: None,
+                returns_window_len: 0,
+                active_token_side: None,
+                poly_updated_at_ms: None,
+                cex_updated_at_ms: Some(1),
+                poly_quote_age_ms: None,
+                cex_quote_age_ms: Some(10),
+                cross_leg_skew_ms: None,
+                evaluable_status: EvaluableStatus::NotEvaluableNoPoly,
+                async_classification: AsyncClassification::NoPolySample,
+                market_tier: MarketTier::Observation,
+                retention_reason: MarketRetentionReason::None,
+                last_focus_at_ms: None,
+                last_tradeable_at_ms: None,
+            },
+        ];
+        let warmup_status = HashMap::from([
+            (
+                Symbol::new("btc-no-poly"),
+                MarketWarmupStatus {
+                    cex_fetch_error: Some("cex timeout".to_owned()),
+                    ..MarketWarmupStatus::default()
+                },
+            ),
+            (
+                Symbol::new("btc-stale"),
+                MarketWarmupStatus {
+                    poly_history_errors: vec![(TokenSide::Yes, "poly 502".to_owned())],
+                    ..MarketWarmupStatus::default()
+                },
+            ),
+        ]);
+
+        let summary = build_strategy_health_summary(&markets, &warmup_status, 600, 4, 3, 1);
+
+        assert_eq!(summary.total_markets, 4);
+        assert_eq!(summary.fair_value_ready_markets, 3);
+        assert_eq!(summary.z_score_ready_markets, 1);
+        assert_eq!(summary.warmup_ready_markets, 1);
+        assert_eq!(summary.insufficient_warmup_markets, 2);
+        assert_eq!(summary.stale_markets, 1);
+        assert_eq!(summary.no_poly_markets, 1);
+        assert_eq!(summary.cex_history_failed_markets, 1);
+        assert_eq!(summary.poly_history_failed_markets, 1);
+        assert_eq!(summary.min_warmup_samples, 600);
+        assert_eq!(summary.warmup_total_markets, 4);
+        assert_eq!(summary.warmup_completed_markets, 3);
+        assert_eq!(summary.warmup_failed_markets, 1);
+    }
+
+    #[test]
+    fn strategy_readiness_alert_reports_zero_zscore_as_not_ready() {
+        let summary = polyalpha_core::StrategyHealthView {
+            total_markets: 256,
+            fair_value_ready_markets: 194,
+            z_score_ready_markets: 0,
+            warmup_ready_markets: 12,
+            insufficient_warmup_markets: 182,
+            stale_markets: 159,
+            no_poly_markets: 62,
+            cex_history_failed_markets: 0,
+            poly_history_failed_markets: 0,
+            min_warmup_samples: 600,
+            warmup_total_markets: 256,
+            warmup_completed_markets: 128,
+            warmup_failed_markets: 0,
+        };
+
+        let alert = strategy_readiness_alert(&summary, 60_000, 0)
+            .expect("zero-zscore state should produce readiness alert");
+
+        assert_eq!(alert.kind, "risk");
+        assert!(alert.summary.contains("策略未就绪"));
+        assert!(alert.summary.contains("0/256"));
+        assert!(alert.summary.contains("预热完成 12/256"));
+        assert!(alert.summary.contains("门槛 600"));
     }
 
     #[test]

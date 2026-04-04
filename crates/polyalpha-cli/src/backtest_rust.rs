@@ -4083,6 +4083,10 @@ mod tests {
             risk_budget_usd: 100.0,
             strength: polyalpha_core::SignalStrength::Normal,
             z_score: Some(-2.4),
+            raw_sigma: None,
+            effective_sigma: None,
+            sigma_source: None,
+            returns_window_len: 0,
             timestamp_ms: row.ts_ms,
         }
     }
@@ -4701,6 +4705,10 @@ mod tests {
             risk_budget_usd: 100.0,
             strength: polyalpha_core::SignalStrength::Weak,
             z_score: Some(-2.0),
+            raw_sigma: None,
+            effective_sigma: None,
+            sigma_source: None,
+            returns_window_len: 0,
             timestamp_ms: row.ts_ms,
         };
         let config = sample_replay_config(1.0, 100.0, 100.0, 100.0, 100.0);

@@ -162,6 +162,10 @@ mod tests {
             risk_budget_usd: 200.0,
             strength: SignalStrength::Normal,
             z_score: Some(2.4),
+            raw_sigma: None,
+            effective_sigma: None,
+            sigma_source: None,
+            returns_window_len: 0,
             timestamp_ms: 1_716_000_000_000,
         });
 

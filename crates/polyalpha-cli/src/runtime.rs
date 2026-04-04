@@ -7,8 +7,7 @@ use async_trait::async_trait;
 use polyalpha_core::{
     cex_venue_symbol, CoreError, Exchange, MarketConfig, MarketDataEvent, OpenCandidate,
     OrderBookSnapshot, OrderExecutor, OrderId, OrderRequest, OrderResponse, OrderStatus,
-    PlanningIntent, ResidualSnapshot, Settings, Symbol, SymbolRegistry,
-    PLANNING_SCHEMA_VERSION,
+    PlanningIntent, ResidualSnapshot, Settings, Symbol, SymbolRegistry, PLANNING_SCHEMA_VERSION,
 };
 use polyalpha_data::{DataManager, MarketDataNormalizer};
 use polyalpha_executor::{
@@ -881,6 +880,10 @@ mod tests {
             risk_budget_usd: 200.0,
             strength: polyalpha_core::SignalStrength::Normal,
             z_score: Some(2.4),
+            raw_sigma: None,
+            effective_sigma: None,
+            sigma_source: None,
+            returns_window_len: 0,
             timestamp_ms: 1,
         };
 
@@ -895,9 +898,9 @@ mod tests {
                 schema_version: PLANNING_SCHEMA_VERSION,
                 residual_delta: 0.12,
                 planned_cex_qty: polyalpha_core::CexBaseQty(rust_decimal::Decimal::new(12, 2)),
-                current_poly_yes_shares: polyalpha_core::PolyShares(
-                    rust_decimal::Decimal::new(10, 0),
-                ),
+                current_poly_yes_shares: polyalpha_core::PolyShares(rust_decimal::Decimal::new(
+                    10, 0,
+                )),
                 current_poly_no_shares: polyalpha_core::PolyShares::ZERO,
                 preferred_cex_side: polyalpha_core::OrderSide::Sell,
             },
@@ -1300,6 +1303,10 @@ mod tests {
             risk_budget_usd: 200.0,
             strength: polyalpha_core::SignalStrength::Normal,
             z_score: Some(2.2),
+            raw_sigma: None,
+            effective_sigma: None,
+            sigma_source: None,
+            returns_window_len: 0,
             timestamp_ms: 20,
         };
         let plan = execution

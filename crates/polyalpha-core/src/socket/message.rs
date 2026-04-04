@@ -398,6 +398,16 @@ pub struct MarketView {
     pub has_position: bool,
     pub minutes_to_expiry: Option<f64>,
     #[serde(default)]
+    pub basis_history_len: usize,
+    #[serde(default)]
+    pub raw_sigma: Option<f64>,
+    #[serde(default)]
+    pub effective_sigma: Option<f64>,
+    #[serde(default)]
+    pub sigma_source: Option<String>,
+    #[serde(default)]
+    pub returns_window_len: usize,
+    #[serde(default)]
     pub active_token_side: Option<String>,
     #[serde(default)]
     pub poly_updated_at_ms: Option<u64>,
@@ -531,11 +541,44 @@ impl Default for MonitorStrategyConfig {
 
 /// 运行时指标
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StrategyHealthView {
+    #[serde(default)]
+    pub total_markets: u64,
+    #[serde(default)]
+    pub fair_value_ready_markets: u64,
+    #[serde(default)]
+    pub z_score_ready_markets: u64,
+    #[serde(default)]
+    pub warmup_ready_markets: u64,
+    #[serde(default)]
+    pub insufficient_warmup_markets: u64,
+    #[serde(default)]
+    pub stale_markets: u64,
+    #[serde(default)]
+    pub no_poly_markets: u64,
+    #[serde(default)]
+    pub cex_history_failed_markets: u64,
+    #[serde(default)]
+    pub poly_history_failed_markets: u64,
+    #[serde(default)]
+    pub min_warmup_samples: u64,
+    #[serde(default)]
+    pub warmup_total_markets: u64,
+    #[serde(default)]
+    pub warmup_completed_markets: u64,
+    #[serde(default)]
+    pub warmup_failed_markets: u64,
+}
+
+/// 运行时指标
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MonitorRuntimeStats {
     #[serde(default)]
     pub snapshot_resync_count: u64,
     #[serde(default)]
     pub funding_refresh_count: u64,
+    #[serde(default)]
+    pub strategy_health: StrategyHealthView,
 }
 
 /// 连接信息
@@ -858,6 +901,10 @@ mod tests {
             risk_budget_usd: 200.0,
             strength: SignalStrength::Normal,
             z_score: Some(2.1),
+            raw_sigma: None,
+            effective_sigma: None,
+            sigma_source: None,
+            returns_window_len: 0,
             timestamp_ms: 1_716_000_000_000,
         };
         let intent = PlanningIntent::OpenPosition {
@@ -1172,6 +1219,7 @@ mod tests {
                 fair_value: Some(0.065),
                 has_position: true,
                 minutes_to_expiry: Some(100.0),
+                basis_history_len: 600,
                 active_token_side: Some("YES".to_owned()),
                 poly_updated_at_ms: Some(1),
                 cex_updated_at_ms: Some(2),
@@ -1196,6 +1244,7 @@ mod tests {
                 fair_value: Some(0.08),
                 has_position: false,
                 minutes_to_expiry: Some(100.0),
+                basis_history_len: 600,
                 active_token_side: Some("YES".to_owned()),
                 poly_updated_at_ms: Some(3),
                 cex_updated_at_ms: Some(4),
@@ -1354,6 +1403,7 @@ mod tests {
                 fair_value: Some(0.37),
                 has_position: true,
                 minutes_to_expiry: Some(60.0),
+                basis_history_len: 600,
                 active_token_side: Some("YES".to_owned()),
                 poly_updated_at_ms: Some(1),
                 cex_updated_at_ms: Some(2),

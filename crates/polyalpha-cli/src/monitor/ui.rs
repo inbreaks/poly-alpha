@@ -100,7 +100,7 @@ pub fn render_performance(state: &TuiState) -> Paragraph<'static> {
     let (market_data_mode, market_data_color) =
         market_data_mode_badge(&state.monitor.config.market_data_mode);
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("总收益 ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -140,6 +140,10 @@ pub fn render_performance(state: &TuiState) -> Paragraph<'static> {
                 Style::default().fg(pnl_color(equity_delta)),
             ),
         ]),
+    ];
+
+    lines.extend(strategy_health_summary_lines(state));
+    lines.extend([
         Line::from(vec![
             Span::styled("参数 ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!(
@@ -213,8 +217,8 @@ pub fn render_performance(state: &TuiState) -> Paragraph<'static> {
                 "禁用".to_owned()
             }),
         ]),
-        recent_trade_summary_line(state),
-    ];
+    ]);
+    lines.push(recent_trade_summary_line(state));
 
     Paragraph::new(lines)
         .block(
@@ -261,8 +265,106 @@ fn recent_trade_summary_line(state: &TuiState) -> Line<'static> {
     ])
 }
 
+fn strategy_health_summary_lines(state: &TuiState) -> Vec<Line<'static>> {
+    let health = &state.monitor.runtime.strategy_health;
+    if health.total_markets == 0 {
+        return Vec::new();
+    }
+
+    vec![
+        Line::from(vec![
+            Span::styled("健康 ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "Z值就绪 {}/{}",
+                    health.z_score_ready_markets, health.total_markets
+                ),
+                Style::default().fg(if health.z_score_ready_markets == 0 {
+                    Color::Red
+                } else {
+                    Color::Green
+                }),
+            ),
+            Span::raw("  "),
+            Span::styled("公允值就绪 ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!(
+                "{}/{}",
+                health.fair_value_ready_markets, health.total_markets
+            )),
+            Span::raw("  "),
+            Span::styled("预热完成 ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}/{}", health.warmup_ready_markets, health.total_markets),
+                Style::default().fg(if health.warmup_ready_markets == 0 {
+                    Color::Yellow
+                } else {
+                    Color::Cyan
+                }),
+            ),
+            Span::raw("  "),
+            Span::styled("预热进度 ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!(
+                "{}/{}",
+                health.warmup_completed_markets, health.warmup_total_markets
+            )),
+            Span::raw("  "),
+            Span::styled("预热不足 ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{}", health.insufficient_warmup_markets)),
+        ]),
+        Line::from(vec![
+            Span::styled("链路 ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("Stale {}", health.stale_markets)),
+            Span::raw("  "),
+            Span::raw(format!("NoPoly {}", health.no_poly_markets)),
+            Span::raw("  "),
+            Span::raw(format!(
+                "历史失败 CEX {}/Poly {}",
+                health.cex_history_failed_markets, health.poly_history_failed_markets
+            )),
+            Span::raw("  "),
+            Span::styled("门槛 ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{}", health.min_warmup_samples)),
+        ]),
+    ]
+}
+
+fn strategy_root_cause_line(state: &TuiState) -> Option<Line<'static>> {
+    let health = &state.monitor.runtime.strategy_health;
+    if health.total_markets == 0 || state.monitor.signals.seen > 0 {
+        return None;
+    }
+
+    let root_cause =
+        if health.cex_history_failed_markets > 0 || health.poly_history_failed_markets > 0 {
+            format!(
+                "历史抓取异常：CEX {} 个，Poly {} 个",
+                health.cex_history_failed_markets, health.poly_history_failed_markets
+            )
+        } else if health.z_score_ready_markets == 0 {
+            format!(
+                "Z值未形成，预热完成 {}/{}，门槛 {}",
+                health.warmup_ready_markets, health.total_markets, health.min_warmup_samples
+            )
+        } else if health.stale_markets > 0 || health.no_poly_markets > 0 {
+            format!(
+                "Stale 市场 {} 个，NoPoly 市场 {} 个",
+                health.stale_markets, health.no_poly_markets
+            )
+        } else {
+            return None;
+        };
+
+    Some(Line::from(vec![
+        Span::styled("当前无信号主因 ", Style::default().fg(Color::DarkGray)),
+        Span::styled(root_cause, Style::default().fg(Color::Yellow)),
+    ]))
+}
+
 pub fn render_signals(state: &TuiState) -> Paragraph<'static> {
     let mut lines = Vec::new();
+    if let Some(line) = strategy_root_cause_line(state) {
+        lines.push(line);
+    }
     let evaluation = &state.monitor.evaluation;
     if evaluation.attempts > 0 {
         let skip_rate = if evaluation.attempts > 0 {
@@ -454,8 +556,9 @@ pub fn render_markets(state: &TuiState) -> Table<'static> {
         let cex_age_ms = market
             .cex_quote_age_ms
             .or_else(|| state.data_age_ms(market.cex_updated_at_ms));
-        let status = format_market_status_compact(market);
-        let status_color = market_status_color(market);
+        let min_warmup_samples = state.monitor.runtime.strategy_health.min_warmup_samples as usize;
+        let status = format_market_status_compact(market, min_warmup_samples);
+        let status_color = market_status_color(market, min_warmup_samples);
 
         Row::new([
             left_styled_cell(
@@ -2193,26 +2296,48 @@ fn market_health_rank(market: &MarketView) -> i32 {
     }
 }
 
-fn compact_market_condition_label(market: &MarketView) -> &'static str {
+fn market_has_insufficient_warmup(market: &MarketView, min_warmup_samples: usize) -> bool {
+    min_warmup_samples > 0
+        && market.z_score.is_none()
+        && market.fair_value.is_some()
+        && market.basis_history_len > 0
+        && market.basis_history_len < min_warmup_samples
+}
+
+fn compact_market_condition_label(market: &MarketView, min_warmup_samples: usize) -> String {
+    if market_has_insufficient_warmup(market, min_warmup_samples) {
+        return format!("预热{}/{}", market.basis_history_len, min_warmup_samples);
+    }
+
     match market.evaluable_status {
         EvaluableStatus::Evaluable => match market.async_classification {
-            AsyncClassification::Unknown => compact_evaluable_status_label(market.evaluable_status),
-            classification => compact_async_classification_label(classification),
+            AsyncClassification::Unknown => {
+                compact_evaluable_status_label(market.evaluable_status).to_owned()
+            }
+            classification => compact_async_classification_label(classification).to_owned(),
         },
-        status => compact_evaluable_status_label(status),
+        status => compact_evaluable_status_label(status).to_owned(),
     }
 }
 
-fn format_market_status_compact(market: &MarketView) -> String {
+fn format_market_status_compact(market: &MarketView, min_warmup_samples: usize) -> String {
     let tier = market.market_tier.label_zh();
     if market.retention_reason != MarketRetentionReason::None {
         format!("{}/{}", tier, market.retention_reason.compact_label_zh())
     } else {
-        format!("{}/{}", tier, compact_market_condition_label(market))
+        format!(
+            "{}/{}",
+            tier,
+            compact_market_condition_label(market, min_warmup_samples)
+        )
     }
 }
 
-fn market_status_color(market: &MarketView) -> Color {
+fn market_status_color(market: &MarketView, min_warmup_samples: usize) -> Color {
+    if market_has_insufficient_warmup(market, min_warmup_samples) {
+        return Color::Yellow;
+    }
+
     match market.market_tier {
         MarketTier::Tradeable => match market.async_classification {
             AsyncClassification::BalancedFresh => Color::Green,
@@ -2670,7 +2795,7 @@ mod tests {
             market.evaluable_status = evaluable_status;
             market.async_classification = async_classification;
 
-            let actual = format_market_status_compact(&market);
+            let actual = format_market_status_compact(&market, 600);
             assert_eq!(actual, expected);
             assert!(display_width(&actual) <= 18, "{actual}");
         }
@@ -2820,6 +2945,81 @@ mod tests {
     }
 
     #[test]
+    fn render_performance_shows_strategy_health_summary_in_chinese() {
+        let mut state = TuiState::default();
+        state.monitor.runtime.strategy_health = polyalpha_core::StrategyHealthView {
+            total_markets: 256,
+            fair_value_ready_markets: 194,
+            z_score_ready_markets: 0,
+            warmup_ready_markets: 12,
+            insufficient_warmup_markets: 182,
+            stale_markets: 159,
+            no_poly_markets: 62,
+            cex_history_failed_markets: 3,
+            poly_history_failed_markets: 7,
+            min_warmup_samples: 600,
+            warmup_total_markets: 256,
+            warmup_completed_markets: 128,
+            warmup_failed_markets: 10,
+        };
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 180, 12));
+        render_performance(&state).render(buffer.area, &mut buffer);
+
+        let compact = compact_text(&buffer_text(&buffer));
+        assert!(compact.contains("健康"));
+        assert!(compact.contains("Z值就绪0/256"));
+        assert!(compact.contains("公允值就绪194/256"));
+        assert!(compact.contains("预热完成12/256"));
+        assert!(compact.contains("预热进度128/256"));
+        assert!(compact.contains("预热不足182"));
+        assert!(compact.contains("Stale159"));
+        assert!(compact.contains("NoPoly62"));
+        assert!(compact.contains("历史失败CEX3/Poly7"));
+        assert!(compact.contains("门槛600"));
+    }
+
+    #[test]
+    fn render_signals_shows_strategy_not_ready_root_cause() {
+        let mut state = TuiState::default();
+        state.monitor.runtime.strategy_health = polyalpha_core::StrategyHealthView {
+            total_markets: 256,
+            fair_value_ready_markets: 194,
+            z_score_ready_markets: 0,
+            warmup_ready_markets: 12,
+            insufficient_warmup_markets: 182,
+            stale_markets: 159,
+            no_poly_markets: 62,
+            cex_history_failed_markets: 0,
+            poly_history_failed_markets: 0,
+            min_warmup_samples: 600,
+            warmup_total_markets: 256,
+            warmup_completed_markets: 128,
+            warmup_failed_markets: 0,
+        };
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 150, 10));
+        render_signals(&state).render(buffer.area, &mut buffer);
+
+        let compact = compact_text(&buffer_text(&buffer));
+        assert!(compact.contains("当前无信号主因"));
+        assert!(compact.contains("Z值未形成"));
+        assert!(compact.contains("预热完成12/256"));
+        assert!(compact.contains("门槛600"));
+    }
+
+    #[test]
+    fn market_table_marks_insufficient_warmup_in_status_column() {
+        let mut market = sample_market("warmup-market", None);
+        market.basis_history_len = 128;
+
+        assert_eq!(
+            format_market_status_compact(&market, 600),
+            "交易池/预热128/600"
+        );
+    }
+
+    #[test]
     fn command_formatters_render_chinese_labels() {
         assert_eq!(format_command_kind(&CommandKind::Pause), "暂停交易");
         assert_eq!(
@@ -2864,6 +3064,11 @@ mod tests {
             fair_value: Some(101.5),
             has_position: false,
             minutes_to_expiry: Some(15.0),
+            basis_history_len: 640,
+            raw_sigma: Some(0.00016),
+            effective_sigma: Some(0.00018),
+            sigma_source: Some("realized".to_owned()),
+            returns_window_len: 64,
             active_token_side: Some("YES".to_owned()),
             poly_updated_at_ms: Some(1_000),
             cex_updated_at_ms: Some(1_500),

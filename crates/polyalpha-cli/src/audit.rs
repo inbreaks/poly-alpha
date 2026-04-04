@@ -6,7 +6,7 @@ use polyalpha_audit::{
     MarketMarkEvent, PositionMarkEvent, SignalEmittedEvent,
 };
 use polyalpha_core::{
-    ExecutionEvent, Exchange, MarketConfig, MarketRule, MarketRuleKind, OrderSide,
+    Exchange, ExecutionEvent, MarketConfig, MarketRule, MarketRuleKind, OrderSide,
     RecoveryDecisionReason, Settings, TokenSide, TradePlan, TradeView, VenueQuantity,
 };
 use rust_decimal::prelude::ToPrimitive;
@@ -185,6 +185,10 @@ struct OpenDecisionSignalView {
     z_score: Option<f64>,
     cex_reference_price: Option<f64>,
     minutes_to_expiry: Option<f64>,
+    raw_sigma_annualized: Option<f64>,
+    effective_sigma_annualized: Option<f64>,
+    sigma_source: Option<String>,
+    returns_window_len: usize,
     implied_sigma_annualized: Option<f64>,
     evaluable_status: String,
     async_classification: String,
@@ -203,6 +207,10 @@ struct OpenDecisionLatestMarketView {
     cex_price: Option<f64>,
     fair_value: Option<f64>,
     minutes_to_expiry: Option<f64>,
+    raw_sigma_annualized: Option<f64>,
+    effective_sigma_annualized: Option<f64>,
+    sigma_source: Option<String>,
+    returns_window_len: usize,
     implied_sigma_annualized: Option<f64>,
     evaluable_status: String,
     async_classification: String,
@@ -357,17 +365,11 @@ fn run_trade_timeline(
             match format {
                 AuditOutputFormat::Json => println!(
                     "{}",
-                    serde_json::to_string_pretty(&TradeTimelineDetailReport {
-                        summary,
-                        ..report
-                    })?
+                    serde_json::to_string_pretty(&TradeTimelineDetailReport { summary, ..report })?
                 ),
-                AuditOutputFormat::Table => print_trade_timeline_detail(
-                    &TradeTimelineDetailReport {
-                        summary,
-                        ..report
-                    },
-                ),
+                AuditOutputFormat::Table => {
+                    print_trade_timeline_detail(&TradeTimelineDetailReport { summary, ..report })
+                }
             }
         }
         None => {
@@ -545,18 +547,18 @@ fn build_trade_timeline_detail(
         ));
     }
 
-    let first_seq = related_events.first().map(|event| event.seq).unwrap_or_default();
-    let pre_close_event = events
-        .iter()
-        .rev()
-        .find(|event| {
-            event.seq < first_seq
-                && matches!(event.kind, polyalpha_audit::AuditEventKind::PositionMark)
-                && event
-                    .symbol
-                    .as_deref()
-                    .is_some_and(|symbol| symbol_matches(symbol, &selected_trade.symbol))
-        });
+    let first_seq = related_events
+        .first()
+        .map(|event| event.seq)
+        .unwrap_or_default();
+    let pre_close_event = events.iter().rev().find(|event| {
+        event.seq < first_seq
+            && matches!(event.kind, polyalpha_audit::AuditEventKind::PositionMark)
+            && event
+                .symbol
+                .as_deref()
+                .is_some_and(|symbol| symbol_matches(symbol, &selected_trade.symbol))
+    });
     let pre_close = pre_close_event.and_then(pre_close_snapshot_view);
 
     let skew_detected = related_events
@@ -873,6 +875,10 @@ fn open_decision_signal_view(
         z_score: signal.candidate.z_score,
         cex_reference_price,
         minutes_to_expiry,
+        raw_sigma_annualized: minute_sigma_to_annualized(signal.candidate.raw_sigma),
+        effective_sigma_annualized: minute_sigma_to_annualized(signal.candidate.effective_sigma),
+        sigma_source: signal.candidate.sigma_source.clone(),
+        returns_window_len: signal.candidate.returns_window_len,
         implied_sigma_annualized,
         evaluable_status: observed
             .map(|item| item.evaluable_status.label_zh().to_owned())
@@ -917,6 +923,10 @@ fn latest_open_decision_market_view(
         cex_price: mark.market.cex_price,
         fair_value: mark.market.fair_value,
         minutes_to_expiry: mark.market.minutes_to_expiry,
+        raw_sigma_annualized: minute_sigma_to_annualized(mark.market.raw_sigma),
+        effective_sigma_annualized: minute_sigma_to_annualized(mark.market.effective_sigma),
+        sigma_source: mark.market.sigma_source.clone(),
+        returns_window_len: mark.market.returns_window_len,
         implied_sigma_annualized,
         evaluable_status: mark.market.evaluable_status.label_zh().to_owned(),
         async_classification: mark.market.async_classification.label_zh().to_owned(),
@@ -1004,12 +1014,13 @@ fn signal_event(event: &AuditEvent) -> Option<&SignalEmittedEvent> {
 }
 
 fn observed_candidate_price(signal: &SignalEmittedEvent) -> Option<f64> {
-    signal.observed.as_ref().and_then(|observed| {
-        match signal.candidate.token_side {
+    signal
+        .observed
+        .as_ref()
+        .and_then(|observed| match signal.candidate.token_side {
             TokenSide::Yes => observed.poly_yes_mid,
             TokenSide::No => observed.poly_no_mid,
-        }
-    })
+        })
 }
 
 fn minutes_to_expiry(timestamp_ms: u64, market: &MarketConfig) -> Option<f64> {
@@ -1064,10 +1075,7 @@ fn aggregate_filled_qty(entries: &[polyalpha_core::OrderLedgerEntry]) -> String 
         return "-".to_owned();
     }
     let total = entries.iter().fold(Decimal::ZERO, |acc, entry| {
-        acc + entry
-            .filled_qty
-            .parse::<Decimal>()
-            .unwrap_or(Decimal::ZERO)
+        acc + entry.filled_qty.parse::<Decimal>().unwrap_or(Decimal::ZERO)
     });
     format_decimal(total)
 }
@@ -1095,7 +1103,13 @@ fn implied_sigma_annualized(
     let mut sigma = 0.01;
     while sigma <= 3.0 {
         let minute_sigma = annualized_to_minute_sigma(sigma);
-        let predicted = token_fair_value(rule, token_side, spot_price, minute_sigma, minutes_to_expiry);
+        let predicted = token_fair_value(
+            rule,
+            token_side,
+            spot_price,
+            minute_sigma,
+            minutes_to_expiry,
+        );
         let error = (predicted - fair_value).abs();
         if error < best_error {
             best_error = error;
@@ -1111,6 +1125,10 @@ fn annualized_to_minute_sigma(value: f64) -> f64 {
     value / TRADING_DAYS_PER_YEAR.sqrt() / MINUTES_PER_DAY.sqrt()
 }
 
+fn minute_sigma_to_annualized(value: Option<f64>) -> Option<f64> {
+    value.map(|sigma| sigma * TRADING_DAYS_PER_YEAR.sqrt() * MINUTES_PER_DAY.sqrt())
+}
+
 fn token_fair_value(
     rule: &MarketRule,
     token_side: TokenSide,
@@ -1118,7 +1136,8 @@ fn token_fair_value(
     minute_sigma: f64,
     minutes_to_expiry: f64,
 ) -> f64 {
-    let yes_probability = yes_probability_from_rule(rule, spot_price, minute_sigma, minutes_to_expiry);
+    let yes_probability =
+        yes_probability_from_rule(rule, spot_price, minute_sigma, minutes_to_expiry);
     match token_side {
         TokenSide::Yes => yes_probability.clamp(0.0, 1.0),
         TokenSide::No => (1.0 - yes_probability).clamp(0.0, 1.0),
@@ -1144,13 +1163,27 @@ fn yes_probability_from_rule(
     };
 
     match rule.kind {
-        MarketRuleKind::Above => above_probability(rule.lower_strike.map(|price| price.0.to_f64().unwrap_or_default()).unwrap_or_default()),
+        MarketRuleKind::Above => above_probability(
+            rule.lower_strike
+                .map(|price| price.0.to_f64().unwrap_or_default())
+                .unwrap_or_default(),
+        ),
         MarketRuleKind::Below => {
-            1.0 - above_probability(rule.upper_strike.map(|price| price.0.to_f64().unwrap_or_default()).unwrap_or_default())
+            1.0 - above_probability(
+                rule.upper_strike
+                    .map(|price| price.0.to_f64().unwrap_or_default())
+                    .unwrap_or_default(),
+            )
         }
         MarketRuleKind::Between => {
-            let lower = rule.lower_strike.map(|price| price.0.to_f64().unwrap_or_default()).unwrap_or_default();
-            let upper = rule.upper_strike.map(|price| price.0.to_f64().unwrap_or_default()).unwrap_or_default();
+            let lower = rule
+                .lower_strike
+                .map(|price| price.0.to_f64().unwrap_or_default())
+                .unwrap_or_default();
+            let upper = rule
+                .upper_strike
+                .map(|price| price.0.to_f64().unwrap_or_default())
+                .unwrap_or_default();
             (above_probability(lower) - above_probability(upper)).clamp(0.0, 1.0)
         }
     }
@@ -1159,22 +1192,38 @@ fn yes_probability_from_rule(
 fn realized_yes_payout(rule: &MarketRule, terminal_price: f64) -> f64 {
     match rule.kind {
         MarketRuleKind::Above => {
-            if terminal_price > rule.lower_strike.map(|price| price.0.to_f64().unwrap_or_default()).unwrap_or_default() {
+            if terminal_price
+                > rule
+                    .lower_strike
+                    .map(|price| price.0.to_f64().unwrap_or_default())
+                    .unwrap_or_default()
+            {
                 1.0
             } else {
                 0.0
             }
         }
         MarketRuleKind::Below => {
-            if terminal_price < rule.upper_strike.map(|price| price.0.to_f64().unwrap_or_default()).unwrap_or_default() {
+            if terminal_price
+                < rule
+                    .upper_strike
+                    .map(|price| price.0.to_f64().unwrap_or_default())
+                    .unwrap_or_default()
+            {
                 1.0
             } else {
                 0.0
             }
         }
         MarketRuleKind::Between => {
-            let lower = rule.lower_strike.map(|price| price.0.to_f64().unwrap_or_default()).unwrap_or_default();
-            let upper = rule.upper_strike.map(|price| price.0.to_f64().unwrap_or_default()).unwrap_or_default();
+            let lower = rule
+                .lower_strike
+                .map(|price| price.0.to_f64().unwrap_or_default())
+                .unwrap_or_default();
+            let upper = rule
+                .upper_strike
+                .map(|price| price.0.to_f64().unwrap_or_default())
+                .unwrap_or_default();
             if terminal_price >= lower && terminal_price < upper {
                 1.0
             } else {
@@ -1511,7 +1560,11 @@ fn print_trade_timeline_detail(report: &TradeTimelineDetailReport) {
             row.price,
             row.edge_usd,
             row.residual_delta,
-            if row.note.is_empty() { "-" } else { row.note.as_str() }
+            if row.note.is_empty() {
+                "-"
+            } else {
+                row.note.as_str()
+            }
         );
     }
 
@@ -1582,9 +1635,13 @@ fn print_open_decision_detail(report: &OpenDecisionDetailReport) {
             format_option_f64(signal.z_score)
         );
         println!(
-            "信号观测: CEX={} 到期剩余={} implied_sigma={} 状态={} / {}",
+            "信号观测: CEX={} 到期剩余={} raw_sigma={} effective_sigma={} source={} window={} implied_sigma={} 状态={} / {}",
             format_option_f64(signal.cex_reference_price),
             format_option_f64(signal.minutes_to_expiry),
+            format_option_f64(signal.raw_sigma_annualized),
+            format_option_f64(signal.effective_sigma_annualized),
+            format_option_text(signal.sigma_source.as_deref()),
+            signal.returns_window_len,
             format_option_f64(signal.implied_sigma_annualized),
             signal.evaluable_status,
             signal.async_classification
@@ -1607,13 +1664,17 @@ fn print_open_decision_detail(report: &OpenDecisionDetailReport) {
     }
     if let Some(mark) = &report.latest_market_snapshot {
         println!(
-            "最新市场快照: tick={} token={} Poly={} CEX={} FV={} mins={} implied_sigma={} 状态={} / {}",
+            "最新市场快照: tick={} token={} Poly={} CEX={} FV={} mins={} raw_sigma={} effective_sigma={} source={} window={} implied_sigma={} 状态={} / {}",
             mark.tick_index,
             format_option_text(mark.active_token_side.as_deref()),
             format_option_f64(mark.poly_price),
             format_option_f64(mark.cex_price),
             format_option_f64(mark.fair_value),
             format_option_f64(mark.minutes_to_expiry),
+            format_option_f64(mark.raw_sigma_annualized),
+            format_option_f64(mark.effective_sigma_annualized),
+            format_option_text(mark.sigma_source.as_deref()),
+            mark.returns_window_len,
             format_option_f64(mark.implied_sigma_annualized),
             mark.evaluable_status,
             mark.async_classification
@@ -2489,34 +2550,46 @@ mod tests {
         assert_eq!(detail.market.rule_kind, "below");
         assert_eq!(detail.market.lower_strike.as_deref(), None);
         assert_eq!(detail.market.upper_strike.as_deref(), Some("1500"));
-        assert_eq!(
-            detail.signal.as_ref().expect("signal").token_side,
-            "NO"
-        );
+        assert_eq!(detail.signal.as_ref().expect("signal").token_side, "NO");
         assert_eq!(
             detail.signal.as_ref().expect("signal").candidate_price,
             Some(0.335)
         );
         assert_eq!(
-            detail.plans.first().expect("open plan").instant_open_loss_usd,
+            detail
+                .plans
+                .first()
+                .expect("open plan")
+                .instant_open_loss_usd,
             format_decimal(dec("7.9939577799514333655105618889"))
         );
-        assert!(
+        assert!(detail
+            .signal
+            .as_ref()
+            .expect("signal")
+            .raw_sigma_annualized
+            .is_some());
+        assert_eq!(
             detail
                 .signal
                 .as_ref()
                 .expect("signal")
-                .implied_sigma_annualized
-                .is_some()
+                .sigma_source
+                .as_deref(),
+            Some("realized")
         );
-        assert!(
-            detail
-                .latest_market_snapshot
-                .as_ref()
-                .expect("latest mark")
-                .implied_sigma_annualized
-                .is_some()
-        );
+        assert!(detail
+            .signal
+            .as_ref()
+            .expect("signal")
+            .effective_sigma_annualized
+            .is_some());
+        assert!(detail
+            .latest_market_snapshot
+            .as_ref()
+            .expect("latest mark")
+            .effective_sigma_annualized
+            .is_some());
     }
 
     fn sample_trade_timeline_events() -> Vec<AuditEvent> {
@@ -2725,15 +2798,7 @@ mod tests {
                 AuditGateResult::Passed,
                 "ok",
             ),
-            market_mark_event(
-                14,
-                1_004,
-                symbol,
-                45,
-                0.335,
-                2045.995,
-                0.6313247925172116,
-            ),
+            market_mark_event(14, 1_004, symbol, 45, 0.335, 2045.995, 0.6313247925172116),
             execution_event(
                 15,
                 1_005,
@@ -3008,6 +3073,11 @@ mod tests {
                     fair_value: Some(fair_value),
                     has_position: true,
                     minutes_to_expiry: Some(392_622.2166666667),
+                    basis_history_len: 600,
+                    raw_sigma: Some(0.00016),
+                    effective_sigma: Some(0.00016),
+                    sigma_source: Some("realized".to_owned()),
+                    returns_window_len: 64,
                     active_token_side: Some("NO".to_owned()),
                     poly_updated_at_ms: Some(995),
                     cex_updated_at_ms: Some(999),
@@ -3043,6 +3113,10 @@ mod tests {
             risk_budget_usd: 200.0,
             strength: polyalpha_core::SignalStrength::Strong,
             z_score: Some(-78.25764036163268),
+            raw_sigma: Some(0.00016),
+            effective_sigma: Some(0.00016),
+            sigma_source: Some("realized".to_owned()),
+            returns_window_len: 64,
             timestamp_ms: 1_000,
         }
     }

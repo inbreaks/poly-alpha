@@ -36,6 +36,14 @@ pub struct OpenCandidate {
     pub risk_budget_usd: f64,
     pub strength: SignalStrength,
     pub z_score: Option<f64>,
+    #[serde(default)]
+    pub raw_sigma: Option<f64>,
+    #[serde(default)]
+    pub effective_sigma: Option<f64>,
+    #[serde(default)]
+    pub sigma_source: Option<String>,
+    #[serde(default)]
+    pub returns_window_len: usize,
     pub timestamp_ms: u64,
 }
 
@@ -392,6 +400,10 @@ mod tests {
             risk_budget_usd: 200.0,
             strength: SignalStrength::Normal,
             z_score: Some(2.1),
+            raw_sigma: Some(0.001),
+            effective_sigma: Some(0.002),
+            sigma_source: Some("default".to_owned()),
+            returns_window_len: 12,
             timestamp_ms: 1_716_000_000_000,
         };
 
@@ -416,6 +428,10 @@ mod tests {
             risk_budget_usd: 150.0,
             strength: SignalStrength::Weak,
             z_score: Some(-1.8),
+            raw_sigma: None,
+            effective_sigma: Some(0.002),
+            sigma_source: Some("default".to_owned()),
+            returns_window_len: 0,
             timestamp_ms: 1_716_000_000_100,
         };
         let intent = PlanningIntent::OpenPosition {
@@ -470,6 +486,10 @@ mod tests {
             risk_budget_usd: 150.0,
             strength: SignalStrength::Weak,
             z_score: Some(-1.8),
+            raw_sigma: None,
+            effective_sigma: None,
+            sigma_source: None,
+            returns_window_len: 0,
             timestamp_ms: 1_716_000_000_100,
         };
 

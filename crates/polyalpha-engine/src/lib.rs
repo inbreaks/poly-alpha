@@ -29,7 +29,11 @@ pub struct BasisStrategySnapshot {
     pub delta: f64,
     pub cex_reference_price: f64,
     pub sigma: Option<f64>,
+    pub raw_sigma: Option<f64>,
+    pub sigma_source: String,
+    pub returns_window_len: usize,
     pub minutes_to_expiry: f64,
+    pub basis_history_len: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -401,6 +405,28 @@ impl SimpleAlphaEngine {
             .and_then(|state| state.last_basis_snapshot.clone())
     }
 
+    pub fn basis_history_lengths(&self, symbol: &Symbol) -> (usize, usize) {
+        self.states
+            .get(symbol)
+            .map(|state| (state.yes.history.len(), state.no.history.len()))
+            .unwrap_or_default()
+    }
+
+    fn sigma_context_from_raw(raw_sigma: Option<f64>, returns_window_len: usize) -> SigmaContext {
+        let effective_sigma = effective_sigma(raw_sigma);
+        let sigma_source = if raw_sigma.filter(|value| *value >= MIN_VOLATILITY).is_some() {
+            "realized"
+        } else {
+            "default"
+        };
+        SigmaContext {
+            raw_sigma,
+            effective_sigma,
+            sigma_source,
+            returns_window_len,
+        }
+    }
+
     pub fn close_reason(&self, symbol: &Symbol) -> Option<String> {
         let state = self.states.get(symbol)?;
         state.active_token_side?;
@@ -505,13 +531,18 @@ impl SimpleAlphaEngine {
             return;
         };
 
-        // Calculate sigma from CEX returns if available
-        let sigma = if state.cex_minutes.returns_window.len() >= 30 {
+        // Warmup keeps its historical >=30-sample gate, but now preserves whether
+        // we used a realized reading or default fallback for downstream auditability.
+        let sigma_context = if state.cex_minutes.returns_window.len() >= 30 {
             let returns: Vec<f64> = state.cex_minutes.returns_window.iter().copied().collect();
-            effective_sigma(calculate_sigma(&returns))
+            Self::sigma_context_from_raw(
+                calculate_sigma(&returns),
+                state.cex_minutes.returns_window.len(),
+            )
         } else {
-            Some(default_minute_sigma())
+            Self::sigma_context_from_raw(None, state.cex_minutes.returns_window.len())
         };
+        let sigma = sigma_context.effective_sigma;
 
         let settlement_ts_ms = market.settlement_timestamp.saturating_mul(1000);
         // Get sorted CEX timestamps for finding closest match
@@ -598,7 +629,11 @@ impl SimpleAlphaEngine {
                             delta,
                             cex_reference_price: cex_price,
                             sigma,
+                            raw_sigma: sigma_context.raw_sigma,
+                            sigma_source: sigma_context.sigma_source.to_owned(),
+                            returns_window_len: sigma_context.returns_window_len,
                             minutes_to_expiry,
+                            basis_history_len: history.len(),
                         };
 
                         match token_side {
@@ -952,7 +987,10 @@ impl SimpleAlphaEngine {
             }
         };
 
-        let sigma = effective_sigma(state.cex_minutes.sigma());
+        let sigma_context = Self::sigma_context_from_raw(
+            state.cex_minutes.sigma(),
+            state.cex_minutes.returns_window.len(),
+        );
         let yes_evaluation = self.evaluate_token_pending(
             symbol,
             &rule,
@@ -961,7 +999,7 @@ impl SimpleAlphaEngine {
             &state.yes,
             cex_reference_price,
             cex_reference_minute_ms,
-            sigma,
+            &sigma_context,
         );
         let no_evaluation = self.evaluate_token_pending(
             symbol,
@@ -971,7 +1009,7 @@ impl SimpleAlphaEngine {
             &state.no,
             cex_reference_price,
             cex_reference_minute_ms,
-            sigma,
+            &sigma_context,
         );
 
         let mut data_quality_issue = false;
@@ -1064,7 +1102,7 @@ impl SimpleAlphaEngine {
         token_state: &TokenMarketState,
         cex_reference_price: f64,
         cex_reference_minute_ms: u64,
-        sigma: Option<f64>,
+        sigma_context: &SigmaContext,
     ) -> Option<EvaluatedToken> {
         let pending = token_state.pending_observation.clone()?;
         if self.config.enable_freshness_check {
@@ -1101,14 +1139,14 @@ impl SimpleAlphaEngine {
             rule,
             token_side,
             cex_reference_price,
-            sigma,
+            sigma_context.effective_sigma,
             minutes_to_expiry,
         );
         let delta = token_delta(
             rule,
             token_side,
             cex_reference_price,
-            sigma,
+            sigma_context.effective_sigma,
             minutes_to_expiry,
         );
         let signal_basis = pending.price - fair_value;
@@ -1128,8 +1166,12 @@ impl SimpleAlphaEngine {
                 z_score,
                 delta,
                 cex_reference_price,
-                sigma,
+                sigma: sigma_context.effective_sigma,
+                raw_sigma: sigma_context.raw_sigma,
+                sigma_source: sigma_context.sigma_source.to_owned(),
+                returns_window_len: sigma_context.returns_window_len,
                 minutes_to_expiry,
+                basis_history_len: token_state.history.len(),
             }),
             warning: None,
         })
@@ -1162,6 +1204,10 @@ impl SimpleAlphaEngine {
             risk_budget_usd: risk_budget.0.to_f64().unwrap_or_default(),
             strength: self.signal_strength(symbol, snapshot.z_score),
             z_score: snapshot.z_score,
+            raw_sigma: snapshot.raw_sigma,
+            effective_sigma: snapshot.sigma,
+            sigma_source: Some(snapshot.sigma_source.clone()),
+            returns_window_len: snapshot.returns_window_len,
             timestamp_ms,
         })
     }
@@ -1238,6 +1284,14 @@ struct EvaluatedToken {
     minute_bucket_ms: u64,
     snapshot: Option<BasisStrategySnapshot>,
     warning: Option<EngineWarning>,
+}
+
+#[derive(Clone, Debug)]
+struct SigmaContext {
+    raw_sigma: Option<f64>,
+    effective_sigma: Option<f64>,
+    sigma_source: &'static str,
+    returns_window_len: usize,
 }
 
 fn apply_token_evaluation(token_state: &mut TokenMarketState, evaluation: EvaluatedToken) {
@@ -1788,6 +1842,10 @@ mod tests {
         assert_eq!(candidate.risk_budget_usd, 1_000.0);
         assert!(candidate.raw_mispricing.abs() > 0.0);
         assert!(candidate.delta_estimate.abs() > 0.0);
+        assert!(candidate.raw_sigma.is_some());
+        assert!(candidate.effective_sigma.is_some());
+        assert_eq!(candidate.sigma_source.as_deref(), Some("realized"));
+        assert!(candidate.returns_window_len >= 2);
     }
 
     #[tokio::test]
