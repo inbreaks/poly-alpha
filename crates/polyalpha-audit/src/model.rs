@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use polyalpha_core::{
     AsyncClassification, ConnectionStatus, EngineWarning, EvaluableStatus, ExecutionEvent,
-    MarketView, MonitorState, OpenCandidate, PerformanceMetrics, PositionView, TradingMode,
+    MarketView, MonitorState, OpenCandidate, PerformanceMetrics, PlanningDiagnostics,
+    PositionView, TradingMode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -259,6 +260,8 @@ pub struct GateDecisionEvent {
     pub candidate: OpenCandidate,
     #[serde(default)]
     pub observed: Option<AuditObservedMarket>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planning_diagnostics: Option<PlanningDiagnostics>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

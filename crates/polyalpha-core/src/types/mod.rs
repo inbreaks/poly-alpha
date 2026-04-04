@@ -31,9 +31,9 @@ pub use order::{
 };
 pub use orderbook::{InstrumentKind, OrderBookSnapshot, PriceLevel, Side};
 pub use planning::{
-    ExecutionResult, OpenCandidate, OrderLedgerEntry, PlanRejectionReason, PlanningIntent,
-    RecoveryDecisionReason, ResidualSnapshot, RevalidationFailureReason, TradePlan,
-    PLANNING_SCHEMA_VERSION,
+    ExecutionResult, OpenCandidate, OrderLedgerEntry, PlanRejectionReason, PlanningBookLevel,
+    PlanningDiagnostics, PlanningIntent, RecoveryDecisionReason, ResidualSnapshot,
+    RevalidationFailureReason, TradePlan, PLANNING_SCHEMA_VERSION,
 };
 pub use position::{Position, PositionKey, PositionSide};
 pub use position_tracker::{FillEffect, PositionTracker};

@@ -45,9 +45,10 @@ use polyalpha_core::{
     MarketDataMode, MarketDataSource, MarketPhase, MarketRetentionReason, MarketTier, MarketView,
     MonitorEvent, MonitorEventPayload, MonitorRuntimeStats, MonitorSocketServer, MonitorState,
     MonitorStrategyConfig, OpenCandidate, OrderSide, OrderStatus, PerformanceMetrics,
-    PlanningIntent, PolyShares, Position, Price, RecoveryDecisionReason, ResidualSnapshot,
-    RiskManager, Settings, SignalStrength, StrategyHealthView, Symbol, SymbolRegistry, TokenSide,
-    TradePlan, TradeView, UsdNotional, VenueQuantity, PLANNING_SCHEMA_VERSION,
+    PlanningDiagnostics, PlanningIntent, PolyShares, Position, Price, RecoveryDecisionReason,
+    ResidualSnapshot, RiskManager, Settings, SignalStrength, StrategyHealthView, Symbol,
+    SymbolRegistry, TokenSide, TradePlan, TradeView, UsdNotional, VenueQuantity,
+    PLANNING_SCHEMA_VERSION,
 };
 use polyalpha_data::{
     BinanceFuturesDataSource, DataManager, OkxMarketDataSource, PolyBookLevel, PolyBookUpdate,
@@ -58,11 +59,14 @@ use polyalpha_engine::{MarketOverrideConfig, SimpleAlphaEngine, SimpleEngineConf
 use polyalpha_executor::dry_run::DryRunExecutor;
 use polyalpha_executor::{
     dry_run::DryRunOrderSnapshot, ExecutionManager, InMemoryOrderbookProvider,
+    PreviewIntentError,
 };
 use polyalpha_risk::{InMemoryRiskManager, RiskLimits};
 
 use crate::args::{LiveExecutorMode, PaperInspectFormat};
-use crate::commands::{open_plan_risk_rejection_reason, preview_open_plan, select_market};
+use crate::commands::{
+    open_plan_risk_rejection_reason, preview_open_plan_detailed, select_market,
+};
 use crate::market_pool::{
     active_open_cooldown_reason, active_open_cooldown_remaining_ms, clear_expired_open_cooldown,
     cooldown_gate_reason, maybe_start_open_cooldown, note_focus_activity, note_tradeable_activity,
@@ -1050,6 +1054,27 @@ impl PaperAudit {
         summary: String,
         observed: Option<AuditObservedMarket>,
     ) -> Result<()> {
+        self.record_gate_decision_with_diagnostics(
+            candidate,
+            gate,
+            result,
+            reason,
+            summary,
+            observed,
+            None,
+        )
+    }
+
+    fn record_gate_decision_with_diagnostics(
+        &mut self,
+        candidate: &OpenCandidate,
+        gate: &str,
+        result: AuditGateResult,
+        reason: &str,
+        summary: String,
+        observed: Option<AuditObservedMarket>,
+        planning_diagnostics: Option<PlanningDiagnostics>,
+    ) -> Result<()> {
         self.record_event(NewAuditEvent {
             timestamp_ms: now_millis(),
             kind: AuditEventKind::GateDecision,
@@ -1066,6 +1091,7 @@ impl PaperAudit {
                 reason: reason.to_owned(),
                 candidate: candidate.clone(),
                 observed,
+                planning_diagnostics,
             }),
         })
     }
@@ -7412,14 +7438,22 @@ async fn process_signal_single(
         ),
     );
 
-    let plan = match preview_open_plan(execution, &candidate) {
+    let plan = match preview_open_plan_detailed(execution, &candidate) {
         Ok(plan) => plan,
         Err(err) => {
             stats.signals_rejected += 1;
             stats.execution_rejected += 1;
             record_signal_rejection(stats, "execution_planner");
-            let reason_code = extract_plan_rejection_reason(&err.to_string())
-                .unwrap_or_else(|| "trade_plan_rejected".to_owned());
+            let (reason_code, planning_diagnostics) = match err {
+                PreviewIntentError::PlanRejected(rejection) => {
+                    (rejection.reason.code().to_owned(), rejection.diagnostics)
+                }
+                PreviewIntentError::Core(err) => (
+                    extract_plan_rejection_reason(&err.to_string())
+                        .unwrap_or_else(|| "trade_plan_rejected".to_owned()),
+                    None,
+                ),
+            };
             let _ = maybe_start_market_pool_cooldown(
                 observed,
                 settings,
@@ -7432,13 +7466,14 @@ async fn process_signal_single(
                 gate_reason_label_zh("trade_plan", &reason_code)
             );
             if let Some(audit) = audit.as_mut() {
-                audit.record_gate_decision(
+                audit.record_gate_decision_with_diagnostics(
                     &candidate,
                     "trade_plan",
                     AuditGateResult::Rejected,
                     &reason_code,
                     summary.clone(),
                     observed_snapshot.clone(),
+                    planning_diagnostics.clone(),
                 )?;
             }
             reject_signal(
@@ -7448,14 +7483,13 @@ async fn process_signal_single(
                 "risk",
                 &reason_code,
                 summary,
-                build_gate_event_details(
+                build_trade_plan_gate_event_details(
                     &candidate,
                     observed_snapshot.as_ref(),
                     settings,
-                    "trade_plan",
                     AuditGateResult::Rejected,
                     &reason_code,
-                    None,
+                    planning_diagnostics.as_ref(),
                 ),
             );
             sync_engine_position_state_from_runtime(
@@ -8054,14 +8088,22 @@ async fn process_signal_multi(
         ),
     );
 
-    let plan = match preview_open_plan(execution, &candidate) {
+    let plan = match preview_open_plan_detailed(execution, &candidate) {
         Ok(plan) => plan,
         Err(err) => {
             stats.signals_rejected += 1;
             stats.execution_rejected += 1;
             record_signal_rejection(stats, "execution_planner");
-            let reason_code = extract_plan_rejection_reason(&err.to_string())
-                .unwrap_or_else(|| "trade_plan_rejected".to_owned());
+            let (reason_code, planning_diagnostics) = match err {
+                PreviewIntentError::PlanRejected(rejection) => {
+                    (rejection.reason.code().to_owned(), rejection.diagnostics)
+                }
+                PreviewIntentError::Core(err) => (
+                    extract_plan_rejection_reason(&err.to_string())
+                        .unwrap_or_else(|| "trade_plan_rejected".to_owned()),
+                    None,
+                ),
+            };
             if let Some(observed) = observed_map.get_mut(&candidate.symbol) {
                 let _ = maybe_start_market_pool_cooldown(
                     observed,
@@ -8076,13 +8118,14 @@ async fn process_signal_multi(
                 gate_reason_label_zh("trade_plan", &reason_code)
             );
             if let Some(audit) = audit.as_mut() {
-                audit.record_gate_decision(
+                audit.record_gate_decision_with_diagnostics(
                     &candidate,
                     "trade_plan",
                     AuditGateResult::Rejected,
                     &reason_code,
                     summary.clone(),
                     observed_snapshot.clone(),
+                    planning_diagnostics.clone(),
                 )?;
             }
             reject_signal(
@@ -8092,14 +8135,13 @@ async fn process_signal_multi(
                 "risk",
                 &reason_code,
                 summary,
-                build_gate_event_details(
+                build_trade_plan_gate_event_details(
                     &candidate,
                     observed_snapshot.as_ref(),
                     settings,
-                    "trade_plan",
                     AuditGateResult::Rejected,
                     &reason_code,
-                    None,
+                    planning_diagnostics.as_ref(),
                 ),
             );
             sync_engine_position_state_from_runtime(
@@ -11608,6 +11650,134 @@ fn build_gate_event_details(
     maybe_details(details)
 }
 
+fn add_planning_diagnostics_details(details: &mut EventDetails, diagnostics: &PlanningDiagnostics) {
+    insert_detail(
+        details,
+        "Planner深度档位",
+        diagnostics.planner_depth_levels.to_string(),
+    );
+    insert_detail_opt(
+        details,
+        "Poly盘口中间价",
+        diagnostics
+            .poly_mid_price
+            .map(|price| format_detail_decimal(price.0)),
+    );
+    insert_detail_opt(
+        details,
+        "Poly最佳买价",
+        diagnostics
+            .poly_best_bid
+            .map(|price| format_detail_decimal(price.0)),
+    );
+    insert_detail_opt(
+        details,
+        "Poly最佳卖价",
+        diagnostics
+            .poly_best_ask
+            .map(|price| format_detail_decimal(price.0)),
+    );
+    insert_detail_opt(
+        details,
+        "Poly盘口均价",
+        diagnostics
+            .poly_book_average_price
+            .map(|price| format_detail_decimal(price.0)),
+    );
+    insert_detail_opt(
+        details,
+        "Poly可执行价",
+        diagnostics
+            .poly_executable_price
+            .map(|price| format_detail_decimal(price.0)),
+    );
+    insert_detail_opt(
+        details,
+        "Poly价格冲击",
+        diagnostics
+            .poly_price_impact_bps
+            .map(|bps| format!("{} bps", format_detail_decimal(bps.round_dp(2)))),
+    );
+    insert_detail(
+        details,
+        "Poly目标股数",
+        format_detail_decimal(diagnostics.poly_requested_shares.0),
+    );
+    insert_detail(
+        details,
+        "Poly计划股数",
+        format_detail_decimal(diagnostics.poly_planned_shares.0),
+    );
+    insert_detail(
+        details,
+        "CEX计划数量",
+        format_detail_decimal(diagnostics.cex_planned_qty.0),
+    );
+    insert_detail_opt(
+        details,
+        "计划边USD",
+        diagnostics
+            .planned_edge_usd
+            .map(|value| format_detail_decimal(value.0)),
+    );
+    insert_detail_opt(
+        details,
+        "开仓瞬时亏损USD",
+        diagnostics
+            .instant_open_loss_usd
+            .map(|value| format_detail_decimal(value.0)),
+    );
+    insert_detail_opt(
+        details,
+        "Poly买盘Top3",
+        (!diagnostics.poly_bids_top.is_empty())
+            .then(|| format_planning_book_levels(&diagnostics.poly_bids_top)),
+    );
+    insert_detail_opt(
+        details,
+        "Poly卖盘Top3",
+        (!diagnostics.poly_asks_top.is_empty())
+            .then(|| format_planning_book_levels(&diagnostics.poly_asks_top)),
+    );
+}
+
+fn build_trade_plan_gate_event_details(
+    candidate: &OpenCandidate,
+    observed: Option<&AuditObservedMarket>,
+    settings: &Settings,
+    result: AuditGateResult,
+    reason: &str,
+    planning_diagnostics: Option<&PlanningDiagnostics>,
+) -> Option<EventDetails> {
+    let mut details = build_gate_event_details(
+        candidate,
+        observed,
+        settings,
+        "trade_plan",
+        result,
+        reason,
+        None,
+    )?;
+    if let Some(diagnostics) = planning_diagnostics {
+        add_planning_diagnostics_details(&mut details, diagnostics);
+    }
+    maybe_details(details)
+}
+
+fn format_planning_book_levels(levels: &[polyalpha_core::PlanningBookLevel]) -> String {
+    levels
+        .iter()
+        .map(|level| {
+            format!(
+                "{} x {}",
+                format_detail_decimal(level.price.0),
+                format_detail_decimal(level.shares.0)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 fn build_skip_event_details(
     reason: EvaluationSkipReason,
     warning: &EngineWarning,
@@ -13876,6 +14046,51 @@ mod tests {
             sigma_source: None,
             returns_window_len: 0,
             timestamp_ms: 1,
+        }
+    }
+
+    fn sample_planning_diagnostics() -> PlanningDiagnostics {
+        PlanningDiagnostics {
+            planner_depth_levels: 5,
+            poly_mid_price: Some(Price(Decimal::new(27, 2))),
+            poly_best_bid: Some(Price(Decimal::new(26, 2))),
+            poly_best_ask: Some(Price(Decimal::new(28, 2))),
+            poly_book_average_price: Some(Price(Decimal::new(275, 3))),
+            poly_executable_price: Some(Price(Decimal::new(27864, 5))),
+            poly_price_impact_bps: Some(Decimal::new(320, 0)),
+            poly_requested_shares: PolyShares(Decimal::new(720, 0)),
+            poly_planned_shares: PolyShares(Decimal::new(720, 0)),
+            cex_planned_qty: polyalpha_core::CexBaseQty(Decimal::new(864, 5)),
+            planned_edge_usd: Some(UsdNotional(Decimal::new(1134, 2))),
+            instant_open_loss_usd: Some(UsdNotional(Decimal::new(796, 2))),
+            poly_bids_top: vec![
+                polyalpha_core::PlanningBookLevel {
+                    price: Price(Decimal::new(26, 2)),
+                    shares: PolyShares(Decimal::new(100, 0)),
+                },
+                polyalpha_core::PlanningBookLevel {
+                    price: Price(Decimal::new(259, 3)),
+                    shares: PolyShares(Decimal::new(80, 0)),
+                },
+                polyalpha_core::PlanningBookLevel {
+                    price: Price(Decimal::new(258, 3)),
+                    shares: PolyShares(Decimal::new(60, 0)),
+                },
+            ],
+            poly_asks_top: vec![
+                polyalpha_core::PlanningBookLevel {
+                    price: Price(Decimal::new(28, 2)),
+                    shares: PolyShares(Decimal::new(120, 0)),
+                },
+                polyalpha_core::PlanningBookLevel {
+                    price: Price(Decimal::new(281, 3)),
+                    shares: PolyShares(Decimal::new(90, 0)),
+                },
+                polyalpha_core::PlanningBookLevel {
+                    price: Price(Decimal::new(282, 3)),
+                    shares: PolyShares(Decimal::new(70, 0)),
+                },
+            ],
         }
     }
 
@@ -16371,6 +16586,38 @@ mod tests {
     }
 
     #[test]
+    fn trade_plan_gate_details_include_planning_diagnostics() {
+        let settings = test_settings_with_price_filter(None, None);
+        let diagnostics = sample_planning_diagnostics();
+        let details = build_trade_plan_gate_event_details(
+            &open_candidate(TokenSide::No),
+            None,
+            &settings,
+            AuditGateResult::Rejected,
+            "poly_price_impact_too_large",
+            Some(&diagnostics),
+        )
+        .expect("trade plan details");
+
+        assert_eq!(
+            details.get("Poly可执行价").map(String::as_str),
+            Some("0.27864")
+        );
+        assert_eq!(
+            details.get("Poly价格冲击").map(String::as_str),
+            Some("320 bps")
+        );
+        assert_eq!(
+            details.get("Poly卖盘Top3").map(String::as_str),
+            Some("0.28 x 120 | 0.281 x 90 | 0.282 x 70")
+        );
+        assert_eq!(
+            details.get("开仓瞬时亏损USD").map(String::as_str),
+            Some("7.96")
+        );
+    }
+
+    #[test]
     fn add_trigger_details_uses_user_facing_rebalance_and_residual_labels() {
         let intent = PlanningIntent::ResidualRecovery {
             schema_version: PLANNING_SCHEMA_VERSION,
@@ -16444,6 +16691,55 @@ mod tests {
                     if anomaly.code == "warehouse_sync_degraded"
             )
         }));
+
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn paper_audit_persists_trade_plan_planning_diagnostics() {
+        let data_dir = unique_test_data_dir("paper-audit-planning-diagnostics");
+        let settings = test_settings_with_audit_data_dir(data_dir.clone());
+        let start_ms = 1_000;
+        let mut audit = PaperAudit::start(
+            &settings,
+            "test-env",
+            &settings.markets,
+            start_ms,
+            polyalpha_core::TradingMode::Paper,
+        )
+        .expect("start paper audit");
+        let session_id = audit.session_id().to_owned();
+        let diagnostics = sample_planning_diagnostics();
+
+        audit
+            .record_gate_decision_with_diagnostics(
+                &open_candidate(TokenSide::No),
+                "trade_plan",
+                AuditGateResult::Rejected,
+                "poly_price_impact_too_large",
+                "候选被拒绝：未通过交易规划".to_owned(),
+                None,
+                Some(diagnostics.clone()),
+            )
+            .expect("record trade plan rejection");
+
+        drop(audit);
+
+        let events = polyalpha_audit::AuditReader::load_events(&data_dir, &session_id)
+            .expect("load raw audit events");
+        let gate = events
+            .iter()
+            .find_map(|event| match &event.payload {
+                AuditEventPayload::GateDecision(gate)
+                    if gate.reason == "poly_price_impact_too_large" =>
+                {
+                    Some(gate)
+                }
+                _ => None,
+            })
+            .expect("gate decision with diagnostics");
+
+        assert_eq!(gate.planning_diagnostics, Some(diagnostics));
 
         let _ = fs::remove_dir_all(&data_dir);
     }

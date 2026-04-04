@@ -15,7 +15,9 @@ use polyalpha_data::{
     OkxMarketDataSource, PolyBookLevel, PolyBookUpdate, PolymarketLiveDataSource,
 };
 use polyalpha_engine::{SimpleAlphaEngine, SimpleEngineConfig};
-use polyalpha_executor::{BinanceFuturesExecutor, ExecutionManager, OkxExecutor};
+use polyalpha_executor::{
+    BinanceFuturesExecutor, ExecutionManager, OkxExecutor, PreviewIntentError,
+};
 use polyalpha_risk::{InMemoryRiskManager, RiskLimits};
 
 use crate::args::{PreviewExchange, PreviewOrderType, PreviewSide};
@@ -450,6 +452,13 @@ pub(crate) fn preview_open_plan(
     execution
         .preview_intent(&open_intent_from_candidate(signal))
         .map_err(Into::into)
+}
+
+pub(crate) fn preview_open_plan_detailed(
+    execution: &mut ExecutionManager<RuntimeExecutor>,
+    signal: &OpenCandidate,
+) -> std::result::Result<TradePlan, PreviewIntentError> {
+    execution.preview_intent_detailed(&open_intent_from_candidate(signal))
 }
 
 pub(crate) fn open_plan_risk_rejection_reason(

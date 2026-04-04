@@ -17,8 +17,41 @@ use polyalpha_core::{
 use crate::{
     orderbook_provider::{OrderbookKey, OrderbookProvider},
     plan_state::{priority_rank, InFlightPlan, PlanLifecycleState},
-    planner::{CanonicalPlanningContext, ExecutionPlanner},
+    planner::{CanonicalPlanningContext, ExecutionPlanner, PlanRejection},
 };
+
+#[derive(Debug)]
+pub enum PreviewIntentError {
+    Core(CoreError),
+    PlanRejected(PlanRejection),
+}
+
+impl std::fmt::Display for PreviewIntentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Core(err) => write!(f, "{err}"),
+            Self::PlanRejected(rejection) => write!(
+                f,
+                "plan rejected [{}]: {}",
+                rejection.reason.code(),
+                rejection.detail
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PreviewIntentError {}
+
+fn preview_intent_error_to_core(err: PreviewIntentError) -> CoreError {
+    match err {
+        PreviewIntentError::Core(err) => err,
+        PreviewIntentError::PlanRejected(rejection) => CoreError::Generic(format!(
+            "plan rejected [{}]: {}",
+            rejection.reason.code(),
+            rejection.detail
+        )),
+    }
+}
 
 #[derive(Clone, Debug)]
 struct ActiveDmmOrders {
@@ -173,7 +206,15 @@ impl<E: OrderExecutor> ExecutionManager<E> {
     }
 
     pub fn preview_intent(&mut self, intent: &PlanningIntent) -> Result<TradePlan> {
-        self.plan_intent(intent)
+        self.preview_intent_detailed(intent)
+            .map_err(preview_intent_error_to_core)
+    }
+
+    pub fn preview_intent_detailed(
+        &mut self,
+        intent: &PlanningIntent,
+    ) -> std::result::Result<TradePlan, PreviewIntentError> {
+        self.plan_intent_detailed(intent)
     }
 
     pub fn hedge_state(&self, symbol: &Symbol) -> Option<HedgeState> {
@@ -415,33 +456,40 @@ impl<E: OrderExecutor> ExecutionManager<E> {
         Ok(events)
     }
 
-    fn plan_intent(&mut self, intent: &PlanningIntent) -> Result<TradePlan> {
-        let initial_context = self.build_planning_context(intent)?;
+    fn plan_intent_detailed(
+        &mut self,
+        intent: &PlanningIntent,
+    ) -> std::result::Result<TradePlan, PreviewIntentError> {
+        let initial_context = self
+            .build_planning_context(intent)
+            .map_err(PreviewIntentError::Core)?;
         let mut plan = self
             .planner
             .plan(intent, &initial_context)
-            .map_err(|rejection| {
-                CoreError::Generic(format!(
-                    "plan rejected [{}]: {}",
-                    rejection.reason.code(),
-                    rejection.detail
-                ))
-            })?;
-        let latest_context = self.build_planning_context(intent)?;
+            .map_err(PreviewIntentError::PlanRejected)?;
+        let latest_context = self
+            .build_planning_context(intent)
+            .map_err(PreviewIntentError::Core)?;
         if let Err(reason) = self.planner.revalidate(&plan, &latest_context) {
             plan = self
                 .planner
                 .plan(intent, &latest_context)
-                .map_err(|rejection| {
-                    CoreError::Generic(format!(
+                .map_err(|mut rejection| {
+                    rejection.detail = format!(
                         "plan revalidation failed [{}] and replan rejected [{}]: {}",
                         reason.code(),
                         rejection.reason.code(),
                         rejection.detail
-                    ))
+                    );
+                    PreviewIntentError::PlanRejected(rejection)
                 })?;
         }
         Ok(plan)
+    }
+
+    fn plan_intent(&mut self, intent: &PlanningIntent) -> Result<TradePlan> {
+        self.plan_intent_detailed(intent)
+            .map_err(preview_intent_error_to_core)
     }
 
     fn build_planning_context(

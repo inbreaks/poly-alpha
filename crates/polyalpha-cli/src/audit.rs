@@ -3070,6 +3070,7 @@ mod tests {
                     2045.995,
                     EvaluableStatus::Evaluable,
                 )),
+                planning_diagnostics: None,
             }),
         }
     }

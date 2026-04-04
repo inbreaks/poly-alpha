@@ -1,3 +1,4 @@
+use rust_decimal::Decimal;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
 use super::{
@@ -287,6 +288,43 @@ pub struct OrderLedgerEntry {
     pub exchange_timestamp_ms: u64,
     pub received_at_ms: u64,
     pub status: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanningBookLevel {
+    pub price: Price,
+    pub shares: PolyShares,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanningDiagnostics {
+    pub planner_depth_levels: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poly_mid_price: Option<Price>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poly_best_bid: Option<Price>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poly_best_ask: Option<Price>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poly_book_average_price: Option<Price>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poly_executable_price: Option<Price>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poly_price_impact_bps: Option<Decimal>,
+    #[serde(default)]
+    pub poly_requested_shares: PolyShares,
+    #[serde(default)]
+    pub poly_planned_shares: PolyShares,
+    #[serde(default)]
+    pub cex_planned_qty: CexBaseQty,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_edge_usd: Option<UsdNotional>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instant_open_loss_usd: Option<UsdNotional>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub poly_bids_top: Vec<PlanningBookLevel>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub poly_asks_top: Vec<PlanningBookLevel>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

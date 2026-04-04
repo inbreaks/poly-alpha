@@ -10,7 +10,7 @@ pub mod router;
 
 pub use binance::{BinanceFuturesExecutor, BinanceSignedRequestPreview};
 pub use dry_run::DryRunExecutor;
-pub use manager::ExecutionManager;
+pub use manager::{ExecutionManager, PreviewIntentError};
 pub use okx::{OkxExecutor, OkxSignedRequestPreview};
 pub use orderbook_provider::{InMemoryOrderbookProvider, NoOpOrderbookProvider, OrderbookProvider};
 pub use plan_state::{InFlightPlan, PlanLifecycleState};
