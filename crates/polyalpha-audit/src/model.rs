@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use polyalpha_core::{
     AsyncClassification, ConnectionStatus, EngineWarning, EvaluableStatus, ExecutionEvent,
-    MarketView, MonitorState, OpenCandidate, PerformanceMetrics, PlanningDiagnostics,
-    PositionView, TradingMode,
+    MarketView, MonitorState, OpenCandidate, PerformanceMetrics, PlanningDiagnostics, PositionView,
+    TradingMode,
 };
 use serde::{Deserialize, Serialize};
 

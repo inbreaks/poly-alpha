@@ -2887,13 +2887,11 @@ mod tests {
             "title": "unexpected object payload"
         });
 
-        let err =
-            parse_event_lookup_payload(payload, "343490").expect_err("non-array payload");
+        let err = parse_event_lookup_payload(payload, "343490").expect_err("non-array payload");
 
-        assert!(
-            err.to_string()
-                .contains("gamma returned non-array event payload for id 343490")
-        );
+        assert!(err
+            .to_string()
+            .contains("gamma returned non-array event payload for id 343490"));
     }
 
     #[test]

@@ -998,8 +998,7 @@ impl<E: OrderExecutor> ExecutionManager<E> {
     ) -> Result<Option<TradePlan>> {
         let context = self.build_planning_context_for_symbol(&plan.symbol)?;
         let planner = self.planner_for_symbol(&plan.symbol);
-        let Some(intent) = planner.recovery_intent_from_result(plan, result, &context)
-        else {
+        let Some(intent) = planner.recovery_intent_from_result(plan, result, &context) else {
             return Ok(None);
         };
         let mut recovery_plan = planner.plan(&intent, &context).map_err(|rejection| {

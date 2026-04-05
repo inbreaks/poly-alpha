@@ -399,17 +399,8 @@ pub fn asset_key_from_cex_symbol(cex_symbol: &str) -> String {
         .filter(|ch| ch.is_ascii_alphanumeric())
         .collect::<String>();
     for suffix in [
-        "usdtswap",
-        "usdcswap",
-        "usdswap",
-        "usdtperp",
-        "usdcperp",
-        "usdperp",
-        "usdt",
-        "usdc",
-        "usd",
-        "perp",
-        "swap",
+        "usdtswap", "usdcswap", "usdswap", "usdtperp", "usdcperp", "usdperp", "usdt", "usdc",
+        "usd", "perp", "swap",
     ] {
         if normalized.ends_with(suffix) && normalized.len() > suffix.len() {
             return normalized[..normalized.len() - suffix.len()].to_owned();
@@ -703,10 +694,7 @@ mod tests {
         let btc = config.effective_for_asset_key("btc");
         assert_eq!(btc.min_poly_price, Some(Decimal::new(10, 2)));
         assert_eq!(btc.max_poly_price, Some(Decimal::new(45, 2)));
-        assert_eq!(
-            btc.max_open_instant_loss_pct_of_budget,
-            Decimal::new(2, 2)
-        );
+        assert_eq!(btc.max_open_instant_loss_pct_of_budget, Decimal::new(2, 2));
         assert_eq!(btc.delta_rebalance_threshold, Decimal::new(8, 2));
         assert_eq!(btc.delta_rebalance_interval_secs, 120);
         assert_eq!(btc.max_data_age_minutes, 2);
@@ -717,10 +705,7 @@ mod tests {
         let eth = config.effective_for_asset_key("eth");
         assert_eq!(eth.min_poly_price, Some(Decimal::new(20, 2)));
         assert_eq!(eth.max_poly_price, Some(Decimal::new(50, 2)));
-        assert_eq!(
-            eth.max_open_instant_loss_pct_of_budget,
-            Decimal::new(1, 2)
-        );
+        assert_eq!(eth.max_open_instant_loss_pct_of_budget, Decimal::new(1, 2));
         assert_eq!(eth.delta_rebalance_threshold, Decimal::new(5, 2));
         assert_eq!(eth.delta_rebalance_interval_secs, 60);
         assert_eq!(eth.max_data_age_minutes, 1);
