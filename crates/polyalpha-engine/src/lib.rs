@@ -17,6 +17,8 @@ const MIN_MINUTES_TO_EXPIRY: f64 = 1.0;
 const MIN_VOLATILITY: f64 = 1e-6;
 const MIN_REALIZED_SIGMA_SAMPLES: usize = 30;
 const DELTA_BUMP_PCT: f64 = 1e-4;
+const DELTA_BUMP_MIN_TICKS: f64 = 10.0;
+const DELTA_BUMP_BETWEEN_WIDTH_FRACTION: f64 = 0.25;
 const SQRT_TWO: f64 = std::f64::consts::SQRT_2;
 const DEFAULT_ANNUALIZED_VOLATILITY: f64 = 0.5;
 
@@ -657,8 +659,14 @@ impl SimpleAlphaEngine {
                         );
                         let signal_basis = poly_price - fair_value;
                         let z_score = rolling_zscore(history, signal_basis, min_signal_samples);
-                        let delta =
-                            token_delta(&rule, token_side, cex_price, sigma, minutes_to_expiry);
+                        let delta = token_delta(
+                            &rule,
+                            token_side,
+                            cex_price,
+                            sigma,
+                            minutes_to_expiry,
+                            market.cex_price_tick.to_f64().unwrap_or_default(),
+                        );
 
                         let snapshot = BasisStrategySnapshot {
                             token_side,
@@ -1189,6 +1197,7 @@ impl SimpleAlphaEngine {
             cex_reference_price,
             sigma_context.effective_sigma,
             minutes_to_expiry,
+            market.cex_price_tick.to_f64().unwrap_or_default(),
         );
         let signal_basis = pending.price - fair_value;
         let z_score = rolling_zscore(
@@ -1463,13 +1472,37 @@ fn token_delta(
     spot_price: f64,
     sigma: Option<f64>,
     minutes_to_expiry: f64,
+    cex_price_tick: f64,
 ) -> f64 {
-    let bump = (spot_price.abs() * DELTA_BUMP_PCT).max(1.0);
+    let bump = delta_bump(rule, spot_price, cex_price_tick);
     let lower_spot = (spot_price - bump).max(1e-9);
     let upper_spot = spot_price + bump;
     let down = token_fair_value(rule, token_side, lower_spot, sigma, minutes_to_expiry);
     let up = token_fair_value(rule, token_side, upper_spot, sigma, minutes_to_expiry);
     (up - down) / (upper_spot - lower_spot)
+}
+
+fn delta_bump(rule: &MarketRule, spot_price: f64, cex_price_tick: f64) -> f64 {
+    let spot = spot_price.abs().max(1e-9);
+    let tick = cex_price_tick.abs().max(1e-9);
+    let base_bump = (spot * DELTA_BUMP_PCT).max(tick * DELTA_BUMP_MIN_TICKS);
+
+    let capped_bump = match rule.kind {
+        MarketRuleKind::Between => {
+            let lower = rule.lower_strike.map(Price::to_f64).unwrap_or_default();
+            let upper = rule.upper_strike.map(Price::to_f64).unwrap_or_default();
+            let width = (upper - lower).abs();
+            if width > 0.0 {
+                let width_cap = (width * DELTA_BUMP_BETWEEN_WIDTH_FRACTION).max(tick);
+                base_bump.min(width_cap)
+            } else {
+                base_bump
+            }
+        }
+        _ => base_bump,
+    };
+
+    capped_bump.max(tick)
 }
 
 fn yes_probability_from_rule(
@@ -1623,8 +1656,7 @@ mod tests {
         MarketConfig {
             settlement_timestamp: 7_200,
             market_question: Some(
-                "Will the price of Bitcoin be above $101,000 in the next two hours?"
-                    .to_owned(),
+                "Will the price of Bitcoin be above $101,000 in the next two hours?".to_owned(),
             ),
             market_rule: Some(MarketRule {
                 kind: MarketRuleKind::Above,
@@ -2081,6 +2113,29 @@ mod tests {
         }
 
         panic!("expected an open candidate during sigma warmup sequence");
+    }
+
+    #[test]
+    fn token_delta_keeps_low_price_between_market_hedgeable() {
+        let rule = MarketRule {
+            kind: MarketRuleKind::Between,
+            lower_strike: Some(Price(Decimal::new(130, 2))),
+            upper_strike: Some(Price(Decimal::new(140, 2))),
+        };
+
+        let delta = token_delta(
+            &rule,
+            TokenSide::Yes,
+            1.28415,
+            Some(0.0008300198675933288),
+            4_480.0,
+            0.0001,
+        );
+
+        assert!(
+            delta.abs() > 1e-6,
+            "low-price between market should remain hedgeable, got delta={delta}"
+        );
     }
 
     #[tokio::test]

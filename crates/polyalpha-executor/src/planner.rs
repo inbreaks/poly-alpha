@@ -603,7 +603,17 @@ impl ExecutionPlanner {
             return Err(PlanRejection::new(
                 PlanRejectionReason::ZeroCexHedgeQty,
                 "open candidate cannot produce a non-zero cex hedge",
-            ));
+            )
+            .with_diagnostics(self.open_planning_diagnostics(
+                context,
+                candidate,
+                PolyShares::ZERO,
+                PolyShares::ZERO,
+                CexBaseQty::ZERO,
+                None,
+                None,
+                None,
+            )));
         }
         let max_shares_by_budget = if poly_best_ask.0 > Decimal::ZERO {
             budget_cap_usd / poly_best_ask.0
@@ -629,20 +639,22 @@ impl ExecutionPlanner {
                 reason,
                 "no executable size remains after depth/budget constraints",
             );
-            return Err(if matches!(reason, PlanRejectionReason::InsufficientPolyDepth) {
-                rejection.with_diagnostics(self.open_planning_diagnostics(
-                    context,
-                    candidate,
-                    capped_max_shares,
-                    PolyShares::ZERO,
-                    CexBaseQty::ZERO,
-                    None,
-                    None,
-                    None,
-                ))
-            } else {
-                rejection
-            });
+            return Err(
+                if matches!(reason, PlanRejectionReason::InsufficientPolyDepth) {
+                    rejection.with_diagnostics(self.open_planning_diagnostics(
+                        context,
+                        candidate,
+                        capped_max_shares,
+                        PolyShares::ZERO,
+                        CexBaseQty::ZERO,
+                        None,
+                        None,
+                        None,
+                    ))
+                } else {
+                    rejection
+                },
+            );
         }
 
         let poly_estimate =
@@ -658,20 +670,22 @@ impl ExecutionPlanner {
                 .clone()
                 .unwrap_or_else(|| "poly estimate rejected".to_owned());
             let rejection = PlanRejection::new(reason, detail);
-            return Err(if matches!(reason, PlanRejectionReason::InsufficientPolyDepth) {
-                rejection.with_diagnostics(self.open_planning_diagnostics(
-                    context,
-                    candidate,
-                    capped_max_shares,
-                    poly_planned_shares,
-                    CexBaseQty::ZERO,
-                    Some(&poly_estimate),
-                    None,
-                    None,
-                ))
-            } else {
-                rejection
-            });
+            return Err(
+                if matches!(reason, PlanRejectionReason::InsufficientPolyDepth) {
+                    rejection.with_diagnostics(self.open_planning_diagnostics(
+                        context,
+                        candidate,
+                        capped_max_shares,
+                        poly_planned_shares,
+                        CexBaseQty::ZERO,
+                        Some(&poly_estimate),
+                        None,
+                        None,
+                    ))
+                } else {
+                    rejection
+                },
+            );
         }
 
         let poly_planned_shares = match poly_estimate.filled_quantity {
@@ -683,7 +697,17 @@ impl ExecutionPlanner {
             return Err(PlanRejection::new(
                 PlanRejectionReason::ZeroCexHedgeQty,
                 "open plan cannot produce a non-zero cex hedge",
-            ));
+            )
+            .with_diagnostics(self.open_planning_diagnostics(
+                context,
+                candidate,
+                capped_max_shares,
+                poly_planned_shares,
+                CexBaseQty::ZERO,
+                Some(&poly_estimate),
+                None,
+                None,
+            )));
         }
         let cex_planned_qty = exact_cex_qty.floor_to_step(context.cex_qty_step);
         let post_rounding_residual_qty = (exact_cex_qty.0 - cex_planned_qty.0).max(Decimal::ZERO);
@@ -691,7 +715,17 @@ impl ExecutionPlanner {
             return Err(PlanRejection::new(
                 PlanRejectionReason::ZeroCexHedgeQty,
                 "open plan cannot produce a non-zero cex hedge after step rounding",
-            ));
+            )
+            .with_diagnostics(self.open_planning_diagnostics(
+                context,
+                candidate,
+                capped_max_shares,
+                poly_planned_shares,
+                CexBaseQty::ZERO,
+                Some(&poly_estimate),
+                None,
+                None,
+            )));
         }
         if cex_planned_qty.0 > cex_depth {
             return Err(PlanRejection::new(
@@ -711,7 +745,8 @@ impl ExecutionPlanner {
                 cex_side,
             )
         };
-        let initial_open_economics = self.open_plan_economics(candidate, &poly_estimate, &cex_estimate);
+        let initial_open_economics =
+            self.open_plan_economics(candidate, &poly_estimate, &cex_estimate);
         let allowed_instant_loss_usd =
             budget_cap_usd * self.max_open_instant_loss_pct_of_budget.max(Decimal::ZERO);
         let selected_open = if self.instant_open_loss_usd(&poly_estimate, &cex_estimate).0
@@ -1438,8 +1473,7 @@ impl ExecutionPlanner {
         poly_estimate: &OrderExecutionEstimate,
         cex_estimate: &OrderExecutionEstimate,
     ) -> OpenPlanEconomics {
-        let delta_abs =
-            Decimal::from_f64(candidate.delta_estimate.abs()).unwrap_or(Decimal::ZERO);
+        let delta_abs = Decimal::from_f64(candidate.delta_estimate.abs()).unwrap_or(Decimal::ZERO);
         let raw_edge_usd = UsdNotional(
             poly_estimate.executable_notional_usd.0
                 * Decimal::from_f64(candidate.raw_mispricing.abs()).unwrap_or(Decimal::ZERO),
@@ -2094,9 +2128,9 @@ mod tests {
     use polyalpha_core::{
         CexBaseQty, Exchange, ExecutionResult, Fill, InstrumentKind, OpenCandidate,
         OrderBookSnapshot, OrderId, OrderSide, PlanRejectionReason, PlanningBookLevel,
-        PlanningIntent, PolyShares, Price, PriceLevel, RecoveryDecisionReason,
-        ResidualSnapshot, RevalidationFailureReason, SignalStrength, Symbol, TokenSide,
-        UsdNotional, VenueQuantity, PLANNING_SCHEMA_VERSION,
+        PlanningIntent, PolyShares, Price, PriceLevel, RecoveryDecisionReason, ResidualSnapshot,
+        RevalidationFailureReason, SignalStrength, Symbol, TokenSide, UsdNotional, VenueQuantity,
+        PLANNING_SCHEMA_VERSION,
     };
 
     use super::{CanonicalPlanningContext, ExecutionPlanner};
@@ -2286,7 +2320,13 @@ mod tests {
 
         assert_eq!(rejection.reason, PlanRejectionReason::ZeroCexHedgeQty);
         assert!(rejection.detail.contains("cannot produce"));
-        assert!(rejection.diagnostics.is_none());
+        let diagnostics = rejection
+            .diagnostics
+            .expect("zero hedge rejection should include planning diagnostics");
+        assert_eq!(diagnostics.poly_best_ask, Some(Price(Decimal::new(47, 2))));
+        assert_eq!(diagnostics.poly_best_bid, Some(Price(Decimal::new(45, 2))));
+        assert_eq!(diagnostics.poly_requested_shares, PolyShares::ZERO);
+        assert!(!diagnostics.poly_asks_top.is_empty());
     }
 
     #[test]
@@ -2302,7 +2342,13 @@ mod tests {
 
         assert_eq!(rejection.reason, PlanRejectionReason::ZeroCexHedgeQty);
         assert!(rejection.detail.contains("step rounding"));
-        assert!(rejection.diagnostics.is_none());
+        let diagnostics = rejection
+            .diagnostics
+            .expect("rounded zero hedge rejection should include planning diagnostics");
+        assert_eq!(diagnostics.poly_best_ask, Some(Price(Decimal::new(47, 2))));
+        assert_eq!(diagnostics.poly_best_bid, Some(Price(Decimal::new(45, 2))));
+        assert!(diagnostics.poly_requested_shares.0 > Decimal::ZERO);
+        assert!(!diagnostics.poly_asks_top.is_empty());
     }
 
     #[test]
@@ -2436,7 +2482,10 @@ mod tests {
         let diagnostics = rejection
             .diagnostics
             .expect("instant loss rejections should keep diagnostics");
-        assert_eq!(diagnostics.planner_depth_levels, context.planner_depth_levels);
+        assert_eq!(
+            diagnostics.planner_depth_levels,
+            context.planner_depth_levels
+        );
         assert_eq!(
             diagnostics.poly_requested_shares.0,
             Decimal::from(200u32) / Decimal::new(90, 2)
@@ -2496,7 +2545,10 @@ mod tests {
         let diagnostics = rejection
             .diagnostics
             .expect("price impact rejections should keep diagnostics");
-        assert_eq!(diagnostics.planner_depth_levels, context.planner_depth_levels);
+        assert_eq!(
+            diagnostics.planner_depth_levels,
+            context.planner_depth_levels
+        );
         assert_eq!(diagnostics.poly_bids_top.len(), 3);
         assert_eq!(diagnostics.poly_asks_top.len(), 3);
         assert_eq!(diagnostics.poly_best_bid, Some(Price(Decimal::new(47, 2))));
