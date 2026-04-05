@@ -7477,7 +7477,7 @@ async fn process_signal_single(
         ),
     );
 
-    let plan = match preview_open_plan_detailed(execution, &candidate) {
+    let plan = match preview_open_plan_detailed(execution, risk, &candidate) {
         Ok(plan) => plan,
         Err(err) => {
             stats.signals_rejected += 1;
@@ -8127,7 +8127,7 @@ async fn process_signal_multi(
         ),
     );
 
-    let plan = match preview_open_plan_detailed(execution, &candidate) {
+    let plan = match preview_open_plan_detailed(execution, risk, &candidate) {
         Ok(plan) => plan,
         Err(err) => {
             stats.signals_rejected += 1;

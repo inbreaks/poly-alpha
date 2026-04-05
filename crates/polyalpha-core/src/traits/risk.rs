@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use crate::types::{
-    CircuitBreakerStatus, Fill, OrderRequest, RiskRejection, TradePlan, UsdNotional,
+    CircuitBreakerStatus, Fill, OrderRequest, RiskRejection, Symbol, TradePlan, UsdNotional,
 };
 use crate::Result;
 
@@ -11,6 +11,7 @@ pub trait RiskManager: Send + Sync {
         &self,
         request: OrderRequest,
     ) -> std::result::Result<OrderRequest, RiskRejection>;
+    fn open_position_exposure_headroom_usd(&self, symbol: &Symbol) -> UsdNotional;
     fn pre_trade_check_open_plan(&self, plan: &TradePlan)
         -> std::result::Result<(), RiskRejection>;
     async fn on_fill(&mut self, fill: &Fill) -> Result<()>;

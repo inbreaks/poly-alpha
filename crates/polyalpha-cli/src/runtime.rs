@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use rust_decimal::prelude::ToPrimitive;
 
 use polyalpha_core::{
     asset_key_from_cex_symbol, cex_venue_symbol, CoreError, Exchange, MarketConfig,
     MarketDataEvent, OpenCandidate, OrderBookSnapshot, OrderExecutor, OrderId, OrderRequest,
-    OrderResponse, OrderStatus, PlanningIntent, ResidualSnapshot, Settings, Symbol,
+    OrderResponse, OrderStatus, PlanningIntent, ResidualSnapshot, RiskManager, Settings, Symbol,
     SymbolRegistry, PLANNING_SCHEMA_VERSION,
 };
 use polyalpha_data::{DataManager, MarketDataNormalizer};
@@ -487,15 +488,35 @@ pub async fn build_execution_stack(
 }
 
 pub fn open_intent_from_candidate(candidate: &OpenCandidate) -> PlanningIntent {
+    open_intent_from_candidate_with_budget(candidate, candidate.risk_budget_usd)
+}
+
+pub fn risk_adjusted_open_intent_from_candidate(
+    candidate: &OpenCandidate,
+    risk: &impl RiskManager,
+) -> PlanningIntent {
+    let headroom = risk
+        .open_position_exposure_headroom_usd(&candidate.symbol)
+        .0
+        .to_f64()
+        .unwrap_or_default()
+        .max(0.0);
+    open_intent_from_candidate_with_budget(candidate, candidate.risk_budget_usd.min(headroom))
+}
+
+fn open_intent_from_candidate_with_budget(
+    candidate: &OpenCandidate,
+    max_budget_usd: f64,
+) -> PlanningIntent {
     PlanningIntent::OpenPosition {
         schema_version: candidate.schema_version,
         intent_id: format!("intent-open-{}", candidate.candidate_id),
         correlation_id: candidate.correlation_id.clone(),
         symbol: candidate.symbol.clone(),
         candidate: candidate.clone(),
-        max_budget_usd: candidate.risk_budget_usd,
+        max_budget_usd,
         max_residual_delta: 0.05,
-        max_shock_loss_usd: candidate.risk_budget_usd.max(25.0),
+        max_shock_loss_usd: max_budget_usd.max(25.0),
     }
 }
 
@@ -585,11 +606,11 @@ mod tests {
 
     use polyalpha_core::{
         create_channels, BandPolicyMode, BasisStrategyConfig, CexBaseQty, CexOrderRequest,
-        ClientOrderId, CoreError, DmmStrategyConfig, MarketConfig, NegRiskStrategyConfig,
+        ClientOrderId, CoreError, DmmStrategyConfig, Fill, MarketConfig, NegRiskStrategyConfig,
         OpenCandidate, OrderExecutor, OrderId, OrderRequest, OrderResponse, OrderSide, OrderStatus,
-        OrderType, PolyShares, PolymarketConfig, PolymarketIds, Price, RiskConfig, RiskRejection,
-        Settings, SettlementRules, StrategyConfig, TimeInForce, TokenSide, UsdNotional,
-        VenueQuantity,
+        OrderType, PolyShares, PolymarketConfig, PolymarketIds, Price, RiskConfig, RiskManager,
+        RiskRejection, Settings, SettlementRules, StrategyConfig, TimeInForce, TokenSide,
+        UsdNotional, VenueQuantity,
     };
     use polyalpha_data::{CexBookLevel, CexBookUpdate, PolyBookLevel, PolyBookUpdate};
     use polyalpha_risk::{InMemoryRiskManager, RiskLimits};
@@ -1010,6 +1031,107 @@ mod tests {
     }
 
     #[test]
+    fn risk_adjusted_open_intent_caps_budget_to_exposure_headroom() {
+        let candidate = OpenCandidate {
+            schema_version: 1,
+            candidate_id: "cand-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            symbol: sample_market().symbol,
+            token_side: TokenSide::Yes,
+            direction: "long".to_owned(),
+            fair_value: 0.55,
+            raw_mispricing: 0.03,
+            delta_estimate: 0.12,
+            risk_budget_usd: 200.0,
+            strength: polyalpha_core::SignalStrength::Normal,
+            z_score: Some(2.4),
+            raw_sigma: None,
+            effective_sigma: None,
+            sigma_source: None,
+            returns_window_len: 0,
+            timestamp_ms: 1,
+        };
+        let risk = InMemoryRiskManager::new(RiskLimits {
+            max_total_exposure_usd: UsdNotional(Decimal::new(500, 0)),
+            max_single_position_usd: UsdNotional(Decimal::new(150, 0)),
+            max_daily_loss_usd: UsdNotional(Decimal::new(1_000, 0)),
+        });
+
+        let open = risk_adjusted_open_intent_from_candidate(&candidate, &risk);
+
+        match open {
+            PlanningIntent::OpenPosition {
+                max_budget_usd,
+                max_shock_loss_usd,
+                ..
+            } => {
+                assert_eq!(max_budget_usd, 150.0);
+                assert_eq!(max_shock_loss_usd, 150.0);
+            }
+            other => panic!("unexpected open intent: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn risk_adjusted_open_intent_uses_remaining_exposure_headroom() {
+        let candidate = OpenCandidate {
+            schema_version: 1,
+            candidate_id: "cand-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            symbol: sample_market().symbol,
+            token_side: TokenSide::Yes,
+            direction: "long".to_owned(),
+            fair_value: 0.55,
+            raw_mispricing: 0.03,
+            delta_estimate: 0.12,
+            risk_budget_usd: 200.0,
+            strength: polyalpha_core::SignalStrength::Normal,
+            z_score: Some(2.4),
+            raw_sigma: None,
+            effective_sigma: None,
+            sigma_source: None,
+            returns_window_len: 0,
+            timestamp_ms: 1,
+        };
+        let mut risk = InMemoryRiskManager::new(RiskLimits {
+            max_total_exposure_usd: UsdNotional(Decimal::new(500, 0)),
+            max_single_position_usd: UsdNotional(Decimal::new(150, 0)),
+            max_daily_loss_usd: UsdNotional(Decimal::new(1_000, 0)),
+        });
+        risk.on_fill(&Fill {
+            fill_id: "fill-1".to_owned(),
+            correlation_id: "corr-1".to_owned(),
+            exchange: Exchange::Polymarket,
+            symbol: candidate.symbol.clone(),
+            instrument: polyalpha_core::InstrumentKind::PolyYes,
+            order_id: OrderId("order-1".to_owned()),
+            side: OrderSide::Buy,
+            price: Price(Decimal::ONE),
+            quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(100, 0))),
+            notional_usd: UsdNotional(Decimal::new(100, 0)),
+            fee: UsdNotional::ZERO,
+            is_maker: false,
+            timestamp_ms: 1,
+        })
+        .await
+        .expect("fill should apply");
+
+        let open = risk_adjusted_open_intent_from_candidate(&candidate, &risk);
+
+        match open {
+            PlanningIntent::OpenPosition {
+                max_budget_usd,
+                max_shock_loss_usd,
+                ..
+            } => {
+                assert_eq!(max_budget_usd, 50.0);
+                assert_eq!(max_shock_loss_usd, 50.0);
+            }
+            other => panic!("unexpected open intent: {other:?}"),
+        }
+    }
+
+    #[test]
     fn build_execution_stack_wires_orderbook_provider_into_execution_manager() {
         let settings = sample_settings();
         let registry = SymbolRegistry::new(settings.markets.clone());
@@ -1375,5 +1497,121 @@ mod tests {
             .expect_err("plan-aware gate should reject poly budget above limit");
 
         assert!(matches!(err, RiskRejection::LimitBreached(_)));
+    }
+
+    #[test]
+    fn risk_adjusted_open_intent_prunes_budget_before_plan_reaches_risk_gate() {
+        let settings = sample_settings();
+        let market = sample_market();
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let channels = create_channels(std::slice::from_ref(&market.symbol));
+        let mut market_data_rx = channels.market_data_tx.subscribe();
+        let manager = build_data_manager(&registry, channels.market_data_tx.clone());
+        let (provider, _executor, mut execution) = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(build_execution_stack(
+                &settings,
+                &registry,
+                RuntimeExecutionMode::Paper,
+                1_700_000_000_000,
+                None,
+            ))
+            .expect("execution stack");
+
+        manager
+            .normalize_and_publish_poly_orderbook(PolyBookUpdate {
+                asset_id: market.poly_ids.yes_token_id.clone(),
+                bids: vec![PolyBookLevel {
+                    price: Price(Decimal::new(49, 2)),
+                    shares: PolyShares(Decimal::new(10, 0)),
+                }],
+                asks: vec![PolyBookLevel {
+                    price: Price(Decimal::new(51, 2)),
+                    shares: PolyShares(Decimal::new(12, 0)),
+                }],
+                exchange_timestamp_ms: 10,
+                received_at_ms: 11,
+                sequence: 7,
+                last_trade_price: None,
+            })
+            .expect("publish yes book");
+        manager
+            .normalize_and_publish_poly_orderbook(PolyBookUpdate {
+                asset_id: market.poly_ids.no_token_id.clone(),
+                bids: vec![PolyBookLevel {
+                    price: Price(Decimal::new(48, 2)),
+                    shares: PolyShares(Decimal::new(8, 0)),
+                }],
+                asks: vec![PolyBookLevel {
+                    price: Price(Decimal::new(52, 2)),
+                    shares: PolyShares(Decimal::new(9, 0)),
+                }],
+                exchange_timestamp_ms: 12,
+                received_at_ms: 13,
+                sequence: 8,
+                last_trade_price: None,
+            })
+            .expect("publish no book");
+        manager
+            .normalize_and_publish_cex_orderbook(CexBookUpdate {
+                exchange: Exchange::Binance,
+                venue_symbol: market.cex_symbol.clone(),
+                bids: vec![CexBookLevel {
+                    price: Price(Decimal::new(100_000, 0)),
+                    base_qty: CexBaseQty(Decimal::new(2, 0)),
+                }],
+                asks: vec![CexBookLevel {
+                    price: Price(Decimal::new(100_010, 0)),
+                    base_qty: CexBaseQty(Decimal::new(3, 0)),
+                }],
+                exchange_timestamp_ms: 14,
+                received_at_ms: 15,
+                sequence: 21,
+            })
+            .expect("publish cex book");
+
+        loop {
+            match market_data_rx.try_recv() {
+                Ok(MarketDataEvent::OrderBookUpdate { snapshot }) => {
+                    apply_orderbook_snapshot(&provider, &registry, &snapshot);
+                }
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            }
+        }
+
+        let candidate = OpenCandidate {
+            schema_version: 1,
+            candidate_id: "cand-risk-plan".to_owned(),
+            correlation_id: "corr-risk-plan".to_owned(),
+            symbol: market.symbol.clone(),
+            token_side: TokenSide::Yes,
+            direction: "long".to_owned(),
+            fair_value: 0.55,
+            raw_mispricing: 0.04,
+            delta_estimate: 0.00012,
+            risk_budget_usd: 200.0,
+            strength: polyalpha_core::SignalStrength::Normal,
+            z_score: Some(2.2),
+            raw_sigma: None,
+            effective_sigma: None,
+            sigma_source: None,
+            returns_window_len: 0,
+            timestamp_ms: 20,
+        };
+        let risk = InMemoryRiskManager::new(RiskLimits {
+            max_total_exposure_usd: UsdNotional(Decimal::new(10_000, 0)),
+            max_single_position_usd: UsdNotional(Decimal::new(150, 0)),
+            max_daily_loss_usd: UsdNotional(Decimal::new(1_000, 0)),
+        });
+        let plan = execution
+            .preview_intent(&risk_adjusted_open_intent_from_candidate(&candidate, &risk))
+            .expect("risk-adjusted candidate should preview into a trade plan");
+
+        assert!(plan.poly_max_cost_usd.0 <= Decimal::new(150, 0));
+        risk.pre_trade_check_open_plan(&plan)
+            .expect("risk-adjusted plan should respect exposure headroom");
     }
 }

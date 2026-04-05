@@ -536,7 +536,7 @@ async fn run_sim_with_mock_ticks(
                             continue;
                         }
 
-                        let plan = match preview_open_plan(&mut execution, &candidate) {
+                        let plan = match preview_open_plan(&mut execution, &risk, &candidate) {
                             Ok(plan) => plan,
                             Err(err) => {
                                 stats.signals_rejected += 1;

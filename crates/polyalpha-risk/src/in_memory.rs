@@ -123,6 +123,16 @@ impl InMemoryRiskManager {
         Ok(())
     }
 
+    pub fn open_position_exposure_headroom_usd(&self, symbol: &Symbol) -> UsdNotional {
+        let symbol_headroom = (self.limits.max_single_position_usd.0
+            - self.position_tracker.symbol_exposure_usd(symbol).0)
+            .max(Decimal::ZERO);
+        let total_headroom = (self.limits.max_total_exposure_usd.0
+            - self.position_tracker.total_exposure_usd().0)
+            .max(Decimal::ZERO);
+        UsdNotional(symbol_headroom.min(total_headroom))
+    }
+
     fn check_market_phase(&self, request: &OrderRequest) -> Result<(), RiskRejection> {
         let symbol = request_symbol(request);
         let Some(phase) = self.market_phases.get(symbol) else {
@@ -300,6 +310,10 @@ impl RiskManager for InMemoryRiskManager {
         self.check_market_phase(&request)?;
         self.check_limits(&request)?;
         Ok(request)
+    }
+
+    fn open_position_exposure_headroom_usd(&self, symbol: &Symbol) -> UsdNotional {
+        InMemoryRiskManager::open_position_exposure_headroom_usd(self, symbol)
     }
 
     fn pre_trade_check_open_plan(
@@ -637,5 +651,34 @@ mod tests {
             UsdNotional(Decimal::new(5, 0))
         );
         assert_eq!(limits.max_daily_loss_usd, UsdNotional(Decimal::new(2, 0)));
+    }
+
+    #[tokio::test]
+    async fn open_position_exposure_headroom_tracks_tighter_limit() {
+        let mut manager = manager_with_limits(150, 220, 2_000);
+        let symbol = Symbol::new("btc-100k-mar-2026");
+
+        assert_eq!(
+            manager.open_position_exposure_headroom_usd(&symbol),
+            UsdNotional(Decimal::new(150, 0))
+        );
+
+        manager
+            .on_fill(&cex_fill(OrderSide::Buy, 1, 100, 0, 1))
+            .await
+            .expect("fill should be applied");
+        assert_eq!(
+            manager.open_position_exposure_headroom_usd(&symbol),
+            UsdNotional(Decimal::new(50, 0))
+        );
+
+        manager
+            .on_fill(&cex_fill(OrderSide::Buy, 1, 50, 0, 2))
+            .await
+            .expect("second fill should be applied");
+        assert_eq!(
+            manager.open_position_exposure_headroom_usd(&symbol),
+            UsdNotional::ZERO
+        );
     }
 }

@@ -24,8 +24,7 @@ use crate::args::{PreviewExchange, PreviewOrderType, PreviewSide};
 use crate::runtime::{
     apply_orderbook_snapshot, build_data_manager, build_execution_stack,
     close_intent_for_symbol as runtime_close_intent_for_symbol,
-    open_intent_from_candidate as runtime_open_intent_from_candidate, RuntimeExecutionMode,
-    RuntimeExecutor,
+    risk_adjusted_open_intent_from_candidate, RuntimeExecutionMode, RuntimeExecutor,
 };
 
 #[derive(Default)]
@@ -132,7 +131,7 @@ pub async fn run_demo(env: &str) -> Result<()> {
                     for signal in output.open_candidates {
                         stats.signals_seen += 1;
 
-                        let plan = match preview_open_plan(&mut execution, &signal) {
+                        let plan = match preview_open_plan(&mut execution, &risk, &signal) {
                             Ok(plan) => plan,
                             Err(_) => {
                                 stats.signals_rejected += 1;
@@ -447,18 +446,20 @@ pub(crate) fn select_market(settings: &Settings, market_index: usize) -> Result<
 
 pub(crate) fn preview_open_plan(
     execution: &mut ExecutionManager<RuntimeExecutor>,
+    risk: &impl RiskManager,
     signal: &OpenCandidate,
 ) -> Result<TradePlan> {
     execution
-        .preview_intent(&open_intent_from_candidate(signal))
+        .preview_intent(&risk_adjusted_open_intent_from_candidate(signal, risk))
         .map_err(Into::into)
 }
 
 pub(crate) fn preview_open_plan_detailed(
     execution: &mut ExecutionManager<RuntimeExecutor>,
+    risk: &impl RiskManager,
     signal: &OpenCandidate,
 ) -> std::result::Result<TradePlan, PreviewIntentError> {
-    execution.preview_intent_detailed(&open_intent_from_candidate(signal))
+    execution.preview_intent_detailed(&risk_adjusted_open_intent_from_candidate(signal, risk))
 }
 
 pub(crate) fn open_plan_risk_rejection_reason(
@@ -513,10 +514,6 @@ async fn apply_execution_events(
     }
 
     Ok(())
-}
-
-fn open_intent_from_candidate(candidate: &OpenCandidate) -> PlanningIntent {
-    runtime_open_intent_from_candidate(candidate)
 }
 
 fn close_intent_for_symbol(
