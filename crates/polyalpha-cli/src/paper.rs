@@ -38,16 +38,18 @@ use polyalpha_audit::{
     PositionMarkEvent, SignalEmittedEvent,
 };
 use polyalpha_core::{
-    cex_venue_symbol, create_channels, AlphaEngine, AsyncClassification, CommandKind,
-    CommandStatus, CommandView, ConnectionInfo, ConnectionStatus, EngineParams, EngineWarning,
-    EvaluableStatus, EvaluationStats, EventKind, Exchange, ExecutionEvent, ExecutionPipelineView,
+    asset_key_from_cex_symbol, cex_venue_symbol, create_channels, AlphaEngine,
+    AsyncClassification, CommandKind, CommandStatus, CommandView, ConnectionInfo,
+    ConnectionStatus, EffectiveBasisConfig, EngineParams, EngineWarning, EvaluableStatus,
+    EvaluationStats, EventKind, Exchange, ExecutionEvent, ExecutionPipelineView,
     ExecutionResult, Fill, HedgeState, InstrumentKind, MarketConfig, MarketDataEvent,
     MarketDataMode, MarketDataSource, MarketPhase, MarketRetentionReason, MarketTier, MarketView,
-    MonitorEvent, MonitorEventPayload, MonitorRuntimeStats, MonitorSocketServer, MonitorState,
-    MonitorStrategyConfig, OpenCandidate, OrderSide, OrderStatus, PerformanceMetrics,
-    PlanningDiagnostics, PlanningIntent, PolyShares, Position, Price, RecoveryDecisionReason,
-    ResidualSnapshot, RiskManager, Settings, SignalStrength, StrategyHealthView, Symbol,
-    SymbolRegistry, TokenSide, TradePlan, TradeView, UsdNotional, VenueQuantity,
+    MonitorAssetStrategyConfig, MonitorEvent, MonitorEventPayload, MonitorRuntimeStats,
+    MonitorSocketServer, MonitorState, MonitorStrategyConfig, OpenCandidate, OrderSide,
+    OrderStatus, PerformanceMetrics, PlanningDiagnostics, PlanningIntent, PolyShares, Position,
+    Price, RecoveryDecisionReason, ResidualSnapshot, RiskManager, Settings, SignalStrength,
+    StrategyHealthView, Symbol, SymbolRegistry, TokenSide, TradePlan, TradeView, UsdNotional,
+    VenueQuantity,
     PLANNING_SCHEMA_VERSION,
 };
 use polyalpha_data::{
@@ -540,14 +542,53 @@ struct AsyncMarketSnapshot {
     async_classification: AsyncClassification,
 }
 
-fn freshness_thresholds(settings: &Settings) -> FreshnessThresholds {
+fn global_basis_config(settings: &Settings) -> EffectiveBasisConfig {
+    settings.strategy.basis.effective_for_asset_key("")
+}
+
+fn effective_basis_config_for_market(
+    settings: &Settings,
+    market: &MarketConfig,
+) -> EffectiveBasisConfig {
+    settings
+        .strategy
+        .basis
+        .effective_for_cex_symbol(&market.cex_symbol)
+}
+
+fn effective_basis_config_for_symbol(
+    settings: &Settings,
+    symbol: &Symbol,
+) -> EffectiveBasisConfig {
+    settings
+        .markets
+        .iter()
+        .find(|market| market.symbol == *symbol)
+        .map(|market| effective_basis_config_for_market(settings, market))
+        .unwrap_or_else(|| global_basis_config(settings))
+}
+
+fn freshness_thresholds(settings: &Settings, basis: &EffectiveBasisConfig) -> FreshnessThresholds {
     let market_data = &settings.strategy.market_data;
-    FreshnessThresholds {
-        poly_open_max_quote_age_ms: market_data.resolved_poly_open_max_quote_age_ms(),
-        cex_open_max_quote_age_ms: market_data.resolved_cex_open_max_quote_age_ms(),
-        close_max_quote_age_ms: market_data.resolved_close_max_quote_age_ms(),
-        max_cross_leg_skew_ms: market_data.resolved_max_cross_leg_skew_ms(),
-        borderline_poly_quote_age_ms: market_data.resolved_borderline_poly_quote_age_ms(),
+    match settings.strategy.market_data.mode {
+        MarketDataMode::Ws => FreshnessThresholds {
+            poly_open_max_quote_age_ms: market_data.resolved_poly_open_max_quote_age_ms(),
+            cex_open_max_quote_age_ms: market_data.resolved_cex_open_max_quote_age_ms(),
+            close_max_quote_age_ms: market_data.resolved_close_max_quote_age_ms(),
+            max_cross_leg_skew_ms: market_data.resolved_max_cross_leg_skew_ms(),
+            borderline_poly_quote_age_ms: market_data.resolved_borderline_poly_quote_age_ms(),
+        },
+        MarketDataMode::Poll => {
+            let age_limit_ms = basis.max_data_age_minutes.saturating_mul(60_000);
+            let skew_limit_ms = basis.max_time_diff_minutes.saturating_mul(60_000);
+            FreshnessThresholds {
+                poly_open_max_quote_age_ms: age_limit_ms,
+                cex_open_max_quote_age_ms: age_limit_ms,
+                close_max_quote_age_ms: age_limit_ms,
+                max_cross_leg_skew_ms: skew_limit_ms,
+                borderline_poly_quote_age_ms: age_limit_ms.saturating_mul(8) / 10,
+            }
+        }
     }
 }
 
@@ -700,16 +741,16 @@ fn build_audit_observed_market(
     settings: &Settings,
     token_side: Option<TokenSide>,
     use_close_thresholds: bool,
-    require_connections: bool,
+    basis: &EffectiveBasisConfig,
 ) -> AuditObservedMarket {
     let async_snapshot = classify_async_market(
         now_ms,
         market,
         observed,
-        freshness_thresholds(settings),
+        freshness_thresholds(settings, basis),
         token_side,
         use_close_thresholds,
-        require_connections,
+        require_connected_inputs(basis),
     );
 
     AuditObservedMarket {
@@ -733,8 +774,8 @@ fn build_audit_observed_market(
     }
 }
 
-fn require_connected_inputs(settings: &Settings) -> bool {
-    settings.strategy.basis.enable_freshness_check && settings.strategy.basis.reject_on_disconnect
+fn require_connected_inputs(basis: &EffectiveBasisConfig) -> bool {
+    basis.enable_freshness_check && basis.reject_on_disconnect
 }
 
 fn market_retention_reason(
@@ -942,6 +983,7 @@ fn audit_snapshot_for_candidate(
     observed: &ObservedState,
 ) -> Option<AuditObservedMarket> {
     registry.get_config(&candidate.symbol).map(|market| {
+        let basis = effective_basis_config_for_market(settings, market);
         build_audit_observed_market(
             now_millis(),
             market,
@@ -949,7 +991,7 @@ fn audit_snapshot_for_candidate(
             settings,
             Some(candidate.token_side),
             false,
-            require_connected_inputs(settings),
+            &basis,
         )
     })
 }
@@ -3625,9 +3667,8 @@ async fn maybe_execute_delta_rebalance(
     audit: &mut Option<PaperAudit>,
     now_ms: u64,
 ) -> Result<()> {
-    let threshold = settings
-        .strategy
-        .basis
+    let basis = effective_basis_config_for_symbol(settings, symbol);
+    let threshold = basis
         .delta_rebalance_threshold
         .to_f64()
         .unwrap_or_default();
@@ -3643,7 +3684,7 @@ async fn maybe_execute_delta_rebalance(
         return Ok(());
     }
 
-    let throttle_ms = settings.strategy.basis.delta_rebalance_interval_secs.max(1) * 1_000;
+    let throttle_ms = basis.delta_rebalance_interval_secs.max(1) * 1_000;
     if stats
         .last_delta_rebalance_at_ms
         .get(symbol)
@@ -4330,27 +4371,23 @@ fn candidate_price_filter_rejection_reason(
     observed: &ObservedState,
     settings: &Settings,
 ) -> Option<&'static str> {
-    if let Some(reason) = settings
+    let market = settings
         .markets
         .iter()
-        .find(|market| market.symbol == candidate.symbol)
-        .and_then(|market| market_open_semantics_guard_reason(market, candidate.timestamp_ms))
-    {
+        .find(|market| market.symbol == candidate.symbol);
+    if let Some(reason) = market.and_then(|market| {
+        market_open_semantics_guard_reason(market, candidate.timestamp_ms)
+    }) {
         return Some(reason);
     }
-    if !settings.strategy.basis.band_policy.uses_configured_band() {
+    let basis = market
+        .map(|market| effective_basis_config_for_market(settings, market))
+        .unwrap_or_else(|| global_basis_config(settings));
+    if !basis.band_policy.uses_configured_band() {
         return None;
     }
-    let min_price = settings
-        .strategy
-        .basis
-        .min_poly_price
-        .and_then(|value| value.to_f64());
-    let max_price = settings
-        .strategy
-        .basis
-        .max_poly_price
-        .and_then(|value| value.to_f64());
+    let min_price = basis.min_poly_price.and_then(|value| value.to_f64());
+    let max_price = basis.max_poly_price.and_then(|value| value.to_f64());
     if min_price.is_none() && max_price.is_none() {
         return None;
     }
@@ -4776,6 +4813,7 @@ async fn run_runtime_single(
                             risk.update_market_phase(symbol.clone(), phase.clone());
                         }
 
+                        let basis = effective_basis_config_for_market(&settings, &market);
                         let evaluation_observed = build_audit_observed_market(
                             now_millis(),
                             &market,
@@ -4783,7 +4821,7 @@ async fn run_runtime_single(
                             &settings,
                             None,
                             false,
-                            require_connected_inputs(&settings),
+                            &basis,
                         );
                         let output = engine.on_market_data(&event).await;
                         record_evaluation_attempt(
@@ -5522,6 +5560,7 @@ async fn run_runtime_multi(
                             .get(symbol)
                             .and_then(|obs| registry.get_config(symbol).map(|market| (obs, market)))
                             .map(|(obs, market)| {
+                                let basis = effective_basis_config_for_market(&settings, market);
                                 build_audit_observed_market(
                                     now_millis(),
                                     market,
@@ -5529,7 +5568,7 @@ async fn run_runtime_multi(
                                     &settings,
                                     None,
                                     false,
-                                    require_connected_inputs(&settings),
+                                    &basis,
                                 )
                             })
                     });
@@ -7370,7 +7409,7 @@ async fn process_signal_single(
             gate_reason_label_zh("price_filter", filter_reason),
             candidate.candidate_id,
             filter_price,
-            price_filter_window_text(settings)
+            price_filter_window_text_for_symbol(settings, &candidate.symbol)
         );
         if let Some(audit) = audit.as_mut() {
             audit.record_gate_decision(
@@ -8020,7 +8059,7 @@ async fn process_signal_multi(
             gate_reason_label_zh("price_filter", filter_reason),
             candidate.candidate_id,
             filter_price,
-            price_filter_window_text(settings)
+            price_filter_window_text_for_symbol(settings, &candidate.symbol)
         );
         if let Some(audit) = audit.as_mut() {
             audit.record_gate_decision(
@@ -8387,6 +8426,7 @@ async fn handle_single_market_event(
         risk.update_market_phase(symbol.clone(), phase.clone());
     }
 
+    let basis = effective_basis_config_for_market(settings, market);
     let evaluation_observed = build_audit_observed_market(
         now_millis(),
         market,
@@ -8394,7 +8434,7 @@ async fn handle_single_market_event(
         settings,
         None,
         false,
-        require_connected_inputs(settings),
+        &basis,
     );
     let output = engine.on_market_data(&event).await;
     record_evaluation_attempt(
@@ -8573,6 +8613,7 @@ async fn handle_multi_market_event(
             .get(symbol)
             .and_then(|obs| registry.get_config(symbol).map(|market| (obs, market)))
             .map(|(obs, market)| {
+                let basis = effective_basis_config_for_market(settings, market);
                 build_audit_observed_market(
                     now_millis(),
                     market,
@@ -8580,7 +8621,7 @@ async fn handle_multi_market_event(
                     settings,
                     None,
                     false,
-                    require_connected_inputs(settings),
+                    &basis,
                 )
             })
     });
@@ -9878,29 +9919,19 @@ async fn run_paper_multi_ws_mode(
 
 fn build_paper_engine_config(settings: &Settings) -> SimpleEngineConfig {
     let mut config = SimpleEngineConfig::default();
-    let configured_entry = settings
-        .strategy
-        .basis
-        .entry_z_score_threshold
-        .to_f64()
-        .unwrap_or(2.0);
-    let configured_exit = settings
-        .strategy
-        .basis
-        .exit_z_score_threshold
-        .to_f64()
-        .unwrap_or(0.5);
+    let basis = global_basis_config(settings);
+    let configured_entry = basis.entry_z_score_threshold.to_f64().unwrap_or(2.0);
+    let configured_exit = basis.exit_z_score_threshold.to_f64().unwrap_or(0.5);
 
-    config.min_signal_samples = settings.strategy.basis.min_warmup_samples.max(2);
-    config.rolling_window_minutes =
-        ((settings.strategy.basis.rolling_window_secs / 60) as usize).max(2);
+    config.min_signal_samples = basis.min_warmup_samples.max(2);
+    config.rolling_window_minutes = ((basis.rolling_window_secs / 60) as usize).max(2);
     config.entry_z = configured_entry.abs().max(0.1);
     config.exit_z = configured_exit.abs().min(config.entry_z).max(0.05);
-    config.position_notional_usd = settings.strategy.basis.max_position_usd;
+    config.position_notional_usd = basis.max_position_usd;
     config.cex_hedge_ratio = 1.0;
     config.dmm_quote_size = PolyShares::ZERO;
-    config.enable_freshness_check = settings.strategy.basis.enable_freshness_check;
-    config.reject_on_disconnect = settings.strategy.basis.reject_on_disconnect;
+    config.enable_freshness_check = basis.enable_freshness_check;
+    config.reject_on_disconnect = basis.reject_on_disconnect;
     let ws_poly_age_ms = settings
         .strategy
         .market_data
@@ -9911,25 +9942,13 @@ fn build_paper_engine_config(settings: &Settings) -> SimpleEngineConfig {
         .resolved_cex_open_max_quote_age_ms();
     config.max_poly_data_age_ms = match settings.strategy.market_data.mode {
         MarketDataMode::Ws => ws_poly_age_ms,
-        MarketDataMode::Poll => settings
-            .strategy
-            .basis
-            .max_data_age_minutes
-            .saturating_mul(60_000),
+        MarketDataMode::Poll => basis.max_data_age_minutes.saturating_mul(60_000),
     };
     config.max_cex_data_age_ms = match settings.strategy.market_data.mode {
         MarketDataMode::Ws => ws_cex_age_ms,
-        MarketDataMode::Poll => settings
-            .strategy
-            .basis
-            .max_data_age_minutes
-            .saturating_mul(60_000),
+        MarketDataMode::Poll => basis.max_data_age_minutes.saturating_mul(60_000),
     };
-    config.max_time_diff_ms = settings
-        .strategy
-        .basis
-        .max_time_diff_minutes
-        .saturating_mul(60_000);
+    config.max_time_diff_ms = basis.max_time_diff_minutes.saturating_mul(60_000);
     config
 }
 
@@ -10949,20 +10968,12 @@ fn candidate_price_for_audit_observed(
     }
 }
 
-fn price_filter_window_text(settings: &Settings) -> String {
-    if !settings.strategy.basis.band_policy.uses_configured_band() {
+fn price_filter_window_text_for_basis(basis: &EffectiveBasisConfig) -> String {
+    if !basis.band_policy.uses_configured_band() {
         return "已禁用".to_owned();
     }
-    let min_price = settings
-        .strategy
-        .basis
-        .min_poly_price
-        .and_then(|value| value.to_f64());
-    let max_price = settings
-        .strategy
-        .basis
-        .max_poly_price
-        .and_then(|value| value.to_f64());
+    let min_price = basis.min_poly_price.and_then(|value| value.to_f64());
+    let max_price = basis.max_poly_price.and_then(|value| value.to_f64());
     match (min_price, max_price) {
         (Some(min), Some(max)) => {
             format!("{} - {}", format_detail_f64(min), format_detail_f64(max))
@@ -10971,6 +10982,10 @@ fn price_filter_window_text(settings: &Settings) -> String {
         (None, Some(max)) => format!("<= {}", format_detail_f64(max)),
         (None, None) => "未配置".to_owned(),
     }
+}
+
+fn price_filter_window_text_for_symbol(settings: &Settings, symbol: &Symbol) -> String {
+    price_filter_window_text_for_basis(&effective_basis_config_for_symbol(settings, symbol))
 }
 
 fn connection_summary_zh(connections: &HashMap<String, ConnectionStatus>) -> Option<String> {
@@ -11565,25 +11580,12 @@ fn build_gate_event_details(
 
     match gate {
         "price_filter" => {
-            let min_price = settings
-                .strategy
-                .basis
-                .min_poly_price
-                .and_then(|value| value.to_f64());
-            let max_price = settings
-                .strategy
-                .basis
-                .max_poly_price
-                .and_then(|value| value.to_f64());
-            let window = match (min_price, max_price) {
-                (Some(min), Some(max)) => {
-                    format!("{} - {}", format_detail_f64(min), format_detail_f64(max))
-                }
-                (Some(min), None) => format!(">= {}", format_detail_f64(min)),
-                (None, Some(max)) => format!("<= {}", format_detail_f64(max)),
-                (None, None) => "未配置".to_owned(),
-            };
-            insert_detail(&mut details, "价格窗口", window);
+            let basis = effective_basis_config_for_symbol(settings, &candidate.symbol);
+            insert_detail(
+                &mut details,
+                "价格窗口",
+                price_filter_window_text_for_basis(&basis),
+            );
             if let Some(observed) = observed {
                 insert_detail_opt(
                     &mut details,
@@ -12915,96 +12917,7 @@ fn build_monitor_state_common(
             evaluable_status_counts: stats.evaluable_status_counts.clone(),
             async_classification_counts: stats.async_classification_counts.clone(),
         },
-        config: MonitorStrategyConfig {
-            entry_z: settings
-                .strategy
-                .basis
-                .entry_z_score_threshold
-                .to_f64()
-                .unwrap_or_default(),
-            exit_z: settings
-                .strategy
-                .basis
-                .exit_z_score_threshold
-                .to_f64()
-                .unwrap_or_default(),
-            position_notional_usd: settings
-                .strategy
-                .basis
-                .max_position_usd
-                .0
-                .to_f64()
-                .unwrap_or_default(),
-            rolling_window: settings.strategy.basis.rolling_window_secs,
-            band_policy: settings.strategy.basis.band_policy.to_string(),
-            market_data_mode: match settings.strategy.market_data.mode {
-                MarketDataMode::Poll => "poll".to_owned(),
-                MarketDataMode::Ws => "ws".to_owned(),
-            },
-            max_stale_ms: settings.strategy.market_data.max_stale_ms,
-            poly_open_max_quote_age_ms: settings
-                .strategy
-                .market_data
-                .resolved_poly_open_max_quote_age_ms(),
-            cex_open_max_quote_age_ms: settings
-                .strategy
-                .market_data
-                .resolved_cex_open_max_quote_age_ms(),
-            close_max_quote_age_ms: settings
-                .strategy
-                .market_data
-                .resolved_close_max_quote_age_ms(),
-            max_cross_leg_skew_ms: settings
-                .strategy
-                .market_data
-                .resolved_max_cross_leg_skew_ms(),
-            borderline_poly_quote_age_ms: settings
-                .strategy
-                .market_data
-                .resolved_borderline_poly_quote_age_ms(),
-            min_poly_price: settings
-                .strategy
-                .basis
-                .min_poly_price
-                .and_then(|value| value.to_f64())
-                .unwrap_or_default(),
-            max_poly_price: settings
-                .strategy
-                .basis
-                .max_poly_price
-                .and_then(|value| value.to_f64())
-                .unwrap_or(1.0),
-            poly_slippage_bps: settings.paper_slippage.poly_slippage_bps,
-            cex_slippage_bps: settings.paper_slippage.cex_slippage_bps,
-            max_total_exposure_usd: settings
-                .risk
-                .max_total_exposure_usd
-                .0
-                .to_f64()
-                .unwrap_or_default(),
-            max_single_position_usd: settings
-                .risk
-                .max_single_position_usd
-                .0
-                .to_f64()
-                .unwrap_or_default(),
-            max_daily_loss_usd: settings
-                .risk
-                .max_daily_loss_usd
-                .0
-                .to_f64()
-                .unwrap_or_default(),
-            max_open_orders: settings.risk.max_open_orders,
-            rate_limit_orders_per_sec: settings.risk.rate_limit_orders_per_sec,
-            min_liquidity: settings
-                .paper_slippage
-                .min_liquidity
-                .to_f64()
-                .unwrap_or_default(),
-            allow_partial_fill: settings.paper_slippage.allow_partial_fill,
-            enable_freshness_check: settings.strategy.basis.enable_freshness_check,
-            reject_on_disconnect: settings.strategy.basis.reject_on_disconnect,
-        },
+        config: build_monitor_strategy_config(settings, markets),
         runtime: MonitorRuntimeStats {
             snapshot_resync_count: stats.snapshot_resync_count as u64,
             funding_refresh_count: stats.funding_refresh_count as u64,
@@ -13014,6 +12927,136 @@ fn build_monitor_state_common(
         recent_events: recent_events.to_vec(),
         recent_trades: trade_book.recent_trades(),
         recent_commands,
+    }
+}
+
+fn build_monitor_strategy_config(
+    settings: &Settings,
+    markets: &[MarketConfig],
+) -> MonitorStrategyConfig {
+    let basis = global_basis_config(settings);
+    let per_asset = {
+        let mut grouped = BTreeMap::new();
+        for market in markets {
+            let effective = effective_basis_config_for_market(settings, market);
+            grouped.entry(effective.asset_key.clone()).or_insert_with(|| {
+                MonitorAssetStrategyConfig {
+                    asset: effective.asset_key.to_ascii_uppercase(),
+                    entry_z: effective
+                        .entry_z_score_threshold
+                        .to_f64()
+                        .unwrap_or_default(),
+                    exit_z: effective
+                        .exit_z_score_threshold
+                        .to_f64()
+                        .unwrap_or_default(),
+                    position_notional_usd: effective
+                        .max_position_usd
+                        .0
+                        .to_f64()
+                        .unwrap_or_default(),
+                    rolling_window: effective.rolling_window_secs,
+                    band_policy: effective.band_policy.to_string(),
+                    min_poly_price: effective
+                        .min_poly_price
+                        .and_then(|value| value.to_f64())
+                        .unwrap_or_default(),
+                    max_poly_price: effective
+                        .max_poly_price
+                        .and_then(|value| value.to_f64())
+                        .unwrap_or(1.0),
+                    max_open_instant_loss_pct_of_budget: effective
+                        .max_open_instant_loss_pct_of_budget
+                        .to_f64()
+                        .unwrap_or_default(),
+                    delta_rebalance_threshold: effective
+                        .delta_rebalance_threshold
+                        .to_f64()
+                        .unwrap_or_default(),
+                    delta_rebalance_interval_secs: effective.delta_rebalance_interval_secs,
+                    enable_freshness_check: effective.enable_freshness_check,
+                    reject_on_disconnect: effective.reject_on_disconnect,
+                }
+            });
+        }
+        grouped.into_values().collect::<Vec<_>>()
+    };
+    MonitorStrategyConfig {
+        entry_z: basis
+            .entry_z_score_threshold
+            .to_f64()
+            .unwrap_or_default(),
+        exit_z: basis
+            .exit_z_score_threshold
+            .to_f64()
+            .unwrap_or_default(),
+        position_notional_usd: basis.max_position_usd.0.to_f64().unwrap_or_default(),
+        rolling_window: basis.rolling_window_secs,
+        band_policy: basis.band_policy.to_string(),
+        market_data_mode: match settings.strategy.market_data.mode {
+            MarketDataMode::Poll => "poll".to_owned(),
+            MarketDataMode::Ws => "ws".to_owned(),
+        },
+        max_stale_ms: settings.strategy.market_data.max_stale_ms,
+        poly_open_max_quote_age_ms: settings
+            .strategy
+            .market_data
+            .resolved_poly_open_max_quote_age_ms(),
+        cex_open_max_quote_age_ms: settings
+            .strategy
+            .market_data
+            .resolved_cex_open_max_quote_age_ms(),
+        close_max_quote_age_ms: settings
+            .strategy
+            .market_data
+            .resolved_close_max_quote_age_ms(),
+        max_cross_leg_skew_ms: settings
+            .strategy
+            .market_data
+            .resolved_max_cross_leg_skew_ms(),
+        borderline_poly_quote_age_ms: settings
+            .strategy
+            .market_data
+            .resolved_borderline_poly_quote_age_ms(),
+        min_poly_price: basis
+            .min_poly_price
+            .and_then(|value| value.to_f64())
+            .unwrap_or_default(),
+        max_poly_price: basis
+            .max_poly_price
+            .and_then(|value| value.to_f64())
+            .unwrap_or(1.0),
+        poly_slippage_bps: settings.paper_slippage.poly_slippage_bps,
+        cex_slippage_bps: settings.paper_slippage.cex_slippage_bps,
+        max_total_exposure_usd: settings
+            .risk
+            .max_total_exposure_usd
+            .0
+            .to_f64()
+            .unwrap_or_default(),
+        max_single_position_usd: settings
+            .risk
+            .max_single_position_usd
+            .0
+            .to_f64()
+            .unwrap_or_default(),
+        max_daily_loss_usd: settings
+            .risk
+            .max_daily_loss_usd
+            .0
+            .to_f64()
+            .unwrap_or_default(),
+        max_open_orders: settings.risk.max_open_orders,
+        rate_limit_orders_per_sec: settings.risk.rate_limit_orders_per_sec,
+        min_liquidity: settings
+            .paper_slippage
+            .min_liquidity
+            .to_f64()
+            .unwrap_or_default(),
+        allow_partial_fill: settings.paper_slippage.allow_partial_fill,
+        enable_freshness_check: basis.enable_freshness_check,
+        reject_on_disconnect: basis.reject_on_disconnect,
+        per_asset,
     }
 }
 
@@ -13113,11 +13156,12 @@ fn build_market_views(
     position_views: &[polyalpha_core::PositionView],
     now_ms: u64,
 ) -> Vec<MarketView> {
-    let thresholds = freshness_thresholds(settings);
-    let require_connections = require_connected_inputs(settings);
     markets
         .iter()
         .map(|market| {
+            let basis = effective_basis_config_for_market(settings, market);
+            let thresholds = freshness_thresholds(settings, &basis);
+            let require_connections = require_connected_inputs(&basis);
             let observed = observed_map.get(&market.symbol);
             let snapshot = engine.basis_snapshot(&market.symbol);
             let (yes_basis_history_len, no_basis_history_len) =
@@ -13899,12 +13943,7 @@ fn build_multi_monitor_state(
 
 /// Extract asset prefix from CEX symbol (e.g., "BTCUSDT" -> "btc")
 fn extract_asset_prefix(cex_symbol: &str) -> String {
-    cex_symbol
-        .to_lowercase()
-        .trim_end_matches("usdt")
-        .trim_end_matches("usd")
-        .trim_end_matches("perp")
-        .to_string()
+    asset_key_from_cex_symbol(cex_symbol)
 }
 
 /// Build per-market parameter overrides from config
@@ -13916,28 +13955,22 @@ fn build_market_overrides(
 
     for market in markets {
         let asset_key = extract_asset_prefix(&market.cex_symbol);
-        if let Some(override_config) = settings.strategy.basis.overrides.get(&asset_key) {
+        if settings.strategy.basis.overrides.contains_key(&asset_key) {
+            let basis = settings.strategy.basis.effective_for_asset_key(&asset_key);
             let market_override = MarketOverrideConfig {
-                entry_z: override_config
-                    .entry_z_score_threshold
-                    .and_then(|d| d.to_f64()),
-                exit_z: override_config
-                    .exit_z_score_threshold
-                    .and_then(|d| d.to_f64()),
-                rolling_window_minutes: override_config
-                    .rolling_window_secs
-                    .map(|s| (s / 60) as usize),
-                min_warmup_samples: override_config.min_warmup_samples,
-                min_basis_bps: override_config.min_basis_bps.and_then(|d| d.to_f64()),
-                position_notional_usd: override_config.max_position_usd,
+                entry_z: basis.entry_z_score_threshold.to_f64(),
+                exit_z: basis.exit_z_score_threshold.to_f64(),
+                rolling_window_minutes: Some((basis.rolling_window_secs / 60) as usize),
+                min_warmup_samples: Some(basis.min_warmup_samples),
+                min_basis_bps: basis.min_basis_bps.to_f64(),
+                position_notional_usd: Some(basis.max_position_usd),
+                enable_freshness_check: Some(basis.enable_freshness_check),
+                reject_on_disconnect: Some(basis.reject_on_disconnect),
+                max_poly_data_age_ms: Some(basis.max_data_age_minutes.saturating_mul(60_000)),
+                max_cex_data_age_ms: Some(basis.max_data_age_minutes.saturating_mul(60_000)),
+                max_time_diff_ms: Some(basis.max_time_diff_minutes.saturating_mul(60_000)),
             };
-            if market_override.entry_z.is_some()
-                || market_override.exit_z.is_some()
-                || market_override.rolling_window_minutes.is_some()
-                || market_override.position_notional_usd.is_some()
-            {
-                overrides.insert(market.symbol.clone(), market_override);
-            }
+            overrides.insert(market.symbol.clone(), market_override);
         }
     }
 
@@ -14468,6 +14501,33 @@ mod tests {
         }
     }
 
+    fn test_settings_with_per_asset_basis_overrides() -> Settings {
+        let mut settings = test_settings_with_price_filter(
+            Some(Decimal::new(20, 2)),
+            Some(Decimal::new(50, 2)),
+        );
+        settings.markets = vec![
+            test_market("btc-test", Exchange::Binance, "BTCUSDT"),
+            test_market("eth-test", Exchange::Binance, "ETHUSDT"),
+        ];
+        settings.strategy.basis.overrides.insert(
+            "btc".to_owned(),
+            polyalpha_core::BasisOverrideConfig {
+                min_poly_price: Some(Decimal::new(10, 2)),
+                max_poly_price: Some(Decimal::new(45, 2)),
+                max_open_instant_loss_pct_of_budget: Some(Decimal::new(2, 2)),
+                delta_rebalance_threshold: Some(Decimal::new(8, 2)),
+                delta_rebalance_interval_secs: Some(120),
+                max_data_age_minutes: Some(2),
+                max_time_diff_minutes: Some(3),
+                enable_freshness_check: Some(false),
+                reject_on_disconnect: Some(false),
+                ..Default::default()
+            },
+        );
+        settings
+    }
+
     fn test_settings_with_audit_data_dir(data_dir: String) -> Settings {
         let mut settings = test_settings_with_price_filter(None, None);
         settings.general.data_dir = data_dir;
@@ -14487,6 +14547,84 @@ mod tests {
         let warehouse_dir = PathBuf::from(data_dir).join("audit").join("warehouse");
         let _ = fs::remove_dir_all(&warehouse_dir);
         fs::write(&warehouse_dir, b"blocked").expect("replace warehouse dir with file");
+    }
+
+    #[test]
+    fn per_asset_basis_price_filter_uses_market_override() {
+        let settings = test_settings_with_per_asset_basis_overrides();
+        let mut observed_map = HashMap::new();
+        observed_map.insert(
+            Symbol::new("btc-test"),
+            ObservedState {
+                poly_no_mid: Some(Decimal::new(15, 2)),
+                ..ObservedState::default()
+            },
+        );
+        observed_map.insert(
+            Symbol::new("eth-test"),
+            ObservedState {
+                poly_no_mid: Some(Decimal::new(15, 2)),
+                ..ObservedState::default()
+            },
+        );
+
+        let btc_candidate = OpenCandidate {
+            symbol: Symbol::new("btc-test"),
+            token_side: TokenSide::No,
+            ..open_candidate(TokenSide::No)
+        };
+        let eth_candidate = OpenCandidate {
+            symbol: Symbol::new("eth-test"),
+            token_side: TokenSide::No,
+            ..open_candidate(TokenSide::No)
+        };
+
+        assert!(candidate_passes_price_filter_multi(
+            &btc_candidate,
+            &observed_map,
+            &settings
+        ));
+        assert!(!candidate_passes_price_filter_multi(
+            &eth_candidate,
+            &observed_map,
+            &settings
+        ));
+    }
+
+    #[test]
+    fn per_asset_basis_builds_engine_overrides_and_monitor_summary() {
+        let settings = test_settings_with_per_asset_basis_overrides();
+        let overrides = build_market_overrides(&settings, &settings.markets);
+        let btc_symbol = Symbol::new("btc-test");
+
+        let btc_override = overrides
+            .get(&btc_symbol)
+            .expect("btc override should exist");
+        assert_eq!(btc_override.max_poly_data_age_ms, Some(120_000));
+        assert_eq!(btc_override.max_time_diff_ms, Some(180_000));
+        assert_eq!(btc_override.enable_freshness_check, Some(false));
+        assert_eq!(btc_override.reject_on_disconnect, Some(false));
+
+        let monitor = build_monitor_strategy_config(&settings, &settings.markets);
+        assert_eq!(monitor.per_asset.len(), 2);
+
+        let btc = monitor
+            .per_asset
+            .iter()
+            .find(|item| item.asset == "BTC")
+            .expect("btc monitor config");
+        assert_eq!(btc.min_poly_price, 0.10);
+        assert_eq!(btc.max_poly_price, 0.45);
+        assert!(!btc.enable_freshness_check);
+
+        let eth = monitor
+            .per_asset
+            .iter()
+            .find(|item| item.asset == "ETH")
+            .expect("eth monitor config");
+        assert_eq!(eth.min_poly_price, 0.20);
+        assert_eq!(eth.max_poly_price, 0.50);
+        assert!(eth.enable_freshness_check);
     }
 
     #[test]
@@ -15113,6 +15251,73 @@ mod tests {
         assert!(!recent_events
             .iter()
             .any(|event| { event.summary.contains("CEX 对冲量为 0") }));
+    }
+
+    #[tokio::test]
+    async fn process_signal_multi_price_filter_summary_uses_per_asset_band() {
+        let settings = test_settings_with_per_asset_basis_overrides();
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let (provider, _executor, mut execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
+        seed_runtime_books(&provider, &registry, 1);
+
+        let symbol = Symbol::new("btc-test");
+        let mut observed_map = HashMap::from([(
+            symbol.clone(),
+            ObservedState {
+                poly_yes_mid: Some(Decimal::new(46, 2)),
+                ..ObservedState::default()
+            },
+        )]);
+        let mut candidate = open_candidate(TokenSide::Yes);
+        candidate.symbol = symbol.clone();
+        candidate.delta_estimate = 0.0;
+
+        let mut stats = PaperStats::default();
+        let mut recent_events = VecDeque::new();
+        let mut engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
+        let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        let mut trade_book = TradeBook::default();
+        let paused = Arc::new(AtomicBool::new(false));
+        let emergency = Arc::new(AtomicBool::new(false));
+        let mut no_audit = None;
+
+        process_signal_multi(
+            candidate,
+            &settings,
+            &registry,
+            &mut observed_map,
+            &mut stats,
+            &mut recent_events,
+            &mut engine,
+            &mut execution,
+            &mut risk,
+            &mut trade_book,
+            &paused,
+            &emergency,
+            false,
+            false,
+            &mut no_audit,
+        )
+        .await
+        .expect("signal should reject cleanly");
+
+        let summary = recent_events
+            .iter()
+            .find(|event| event.summary.contains("高于或等于最大 Poly 价格带"))
+            .map(|event| event.summary.as_str())
+            .expect("price filter summary");
+        assert!(summary.contains("0.1 - 0.45"), "unexpected summary: {summary}");
     }
 
     #[tokio::test]
@@ -17438,7 +17643,7 @@ mod tests {
             1_500,
             &market,
             &observed,
-            freshness_thresholds(&settings),
+            freshness_thresholds(&settings, &effective_basis_config_for_market(&settings, &market)),
             Some(TokenSide::Yes),
             false,
             true,

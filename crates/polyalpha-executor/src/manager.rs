@@ -119,6 +119,7 @@ pub struct ExecutionManager<E: OrderExecutor> {
     symbol_registry: Option<SymbolRegistry>,
     orderbook_provider: Option<Arc<dyn OrderbookProvider>>,
     planner: ExecutionPlanner,
+    planner_overrides: HashMap<Symbol, ExecutionPlanner>,
     planner_depth_levels: usize,
     dmm_quote_states: HashMap<Symbol, DmmQuoteState>,
     active_dmm_orders: HashMap<Symbol, ActiveDmmOrders>,
@@ -164,6 +165,7 @@ impl<E: OrderExecutor> ExecutionManager<E> {
             symbol_registry,
             orderbook_provider,
             planner: ExecutionPlanner::default(),
+            planner_overrides: HashMap::new(),
             planner_depth_levels: 1,
             dmm_quote_states: HashMap::new(),
             active_dmm_orders: HashMap::new(),
@@ -193,9 +195,24 @@ impl<E: OrderExecutor> ExecutionManager<E> {
         self
     }
 
+    pub fn with_planner_overrides(
+        mut self,
+        planner_overrides: HashMap<Symbol, ExecutionPlanner>,
+    ) -> Self {
+        self.planner_overrides = planner_overrides;
+        self
+    }
+
     pub fn with_planner_depth_levels(mut self, levels: usize) -> Self {
         self.planner_depth_levels = levels.max(1);
         self
+    }
+
+    fn planner_for_symbol(&self, symbol: &Symbol) -> ExecutionPlanner {
+        self.planner_overrides
+            .get(symbol)
+            .cloned()
+            .unwrap_or_else(|| self.planner.clone())
     }
 
     pub fn planning_context_for_symbol(
@@ -321,7 +338,8 @@ impl<E: OrderExecutor> ExecutionManager<E> {
             )));
         }
         let latest_context = self.build_planning_context_for_symbol(&plan.symbol)?;
-        if let Err(reason) = self.planner.revalidate(plan, &latest_context) {
+        let planner = self.planner_for_symbol(&plan.symbol);
+        if let Err(reason) = planner.revalidate(plan, &latest_context) {
             return Err(CoreError::Generic(format!(
                 "plan rejected [{}]: external plan failed revalidation",
                 reason.code()
@@ -460,19 +478,18 @@ impl<E: OrderExecutor> ExecutionManager<E> {
         &mut self,
         intent: &PlanningIntent,
     ) -> std::result::Result<TradePlan, PreviewIntentError> {
+        let planner = self.planner_for_symbol(intent.symbol());
         let initial_context = self
             .build_planning_context(intent)
             .map_err(PreviewIntentError::Core)?;
-        let mut plan = self
-            .planner
+        let mut plan = planner
             .plan(intent, &initial_context)
             .map_err(PreviewIntentError::PlanRejected)?;
         let latest_context = self
             .build_planning_context(intent)
             .map_err(PreviewIntentError::Core)?;
-        if let Err(reason) = self.planner.revalidate(&plan, &latest_context) {
-            plan = self
-                .planner
+        if let Err(reason) = planner.revalidate(&plan, &latest_context) {
+            plan = planner
                 .plan(intent, &latest_context)
                 .map_err(|mut rejection| {
                     rejection.detail = format!(
@@ -980,13 +997,12 @@ impl<E: OrderExecutor> ExecutionManager<E> {
         result: &ExecutionResult,
     ) -> Result<Option<TradePlan>> {
         let context = self.build_planning_context_for_symbol(&plan.symbol)?;
-        let Some(intent) = self
-            .planner
-            .recovery_intent_from_result(plan, result, &context)
+        let planner = self.planner_for_symbol(&plan.symbol);
+        let Some(intent) = planner.recovery_intent_from_result(plan, result, &context)
         else {
             return Ok(None);
         };
-        let mut recovery_plan = self.planner.plan(&intent, &context).map_err(|rejection| {
+        let mut recovery_plan = planner.plan(&intent, &context).map_err(|rejection| {
             CoreError::Generic(format!(
                 "recovery plan rejected [{}]: {}",
                 rejection.reason.code(),

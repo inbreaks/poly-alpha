@@ -5,9 +5,10 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 
 use polyalpha_core::{
-    cex_venue_symbol, CoreError, Exchange, MarketConfig, MarketDataEvent, OpenCandidate,
-    OrderBookSnapshot, OrderExecutor, OrderId, OrderRequest, OrderResponse, OrderStatus,
-    PlanningIntent, ResidualSnapshot, Settings, Symbol, SymbolRegistry, PLANNING_SCHEMA_VERSION,
+    asset_key_from_cex_symbol, cex_venue_symbol, CoreError, Exchange, MarketConfig,
+    MarketDataEvent, OpenCandidate, OrderBookSnapshot, OrderExecutor, OrderId, OrderRequest,
+    OrderResponse, OrderStatus, PlanningIntent, ResidualSnapshot, Settings, Symbol,
+    SymbolRegistry, PLANNING_SCHEMA_VERSION,
 };
 use polyalpha_data::{DataManager, MarketDataNormalizer};
 use polyalpha_executor::{
@@ -108,9 +109,32 @@ fn build_runtime_execution_planner(settings: &Settings) -> ExecutionPlanner {
     let mut planner = ExecutionPlanner::from_execution_costs(&settings.execution_costs);
     planner.poly_slippage_bps = settings.paper_slippage.poly_slippage_bps as u32;
     planner.cex_slippage_bps = settings.paper_slippage.cex_slippage_bps as u32;
-    planner.max_open_instant_loss_pct_of_budget =
-        settings.strategy.basis.max_open_instant_loss_pct_of_budget;
+    planner.max_open_instant_loss_pct_of_budget = settings
+        .strategy
+        .basis
+        .effective_for_asset_key("")
+        .max_open_instant_loss_pct_of_budget;
     planner
+}
+
+fn build_runtime_execution_planner_overrides(
+    settings: &Settings,
+) -> HashMap<Symbol, ExecutionPlanner> {
+    let base_planner = build_runtime_execution_planner(settings);
+    let mut overrides = HashMap::new();
+    for market in &settings.markets {
+        let asset_key = asset_key_from_cex_symbol(&market.cex_symbol);
+        if settings.strategy.basis.overrides.contains_key(&asset_key) {
+            let mut planner = base_planner.clone();
+            planner.max_open_instant_loss_pct_of_budget = settings
+                .strategy
+                .basis
+                .effective_for_asset_key(&asset_key)
+                .max_open_instant_loss_pct_of_budget;
+            overrides.insert(market.symbol.clone(), planner);
+        }
+    }
+    overrides
 }
 
 #[derive(Clone, Default)]
@@ -456,6 +480,7 @@ pub async fn build_execution_stack(
         orderbook_provider.clone(),
     )
     .with_planner(build_runtime_execution_planner(settings))
+    .with_planner_overrides(build_runtime_execution_planner_overrides(settings))
     .with_planner_depth_levels(settings.strategy.market_data.planner_depth_levels);
 
     Ok((orderbook_provider, executor, execution))
@@ -680,6 +705,33 @@ mod tests {
         market.cex_symbol = "ETH-USDT-SWAP".to_owned();
         market.hedge_exchange = Exchange::Okx;
         market
+    }
+
+    #[test]
+    fn runtime_planner_overrides_follow_per_asset_basis_config() {
+        let mut settings = sample_settings();
+        settings.markets = vec![sample_market(), sample_okx_market()];
+        settings.strategy.basis.overrides.insert(
+            "btc".to_owned(),
+            polyalpha_core::BasisOverrideConfig {
+                max_open_instant_loss_pct_of_budget: Some(Decimal::new(2, 2)),
+                ..Default::default()
+            },
+        );
+
+        let overrides = build_runtime_execution_planner_overrides(&settings);
+
+        assert_eq!(
+            overrides
+                .get(&Symbol::new("btc-runtime"))
+                .expect("btc override")
+                .max_open_instant_loss_pct_of_budget,
+            Decimal::new(2, 2)
+        );
+        assert!(
+            overrides.get(&Symbol::new("eth-runtime")).is_none(),
+            "eth should keep the global planner"
+        );
     }
 
     #[derive(Clone, Default)]

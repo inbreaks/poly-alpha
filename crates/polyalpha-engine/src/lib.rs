@@ -303,6 +303,11 @@ pub struct MarketOverrideConfig {
     pub min_warmup_samples: Option<usize>,
     pub min_basis_bps: Option<f64>,
     pub position_notional_usd: Option<UsdNotional>,
+    pub enable_freshness_check: Option<bool>,
+    pub reject_on_disconnect: Option<bool>,
+    pub max_poly_data_age_ms: Option<u64>,
+    pub max_cex_data_age_ms: Option<u64>,
+    pub max_time_diff_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -391,6 +396,41 @@ impl SimpleAlphaEngine {
             .get(symbol)
             .and_then(|o| o.position_notional_usd)
             .unwrap_or(self.config.position_notional_usd)
+    }
+
+    fn get_enable_freshness_check(&self, symbol: &Symbol) -> bool {
+        self.market_overrides
+            .get(symbol)
+            .and_then(|o| o.enable_freshness_check)
+            .unwrap_or(self.config.enable_freshness_check)
+    }
+
+    fn get_reject_on_disconnect(&self, symbol: &Symbol) -> bool {
+        self.market_overrides
+            .get(symbol)
+            .and_then(|o| o.reject_on_disconnect)
+            .unwrap_or(self.config.reject_on_disconnect)
+    }
+
+    fn get_max_poly_data_age_ms(&self, symbol: &Symbol) -> u64 {
+        self.market_overrides
+            .get(symbol)
+            .and_then(|o| o.max_poly_data_age_ms)
+            .unwrap_or(self.config.max_poly_data_age_ms)
+    }
+
+    fn get_max_cex_data_age_ms(&self, symbol: &Symbol) -> u64 {
+        self.market_overrides
+            .get(symbol)
+            .and_then(|o| o.max_cex_data_age_ms)
+            .unwrap_or(self.config.max_cex_data_age_ms)
+    }
+
+    fn get_max_time_diff_ms(&self, symbol: &Symbol) -> u64 {
+        self.market_overrides
+            .get(symbol)
+            .and_then(|o| o.max_time_diff_ms)
+            .unwrap_or(self.config.max_time_diff_ms)
     }
 
     pub fn replace_markets(&mut self, markets: Vec<MarketConfig>) {
@@ -493,7 +533,7 @@ impl SimpleAlphaEngine {
     /// Warmup engine with historical CEX kline data
     /// This pre-populates the returns_window to reduce warmup time
     pub fn warmup_cex_prices(&mut self, symbol: &Symbol, klines: &[(u64, f64)]) {
-        let capacity = self.history_capacity();
+        let capacity = self.history_capacity_for_symbol(symbol);
         let default_state = self.state_for_symbol(symbol);
         let state = self.states.entry(symbol.clone()).or_insert(default_state);
 
@@ -528,7 +568,8 @@ impl SimpleAlphaEngine {
         cex_prices: &std::collections::HashMap<u64, f64>,
         poly_prices: &[(u64, f64)],
     ) {
-        let capacity = self.history_capacity();
+        let capacity = self.history_capacity_for_symbol(symbol);
+        let min_signal_samples = self.get_min_warmup_samples(symbol);
         let default_state = self.state_for_symbol(symbol);
         let state = self.states.entry(symbol.clone()).or_insert(default_state);
 
@@ -598,7 +639,7 @@ impl SimpleAlphaEngine {
                 TokenSide::No => &state.no.history,
             };
 
-            if history.len() >= self.config.min_signal_samples {
+            if history.len() >= min_signal_samples {
                 // Get the last matched poly price and its CEX reference
                 // We need to iterate backwards to find the last matched point
                 for (ts_ms, poly_price) in poly_prices.iter().rev() {
@@ -615,8 +656,7 @@ impl SimpleAlphaEngine {
                             minutes_to_expiry,
                         );
                         let signal_basis = poly_price - fair_value;
-                        let z_score =
-                            rolling_zscore(history, signal_basis, self.config.min_signal_samples);
+                        let z_score = rolling_zscore(history, signal_basis, min_signal_samples);
                         let delta =
                             token_delta(&rule, token_side, cex_price, sigma, minutes_to_expiry);
 
@@ -682,16 +722,15 @@ impl SimpleAlphaEngine {
         best_match.map(|(_, price)| price)
     }
 
-    fn history_capacity(&self) -> usize {
-        self.config
-            .rolling_window_minutes
-            .max(self.config.min_signal_samples)
+    fn history_capacity_for_symbol(&self, symbol: &Symbol) -> usize {
+        self.get_rolling_window_minutes(symbol)
+            .max(self.get_min_warmup_samples(symbol))
             .max(2)
     }
 
     fn state_for_symbol(&self, symbol: &Symbol) -> SymbolState {
         SymbolState::new(
-            self.history_capacity(),
+            self.history_capacity_for_symbol(symbol),
             self.poly_connected,
             self.cex_connected_for_symbol(symbol),
         )
@@ -752,7 +791,7 @@ impl SimpleAlphaEngine {
                                 let _ = state.cex_minutes.ingest_price(
                                     snapshot.received_at_ms,
                                     price,
-                                    self.history_capacity(),
+                                    self.history_capacity_for_symbol(&symbol),
                                 );
                             }
                         }
@@ -791,7 +830,7 @@ impl SimpleAlphaEngine {
                             let _ = state.cex_minutes.ingest_price(
                                 *timestamp_ms,
                                 value,
-                                self.history_capacity(),
+                                self.history_capacity_for_symbol(&symbol),
                             );
                         }
                     }
@@ -932,8 +971,8 @@ impl SimpleAlphaEngine {
             return;
         }
 
-        if self.config.enable_freshness_check
-            && self.config.reject_on_disconnect
+        if self.get_enable_freshness_check(symbol)
+            && self.get_reject_on_disconnect(symbol)
             && (!state.poly_connected || !state.cex_connected)
         {
             output.push_warning(EngineWarning::ConnectionLost {
@@ -957,15 +996,16 @@ impl SimpleAlphaEngine {
             return;
         };
 
-        if self.config.enable_freshness_check {
+        if self.get_enable_freshness_check(symbol) {
             let cex_age_ms = state
                 .last_update_ms
                 .saturating_sub(state.last_cex_update_ms);
-            if cex_age_ms > self.config.max_cex_data_age_ms {
+            let max_cex_data_age_ms = self.get_max_cex_data_age_ms(symbol);
+            if cex_age_ms > max_cex_data_age_ms {
                 output.push_warning(EngineWarning::CexPriceStale {
                     symbol: symbol.clone(),
                     cex_age_ms,
-                    max_age_ms: self.config.max_cex_data_age_ms,
+                    max_age_ms: max_cex_data_age_ms,
                 });
                 state.discard_pending_observations();
                 state.set_basis_snapshot(None);
@@ -975,11 +1015,12 @@ impl SimpleAlphaEngine {
             let poly_age_ms = state
                 .last_update_ms
                 .saturating_sub(state.last_poly_update_ms);
-            if poly_age_ms > self.config.max_poly_data_age_ms {
+            let max_poly_data_age_ms = self.get_max_poly_data_age_ms(symbol);
+            if poly_age_ms > max_poly_data_age_ms {
                 output.push_warning(EngineWarning::PolyPriceStale {
                     symbol: symbol.clone(),
                     poly_age_ms,
-                    max_age_ms: self.config.max_poly_data_age_ms,
+                    max_age_ms: max_poly_data_age_ms,
                 });
                 state.discard_pending_observations();
                 state.set_basis_snapshot(None);
@@ -1105,13 +1146,13 @@ impl SimpleAlphaEngine {
         sigma_context: &SigmaContext,
     ) -> Option<EvaluatedToken> {
         let pending = token_state.pending_observation.clone()?;
-        if self.config.enable_freshness_check {
+        if self.get_enable_freshness_check(symbol) {
             let time_diff_ms = if pending.minute_bucket_ms >= cex_reference_minute_ms {
                 pending.minute_bucket_ms - cex_reference_minute_ms
             } else {
                 cex_reference_minute_ms - pending.minute_bucket_ms
             };
-            if time_diff_ms > self.config.max_time_diff_ms {
+            if time_diff_ms > self.get_max_time_diff_ms(symbol) {
                 return Some(EvaluatedToken {
                     minute_bucket_ms: pending.minute_bucket_ms,
                     snapshot: None,
@@ -1153,7 +1194,7 @@ impl SimpleAlphaEngine {
         let z_score = rolling_zscore(
             &token_state.history,
             signal_basis,
-            self.config.min_signal_samples,
+            self.get_min_warmup_samples(symbol),
         );
 
         Some(EvaluatedToken {

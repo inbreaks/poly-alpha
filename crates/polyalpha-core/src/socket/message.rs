@@ -461,6 +461,36 @@ pub struct EvaluationStats {
 }
 
 /// 策略配置（用于 Monitor 显示）
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MonitorAssetStrategyConfig {
+    pub asset: String,
+    #[serde(default)]
+    pub entry_z: f64,
+    #[serde(default)]
+    pub exit_z: f64,
+    #[serde(default)]
+    pub position_notional_usd: f64,
+    #[serde(default)]
+    pub rolling_window: u64,
+    #[serde(default)]
+    pub band_policy: String,
+    #[serde(default)]
+    pub min_poly_price: f64,
+    #[serde(default)]
+    pub max_poly_price: f64,
+    #[serde(default)]
+    pub max_open_instant_loss_pct_of_budget: f64,
+    #[serde(default)]
+    pub delta_rebalance_threshold: f64,
+    #[serde(default)]
+    pub delta_rebalance_interval_secs: u64,
+    #[serde(default)]
+    pub enable_freshness_check: bool,
+    #[serde(default)]
+    pub reject_on_disconnect: bool,
+}
+
+/// 策略配置（用于 Monitor 显示）
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MonitorStrategyConfig {
     pub entry_z: f64,
@@ -505,6 +535,8 @@ pub struct MonitorStrategyConfig {
     pub enable_freshness_check: bool,
     #[serde(default)]
     pub reject_on_disconnect: bool,
+    #[serde(default)]
+    pub per_asset: Vec<MonitorAssetStrategyConfig>,
 }
 
 impl Default for MonitorStrategyConfig {
@@ -535,6 +567,7 @@ impl Default for MonitorStrategyConfig {
             allow_partial_fill: false,
             enable_freshness_check: true,
             reject_on_disconnect: true,
+            per_asset: Vec::new(),
         }
     }
 }

@@ -307,15 +307,57 @@ pub struct BasisOverrideConfig {
     /// Override maximum position size in USD
     #[serde(default)]
     pub max_position_usd: Option<UsdNotional>,
+    /// Override maximum allowed instant open loss as pct of budget
+    #[serde(default)]
+    pub max_open_instant_loss_pct_of_budget: Option<Decimal>,
+    /// Override delta rebalance threshold
+    #[serde(default)]
+    pub delta_rebalance_threshold: Option<Decimal>,
+    /// Override delta rebalance interval in seconds
+    #[serde(default)]
+    pub delta_rebalance_interval_secs: Option<u64>,
     /// Override minimum Polymarket price for trading
     #[serde(default)]
     pub min_poly_price: Option<Decimal>,
     /// Override maximum Polymarket price for trading
     #[serde(default)]
     pub max_poly_price: Option<Decimal>,
+    /// Override maximum data age in minutes
+    #[serde(default)]
+    pub max_data_age_minutes: Option<u64>,
+    /// Override maximum poly/cex time diff in minutes
+    #[serde(default)]
+    pub max_time_diff_minutes: Option<u64>,
+    /// Override freshness guard enablement
+    #[serde(default)]
+    pub enable_freshness_check: Option<bool>,
+    /// Override whether to reject on disconnect
+    #[serde(default)]
+    pub reject_on_disconnect: Option<bool>,
     /// Override band policy for specific asset
     #[serde(default)]
     pub band_policy: Option<BandPolicyMode>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EffectiveBasisConfig {
+    pub asset_key: String,
+    pub entry_z_score_threshold: Decimal,
+    pub exit_z_score_threshold: Decimal,
+    pub rolling_window_secs: u64,
+    pub min_warmup_samples: usize,
+    pub min_basis_bps: Decimal,
+    pub max_position_usd: UsdNotional,
+    pub max_open_instant_loss_pct_of_budget: Decimal,
+    pub delta_rebalance_threshold: Decimal,
+    pub delta_rebalance_interval_secs: u64,
+    pub band_policy: BandPolicyMode,
+    pub min_poly_price: Option<Decimal>,
+    pub max_poly_price: Option<Decimal>,
+    pub max_data_age_minutes: u64,
+    pub max_time_diff_minutes: u64,
+    pub enable_freshness_check: bool,
+    pub reject_on_disconnect: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -347,6 +389,95 @@ pub struct BasisStrategyConfig {
     /// Per-asset parameter overrides, keyed by asset prefix (e.g., "btc", "eth")
     #[serde(default)]
     pub overrides: HashMap<String, BasisOverrideConfig>,
+}
+
+pub fn asset_key_from_cex_symbol(cex_symbol: &str) -> String {
+    let normalized = cex_symbol
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>();
+    for suffix in [
+        "usdtswap",
+        "usdcswap",
+        "usdswap",
+        "usdtperp",
+        "usdcperp",
+        "usdperp",
+        "usdt",
+        "usdc",
+        "usd",
+        "perp",
+        "swap",
+    ] {
+        if normalized.ends_with(suffix) && normalized.len() > suffix.len() {
+            return normalized[..normalized.len() - suffix.len()].to_owned();
+        }
+    }
+    normalized
+}
+
+impl BasisStrategyConfig {
+    pub fn effective_for_asset_key(&self, asset_key: &str) -> EffectiveBasisConfig {
+        let asset_key = asset_key.trim().to_ascii_lowercase();
+        let override_config = self.overrides.get(&asset_key);
+        EffectiveBasisConfig {
+            asset_key,
+            entry_z_score_threshold: override_config
+                .and_then(|config| config.entry_z_score_threshold)
+                .unwrap_or(self.entry_z_score_threshold),
+            exit_z_score_threshold: override_config
+                .and_then(|config| config.exit_z_score_threshold)
+                .unwrap_or(self.exit_z_score_threshold),
+            rolling_window_secs: override_config
+                .and_then(|config| config.rolling_window_secs)
+                .unwrap_or(self.rolling_window_secs),
+            min_warmup_samples: override_config
+                .and_then(|config| config.min_warmup_samples)
+                .unwrap_or(self.min_warmup_samples),
+            min_basis_bps: override_config
+                .and_then(|config| config.min_basis_bps)
+                .unwrap_or(self.min_basis_bps),
+            max_position_usd: override_config
+                .and_then(|config| config.max_position_usd)
+                .unwrap_or(self.max_position_usd),
+            max_open_instant_loss_pct_of_budget: override_config
+                .and_then(|config| config.max_open_instant_loss_pct_of_budget)
+                .unwrap_or(self.max_open_instant_loss_pct_of_budget),
+            delta_rebalance_threshold: override_config
+                .and_then(|config| config.delta_rebalance_threshold)
+                .unwrap_or(self.delta_rebalance_threshold),
+            delta_rebalance_interval_secs: override_config
+                .and_then(|config| config.delta_rebalance_interval_secs)
+                .unwrap_or(self.delta_rebalance_interval_secs),
+            band_policy: override_config
+                .and_then(|config| config.band_policy)
+                .unwrap_or(self.band_policy),
+            min_poly_price: override_config
+                .and_then(|config| config.min_poly_price)
+                .or(self.min_poly_price),
+            max_poly_price: override_config
+                .and_then(|config| config.max_poly_price)
+                .or(self.max_poly_price),
+            max_data_age_minutes: override_config
+                .and_then(|config| config.max_data_age_minutes)
+                .unwrap_or(self.max_data_age_minutes),
+            max_time_diff_minutes: override_config
+                .and_then(|config| config.max_time_diff_minutes)
+                .unwrap_or(self.max_time_diff_minutes),
+            enable_freshness_check: override_config
+                .and_then(|config| config.enable_freshness_check)
+                .unwrap_or(self.enable_freshness_check),
+            reject_on_disconnect: override_config
+                .and_then(|config| config.reject_on_disconnect)
+                .unwrap_or(self.reject_on_disconnect),
+        }
+    }
+
+    pub fn effective_for_cex_symbol(&self, cex_symbol: &str) -> EffectiveBasisConfig {
+        self.effective_for_asset_key(&asset_key_from_cex_symbol(cex_symbol))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -532,6 +663,70 @@ mod tests {
             config.max_open_instant_loss_pct_of_budget,
             Decimal::new(4, 2)
         );
+    }
+
+    #[test]
+    fn per_asset_basis_override_resolution() {
+        let config: BasisStrategyConfig = serde_json::from_value(serde_json::json!({
+            "entry_z_score_threshold": "4.0",
+            "exit_z_score_threshold": "0.5",
+            "rolling_window_secs": 36000,
+            "min_warmup_samples": 600,
+            "min_basis_bps": "50.0",
+            "max_position_usd": "200",
+            "max_open_instant_loss_pct_of_budget": "0.01",
+            "delta_rebalance_threshold": "0.05",
+            "delta_rebalance_interval_secs": 60,
+            "band_policy": "configured_band",
+            "min_poly_price": "0.2",
+            "max_poly_price": "0.5",
+            "max_data_age_minutes": 1,
+            "max_time_diff_minutes": 1,
+            "enable_freshness_check": true,
+            "reject_on_disconnect": true,
+            "overrides": {
+                "btc": {
+                    "min_poly_price": "0.10",
+                    "max_poly_price": "0.45",
+                    "max_open_instant_loss_pct_of_budget": "0.02",
+                    "delta_rebalance_threshold": "0.08",
+                    "delta_rebalance_interval_secs": 120,
+                    "max_data_age_minutes": 2,
+                    "max_time_diff_minutes": 3,
+                    "enable_freshness_check": false,
+                    "reject_on_disconnect": false
+                }
+            }
+        }))
+        .expect("config should deserialize");
+
+        let btc = config.effective_for_asset_key("btc");
+        assert_eq!(btc.min_poly_price, Some(Decimal::new(10, 2)));
+        assert_eq!(btc.max_poly_price, Some(Decimal::new(45, 2)));
+        assert_eq!(
+            btc.max_open_instant_loss_pct_of_budget,
+            Decimal::new(2, 2)
+        );
+        assert_eq!(btc.delta_rebalance_threshold, Decimal::new(8, 2));
+        assert_eq!(btc.delta_rebalance_interval_secs, 120);
+        assert_eq!(btc.max_data_age_minutes, 2);
+        assert_eq!(btc.max_time_diff_minutes, 3);
+        assert!(!btc.enable_freshness_check);
+        assert!(!btc.reject_on_disconnect);
+
+        let eth = config.effective_for_asset_key("eth");
+        assert_eq!(eth.min_poly_price, Some(Decimal::new(20, 2)));
+        assert_eq!(eth.max_poly_price, Some(Decimal::new(50, 2)));
+        assert_eq!(
+            eth.max_open_instant_loss_pct_of_budget,
+            Decimal::new(1, 2)
+        );
+        assert_eq!(eth.delta_rebalance_threshold, Decimal::new(5, 2));
+        assert_eq!(eth.delta_rebalance_interval_secs, 60);
+        assert_eq!(eth.max_data_age_minutes, 1);
+        assert_eq!(eth.max_time_diff_minutes, 1);
+        assert!(eth.enable_freshness_check);
+        assert!(eth.reject_on_disconnect);
     }
 
     #[test]

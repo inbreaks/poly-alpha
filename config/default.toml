@@ -31,6 +31,7 @@ rolling_window_secs = 36000
 min_warmup_samples = 600
 min_basis_bps = 50.0
 max_position_usd = 200.0
+max_open_instant_loss_pct_of_budget = 0.01
 delta_rebalance_threshold = 0.05
 delta_rebalance_interval_secs = 60
 band_policy = "configured_band"
@@ -40,6 +41,31 @@ max_data_age_minutes = 1
 max_time_diff_minutes = 1
 enable_freshness_check = true
 reject_on_disconnect = true
+
+[strategy.basis.overrides]
+
+[strategy.basis.overrides.btc]
+min_poly_price = 0.10
+max_poly_price = 0.45
+
+[strategy.basis.overrides.eth]
+min_poly_price = 0.14
+max_poly_price = 0.65
+entry_z_score_threshold = 4.0
+rolling_window_secs = 21600
+min_warmup_samples = 360
+exit_z_score_threshold = 0.6
+
+[strategy.basis.overrides.sol]
+min_poly_price = 0.24
+max_poly_price = 0.65
+entry_z_score_threshold = 4.0
+rolling_window_secs = 36000
+exit_z_score_threshold = 0.6
+
+[strategy.basis.overrides.xrp]
+min_poly_price = 0.06
+max_poly_price = 0.65
 
 [strategy.market_data]
 mode = "ws"

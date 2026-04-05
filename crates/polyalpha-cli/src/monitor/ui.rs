@@ -99,6 +99,34 @@ pub fn render_performance(state: &TuiState) -> Paragraph<'static> {
     let equity_delta = perf.equity - perf.initial_capital;
     let (market_data_mode, market_data_color) =
         market_data_mode_badge(&state.monitor.config.market_data_mode);
+    let per_asset_summary = state
+        .monitor
+        .config
+        .per_asset
+        .iter()
+        .map(|item| {
+            format!(
+                "{} {:.2}-{:.2} Z{:.1}/{:.1} 窗口{}s{}{}",
+                item.asset,
+                item.min_poly_price,
+                item.max_poly_price,
+                item.entry_z,
+                item.exit_z,
+                item.rolling_window,
+                if item.enable_freshness_check {
+                    " 新鲜度开"
+                } else {
+                    " 新鲜度关"
+                },
+                if item.reject_on_disconnect {
+                    " 断连拒单"
+                } else {
+                    ""
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("  |  ");
 
     let mut lines = vec![
         Line::from(vec![
@@ -161,6 +189,14 @@ pub fn render_performance(state: &TuiState) -> Paragraph<'static> {
                 state.monitor.config.min_poly_price,
                 state.monitor.config.max_poly_price,
             )),
+        ]),
+        Line::from(vec![
+            Span::styled("币种参数 ", Style::default().fg(Color::DarkGray)),
+            Span::raw(if per_asset_summary.is_empty() {
+                "跟随全局默认".to_owned()
+            } else {
+                per_asset_summary
+            }),
         ]),
         Line::from(vec![
             Span::styled("行情 ", Style::default().fg(Color::DarkGray)),

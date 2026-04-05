@@ -93,3 +93,4 @@ config/*.auto.toml
 
 # Local diagnostics
 tmp/
+config/multi-market-active.fresh.report.json
