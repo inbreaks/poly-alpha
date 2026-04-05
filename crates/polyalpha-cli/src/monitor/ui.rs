@@ -2984,7 +2984,7 @@ mod tests {
             correlation_id: Some("corr-1".to_owned()),
         }];
 
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 8));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 9));
         render_performance(&state).render(buffer.area, &mut buffer);
 
         let text = buffer_text(&buffer);

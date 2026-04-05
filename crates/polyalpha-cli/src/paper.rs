@@ -15322,7 +15322,8 @@ mod tests {
 
     #[tokio::test]
     async fn process_signal_single_cools_market_after_ws_freshness_rejection() {
-        let settings = test_settings_with_price_filter(None, None);
+        let mut settings = test_settings_with_price_filter(None, None);
+        settings.strategy.market_data.mode = polyalpha_core::MarketDataMode::Ws;
         let registry = SymbolRegistry::new(settings.markets.clone());
         let (_provider, _executor, mut execution) = build_paper_execution_stack(
             &settings,
