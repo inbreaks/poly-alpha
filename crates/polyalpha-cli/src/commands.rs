@@ -113,53 +113,55 @@ pub async fn run_demo(env: &str) -> Result<()> {
         loop {
             match market_data_rx.try_recv() {
                 Ok(event) => {
-                    stats.market_events += 1;
-                    if let MarketDataEvent::OrderBookUpdate { snapshot } = &event {
-                        apply_orderbook_snapshot(&orderbook_provider, &registry, snapshot);
-                    }
-                    if let MarketDataEvent::MarketLifecycle { symbol, phase, .. } = &event {
-                        risk.update_market_phase(symbol.clone(), phase.clone());
-                    }
+                    for event in event.into_expanded_for_registry(&registry) {
+                        stats.market_events += 1;
+                        if let MarketDataEvent::OrderBookUpdate { snapshot } = &event {
+                            apply_orderbook_snapshot(&orderbook_provider, &registry, snapshot);
+                        }
+                        if let MarketDataEvent::MarketLifecycle { symbol, phase, .. } = &event {
+                            risk.update_market_phase(symbol.clone(), phase.clone());
+                        }
 
-                    let output = engine.on_market_data(&event).await;
-                    for update in output.dmm_updates {
-                        let events = execution.apply_dmm_quote_update(update).await?;
-                        apply_execution_events(&mut risk, &mut stats, events).await?;
-                        sync_engine_position_state(&mut engine, &risk, &market.symbol);
-                    }
+                        let output = engine.on_market_data(&event).await;
+                        for update in output.dmm_updates {
+                            let events = execution.apply_dmm_quote_update(update).await?;
+                            apply_execution_events(&mut risk, &mut stats, events).await?;
+                            sync_engine_position_state(&mut engine, &risk, &market.symbol);
+                        }
 
-                    for signal in output.open_candidates {
-                        stats.signals_seen += 1;
+                        for signal in output.open_candidates {
+                            stats.signals_seen += 1;
 
-                        let plan = match preview_open_plan(&mut execution, &risk, &signal) {
-                            Ok(plan) => plan,
-                            Err(_) => {
+                            let plan = match preview_open_plan(&mut execution, &risk, &signal) {
+                                Ok(plan) => plan,
+                                Err(_) => {
+                                    stats.signals_rejected += 1;
+                                    continue;
+                                }
+                            };
+
+                            // 这里先在 CLI 做最小 pre-trade gate，避免 demo 把风控旁路掉。
+                            if open_plan_risk_rejection_reason(&risk, &plan).is_some() {
                                 stats.signals_rejected += 1;
                                 continue;
                             }
-                        };
 
-                        // 这里先在 CLI 做最小 pre-trade gate，避免 demo 把风控旁路掉。
-                        if open_plan_risk_rejection_reason(&risk, &plan).is_some() {
-                            stats.signals_rejected += 1;
-                            continue;
+                            let events = execution.process_plan(plan).await?;
+                            apply_execution_events(&mut risk, &mut stats, events).await?;
+                            sync_engine_position_state(&mut engine, &risk, &market.symbol);
                         }
 
-                        let events = execution.process_plan(plan).await?;
-                        apply_execution_events(&mut risk, &mut stats, events).await?;
-                        sync_engine_position_state(&mut engine, &risk, &market.symbol);
-                    }
-
-                    if let Some(reason) = engine.close_reason(&market.symbol) {
-                        let events = execution
-                            .process_intent(close_intent_for_symbol(
-                                &market.symbol,
-                                &reason,
-                                event_timestamp_ms(&event),
-                            ))
-                            .await?;
-                        apply_execution_events(&mut risk, &mut stats, events).await?;
-                        sync_engine_position_state(&mut engine, &risk, &market.symbol);
+                        if let Some(reason) = engine.close_reason(&market.symbol) {
+                            let events = execution
+                                .process_intent(close_intent_for_symbol(
+                                    &market.symbol,
+                                    &reason,
+                                    event_timestamp_ms(&event),
+                                ))
+                                .await?;
+                            apply_execution_events(&mut risk, &mut stats, events).await?;
+                            sync_engine_position_state(&mut engine, &risk, &market.symbol);
+                        }
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -559,10 +561,13 @@ fn drain_orderbook_updates(
 ) {
     loop {
         match market_data_rx.try_recv() {
-            Ok(MarketDataEvent::OrderBookUpdate { snapshot }) => {
-                apply_orderbook_snapshot(provider, registry, &snapshot);
+            Ok(event) => {
+                for expanded in event.into_expanded_for_registry(registry) {
+                    if let MarketDataEvent::OrderBookUpdate { snapshot } = expanded {
+                        apply_orderbook_snapshot(provider, registry, &snapshot);
+                    }
+                }
             }
-            Ok(_) => continue,
             Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
             Err(TryRecvError::Lagged(_)) => continue,
         }
@@ -572,8 +577,14 @@ fn drain_orderbook_updates(
 fn event_timestamp_ms(event: &MarketDataEvent) -> u64 {
     match event {
         MarketDataEvent::OrderBookUpdate { snapshot } => snapshot.received_at_ms,
+        MarketDataEvent::CexVenueOrderBookUpdate { received_at_ms, .. } => *received_at_ms,
         MarketDataEvent::TradeUpdate { timestamp_ms, .. } => *timestamp_ms,
+        MarketDataEvent::CexVenueTradeUpdate { timestamp_ms, .. } => *timestamp_ms,
         MarketDataEvent::FundingRate {
+            next_funding_time_ms,
+            ..
+        } => *next_funding_time_ms,
+        MarketDataEvent::CexVenueFundingRate {
             next_funding_time_ms,
             ..
         } => *next_funding_time_ms,

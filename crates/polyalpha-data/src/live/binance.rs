@@ -265,6 +265,25 @@ impl BinanceFuturesDataSource {
         format!("{}@depth{}@100ms", venue_symbol.to_ascii_lowercase(), depth)
     }
 
+    pub fn build_combined_partial_depth_stream_names(
+        venue_symbols: &[String],
+        depth_limit: u16,
+    ) -> Vec<String> {
+        venue_symbols
+            .iter()
+            .map(|symbol| Self::build_partial_depth_stream_name(symbol, depth_limit))
+            .collect()
+    }
+
+    pub fn build_combined_partial_depth_stream_path(
+        venue_symbols: &[String],
+        depth_limit: u16,
+    ) -> String {
+        let streams =
+            Self::build_combined_partial_depth_stream_names(venue_symbols, depth_limit).join("/");
+        format!("/stream?streams={streams}")
+    }
+
     pub fn parse_depth_payload(payload: &str, venue_symbol: &str) -> Result<CexBookUpdate> {
         let response: BinanceDepthResponse = serde_json::from_str(payload)?;
         Ok(CexBookUpdate {
@@ -566,6 +585,42 @@ mod tests {
         assert_eq!(msg["method"], "SUBSCRIBE");
         assert_eq!(msg["params"][0], "btcusdt@depth@100ms");
         assert_eq!(msg["id"], 7);
+    }
+
+    #[test]
+    fn build_combined_depth_stream_path_joins_multiple_symbols() {
+        let path = BinanceFuturesDataSource::build_combined_partial_depth_stream_path(
+            &["BTCUSDT".to_owned(), "ETHUSDT".to_owned()],
+            5,
+        );
+
+        assert_eq!(
+            path,
+            "/stream?streams=btcusdt@depth5@100ms/ethusdt@depth5@100ms"
+        );
+    }
+
+    #[test]
+    fn parse_binance_partial_depth_ws_payload_accepts_combined_wrapper() {
+        let payload = r#"{
+            "stream":"btcusdt@depth5@100ms",
+            "data":{
+                "e":"depthUpdate",
+                "E":1712400000000,
+                "s":"BTCUSDT",
+                "U":1,
+                "u":2,
+                "b":[["68000.1","1.25"]],
+                "a":[["68000.2","0.75"]]
+            }
+        }"#;
+
+        let update = BinanceFuturesDataSource::parse_partial_depth_ws_payload(payload, "")
+            .expect("parse combined payload")
+            .expect("depth update");
+
+        assert_eq!(update.venue_symbol, "BTCUSDT");
+        assert_eq!(update.sequence, 2);
     }
 
     #[test]

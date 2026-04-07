@@ -15,7 +15,8 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -25,7 +26,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep, Duration, MissedTickBehavior};
 use tokio_tungstenite::{
     client_async_tls_with_config,
-    tungstenite::{self, Message},
+    tungstenite::{self, client::IntoClientRequest, http::HeaderValue, Message},
     MaybeTlsStream, WebSocketStream,
 };
 use uuid::Uuid;
@@ -38,37 +39,35 @@ use polyalpha_audit::{
     PositionMarkEvent, SignalEmittedEvent,
 };
 use polyalpha_core::{
-    asset_key_from_cex_symbol, cex_venue_symbol, create_channels, AlphaEngine,
-    AsyncClassification, CommandKind, CommandStatus, CommandView, ConnectionInfo,
-    ConnectionStatus, EffectiveBasisConfig, EngineParams, EngineWarning, EvaluableStatus,
-    EvaluationStats, EventKind, Exchange, ExecutionEvent, ExecutionPipelineView,
-    ExecutionResult, Fill, HedgeState, InstrumentKind, MarketConfig, MarketDataEvent,
-    MarketDataMode, MarketDataSource, MarketPhase, MarketRetentionReason, MarketTier, MarketView,
-    MonitorAssetStrategyConfig, MonitorEvent, MonitorEventPayload, MonitorRuntimeStats,
-    MonitorSocketServer, MonitorState, MonitorStrategyConfig, OpenCandidate, OrderSide,
-    OrderStatus, PerformanceMetrics, PlanningDiagnostics, PlanningIntent, PolyShares, Position,
-    Price, RecoveryDecisionReason, ResidualSnapshot, RiskManager, Settings, SignalStrength,
-    StrategyHealthView, Symbol, SymbolRegistry, TokenSide, TradePlan, TradeView, UsdNotional,
-    VenueQuantity,
-    PLANNING_SCHEMA_VERSION,
+    asset_key_from_cex_symbol, cex_venue_symbol, create_channels, AlphaEngine, AsyncClassification,
+    CommandKind, CommandStatus, CommandView, ConnectionInfo, ConnectionStatus,
+    EffectiveBasisConfig, EngineParams, EngineWarning, EvaluableStatus, EvaluationStats, EventKind,
+    Exchange, ExecutionEvent, ExecutionPipelineView, ExecutionResult, Fill, HedgeState,
+    InstrumentKind, MarketConfig, MarketDataEvent, MarketDataMode, MarketDataSource, MarketPhase,
+    MarketRetentionReason, MarketTier, MarketView, MonitorAssetStrategyConfig, MonitorEvent,
+    MonitorEventPayload, MonitorRuntimeStats, MonitorSocketServer, MonitorState,
+    MonitorStrategyConfig, OpenCandidate, OrderSide, OrderStatus, PerformanceMetrics,
+    PlanningDiagnostics, PlanningIntent, PolyShares, Position, Price, RecoveryDecisionReason,
+    ResidualSnapshot, RiskManager, Settings, SignalStrength, StrategyHealthView,
+    StrategyMarketScopeConfig, Symbol, SymbolRegistry, TokenSide, TradePlan, TradeView,
+    UsdNotional, VenueQuantity, PLANNING_SCHEMA_VERSION,
 };
 use polyalpha_data::{
     BinanceFuturesDataSource, DataManager, OkxMarketDataSource, PolyBookLevel, PolyBookUpdate,
     PolymarketLiveDataSource,
 };
-use polyalpha_engine::{MarketOverrideConfig, SimpleAlphaEngine, SimpleEngineConfig};
+use polyalpha_engine::{
+    BasisStrategySnapshot, MarketOverrideConfig, SimpleAlphaEngine, SimpleEngineConfig,
+};
 #[cfg(test)]
 use polyalpha_executor::dry_run::DryRunExecutor;
 use polyalpha_executor::{
-    dry_run::DryRunOrderSnapshot, ExecutionManager, InMemoryOrderbookProvider,
-    PreviewIntentError,
+    dry_run::DryRunOrderSnapshot, ExecutionManager, InMemoryOrderbookProvider, PreviewIntentError,
 };
 use polyalpha_risk::{InMemoryRiskManager, RiskLimits};
 
 use crate::args::{LiveExecutorMode, PaperInspectFormat};
-use crate::commands::{
-    open_plan_risk_rejection_reason, preview_open_plan_detailed, select_market,
-};
+use crate::commands::{open_plan_risk_rejection_reason, preview_open_plan_detailed, select_market};
 use crate::market_pool::{
     active_open_cooldown_reason, active_open_cooldown_remaining_ms, clear_expired_open_cooldown,
     cooldown_gate_reason, maybe_start_open_cooldown, note_focus_activity, note_tradeable_activity,
@@ -83,6 +82,7 @@ use crate::runtime::{
     force_exit_intent_for_symbol as runtime_force_exit_intent_for_symbol, RuntimeExecutionMode,
     RuntimeExecutor,
 };
+use crate::strategy_scope::{main_strategy_rejection_reason, strategy_rejection_label_zh};
 
 const MAX_EVENT_LOGS: usize = 128;
 const MAX_MONITOR_EVENTS: usize = 48;
@@ -349,6 +349,27 @@ impl ExchangeConnectionTracker {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BinanceWsTransportMode {
+    PerSymbol,
+    Combined,
+}
+
+fn select_binance_ws_transport_mode(settings: &Settings) -> BinanceWsTransportMode {
+    if settings.strategy.market_data.binance_combined_ws_enabled {
+        BinanceWsTransportMode::Combined
+    } else {
+        BinanceWsTransportMode::PerSymbol
+    }
+}
+
+fn binance_combined_ws_requested_extensions() -> Option<&'static str> {
+    // tungstenite 0.24 rejects non-zero RSV bits and does not implement
+    // permessage-deflate decoding, so requesting compression causes the
+    // combined socket to fail immediately after the first compressed frame.
+    None
+}
+
 #[derive(Clone, Debug, Default)]
 struct LocalPolyBook {
     bids: BTreeMap<Decimal, Decimal>,
@@ -441,7 +462,59 @@ struct PolymarketPriceChange {
     timestamp_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PolymarketWsDiagnosticsSnapshot {
+    text_frames: u64,
+    price_change_messages: u64,
+    book_messages: u64,
+    orderbook_updates: u64,
+}
+
+#[derive(Clone, Default)]
+struct PolymarketWsDiagnostics {
+    inner: Arc<PolymarketWsDiagnosticsInner>,
+}
+
 #[derive(Default)]
+struct PolymarketWsDiagnosticsInner {
+    text_frames: AtomicU64,
+    price_change_messages: AtomicU64,
+    book_messages: AtomicU64,
+    orderbook_updates: AtomicU64,
+}
+
+impl PolymarketWsDiagnostics {
+    fn record_text_frame(&self) {
+        self.inner.text_frames.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_price_change_message(&self) {
+        self.inner
+            .price_change_messages
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_book_message(&self) {
+        self.inner.book_messages.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_orderbook_updates(&self, count: u64) {
+        self.inner
+            .orderbook_updates
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> PolymarketWsDiagnosticsSnapshot {
+        PolymarketWsDiagnosticsSnapshot {
+            text_frames: self.inner.text_frames.load(Ordering::Relaxed),
+            price_change_messages: self.inner.price_change_messages.load(Ordering::Relaxed),
+            book_messages: self.inner.book_messages.load(Ordering::Relaxed),
+            orderbook_updates: self.inner.orderbook_updates.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
 struct PaperStats {
     ticks_processed: usize,
     market_events: usize,
@@ -463,9 +536,28 @@ struct PaperStats {
     snapshot_resync_count: usize,
     funding_refresh_count: usize,
     trades_closed: usize,
+    market_data_rx_lag_events: u64,
+    market_data_rx_lagged_messages: u64,
+    market_data_tick_drain_last: u64,
+    market_data_tick_drain_max: u64,
     total_pnl_usd: f64,
     last_skip_event_ms: HashMap<String, u64>,
     last_delta_rebalance_at_ms: HashMap<Symbol, u64>,
+    polymarket_ws_diagnostics: PolymarketWsDiagnostics,
+}
+
+fn record_market_data_rx_lag(stats: &mut PaperStats, lagged_messages: u64) {
+    stats.market_data_rx_lag_events = stats.market_data_rx_lag_events.saturating_add(1);
+    stats.market_data_rx_lagged_messages = stats
+        .market_data_rx_lagged_messages
+        .saturating_add(lagged_messages);
+}
+
+fn record_market_data_tick_drain(stats: &mut PaperStats, processed_since_last_tick: &mut u64) {
+    let drained = *processed_since_last_tick;
+    stats.market_data_tick_drain_last = drained;
+    stats.market_data_tick_drain_max = stats.market_data_tick_drain_max.max(drained);
+    *processed_since_last_tick = 0;
 }
 
 #[derive(Clone, Debug, Default)]
@@ -556,10 +648,7 @@ fn effective_basis_config_for_market(
         .effective_for_cex_symbol(&market.cex_symbol)
 }
 
-fn effective_basis_config_for_symbol(
-    settings: &Settings,
-    symbol: &Symbol,
-) -> EffectiveBasisConfig {
+fn effective_basis_config_for_symbol(settings: &Settings, symbol: &Symbol) -> EffectiveBasisConfig {
     settings
         .markets
         .iter()
@@ -996,282 +1085,62 @@ fn audit_snapshot_for_candidate(
     })
 }
 
-struct PaperAudit {
+enum AuditCommand {
+    Event(NewAuditEvent),
+    RuntimeState {
+        stats: PaperStats,
+        monitor_state: MonitorState,
+        tick_index: usize,
+        now_ms: u64,
+        record_marks: bool,
+        write_checkpoint: bool,
+        write_summary: bool,
+        sync_warehouse: bool,
+    },
+    Finalize {
+        stats: PaperStats,
+        monitor_state: MonitorState,
+        tick_index: usize,
+        now_ms: u64,
+        reply: std_mpsc::SyncSender<std::result::Result<(), String>>,
+    },
+    #[cfg(test)]
+    Barrier {
+        reply: std_mpsc::SyncSender<std::result::Result<(), String>>,
+    },
+    Shutdown {
+        reply: Option<std_mpsc::SyncSender<()>>,
+    },
+}
+
+struct PaperAuditWorker {
     data_dir: String,
     writer: AuditWriter,
     warehouse: AuditWarehouse,
     summary: AuditSessionSummary,
-    snapshot_interval_ms: u64,
-    checkpoint_interval_ms: u64,
-    warehouse_sync_interval_ms: u64,
-    last_snapshot_ms: u64,
-    last_checkpoint_ms: u64,
-    last_summary_write_ms: u64,
-    last_warehouse_sync_attempt_ms: u64,
     warehouse_sync_degraded: bool,
     last_mark_tick_index: Option<u64>,
 }
 
-impl PaperAudit {
-    fn start(
-        settings: &Settings,
-        env: &str,
-        markets: &[MarketConfig],
-        now_ms: u64,
-        trading_mode: polyalpha_core::TradingMode,
-    ) -> Result<Self> {
-        let manifest = AuditSessionManifest {
-            version: 1,
-            session_id: Uuid::new_v4().to_string(),
-            env: env.to_owned(),
-            mode: trading_mode,
-            started_at_ms: now_ms,
-            market_count: markets.len(),
-            markets: markets
-                .iter()
-                .map(|market| market.symbol.0.clone())
-                .collect(),
-        };
-        let mut writer = AuditWriter::create(
-            &settings.general.data_dir,
-            manifest.clone(),
-            settings.audit.raw_segment_max_bytes,
-        )?;
-        let warehouse = AuditWarehouse::new(&settings.general.data_dir)?;
-        let summary = AuditSessionSummary::new_running(&manifest);
-        writer.write_summary(&summary)?;
-        Ok(Self {
-            data_dir: settings.general.data_dir.clone(),
-            writer,
-            warehouse,
-            summary,
-            snapshot_interval_ms: settings.audit.snapshot_interval_secs.max(1) * 1_000,
-            checkpoint_interval_ms: settings.audit.checkpoint_interval_secs.max(1) * 1_000,
-            warehouse_sync_interval_ms: settings.audit.warehouse_sync_interval_secs.max(1) * 1_000,
-            last_snapshot_ms: now_ms,
-            last_checkpoint_ms: now_ms,
-            last_summary_write_ms: now_ms,
-            last_warehouse_sync_attempt_ms: now_ms,
-            warehouse_sync_degraded: false,
-            last_mark_tick_index: None,
-        })
-    }
-
-    fn session_id(&self) -> &str {
-        &self.summary.session_id
-    }
-
-    fn session_dir(&self) -> &std::path::Path {
-        self.writer.paths().session_dir()
-    }
-
-    fn record_signal_emitted(
-        &mut self,
-        candidate: &OpenCandidate,
-        observed: Option<AuditObservedMarket>,
-    ) -> Result<()> {
-        self.record_event(NewAuditEvent {
-            timestamp_ms: candidate.timestamp_ms,
-            kind: AuditEventKind::SignalEmitted,
-            symbol: Some(candidate.symbol.0.clone()),
-            signal_id: Some(candidate.candidate_id.clone()),
-            correlation_id: Some(candidate.correlation_id.clone()),
-            gate: None,
-            result: None,
-            reason: None,
-            summary: summarize_candidate(candidate),
-            payload: AuditEventPayload::SignalEmitted(SignalEmittedEvent {
-                candidate: candidate.clone(),
-                observed,
-            }),
-        })
-    }
-
-    fn record_gate_decision(
-        &mut self,
-        candidate: &OpenCandidate,
-        gate: &str,
-        result: AuditGateResult,
-        reason: &str,
-        summary: String,
-        observed: Option<AuditObservedMarket>,
-    ) -> Result<()> {
-        self.record_gate_decision_with_diagnostics(
-            candidate,
-            gate,
-            result,
-            reason,
-            summary,
-            observed,
-            None,
-        )
-    }
-
-    fn record_gate_decision_with_diagnostics(
-        &mut self,
-        candidate: &OpenCandidate,
-        gate: &str,
-        result: AuditGateResult,
-        reason: &str,
-        summary: String,
-        observed: Option<AuditObservedMarket>,
-        planning_diagnostics: Option<PlanningDiagnostics>,
-    ) -> Result<()> {
-        self.record_event(NewAuditEvent {
-            timestamp_ms: now_millis(),
-            kind: AuditEventKind::GateDecision,
-            symbol: Some(candidate.symbol.0.clone()),
-            signal_id: Some(candidate.candidate_id.clone()),
-            correlation_id: Some(candidate.correlation_id.clone()),
-            gate: Some(gate.to_owned()),
-            result: Some(result.as_str().to_owned()),
-            reason: Some(reason.to_owned()),
-            summary,
-            payload: AuditEventPayload::GateDecision(GateDecisionEvent {
-                gate: gate.to_owned(),
-                result,
-                reason: reason.to_owned(),
-                candidate: candidate.clone(),
-                observed,
-                planning_diagnostics,
-            }),
-        })
-    }
-
-    fn record_evaluation_skip(
-        &mut self,
-        event: &MarketDataEvent,
-        warnings: &[EngineWarning],
-        observed: Option<AuditObservedMarket>,
-    ) -> Result<()> {
-        if warnings.is_empty() {
-            return Ok(());
-        }
-        let primary_warning = primary_evaluation_skip_warning(warnings).map(|(_, warning)| warning);
-        let summary = primary_warning
-            .map(summarize_engine_warning)
-            .unwrap_or_else(|| summarize_market_event(event));
-        self.record_event(NewAuditEvent {
-            timestamp_ms: now_millis(),
-            kind: AuditEventKind::EvaluationSkip,
-            symbol: warning_symbol_opt(primary_warning).map(|symbol| symbol.0.clone()),
-            signal_id: None,
-            correlation_id: None,
-            gate: None,
-            result: None,
-            reason: None,
-            summary,
-            payload: AuditEventPayload::EvaluationSkip(EvaluationSkipEvent {
-                source_event: summarize_market_event(event),
-                symbol: warning_symbol_opt(primary_warning).map(|symbol| symbol.0.clone()),
-                observed,
-                warnings: warnings.to_vec(),
-            }),
-        })
-    }
-
-    fn record_execution(
-        &mut self,
-        event: &ExecutionEvent,
-        trigger: Option<&RuntimeTrigger>,
-    ) -> Result<()> {
-        let (symbol, correlation_id) = audit_execution_identity(event, trigger);
-        self.record_event(NewAuditEvent {
-            timestamp_ms: audit_execution_timestamp_ms(event),
-            kind: AuditEventKind::Execution,
-            symbol,
-            signal_id: trigger.map(|trigger| trigger.id().to_owned()),
-            correlation_id,
-            gate: None,
-            result: None,
-            reason: None,
-            summary: summarize_execution_event(event),
-            payload: AuditEventPayload::Execution(ExecutionAuditEvent {
-                event: event.clone(),
-            }),
-        })
-    }
-
-    fn record_open_signal_rejected_post_submit(
-        &mut self,
-        candidate: &OpenCandidate,
-        rejection_reasons: &[String],
-    ) -> Result<()> {
-        self.record_event(NewAuditEvent {
-            timestamp_ms: now_millis(),
-            kind: AuditEventKind::Anomaly,
-            symbol: Some(candidate.symbol.0.clone()),
-            signal_id: Some(candidate.candidate_id.clone()),
-            correlation_id: Some(candidate.correlation_id.clone()),
-            gate: None,
-            result: None,
-            reason: Some("post_submit_rejection".to_owned()),
-            summary: format!(
-                "候选提交后被拒绝 {}（{}）",
-                candidate.candidate_id,
-                rejection_reasons.join(", ")
-            ),
-            payload: AuditEventPayload::Anomaly(AuditAnomalyEvent {
-                severity: AuditSeverity::Warning,
-                code: "post_submit_rejection".to_owned(),
-                message: format!(
-                    "开仓机会提交后被交易执行层拒绝：{}",
-                    rejection_reasons.join(", ")
-                ),
-                symbol: Some(candidate.symbol.0.clone()),
-                signal_id: Some(candidate.candidate_id.clone()),
-                correlation_id: Some(candidate.correlation_id.clone()),
-            }),
-        })
-    }
-
-    fn record_intent_rejected(
-        &mut self,
-        trigger: &RuntimeTrigger,
-        reason_code: &str,
-        message: &str,
-    ) -> Result<()> {
-        self.record_event(NewAuditEvent {
-            timestamp_ms: trigger.timestamp_ms(),
-            kind: AuditEventKind::Anomaly,
-            symbol: Some(trigger.symbol().0.clone()),
-            signal_id: Some(trigger.id().to_owned()),
-            correlation_id: Some(trigger.correlation_id().to_owned()),
-            gate: Some("trade_plan".to_owned()),
-            result: Some("rejected".to_owned()),
-            reason: Some(reason_code.to_owned()),
-            summary: format!(
-                "{} {}未执行（{}）",
-                trigger.symbol().0,
-                trigger_action_label_zh(trigger),
-                translate_trade_plan_rejection(reason_code)
-            ),
-            payload: AuditEventPayload::Anomaly(AuditAnomalyEvent {
-                severity: AuditSeverity::Warning,
-                code: "intent_rejected".to_owned(),
-                message: message.to_owned(),
-                symbol: Some(trigger.symbol().0.clone()),
-                signal_id: Some(trigger.id().to_owned()),
-                correlation_id: Some(trigger.correlation_id().to_owned()),
-            }),
-        })
-    }
-
-    fn maybe_record_runtime_state(
+impl PaperAuditWorker {
+    fn apply_runtime_state(
         &mut self,
         stats: &PaperStats,
         monitor_state: &MonitorState,
         tick_index: usize,
         now_ms: u64,
+        record_marks: bool,
+        write_checkpoint: bool,
+        write_summary: bool,
+        sync_warehouse: bool,
     ) -> Result<()> {
         self.refresh_summary(stats, monitor_state, tick_index, now_ms);
 
-        if now_ms.saturating_sub(self.last_snapshot_ms) >= self.snapshot_interval_ms {
+        if record_marks {
             self.record_marks(monitor_state, tick_index as u64, now_ms)?;
-            self.last_snapshot_ms = now_ms;
         }
 
-        if now_ms.saturating_sub(self.last_checkpoint_ms) >= self.checkpoint_interval_ms {
+        if write_checkpoint {
             self.summary.latest_checkpoint_ms = Some(now_ms);
             let checkpoint = build_audit_checkpoint(
                 &self.summary.session_id,
@@ -1282,29 +1151,15 @@ impl PaperAudit {
             );
             self.writer.write_checkpoint(&checkpoint)?;
             self.writer.write_summary(&self.summary)?;
-            self.last_checkpoint_ms = now_ms;
-            self.last_summary_write_ms = now_ms;
-        } else if now_ms.saturating_sub(self.last_summary_write_ms)
-            >= AUDIT_SUMMARY_WRITE_THROTTLE_MS
-        {
+        } else if write_summary {
             self.writer.write_summary(&self.summary)?;
-            self.last_summary_write_ms = now_ms;
         }
 
-        if now_ms.saturating_sub(self.last_warehouse_sync_attempt_ms)
-            >= self.warehouse_sync_interval_ms
-        {
-            self.last_warehouse_sync_attempt_ms = now_ms;
+        if sync_warehouse {
             self.sync_warehouse_best_effort(now_ms)?;
         }
 
         Ok(())
-    }
-
-    fn needs_runtime_state(&self, now_ms: u64) -> bool {
-        now_ms.saturating_sub(self.last_snapshot_ms) >= self.snapshot_interval_ms
-            || now_ms.saturating_sub(self.last_checkpoint_ms) >= self.checkpoint_interval_ms
-            || now_ms.saturating_sub(self.last_summary_write_ms) >= AUDIT_SUMMARY_WRITE_THROTTLE_MS
     }
 
     fn finalize(
@@ -1329,8 +1184,11 @@ impl PaperAudit {
         );
         self.writer.write_checkpoint(&checkpoint)?;
         self.writer.write_summary(&self.summary)?;
-        self.last_summary_write_ms = now_ms;
         self.sync_warehouse_best_effort(now_ms)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.writer.flush_raw()
     }
 
     fn record_marks(
@@ -1496,6 +1354,529 @@ impl PaperAudit {
     fn record_event(&mut self, event: NewAuditEvent) -> Result<()> {
         self.writer.append_event(event)?;
         Ok(())
+    }
+}
+
+struct PaperAudit {
+    sender: std_mpsc::Sender<AuditCommand>,
+    worker_error: Arc<Mutex<Option<String>>>,
+    worker_handle: Option<std::thread::JoinHandle<()>>,
+    session_id: String,
+    session_dir: PathBuf,
+    snapshot_interval_ms: u64,
+    checkpoint_interval_ms: u64,
+    warehouse_sync_interval_ms: u64,
+    last_snapshot_ms: u64,
+    last_checkpoint_ms: u64,
+    last_summary_write_ms: u64,
+    last_warehouse_sync_attempt_ms: u64,
+}
+
+impl PaperAudit {
+    fn start(
+        settings: &Settings,
+        env: &str,
+        markets: &[MarketConfig],
+        now_ms: u64,
+        trading_mode: polyalpha_core::TradingMode,
+    ) -> Result<Self> {
+        let manifest = AuditSessionManifest {
+            version: 1,
+            session_id: Uuid::new_v4().to_string(),
+            env: env.to_owned(),
+            mode: trading_mode,
+            started_at_ms: now_ms,
+            market_count: markets.len(),
+            markets: markets
+                .iter()
+                .map(|market| market.symbol.0.clone())
+                .collect(),
+        };
+        let mut writer = AuditWriter::create(
+            &settings.general.data_dir,
+            manifest.clone(),
+            settings.audit.raw_segment_max_bytes,
+        )?;
+        let warehouse = AuditWarehouse::new(&settings.general.data_dir)?;
+        let summary = AuditSessionSummary::new_running(&manifest);
+        writer.write_summary(&summary)?;
+
+        let session_id = summary.session_id.clone();
+        let session_dir = writer.paths().session_dir().to_path_buf();
+        let worker = PaperAuditWorker {
+            data_dir: settings.general.data_dir.clone(),
+            writer,
+            warehouse,
+            summary,
+            warehouse_sync_degraded: false,
+            last_mark_tick_index: None,
+        };
+        let (sender, receiver) = std_mpsc::channel();
+        let worker_error = Arc::new(Mutex::new(None));
+        let worker_error_clone = Arc::clone(&worker_error);
+        let thread_name = format!("paper-audit-{session_id}");
+        let worker_handle = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || run_paper_audit_worker(worker, receiver, worker_error_clone))
+            .context("启动审计后台线程失败")?;
+
+        Ok(Self {
+            sender,
+            worker_error,
+            worker_handle: Some(worker_handle),
+            session_id,
+            session_dir,
+            snapshot_interval_ms: settings.audit.snapshot_interval_secs.max(1) * 1_000,
+            checkpoint_interval_ms: settings.audit.checkpoint_interval_secs.max(1) * 1_000,
+            warehouse_sync_interval_ms: settings.audit.warehouse_sync_interval_secs.max(1) * 1_000,
+            last_snapshot_ms: now_ms,
+            last_checkpoint_ms: now_ms,
+            last_summary_write_ms: now_ms,
+            last_warehouse_sync_attempt_ms: now_ms,
+        })
+    }
+
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    fn session_dir(&self) -> &std::path::Path {
+        &self.session_dir
+    }
+
+    fn record_signal_emitted(
+        &mut self,
+        candidate: &OpenCandidate,
+        observed: Option<AuditObservedMarket>,
+    ) -> Result<()> {
+        self.record_event(NewAuditEvent {
+            timestamp_ms: candidate.timestamp_ms,
+            kind: AuditEventKind::SignalEmitted,
+            symbol: Some(candidate.symbol.0.clone()),
+            signal_id: Some(candidate.candidate_id.clone()),
+            correlation_id: Some(candidate.correlation_id.clone()),
+            gate: None,
+            result: None,
+            reason: None,
+            summary: summarize_candidate(candidate),
+            payload: AuditEventPayload::SignalEmitted(SignalEmittedEvent {
+                candidate: candidate.clone(),
+                observed,
+            }),
+        })
+    }
+
+    fn record_gate_decision(
+        &mut self,
+        candidate: &OpenCandidate,
+        gate: &str,
+        result: AuditGateResult,
+        reason: &str,
+        summary: String,
+        observed: Option<AuditObservedMarket>,
+    ) -> Result<()> {
+        self.record_gate_decision_with_diagnostics(
+            candidate, gate, result, reason, summary, observed, None,
+        )
+    }
+
+    fn record_gate_decision_with_diagnostics(
+        &mut self,
+        candidate: &OpenCandidate,
+        gate: &str,
+        result: AuditGateResult,
+        reason: &str,
+        summary: String,
+        observed: Option<AuditObservedMarket>,
+        planning_diagnostics: Option<PlanningDiagnostics>,
+    ) -> Result<()> {
+        self.record_event(NewAuditEvent {
+            timestamp_ms: now_millis(),
+            kind: AuditEventKind::GateDecision,
+            symbol: Some(candidate.symbol.0.clone()),
+            signal_id: Some(candidate.candidate_id.clone()),
+            correlation_id: Some(candidate.correlation_id.clone()),
+            gate: Some(gate.to_owned()),
+            result: Some(result.as_str().to_owned()),
+            reason: Some(reason.to_owned()),
+            summary,
+            payload: AuditEventPayload::GateDecision(GateDecisionEvent {
+                gate: gate.to_owned(),
+                result,
+                reason: reason.to_owned(),
+                candidate: candidate.clone(),
+                observed,
+                planning_diagnostics,
+            }),
+        })
+    }
+
+    fn record_evaluation_skip(
+        &mut self,
+        event: &MarketDataEvent,
+        warnings: &[EngineWarning],
+        observed: Option<AuditObservedMarket>,
+    ) -> Result<()> {
+        if warnings.is_empty() {
+            return Ok(());
+        }
+        let primary_warning = primary_evaluation_skip_warning(warnings).map(|(_, warning)| warning);
+        let summary = primary_warning
+            .map(summarize_engine_warning)
+            .unwrap_or_else(|| summarize_market_event(event));
+        self.record_event(NewAuditEvent {
+            timestamp_ms: now_millis(),
+            kind: AuditEventKind::EvaluationSkip,
+            symbol: warning_symbol_opt(primary_warning).map(|symbol| symbol.0.clone()),
+            signal_id: None,
+            correlation_id: None,
+            gate: None,
+            result: None,
+            reason: None,
+            summary,
+            payload: AuditEventPayload::EvaluationSkip(EvaluationSkipEvent {
+                source_event: summarize_market_event(event),
+                symbol: warning_symbol_opt(primary_warning).map(|symbol| symbol.0.clone()),
+                observed,
+                warnings: warnings.to_vec(),
+            }),
+        })
+    }
+
+    fn record_execution(
+        &mut self,
+        event: &ExecutionEvent,
+        trigger: Option<&RuntimeTrigger>,
+    ) -> Result<()> {
+        let (symbol, correlation_id) = audit_execution_identity(event, trigger);
+        self.record_event(NewAuditEvent {
+            timestamp_ms: audit_execution_timestamp_ms(event),
+            kind: AuditEventKind::Execution,
+            symbol,
+            signal_id: trigger.map(|trigger| trigger.id().to_owned()),
+            correlation_id,
+            gate: None,
+            result: None,
+            reason: None,
+            summary: summarize_execution_event(event),
+            payload: AuditEventPayload::Execution(ExecutionAuditEvent {
+                event: event.clone(),
+            }),
+        })
+    }
+
+    fn record_open_signal_rejected_post_submit(
+        &mut self,
+        candidate: &OpenCandidate,
+        rejection_reasons: &[String],
+    ) -> Result<()> {
+        self.record_event(NewAuditEvent {
+            timestamp_ms: now_millis(),
+            kind: AuditEventKind::Anomaly,
+            symbol: Some(candidate.symbol.0.clone()),
+            signal_id: Some(candidate.candidate_id.clone()),
+            correlation_id: Some(candidate.correlation_id.clone()),
+            gate: None,
+            result: None,
+            reason: Some("post_submit_rejection".to_owned()),
+            summary: format!(
+                "候选提交后被拒绝 {}（{}）",
+                candidate.candidate_id,
+                rejection_reasons.join(", ")
+            ),
+            payload: AuditEventPayload::Anomaly(AuditAnomalyEvent {
+                severity: AuditSeverity::Warning,
+                code: "post_submit_rejection".to_owned(),
+                message: format!(
+                    "开仓机会提交后被交易执行层拒绝：{}",
+                    rejection_reasons.join(", ")
+                ),
+                symbol: Some(candidate.symbol.0.clone()),
+                signal_id: Some(candidate.candidate_id.clone()),
+                correlation_id: Some(candidate.correlation_id.clone()),
+            }),
+        })
+    }
+
+    fn record_intent_rejected(
+        &mut self,
+        trigger: &RuntimeTrigger,
+        reason_code: &str,
+        message: &str,
+    ) -> Result<()> {
+        self.record_event(NewAuditEvent {
+            timestamp_ms: trigger.timestamp_ms(),
+            kind: AuditEventKind::Anomaly,
+            symbol: Some(trigger.symbol().0.clone()),
+            signal_id: Some(trigger.id().to_owned()),
+            correlation_id: Some(trigger.correlation_id().to_owned()),
+            gate: Some("trade_plan".to_owned()),
+            result: Some("rejected".to_owned()),
+            reason: Some(reason_code.to_owned()),
+            summary: format!(
+                "{} {}未执行（{}）",
+                trigger.symbol().0,
+                trigger_action_label_zh(trigger),
+                translate_trade_plan_rejection(reason_code)
+            ),
+            payload: AuditEventPayload::Anomaly(AuditAnomalyEvent {
+                severity: AuditSeverity::Warning,
+                code: "intent_rejected".to_owned(),
+                message: message.to_owned(),
+                symbol: Some(trigger.symbol().0.clone()),
+                signal_id: Some(trigger.id().to_owned()),
+                correlation_id: Some(trigger.correlation_id().to_owned()),
+            }),
+        })
+    }
+
+    fn maybe_record_runtime_state(
+        &mut self,
+        stats: &PaperStats,
+        monitor_state: &MonitorState,
+        tick_index: usize,
+        now_ms: u64,
+    ) -> Result<()> {
+        let record_marks = if now_ms.saturating_sub(self.last_snapshot_ms) >= self.snapshot_interval_ms
+        {
+            self.last_snapshot_ms = now_ms;
+            true
+        } else {
+            false
+        };
+
+        let write_checkpoint =
+            if now_ms.saturating_sub(self.last_checkpoint_ms) >= self.checkpoint_interval_ms {
+                self.last_checkpoint_ms = now_ms;
+                self.last_summary_write_ms = now_ms;
+                true
+            } else {
+                false
+            };
+
+        let write_summary = if !write_checkpoint
+            && now_ms.saturating_sub(self.last_summary_write_ms)
+                >= AUDIT_SUMMARY_WRITE_THROTTLE_MS
+        {
+            self.last_summary_write_ms = now_ms;
+            true
+        } else {
+            false
+        };
+
+        let sync_warehouse = if now_ms.saturating_sub(self.last_warehouse_sync_attempt_ms)
+            >= self.warehouse_sync_interval_ms
+        {
+            self.last_warehouse_sync_attempt_ms = now_ms;
+            true
+        } else {
+            false
+        };
+
+        if !(record_marks || write_checkpoint || write_summary || sync_warehouse) {
+            return Ok(());
+        }
+
+        self.send_command(AuditCommand::RuntimeState {
+            stats: stats.clone(),
+            monitor_state: monitor_state.clone(),
+            tick_index,
+            now_ms,
+            record_marks,
+            write_checkpoint,
+            write_summary,
+            sync_warehouse,
+        })
+    }
+
+    fn needs_runtime_state(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.last_snapshot_ms) >= self.snapshot_interval_ms
+            || now_ms.saturating_sub(self.last_checkpoint_ms) >= self.checkpoint_interval_ms
+            || now_ms.saturating_sub(self.last_summary_write_ms) >= AUDIT_SUMMARY_WRITE_THROTTLE_MS
+    }
+
+    fn finalize(
+        &mut self,
+        stats: &PaperStats,
+        monitor_state: &MonitorState,
+        tick_index: usize,
+        now_ms: u64,
+    ) -> Result<()> {
+        self.check_worker_health()?;
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+        self.sender
+            .send(AuditCommand::Finalize {
+                stats: stats.clone(),
+                monitor_state: monitor_state.clone(),
+                tick_index,
+                now_ms,
+                reply: reply_tx,
+            })
+            .map_err(|_| self.worker_closed_error())?;
+
+        match reply_rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => Err(anyhow!("审计后台线程失败：{message}")),
+            Err(err) => Err(anyhow!("等待审计后台线程完成失败：{err}")),
+        }
+    }
+
+    #[cfg(test)]
+    fn flush(&mut self) -> Result<()> {
+        self.check_worker_health()?;
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+        self.sender
+            .send(AuditCommand::Barrier { reply: reply_tx })
+            .map_err(|_| self.worker_closed_error())?;
+
+        match reply_rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => Err(anyhow!("审计后台线程失败：{message}")),
+            Err(err) => Err(anyhow!("等待审计后台线程刷新失败：{err}")),
+        }
+    }
+
+    fn record_event(&mut self, event: NewAuditEvent) -> Result<()> {
+        self.send_command(AuditCommand::Event(event))
+    }
+
+    fn send_command(&self, command: AuditCommand) -> Result<()> {
+        self.check_worker_health()?;
+        self.sender
+            .send(command)
+            .map_err(|_| self.worker_closed_error())
+    }
+
+    fn check_worker_health(&self) -> Result<()> {
+        let worker_error = self
+            .worker_error
+            .lock()
+            .map_err(|_| anyhow!("审计后台线程错误状态锁异常"))?;
+        if let Some(message) = worker_error.as_ref() {
+            Err(anyhow!("审计后台线程失败：{message}"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn worker_closed_error(&self) -> anyhow::Error {
+        self.worker_error
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .map(|message| anyhow!("审计后台线程失败：{message}"))
+            .unwrap_or_else(|| anyhow!("审计后台线程已关闭"))
+    }
+
+    fn shutdown_worker(&mut self) {
+        let Some(handle) = self.worker_handle.take() else {
+            return;
+        };
+        let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+        if self
+            .sender
+            .send(AuditCommand::Shutdown {
+                reply: Some(reply_tx),
+            })
+            .is_ok()
+        {
+            let _ = reply_rx.recv();
+        }
+        let _ = handle.join();
+    }
+}
+
+impl Drop for PaperAudit {
+    fn drop(&mut self) {
+        self.shutdown_worker();
+    }
+}
+
+fn run_paper_audit_worker(
+    mut worker: PaperAuditWorker,
+    receiver: std_mpsc::Receiver<AuditCommand>,
+    worker_error: Arc<Mutex<Option<String>>>,
+) {
+    while let Ok(command) = receiver.recv() {
+        match command {
+            AuditCommand::Event(event) => {
+                if let Err(err) = worker.record_event(event) {
+                    store_paper_audit_worker_error(&worker_error, &err);
+                    break;
+                }
+            }
+            AuditCommand::RuntimeState {
+                stats,
+                monitor_state,
+                tick_index,
+                now_ms,
+                record_marks,
+                write_checkpoint,
+                write_summary,
+                sync_warehouse,
+            } => {
+                if let Err(err) = worker.apply_runtime_state(
+                    &stats,
+                    &monitor_state,
+                    tick_index,
+                    now_ms,
+                    record_marks,
+                    write_checkpoint,
+                    write_summary,
+                    sync_warehouse,
+                ) {
+                    store_paper_audit_worker_error(&worker_error, &err);
+                    break;
+                }
+            }
+            AuditCommand::Finalize {
+                stats,
+                monitor_state,
+                tick_index,
+                now_ms,
+                reply,
+            } => {
+                let result = worker
+                    .finalize(&stats, &monitor_state, tick_index, now_ms)
+                    .map_err(|err| format!("{err:#}"));
+                if let Err(message) = &result {
+                    if let Ok(mut guard) = worker_error.lock() {
+                        *guard = Some(message.clone());
+                    }
+                }
+                let _ = reply.send(result);
+            }
+            #[cfg(test)]
+            AuditCommand::Barrier { reply } => {
+                let result = worker.flush().map_err(|err| format!("{err:#}"));
+                if let Err(message) = &result {
+                    if let Ok(mut guard) = worker_error.lock() {
+                        *guard = Some(message.clone());
+                    }
+                }
+                let _ = reply.send(result);
+            }
+            AuditCommand::Shutdown { reply } => {
+                let _ = worker.flush();
+                if let Some(reply) = reply {
+                    let _ = reply.send(());
+                }
+                break;
+            }
+        }
+    }
+
+    let _ = worker.flush();
+}
+
+fn store_paper_audit_worker_error(
+    worker_error: &Arc<Mutex<Option<String>>>,
+    err: &anyhow::Error,
+) {
+    if let Ok(mut guard) = worker_error.lock() {
+        if guard.is_none() {
+            *guard = Some(format!("{err:#}"));
+        }
     }
 }
 
@@ -2287,7 +2668,7 @@ struct EquityPoint {
     equity: f64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct TradeBook {
     open: HashMap<Symbol, OpenTradeInfo>,
     closed: VecDeque<ClosedTradeInfo>,
@@ -3668,10 +4049,7 @@ async fn maybe_execute_delta_rebalance(
     now_ms: u64,
 ) -> Result<()> {
     let basis = effective_basis_config_for_symbol(settings, symbol);
-    let threshold = basis
-        .delta_rebalance_threshold
-        .to_f64()
-        .unwrap_or_default();
+    let threshold = basis.delta_rebalance_threshold.to_f64().unwrap_or_default();
     if threshold <= 0.0 {
         return Ok(());
     }
@@ -3920,7 +4298,8 @@ async fn process_pending_command_single(
     trade_book: &mut TradeBook,
     audit: &mut Option<PaperAudit>,
     now_ms: u64,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut processed_any = false;
     loop {
         let command = {
             let mut center = command_center
@@ -3931,6 +4310,7 @@ async fn process_pending_command_single(
         let Some(command) = command else {
             break;
         };
+        processed_any = true;
 
         let outcome = match command.kind.clone() {
             CommandKind::Pause => {
@@ -4092,7 +4472,7 @@ async fn process_pending_command_single(
         )?;
     }
 
-    Ok(())
+    Ok(processed_any)
 }
 
 fn resolve_market_symbol(markets: &[MarketConfig], requested: &str) -> Option<Symbol> {
@@ -4117,7 +4497,8 @@ async fn process_pending_command_multi(
     trade_book: &mut TradeBook,
     audit: &mut Option<PaperAudit>,
     now_ms: u64,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut processed_any = false;
     loop {
         let command = {
             let mut center = command_center
@@ -4128,6 +4509,7 @@ async fn process_pending_command_multi(
         let Some(command) = command else {
             break;
         };
+        processed_any = true;
 
         let outcome = match command.kind.clone() {
             CommandKind::Pause => {
@@ -4322,7 +4704,7 @@ async fn process_pending_command_multi(
         )?;
     }
 
-    Ok(())
+    Ok(processed_any)
 }
 
 fn candidate_price_for_filter(candidate: &OpenCandidate, observed: &ObservedState) -> Option<f64> {
@@ -4332,38 +4714,91 @@ fn candidate_price_for_filter(candidate: &OpenCandidate, observed: &ObservedStat
     }
 }
 
-fn market_open_semantics_guard_reason(market: &MarketConfig, now_ms: u64) -> Option<&'static str> {
-    let Some(rule) = market.resolved_market_rule() else {
-        return None;
-    };
-    if !matches!(
-        rule.kind,
-        polyalpha_core::MarketRuleKind::Above | polyalpha_core::MarketRuleKind::Below
-    ) {
-        return None;
+fn market_open_semantics_guard_reason(
+    market: &MarketConfig,
+    scope: &StrategyMarketScopeConfig,
+    now_ms: u64,
+) -> Option<&'static str> {
+    let _ = now_ms;
+    main_strategy_rejection_reason(
+        scope,
+        market.market_question.as_deref(),
+        &market.symbol.0,
+        market.market_rule.as_ref(),
+    )
+}
+
+fn market_runtime_expired_settlement_reason(
+    market: &MarketConfig,
+    now_timestamp_secs: u64,
+) -> Option<&'static str> {
+    (market.settlement_timestamp <= now_timestamp_secs).then_some("expired_settlement_market")
+}
+
+fn filter_runtime_markets_for_expired_settlement(
+    settings: &mut Settings,
+    now_timestamp_secs: u64,
+) -> Vec<Symbol> {
+    let mut skipped = Vec::new();
+    settings.markets.retain(|market| {
+        if market_runtime_expired_settlement_reason(market, now_timestamp_secs).is_some() {
+            skipped.push(market.symbol.clone());
+            false
+        } else {
+            true
+        }
+    });
+    skipped
+}
+
+fn filter_runtime_markets_for_main_strategy(
+    settings: &mut Settings,
+) -> Vec<(Symbol, &'static str)> {
+    let mut skipped = Vec::new();
+    settings.markets.retain(|market| {
+        if let Some(reason) = main_strategy_rejection_reason(
+            &settings.strategy.market_scope,
+            market.market_question.as_deref(),
+            &market.symbol.0,
+            market.market_rule.as_ref(),
+        ) {
+            skipped.push((market.symbol.clone(), reason));
+            false
+        } else {
+            true
+        }
+    });
+    skipped
+}
+
+fn log_runtime_expired_settlement_filter(skipped: &[Symbol]) {
+    if skipped.is_empty() {
+        return;
     }
 
-    let combined = format!(
-        "{} {}",
-        market
-            .market_question
-            .as_deref()
-            .unwrap_or_default()
-            .to_ascii_lowercase(),
-        market.symbol.0.to_ascii_lowercase()
-    );
-    let is_touch_style = combined.contains("reach")
-        || combined.contains("dip to")
-        || combined.contains("dip-to")
-        || combined.contains("fall to")
-        || combined.contains("fall-to")
-        || combined.contains("drop to")
-        || combined.contains("drop-to")
-        || combined.contains("hit")
-        || combined.contains("touch");
+    println!("已从运行集移除 {} 个已过结算时间的市场：", skipped.len());
+    for symbol in skipped.iter().take(8) {
+        println!("  {}：市场结算时间已过", symbol.0);
+    }
+    if skipped.len() > 8 {
+        println!("  其余 {} 个市场已省略", skipped.len() - 8);
+    }
+    println!();
+}
 
-    let _ = now_ms;
-    is_touch_style.then_some("path_dependent_market_not_supported")
+fn log_runtime_market_scope_filter(skipped: &[(Symbol, &'static str)]) {
+    if skipped.is_empty() {
+        return;
+    }
+
+    println!("已从运行集移除 {} 个未纳入主策略的市场：", skipped.len());
+    for (symbol, reason) in skipped.iter().take(8) {
+        println!("  {}：{}", symbol.0, strategy_rejection_label_zh(reason));
+    }
+    if skipped.len() > 8 {
+        println!("  其余 {} 个市场已省略", skipped.len() - 8);
+    }
+    println!();
 }
 
 fn candidate_price_filter_rejection_reason(
@@ -4376,7 +4811,11 @@ fn candidate_price_filter_rejection_reason(
         .iter()
         .find(|market| market.symbol == candidate.symbol);
     if let Some(reason) = market.and_then(|market| {
-        market_open_semantics_guard_reason(market, candidate.timestamp_ms)
+        market_open_semantics_guard_reason(
+            market,
+            &settings.strategy.market_scope,
+            candidate.timestamp_ms,
+        )
     }) {
         return Some(reason);
     }
@@ -4523,11 +4962,40 @@ async fn run_runtime_single(
     execution_mode: RuntimeExecutionMode,
     trading_mode: polyalpha_core::TradingMode,
 ) -> Result<()> {
+    let requested_market = select_market(&settings, market_index)?.clone();
+    let now_timestamp_secs = now_millis() / 1000;
+    if market_runtime_expired_settlement_reason(&requested_market, now_timestamp_secs).is_some() {
+        anyhow::bail!("{} 已过结算时间，禁止运行", requested_market.symbol.0);
+    }
+    if let Some(reason) = main_strategy_rejection_reason(
+        &settings.strategy.market_scope,
+        requested_market.market_question.as_deref(),
+        &requested_market.symbol.0,
+        requested_market.market_rule.as_ref(),
+    ) {
+        anyhow::bail!(
+            "{} 未纳入当前主策略：{}",
+            requested_market.symbol.0,
+            strategy_rejection_label_zh(reason)
+        );
+    }
+    let requested_symbol = requested_market.symbol.clone();
+    let expired_skipped =
+        filter_runtime_markets_for_expired_settlement(&mut settings, now_timestamp_secs);
+    log_runtime_expired_settlement_filter(&expired_skipped);
+    let skipped = filter_runtime_markets_for_main_strategy(&mut settings);
+    log_runtime_market_scope_filter(&skipped);
+    let filtered_market_index = settings
+        .markets
+        .iter()
+        .position(|market| market.symbol == requested_symbol)
+        .ok_or_else(|| anyhow!("选中的市场已被运行集过滤：{}", requested_symbol.0))?;
+
     if matches!(settings.strategy.market_data.mode, MarketDataMode::Ws) {
         return run_paper_ws_mode(
             env,
             settings,
-            market_index,
+            filtered_market_index,
             poll_interval_ms,
             print_every,
             max_ticks,
@@ -4540,7 +5008,7 @@ async fn run_runtime_single(
         )
         .await;
     }
-    let market = select_market(&settings, market_index)?;
+    let market = select_market(&settings, filtered_market_index)?;
     let registry = SymbolRegistry::new(settings.markets.clone());
     let channels = create_channels(std::slice::from_ref(&market.symbol));
     let manager = build_data_manager(&registry, channels.market_data_tx.clone());
@@ -4679,7 +5147,7 @@ async fn run_runtime_single(
             let now_secs = now_ms / 1000;
 
             drain_command_events(&command_center, &mut recent_events);
-            process_pending_command_single(
+            let _ = process_pending_command_single(
                 &command_center,
                 &paused,
                 &emergency,
@@ -4798,108 +5266,24 @@ async fn run_runtime_single(
             loop {
                 match market_data_rx.try_recv() {
                     Ok(event) => {
-                        stats.market_events += 1;
-                        if let MarketDataEvent::OrderBookUpdate { snapshot } = &event {
-                            update_paper_orderbook(&orderbook_provider, &registry, snapshot);
-                        }
-                        observe_market_event(&mut observed, &event);
-                        push_event_simple(
-                            &mut recent_events,
-                            "market_data",
-                            summarize_market_event(&event),
-                        );
-
-                        if let MarketDataEvent::MarketLifecycle { symbol, phase, .. } = &event {
-                            risk.update_market_phase(symbol.clone(), phase.clone());
-                        }
-
-                        let basis = effective_basis_config_for_market(&settings, &market);
-                        let evaluation_observed = build_audit_observed_market(
-                            now_millis(),
+                        handle_single_market_event(
+                            event,
                             &market,
-                            &observed,
                             &settings,
-                            None,
-                            false,
-                            &basis,
-                        );
-                        let output = engine.on_market_data(&event).await;
-                        record_evaluation_attempt(
+                            &registry,
+                            &orderbook_provider,
+                            &mut observed,
                             &mut stats,
                             &mut recent_events,
-                            &event,
-                            &output.warnings,
-                            Some(&evaluation_observed),
+                            &mut engine,
+                            &mut execution,
+                            &mut risk,
+                            &mut trade_book,
+                            &paused,
+                            &emergency,
                             &mut audit,
-                        )?;
-                        for update in output.dmm_updates {
-                            let events = execution.apply_dmm_quote_update(update).await?;
-                            apply_execution_events(
-                                &mut risk,
-                                &mut stats,
-                                &mut recent_events,
-                                &mut trade_book,
-                                None,
-                                events,
-                                &mut audit,
-                            )
-                            .await?;
-                        }
-
-                        for candidate in output.open_candidates {
-                            process_signal_single(
-                                candidate,
-                                &settings,
-                                &registry,
-                                &mut observed,
-                                &mut stats,
-                                &mut recent_events,
-                                &mut engine,
-                                &mut execution,
-                                &mut risk,
-                                &mut trade_book,
-                                &paused,
-                                &emergency,
-                                false,
-                                &mut audit,
-                            )
-                            .await?;
-                        }
-
-                        if let Some(reason) = engine.close_reason(&market.symbol) {
-                            execute_intent_trigger(
-                                close_intent_for_symbol(
-                                    &market.symbol,
-                                    &reason,
-                                    &format!("corr-close-{}-{}", market.symbol.0, now_millis()),
-                                    now_millis(),
-                                ),
-                                now_millis(),
-                                &mut engine,
-                                &mut execution,
-                                &mut risk,
-                                &mut stats,
-                                &mut recent_events,
-                                &mut trade_book,
-                                &mut audit,
-                            )
-                            .await?;
-                        } else {
-                            maybe_execute_delta_rebalance(
-                                &settings,
-                                &HashMap::from([(market.symbol.clone(), observed.clone())]),
-                                &market.symbol,
-                                &mut engine,
-                                &mut execution,
-                                &mut risk,
-                                &mut stats,
-                                &mut recent_events,
-                                &mut trade_book,
-                                &mut audit,
-                                now_millis(),
-                            )
-                            .await?;
-                        }
+                        )
+                        .await?;
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Lagged(_)) => continue,
@@ -5147,6 +5531,20 @@ async fn run_runtime_multi(
     execution_mode: RuntimeExecutionMode,
     trading_mode: polyalpha_core::TradingMode,
 ) -> Result<()> {
+    let now_timestamp_secs = now_millis() / 1000;
+    let expired_skipped =
+        filter_runtime_markets_for_expired_settlement(&mut settings, now_timestamp_secs);
+    log_runtime_expired_settlement_filter(&expired_skipped);
+    if settings.markets.is_empty() {
+        anyhow::bail!("配置中的市场均已过结算时间");
+    }
+
+    let skipped = filter_runtime_markets_for_main_strategy(&mut settings);
+    log_runtime_market_scope_filter(&skipped);
+    if settings.markets.is_empty() {
+        anyhow::bail!("配置中的市场均未纳入当前主策略");
+    }
+
     if matches!(settings.strategy.market_data.mode, MarketDataMode::Ws) {
         return run_paper_multi_ws_mode(
             env,
@@ -5332,7 +5730,7 @@ async fn run_runtime_multi(
         let now_secs = now_ms / 1000;
 
         drain_command_events(&command_center, &mut recent_events);
-        process_pending_command_multi(
+        let _ = process_pending_command_multi(
             &command_center,
             &paused,
             &emergency,
@@ -5519,140 +5917,24 @@ async fn run_runtime_multi(
         loop {
             match market_data_rx.try_recv() {
                 Ok(event) => {
-                    stats.market_events += 1;
-
-                    // Get the symbol from the event
-                    let event_symbol = match &event {
-                        MarketDataEvent::OrderBookUpdate { snapshot } => {
-                            update_paper_orderbook(&orderbook_provider, &registry, snapshot);
-                            Some(snapshot.symbol.clone())
-                        }
-                        MarketDataEvent::TradeUpdate { symbol, .. } => Some(symbol.clone()),
-                        MarketDataEvent::MarketLifecycle { symbol, .. } => Some(symbol.clone()),
-                        MarketDataEvent::FundingRate { symbol, .. } => Some(symbol.clone()),
-                        MarketDataEvent::ConnectionEvent { exchange, status } => {
-                            // Update connection state for all observed markets with this exchange
-                            for (_, obs) in &mut observed {
-                                record_connection_status(
-                                    obs,
-                                    format!("{exchange:?}"),
-                                    *status,
-                                    now_millis(),
-                                );
-                            }
-                            None
-                        }
-                    };
-
-                    // Update observed state for the relevant market
-                    if let Some(symbol) = &event_symbol {
-                        if let Some(obs) = observed.get_mut(symbol) {
-                            observe_market_event(obs, &event);
-                        }
-                    }
-
-                    if let MarketDataEvent::MarketLifecycle { symbol, phase, .. } = &event {
-                        risk.update_market_phase(symbol.clone(), phase.clone());
-                    }
-
-                    let evaluation_observed = event_symbol.as_ref().and_then(|symbol| {
-                        observed
-                            .get(symbol)
-                            .and_then(|obs| registry.get_config(symbol).map(|market| (obs, market)))
-                            .map(|(obs, market)| {
-                                let basis = effective_basis_config_for_market(&settings, market);
-                                build_audit_observed_market(
-                                    now_millis(),
-                                    market,
-                                    obs,
-                                    &settings,
-                                    None,
-                                    false,
-                                    &basis,
-                                )
-                            })
-                    });
-                    let output = engine.on_market_data(&event).await;
-                    record_evaluation_attempt(
+                    handle_multi_market_event(
+                        event,
+                        &settings,
+                        &registry,
+                        &orderbook_provider,
+                        &mut observed,
                         &mut stats,
                         &mut recent_events,
-                        &event,
-                        &output.warnings,
-                        evaluation_observed.as_ref(),
+                        &mut engine,
+                        &mut execution,
+                        &mut risk,
+                        &mut trade_book,
+                        &paused,
+                        &emergency,
+                        false,
                         &mut audit,
-                    )?;
-                    for update in output.dmm_updates {
-                        let events = execution.apply_dmm_quote_update(update).await?;
-                        apply_execution_events(
-                            &mut risk,
-                            &mut stats,
-                            &mut recent_events,
-                            &mut trade_book,
-                            None,
-                            events,
-                            &mut audit,
-                        )
-                        .await?;
-                    }
-
-                    for candidate in output.open_candidates {
-                        process_signal_multi(
-                            candidate,
-                            &settings,
-                            &registry,
-                            &mut observed,
-                            &mut stats,
-                            &mut recent_events,
-                            &mut engine,
-                            &mut execution,
-                            &mut risk,
-                            &mut trade_book,
-                            &paused,
-                            &emergency,
-                            false,
-                            false,
-                            &mut audit,
-                        )
-                        .await?;
-                    }
-
-                    if let Some(symbol) = &event_symbol {
-                        if let Some(reason) = engine.close_reason(symbol) {
-                            let now_ms = now_millis();
-                            execute_intent_trigger(
-                                close_intent_for_symbol(
-                                    symbol,
-                                    &reason,
-                                    &format!("corr-close-{}-{now_ms}", symbol.0),
-                                    now_ms,
-                                ),
-                                now_ms,
-                                &mut engine,
-                                &mut execution,
-                                &mut risk,
-                                &mut stats,
-                                &mut recent_events,
-                                &mut trade_book,
-                                &mut audit,
-                            )
-                            .await?;
-                        } else {
-                            maybe_execute_delta_rebalance(
-                                &settings,
-                                &observed,
-                                symbol,
-                                &mut engine,
-                                &mut execution,
-                                &mut risk,
-                                &mut stats,
-                                &mut recent_events,
-                                &mut trade_book,
-                                &mut audit,
-                                now_millis(),
-                            )
-                            .await?;
-                        }
-                    }
+                    )
+                    .await?;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Lagged(_)) => continue,
@@ -6138,9 +6420,45 @@ fn ws_transport_error(message: impl Into<String>) -> tungstenite::Error {
     tungstenite::Error::Io(std::io::Error::other(message.into()))
 }
 
+fn build_ws_request_with_optional_extensions(
+    ws_url: &str,
+    extensions: Option<&str>,
+) -> Result<tungstenite::http::Request<()>> {
+    let mut request = ws_url.into_client_request()?;
+    if let Some(extensions) = extensions {
+        request.headers_mut().insert(
+            "Sec-WebSocket-Extensions",
+            HeaderValue::from_str(extensions)?,
+        );
+    }
+    Ok(request)
+}
+
+fn negotiated_ws_extensions<B>(response: &tungstenite::http::Response<B>) -> Option<String> {
+    response
+        .headers()
+        .get("Sec-WebSocket-Extensions")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
 async fn connect_websocket(
     ws_url: &str,
     proxy: Option<&WsProxyConfig>,
+) -> std::result::Result<
+    (
+        WsSocket,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    tungstenite::Error,
+> {
+    connect_websocket_with_extensions(ws_url, proxy, None).await
+}
+
+async fn connect_websocket_with_extensions(
+    ws_url: &str,
+    proxy: Option<&WsProxyConfig>,
+    extensions: Option<&str>,
 ) -> std::result::Result<
     (
         WsSocket,
@@ -6161,7 +6479,9 @@ async fn connect_websocket(
             })?,
     };
 
-    client_async_tls_with_config(ws_url, stream, None, None).await
+    let request = build_ws_request_with_optional_extensions(ws_url, extensions)
+        .map_err(|err| ws_transport_error(err.to_string()))?;
+    client_async_tls_with_config(request, stream, None, None).await
 }
 
 async fn connect_via_proxy(
@@ -6349,6 +6669,7 @@ fn spawn_ws_market_data_tasks(
     settings: &Settings,
     markets: &[MarketConfig],
     depth: u16,
+    polymarket_ws_diagnostics: PolymarketWsDiagnostics,
 ) -> Vec<JoinHandle<()>> {
     let mut handles = Vec::new();
     let reconnect_backoff_ms = settings.strategy.market_data.reconnect_backoff_ms.max(250);
@@ -6374,6 +6695,7 @@ fn spawn_ws_market_data_tasks(
             poly_asset_ids,
             reconnect_backoff_ms,
             proxy_settings.clone(),
+            polymarket_ws_diagnostics,
         ));
     }
 
@@ -6381,20 +6703,13 @@ fn spawn_ws_market_data_tasks(
     let okx_tracker = ExchangeConnectionTracker::new(Exchange::Okx, manager.clone());
     let mut seen_binance = HashSet::new();
     let mut seen_okx = HashSet::new();
+    let mut binance_symbols = Vec::new();
 
     for market in markets {
         let venue_symbol = cex_venue_symbol(market.hedge_exchange, &market.cex_symbol);
         match market.hedge_exchange {
             Exchange::Binance if seen_binance.insert(venue_symbol.clone()) => {
-                handles.push(spawn_binance_ws_task(
-                    manager.clone(),
-                    settings.binance.ws_url.clone(),
-                    venue_symbol,
-                    depth,
-                    reconnect_backoff_ms,
-                    binance_tracker.clone(),
-                    proxy_settings.clone(),
-                ));
+                binance_symbols.push(venue_symbol);
             }
             Exchange::Okx if seen_okx.insert(venue_symbol.clone()) => {
                 handles.push(spawn_okx_ws_task(
@@ -6410,6 +6725,34 @@ fn spawn_ws_market_data_tasks(
         }
     }
 
+    match select_binance_ws_transport_mode(settings) {
+        BinanceWsTransportMode::PerSymbol => {
+            for venue_symbol in binance_symbols {
+                handles.push(spawn_binance_ws_task(
+                    manager.clone(),
+                    settings.binance.ws_url.clone(),
+                    venue_symbol,
+                    depth,
+                    reconnect_backoff_ms,
+                    binance_tracker.clone(),
+                    proxy_settings.clone(),
+                ));
+            }
+        }
+        BinanceWsTransportMode::Combined if !binance_symbols.is_empty() => {
+            handles.push(spawn_binance_combined_ws_task(
+                manager.clone(),
+                settings.binance.ws_url.clone(),
+                binance_symbols,
+                depth,
+                reconnect_backoff_ms,
+                binance_tracker,
+                proxy_settings,
+            ));
+        }
+        BinanceWsTransportMode::Combined => {}
+    }
+
     handles
 }
 
@@ -6419,6 +6762,7 @@ fn spawn_polymarket_ws_task(
     asset_ids: Vec<String>,
     reconnect_backoff_ms: u64,
     proxy_settings: WsProxySettings,
+    diagnostics: PolymarketWsDiagnostics,
 ) -> JoinHandle<()> {
     let tracker = ExchangeConnectionTracker::new(Exchange::Polymarket, manager.clone());
     let proxy_resolution = proxy_settings.resolve_for_url(&ws_url);
@@ -6484,10 +6828,18 @@ fn spawn_polymarket_ws_task(
                                 match message {
                                     Some(Ok(Message::Text(text))) => {
                                         tracker.reaffirm_connected();
+                                        diagnostics.record_text_frame();
                                         if text == "PONG" {
                                             continue;
                                         }
-                                        if let Err(err) = handle_polymarket_ws_text(&manager, &books, &text).await {
+                                        if let Err(err) = handle_polymarket_ws_text(
+                                            &manager,
+                                            &books,
+                                            &diagnostics,
+                                            &text,
+                                        )
+                                        .await
+                                        {
                                             log_ws_warning(format!("polymarket ws payload ignored: {err}"));
                                         }
                                     }
@@ -6631,6 +6983,178 @@ fn spawn_binance_ws_task(
 
             tracker.mark_disconnected(&venue_symbol);
         }
+    })
+}
+
+async fn fallback_to_binance_per_symbol_ws(
+    manager: DataManager,
+    ws_url: String,
+    venue_symbols: Vec<String>,
+    depth: u16,
+    reconnect_backoff_ms: u64,
+    tracker: ExchangeConnectionTracker,
+    proxy_settings: WsProxySettings,
+) {
+    log_ws_warning("binance combined ws failed; falling back to per-symbol transport");
+    for venue_symbol in &venue_symbols {
+        tracker.mark_disconnected(venue_symbol);
+    }
+
+    let mut fallback_handles = venue_symbols
+        .into_iter()
+        .map(|venue_symbol| {
+            spawn_binance_ws_task(
+                manager.clone(),
+                ws_url.clone(),
+                venue_symbol,
+                depth,
+                reconnect_backoff_ms,
+                tracker.clone(),
+                proxy_settings.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for handle in fallback_handles.drain(..) {
+        let _ = handle.await;
+    }
+}
+
+fn spawn_binance_combined_ws_task(
+    manager: DataManager,
+    ws_url: String,
+    venue_symbols: Vec<String>,
+    depth: u16,
+    reconnect_backoff_ms: u64,
+    tracker: ExchangeConnectionTracker,
+    proxy_settings: WsProxySettings,
+) -> JoinHandle<()> {
+    let stream_path =
+        BinanceFuturesDataSource::build_combined_partial_depth_stream_path(&venue_symbols, depth);
+    let endpoint = format!("{}{}", ws_url.trim_end_matches('/'), stream_path);
+    let proxy_resolution = proxy_settings.resolve_for_url(&endpoint);
+    if let Ok(Some(proxy)) = proxy_resolution.as_ref() {
+        eprintln!(
+            "binance combined ws using {} for {} symbols",
+            proxy.describe(),
+            venue_symbols.len()
+        );
+    } else if let Err(err) = proxy_resolution.as_ref() {
+        log_ws_warning(format!(
+            "binance combined ws proxy resolution failed: {err}"
+        ));
+    }
+
+    tokio::spawn(async move {
+        tracker.mark_connecting();
+
+        let proxy = match proxy_resolution {
+            Ok(proxy) => proxy,
+            Err(_) => {
+                fallback_to_binance_per_symbol_ws(
+                    manager.clone(),
+                    ws_url.clone(),
+                    venue_symbols.clone(),
+                    depth,
+                    reconnect_backoff_ms,
+                    tracker.clone(),
+                    proxy_settings.clone(),
+                )
+                .await;
+                return;
+            }
+        };
+
+        sleep(Duration::from_millis(ws_connect_delay_ms(
+            reconnect_backoff_ms,
+            "binance:combined",
+        )))
+        .await;
+        tracker.mark_connecting();
+
+        match run_ws_future_with_timeout(
+            connect_websocket_with_extensions(
+                endpoint.as_str(),
+                proxy.as_ref(),
+                binance_combined_ws_requested_extensions(),
+            ),
+            Duration::from_millis(WS_CONNECT_TIMEOUT_MS),
+            "binance combined ws connect".to_owned(),
+        )
+        .await
+        {
+            Ok((socket, response)) => {
+                if let Some(extensions) = negotiated_ws_extensions(&response) {
+                    eprintln!("binance combined ws negotiated extensions: {extensions}");
+                } else {
+                    eprintln!(
+                        "binance combined ws connected without negotiated extensions (client requested none)"
+                    );
+                }
+
+                let (_writer, mut reader) = socket.split();
+                for venue_symbol in &venue_symbols {
+                    tracker.mark_connected(venue_symbol);
+                }
+                eprintln!(
+                    "binance combined ws connected for {} symbols",
+                    venue_symbols.len()
+                );
+
+                loop {
+                    match reader.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            tracker.reaffirm_connected();
+                            match BinanceFuturesDataSource::parse_partial_depth_ws_payload(
+                                &text, "",
+                            ) {
+                                Ok(Some(update)) => {
+                                    if let Err(err) =
+                                        manager.normalize_and_publish_cex_orderbook(update)
+                                    {
+                                        log_ws_warning(format!(
+                                            "binance combined ws publish failed: {err}"
+                                        ));
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(err) => log_ws_warning(format!(
+                                    "binance combined ws payload ignored: {err}"
+                                )),
+                            }
+                        }
+                        Some(Ok(Message::Close(frame))) => {
+                            log_ws_warning(format!(
+                                "binance combined ws closed: {}",
+                                format_ws_close_reason(frame.as_ref())
+                            ));
+                            break;
+                        }
+                        Some(Err(err)) => {
+                            log_ws_warning(format!("binance combined ws read error: {err}"));
+                            break;
+                        }
+                        None => {
+                            log_ws_warning("binance combined ws stream ended without close frame");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(err) => log_ws_warning(format!("binance combined ws connect failed: {err}")),
+        }
+
+        fallback_to_binance_per_symbol_ws(
+            manager,
+            ws_url,
+            venue_symbols,
+            depth,
+            reconnect_backoff_ms,
+            tracker,
+            proxy_settings,
+        )
+        .await;
     })
 }
 
@@ -6780,6 +7304,7 @@ fn spawn_okx_ws_task(
 async fn handle_polymarket_ws_text(
     manager: &DataManager,
     books: &Arc<Mutex<HashMap<String, LocalPolyBook>>>,
+    diagnostics: &PolymarketWsDiagnostics,
     payload: &str,
 ) -> Result<()> {
     let value: Value = serde_json::from_str(payload)?;
@@ -6796,9 +7321,11 @@ async fn handle_polymarket_ws_text(
             .map(|kind| kind.eq_ignore_ascii_case("price_change"))
             .unwrap_or(false)
         {
+            diagnostics.record_price_change_message();
             let changes = parse_polymarket_price_changes(&message)?;
             if !changes.is_empty() {
-                apply_polymarket_price_changes(manager, books, &changes)?;
+                let emitted_updates = apply_polymarket_price_changes(manager, books, &changes)?;
+                diagnostics.add_orderbook_updates(emitted_updates as u64);
             }
             continue;
         }
@@ -6824,6 +7351,7 @@ async fn handle_polymarket_ws_text(
             || message.get("bids").is_some()
             || message.get("asks").is_some()
         {
+            diagnostics.record_book_message();
             let mut update =
                 PolymarketLiveDataSource::parse_ws_orderbook_payload(&message.to_string(), "")?;
             if let Ok(mut guard) = books.lock() {
@@ -6836,6 +7364,7 @@ async fn handle_polymarket_ws_text(
                 guard.insert(update.asset_id.clone(), book);
             }
             let _ = manager.normalize_and_publish_poly_orderbook(update)?;
+            diagnostics.add_orderbook_updates(1);
         }
     }
 
@@ -6846,7 +7375,7 @@ fn apply_polymarket_price_changes(
     manager: &DataManager,
     books: &Arc<Mutex<HashMap<String, LocalPolyBook>>>,
     changes: &[PolymarketPriceChange],
-) -> Result<()> {
+) -> Result<usize> {
     let mut grouped: HashMap<String, (u64, LocalPolyBook)> = HashMap::new();
     let mut guard = books
         .lock()
@@ -6861,6 +7390,7 @@ fn apply_polymarket_price_changes(
         entry.1.apply_level(change.side, change.price, change.size);
     }
 
+    let emitted_updates = grouped.len();
     for (asset_id, (timestamp_ms, mut book)) in grouped {
         let sequence = book.next_sequence();
         book.sequence = sequence;
@@ -6869,7 +7399,7 @@ fn apply_polymarket_price_changes(
         let _ = manager.normalize_and_publish_poly_orderbook(update)?;
     }
 
-    Ok(())
+    Ok(emitted_updates)
 }
 
 fn parse_polymarket_price_changes(message: &Value) -> Result<Vec<PolymarketPriceChange>> {
@@ -8372,14 +8902,20 @@ async fn handle_single_market_event(
     audit: &mut Option<PaperAudit>,
 ) -> Result<()> {
     stats.market_events += 1;
-    if let MarketDataEvent::OrderBookUpdate { snapshot } = &event {
-        update_paper_orderbook(orderbook_provider, registry, snapshot);
-    }
+    update_paper_orderbook_for_event(orderbook_provider, registry, &event);
     let previous_market_phase = match &event {
         MarketDataEvent::MarketLifecycle { .. } => observed.market_phase.clone(),
         _ => None,
     };
-    observe_market_event(observed, &event);
+    let touches_market = match &event {
+        MarketDataEvent::ConnectionEvent { .. } => true,
+        _ => market_symbols_for_event(&event, registry)
+            .iter()
+            .any(|symbol| symbol == &market.symbol),
+    };
+    if touches_market {
+        observe_market_event(observed, &event);
+    }
     match &event {
         MarketDataEvent::ConnectionEvent { exchange, status } => {
             let exchange_name = format!("{exchange:?}");
@@ -8426,25 +8962,27 @@ async fn handle_single_market_event(
         risk.update_market_phase(symbol.clone(), phase.clone());
     }
 
-    let basis = effective_basis_config_for_market(settings, market);
-    let evaluation_observed = build_audit_observed_market(
-        now_millis(),
-        market,
-        observed,
-        settings,
-        None,
-        false,
-        &basis,
-    );
     let output = engine.on_market_data(&event).await;
-    record_evaluation_attempt(
-        stats,
-        recent_events,
-        &event,
-        &output.warnings,
-        Some(&evaluation_observed),
-        audit,
-    )?;
+    if touches_market {
+        let basis = effective_basis_config_for_market(settings, market);
+        let evaluation_observed = build_audit_observed_market(
+            now_millis(),
+            market,
+            observed,
+            settings,
+            None,
+            false,
+            &basis,
+        );
+        record_evaluation_attempt(
+            stats,
+            recent_events,
+            &event,
+            &output.warnings,
+            Some(&evaluation_observed),
+            audit,
+        )?;
+    }
     for update in output.dmm_updates {
         let events = execution.apply_dmm_quote_update(update).await?;
         apply_execution_events(risk, stats, recent_events, trade_book, None, events, audit).await?;
@@ -8528,6 +9066,7 @@ async fn handle_multi_market_event(
     audit: &mut Option<PaperAudit>,
 ) -> Result<()> {
     stats.market_events += 1;
+    let event_symbols = market_symbols_for_event(&event, registry);
     let previous_market_phase = match &event {
         MarketDataEvent::MarketLifecycle { symbol, .. } => observed
             .get(symbol)
@@ -8541,25 +9080,17 @@ async fn handle_multi_market_event(
         _ => None,
     };
 
-    let event_symbol = match &event {
-        MarketDataEvent::OrderBookUpdate { snapshot } => {
-            update_paper_orderbook(orderbook_provider, registry, snapshot);
-            Some(snapshot.symbol.clone())
-        }
-        MarketDataEvent::TradeUpdate { symbol, .. } => Some(symbol.clone()),
-        MarketDataEvent::MarketLifecycle { symbol, .. } => Some(symbol.clone()),
-        MarketDataEvent::FundingRate { symbol, .. } => Some(symbol.clone()),
-        MarketDataEvent::ConnectionEvent { exchange, status } => {
-            for obs in observed.values_mut() {
-                record_connection_status(obs, format!("{exchange:?}"), *status, now_millis());
-            }
-            None
-        }
-    };
+    update_paper_orderbook_for_event(orderbook_provider, registry, &event);
 
-    if let Some(symbol) = &event_symbol {
-        if let Some(obs) = observed.get_mut(symbol) {
-            observe_market_event(obs, &event);
+    if let MarketDataEvent::ConnectionEvent { exchange, status } = &event {
+        for obs in observed.values_mut() {
+            record_connection_status(obs, format!("{exchange:?}"), *status, now_millis());
+        }
+    } else {
+        for symbol in &event_symbols {
+            if let Some(obs) = observed.get_mut(symbol) {
+                observe_market_event(obs, &event);
+            }
         }
     }
 
@@ -8608,31 +9139,38 @@ async fn handle_multi_market_event(
         risk.update_market_phase(symbol.clone(), phase.clone());
     }
 
-    let evaluation_observed = event_symbol.as_ref().and_then(|symbol| {
-        observed
-            .get(symbol)
-            .and_then(|obs| registry.get_config(symbol).map(|market| (obs, market)))
-            .map(|(obs, market)| {
-                let basis = effective_basis_config_for_market(settings, market);
-                build_audit_observed_market(
-                    now_millis(),
-                    market,
-                    obs,
-                    settings,
-                    None,
-                    false,
-                    &basis,
-                )
-            })
-    });
+    let evaluation_observed_by_symbol = event_symbols
+        .iter()
+        .filter_map(|symbol| {
+            observed
+                .get(symbol)
+                .and_then(|obs| registry.get_config(symbol).map(|market| (obs, market)))
+                .map(|(obs, market)| {
+                    let basis = effective_basis_config_for_market(settings, market);
+                    (
+                        symbol.clone(),
+                        build_audit_observed_market(
+                            now_millis(),
+                            market,
+                            obs,
+                            settings,
+                            None,
+                            false,
+                            &basis,
+                        ),
+                    )
+                })
+        })
+        .collect::<HashMap<_, _>>();
 
     let output = engine.on_market_data(&event).await;
-    record_evaluation_attempt(
+    record_evaluation_attempts_for_symbols(
         stats,
         recent_events,
         &event,
+        &event_symbols,
         &output.warnings,
-        evaluation_observed.as_ref(),
+        &evaluation_observed_by_symbol,
         audit,
     )?;
     for update in output.dmm_updates {
@@ -8661,7 +9199,7 @@ async fn handle_multi_market_event(
         .await?;
     }
 
-    if let Some(symbol) = &event_symbol {
+    for symbol in &event_symbols {
         if let Some(reason) = engine.close_reason(symbol) {
             let now_ms = now_millis();
             execute_intent_trigger(
@@ -8733,6 +9271,7 @@ async fn run_paper_ws_mode(
         socket_path.clone(),
         Arc::clone(&current_state),
     );
+    let monitor_client_count = socket_server.client_count_handle();
     let state_broadcaster = socket_server.state_broadcaster();
     let event_broadcaster = socket_server.event_broadcaster();
     let command_center_clone = Arc::clone(&command_center);
@@ -8849,11 +9388,43 @@ async fn run_paper_ws_mode(
     )
     .await;
 
+    let monitor_market_cache: Arc<std::sync::RwLock<HashMap<Symbol, MonitorMarketSeed>>> =
+        Arc::new(std::sync::RwLock::new(HashMap::new()));
+    refresh_single_monitor_cache(
+        &monitor_market_cache,
+        &market.symbol,
+        &observed,
+        &engine,
+        &execution,
+        &risk,
+    );
+    let (monitor_render_tx, mut monitor_render_rx) =
+        mpsc::channel::<MultiMonitorRenderRequest>(1);
+    let (monitor_render_result_tx, mut monitor_render_result_rx) =
+        mpsc::channel::<MultiMonitorRenderResult>(1);
+    let monitor_market_cache_clone = Arc::clone(&monitor_market_cache);
+    let mut monitor_render_task = Some(tokio::spawn(async move {
+        while let Some(request) = monitor_render_rx.recv().await {
+            let result = {
+                let cache = monitor_market_cache_clone
+                    .read()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_default();
+                build_multi_monitor_state_from_seed_cache(&request, &cache)
+            };
+            if monitor_render_result_tx.send(result).await.is_err() {
+                break;
+            }
+        }
+    }));
+    let mut monitor_render_in_flight = false;
+
     let mut ws_tasks = spawn_ws_market_data_tasks(
         manager.clone(),
         &settings,
         std::slice::from_ref(&market),
         depth,
+        stats.polymarket_ws_diagnostics.clone(),
     );
     let funding_targets = vec![funding_target_for_market(&market)];
     let (funding_refresh_tx, mut funding_refresh_rx) =
@@ -8876,10 +9447,30 @@ async fn run_paper_ws_mode(
     funding_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
     funding_poll.tick().await;
     let mut state_dirty = true;
+    let mut market_data_events_since_last_tick = 0_u64;
 
     let loop_result: Result<()> = async {
         loop {
             tokio::select! {
+            Some(rendered) = monitor_render_result_rx.recv() => {
+                monitor_render_in_flight = false;
+                if let Some(audit) = audit.as_mut() {
+                    audit.maybe_record_runtime_state(
+                        &rendered.stats,
+                        &rendered.monitor_state,
+                        rendered.tick_index,
+                        rendered.now_ms,
+                    )?;
+                }
+                if rendered.has_monitor_clients {
+                    if let Ok(mut guard) = current_state.write() {
+                        *guard = Some(rendered.monitor_state.clone());
+                    }
+                    let _ = state_broadcaster.send(rendered.monitor_state);
+                } else if let Ok(mut guard) = current_state.write() {
+                    *guard = Some(rendered.monitor_state);
+                }
+            }
             Some(result) = funding_refresh_rx.recv() => {
                 funding_refresh_task = None;
                 handle_funding_refresh_result(&mut stats, &mut recent_events, result);
@@ -8888,6 +9479,8 @@ async fn run_paper_ws_mode(
             event = market_data_rx.recv() => {
                 match event {
                     Ok(event) => {
+                        market_data_events_since_last_tick =
+                            market_data_events_since_last_tick.saturating_add(1);
                         handle_single_market_event(
                             event,
                             &market,
@@ -8905,20 +9498,35 @@ async fn run_paper_ws_mode(
                             &emergency,
                             &mut audit,
                         ).await?;
+                        refresh_single_monitor_cache(
+                            &monitor_market_cache,
+                            &market.symbol,
+                            &observed,
+                            &engine,
+                            &execution,
+                            &risk,
+                        );
                         state_dirty = true;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(lagged_messages)) => {
+                        record_market_data_rx_lag(&mut stats, lagged_messages as u64);
+                        continue;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
             _ = housekeeping.tick() => {
+                record_market_data_tick_drain(
+                    &mut stats,
+                    &mut market_data_events_since_last_tick,
+                );
                 stats.ticks_processed += 1;
                 let tick_index = stats.ticks_processed;
                 let now_ms = now_millis();
                 let now_secs = now_ms / 1000;
 
                 drain_command_events(&command_center, &mut recent_events);
-                process_pending_command_single(
+                let _ = process_pending_command_single(
                     &command_center,
                     &paused,
                     &emergency,
@@ -8964,6 +9572,14 @@ async fn run_paper_ws_mode(
                         &settings.strategy.settlement,
                     ));
                 }
+                refresh_single_monitor_cache(
+                    &monitor_market_cache,
+                    &market.symbol,
+                    &observed,
+                    &engine,
+                    &execution,
+                    &risk,
+                );
 
                 let snapshot = build_snapshot(
                     &market,
@@ -8997,38 +9613,49 @@ async fn run_paper_ws_mode(
             _ = monitor_publish.tick(), if state_dirty => {
                 let now_ms = now_millis();
                 let tick_index = stats.ticks_processed;
-                let monitor_events = build_monitor_events(&recent_events);
-
-                let monitor_state = build_monitor_state(
-                    &settings,
-                    &market,
-                    &engine,
-                    &observed,
-                    &stats,
-                    &risk,
-                    &execution,
-                    &mut trade_book,
-                    &command_center,
-                    paused.load(Ordering::SeqCst),
-                    emergency.load(Ordering::SeqCst),
-                    start_time_ms,
-                    now_ms,
-                    &monitor_events,
-                    trading_mode,
-                );
-                if let Ok(mut guard) = current_state.write() {
-                    *guard = Some(monitor_state.clone());
-                }
                 broadcast_monitor_events_since(
                     &recent_events,
                     &mut last_event_seq_sent,
                     &event_broadcaster,
                 );
-                if let Some(audit) = audit.as_mut() {
-                    audit.maybe_record_runtime_state(&stats, &monitor_state, tick_index, now_ms)?;
+                let monitor_client_count = *monitor_client_count.read().await;
+                let has_monitor_clients = monitor_client_count > 0;
+                let should_render =
+                    should_build_monitor_state(monitor_client_count, audit.as_ref(), now_ms);
+                if !should_render {
+                    state_dirty = false;
+                } else if !monitor_render_in_flight {
+                    let monitor_events = build_monitor_events(&recent_events);
+                    let observed_map = HashMap::from([(market.symbol.clone(), observed.clone())]);
+                    let request = build_monitor_render_request(
+                        &settings,
+                        &stats,
+                        &observed_map,
+                        &engine,
+                        &risk,
+                        &mut trade_book,
+                        &command_center,
+                        paused.load(Ordering::SeqCst),
+                        emergency.load(Ordering::SeqCst),
+                        start_time_ms,
+                        now_ms,
+                        &monitor_events,
+                        trading_mode,
+                        HashMap::new(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        has_monitor_clients,
+                        false,
+                        tick_index,
+                        false,
+                    );
+                    if monitor_render_tx.try_send(request).is_ok() {
+                        monitor_render_in_flight = true;
+                        state_dirty = false;
+                    }
                 }
-                let _ = state_broadcaster.send(monitor_state);
-                state_dirty = false;
             }
             _ = snapshot_refresh.tick() => {
                 stats.snapshot_resync_count += 1;
@@ -9070,6 +9697,7 @@ async fn run_paper_ws_mode(
 
     abort_join_handles(&mut ws_tasks).await;
     abort_optional_join_handle(&mut funding_refresh_task).await;
+    abort_optional_join_handle(&mut monitor_render_task).await;
 
     let final_monitor_state = current_state
         .read()
@@ -9344,7 +9972,44 @@ async fn run_paper_multi_ws_mode(
     }
     let _ = state_broadcaster.send(initial_monitor_state);
 
-    let mut ws_tasks = spawn_ws_market_data_tasks(manager.clone(), &settings, &markets, depth);
+    let monitor_market_cache: Arc<std::sync::RwLock<HashMap<Symbol, MonitorMarketSeed>>> =
+        Arc::new(std::sync::RwLock::new(HashMap::new()));
+    refresh_multi_monitor_cache(
+        &monitor_market_cache,
+        &symbols,
+        &observed,
+        &engine,
+        &execution,
+        &risk,
+    );
+    let (monitor_render_tx, mut monitor_render_rx) =
+        mpsc::channel::<MultiMonitorRenderRequest>(1);
+    let (monitor_render_result_tx, mut monitor_render_result_rx) =
+        mpsc::channel::<MultiMonitorRenderResult>(1);
+    let monitor_market_cache_clone = Arc::clone(&monitor_market_cache);
+    let mut monitor_render_task = Some(tokio::spawn(async move {
+        while let Some(request) = monitor_render_rx.recv().await {
+            let result = {
+                let cache = monitor_market_cache_clone
+                    .read()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_default();
+                build_multi_monitor_state_from_seed_cache(&request, &cache)
+            };
+            if monitor_render_result_tx.send(result).await.is_err() {
+                break;
+            }
+        }
+    }));
+    let mut monitor_render_in_flight = false;
+
+    let mut ws_tasks = spawn_ws_market_data_tasks(
+        manager.clone(),
+        &settings,
+        &markets,
+        depth,
+        stats.polymarket_ws_diagnostics.clone(),
+    );
 
     let mut warmup_task: Option<JoinHandle<()>> = None;
     let mut warmup_completed_markets = 0usize;
@@ -9445,10 +10110,43 @@ async fn run_paper_multi_ws_mode(
     funding_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
     funding_poll.tick().await;
     let mut state_dirty = true;
+    let mut market_data_events_since_last_tick = 0_u64;
 
     let loop_result: Result<()> = async {
         loop {
             tokio::select! {
+            Some(rendered) = monitor_render_result_rx.recv() => {
+                monitor_render_in_flight = false;
+                if let Some(alert) = rendered.readiness_alert.clone() {
+                    push_event_with_context(
+                        &mut recent_events,
+                        alert.kind,
+                        alert.summary,
+                        None,
+                        None,
+                        None,
+                        alert.details,
+                    );
+                    last_strategy_readiness_event_ms = Some(rendered.now_ms);
+                    state_dirty = true;
+                }
+                if let Some(audit) = audit.as_mut() {
+                    audit.maybe_record_runtime_state(
+                        &rendered.stats,
+                        &rendered.monitor_state,
+                        rendered.tick_index,
+                        rendered.now_ms,
+                    )?;
+                }
+                if rendered.has_monitor_clients {
+                    if let Ok(mut guard) = current_state.write() {
+                        *guard = Some(rendered.monitor_state.clone());
+                    }
+                    let _ = state_broadcaster.send(rendered.monitor_state);
+                } else if let Ok(mut guard) = current_state.write() {
+                    *guard = Some(rendered.monitor_state);
+                }
+            }
             Some(result) = funding_refresh_rx.recv() => {
                 funding_refresh_task = None;
                 handle_funding_refresh_result(&mut stats, &mut recent_events, result);
@@ -9485,6 +10183,14 @@ async fn run_paper_multi_ws_mode(
                         }
                         warmup_status_by_symbol.insert(market.symbol.clone(), status);
                         apply_market_warmup_data(&market, &mut engine, &data);
+                        refresh_multi_monitor_cache(
+                            &monitor_market_cache,
+                            std::slice::from_ref(&market.symbol),
+                            &observed,
+                            &engine,
+                            &execution,
+                            &risk,
+                        );
                         if let Some(message) = market_warmup_diagnostic_message(&market, &data) {
                             println!("{message}");
                             push_event_simple(&mut recent_events, "warmup", message);
@@ -9597,6 +10303,10 @@ async fn run_paper_multi_ws_mode(
             event = market_data_rx.recv() => {
                 match event {
                     Ok(event) => {
+                        let refresh_symbols =
+                            monitor_cache_symbols_for_market_event(&event, &registry, &symbols);
+                        market_data_events_since_last_tick =
+                            market_data_events_since_last_tick.saturating_add(1);
                         handle_multi_market_event(
                             event,
                             &settings,
@@ -9614,20 +10324,37 @@ async fn run_paper_multi_ws_mode(
                             bootstrap_in_flight,
                             &mut audit,
                         ).await?;
+                        if !refresh_symbols.is_empty() {
+                            refresh_multi_monitor_cache(
+                                &monitor_market_cache,
+                                &refresh_symbols,
+                                &observed,
+                                &engine,
+                                &execution,
+                                &risk,
+                            );
+                        }
                         state_dirty = true;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(lagged_messages)) => {
+                        record_market_data_rx_lag(&mut stats, lagged_messages as u64);
+                        continue;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
             _ = housekeeping.tick() => {
+                record_market_data_tick_drain(
+                    &mut stats,
+                    &mut market_data_events_since_last_tick,
+                );
                 stats.ticks_processed += 1;
                 let tick_index = stats.ticks_processed;
                 let now_ms = now_millis();
                 let now_secs = now_ms / 1000;
 
                 drain_command_events(&command_center, &mut recent_events);
-                process_pending_command_multi(
+                let commands_processed = process_pending_command_multi(
                     &command_center,
                     &paused,
                     &emergency,
@@ -9644,6 +10371,16 @@ async fn run_paper_multi_ws_mode(
                     now_ms,
                 ).await?;
                 drain_command_events(&command_center, &mut recent_events);
+                if commands_processed {
+                    refresh_multi_monitor_cache(
+                        &monitor_market_cache,
+                        &symbols,
+                        &observed,
+                        &engine,
+                        &execution,
+                        &risk,
+                    );
+                }
 
                 for market in &markets {
                     if next_market_lifecycle_phase(
@@ -9709,16 +10446,18 @@ async fn run_paper_multi_ws_mode(
 
                 let monitor_client_count = *monitor_client_count.read().await;
                 let has_monitor_clients = monitor_client_count > 0;
-                if should_build_monitor_state(monitor_client_count, audit.as_ref(), now_ms) {
-                    let mut monitor_events = build_monitor_events(&recent_events);
-                    let mut monitor_state = build_multi_monitor_state(
+                let should_render =
+                    should_build_monitor_state(monitor_client_count, audit.as_ref(), now_ms);
+                if !should_render {
+                    state_dirty = false;
+                } else if !monitor_render_in_flight {
+                    let monitor_events = build_monitor_events(&recent_events);
+                    let request = build_monitor_render_request(
                         &settings,
-                        &markets,
-                        &engine,
-                        &observed,
                         &stats,
+                        &observed,
+                        &engine,
                         &risk,
-                        &execution,
                         &mut trade_book,
                         &command_center,
                         paused.load(Ordering::SeqCst),
@@ -9727,54 +10466,26 @@ async fn run_paper_multi_ws_mode(
                         now_ms,
                         &monitor_events,
                         trading_mode,
-                    );
-                    apply_strategy_health_to_monitor_state(
-                        &mut monitor_state,
-                        &warmup_status_by_symbol,
+                        warmup_status_by_symbol.clone(),
                         min_warmup_samples,
                         warmup_total_markets,
                         warmup_completed_markets,
                         warmup_failed_markets,
+                        has_monitor_clients,
+                        last_strategy_readiness_event_ms
+                            .map(|last_seen_ms| {
+                                now_ms.saturating_sub(last_seen_ms)
+                                    >= STRATEGY_READINESS_ALERT_INTERVAL_MS
+                            })
+                            .unwrap_or(true),
+                        tick_index,
+                        true,
                     );
-                    if last_strategy_readiness_event_ms
-                        .map(|last_seen_ms| {
-                            now_ms.saturating_sub(last_seen_ms)
-                                >= STRATEGY_READINESS_ALERT_INTERVAL_MS
-                        })
-                        .unwrap_or(true)
-                    {
-                        if let Some(alert) = strategy_readiness_alert(
-                            &monitor_state.runtime.strategy_health,
-                            now_ms.saturating_sub(start_time_ms),
-                            stats.signals_seen,
-                        ) {
-                            push_event_with_context(
-                                &mut recent_events,
-                                alert.kind,
-                                alert.summary,
-                                None,
-                                None,
-                                None,
-                                alert.details,
-                            );
-                            last_strategy_readiness_event_ms = Some(now_ms);
-                            monitor_events = build_monitor_events(&recent_events);
-                            monitor_state.recent_events = monitor_events.clone();
-                        }
-                    }
-                    if let Some(audit) = audit.as_mut() {
-                        audit.maybe_record_runtime_state(&stats, &monitor_state, tick_index, now_ms)?;
-                    }
-                    if has_monitor_clients {
-                        if let Ok(mut guard) = current_state.write() {
-                            *guard = Some(monitor_state.clone());
-                        }
-                        let _ = state_broadcaster.send(monitor_state);
-                    } else if let Ok(mut guard) = current_state.write() {
-                        *guard = Some(monitor_state);
+                    if monitor_render_tx.try_send(request).is_ok() {
+                        monitor_render_in_flight = true;
+                        state_dirty = false;
                     }
                 }
-                state_dirty = false;
             }
             _ = snapshot_refresh.tick() => {
                 if bootstrap_in_flight {
@@ -9829,6 +10540,7 @@ async fn run_paper_multi_ws_mode(
     abort_optional_join_handle(&mut bootstrap_task).await;
     abort_optional_join_handle(&mut warmup_task).await;
     abort_optional_join_handle(&mut funding_refresh_task).await;
+    abort_optional_join_handle(&mut monitor_render_task).await;
 
     println!(
         "多市场模拟盘已完成，共处理 {} 个轮次。",
@@ -10116,6 +10828,52 @@ fn observe_market_event(observed: &mut ObservedState, event: &MarketDataEvent) {
                 },
             );
         }
+        MarketDataEvent::CexVenueOrderBookUpdate {
+            exchange,
+            bids,
+            asks,
+            exchange_timestamp_ms,
+            received_at_ms,
+            sequence,
+            ..
+        } => {
+            record_connection_activity(observed, *exchange, *received_at_ms);
+            if let Some(mid) = mid_from_price_levels(bids, asks) {
+                update_observed_leg(
+                    observed,
+                    InstrumentKind::CexPerp,
+                    mid,
+                    *received_at_ms,
+                    ObservedDataVersion {
+                        exchange_timestamp_ms: *exchange_timestamp_ms,
+                        sequence: *sequence,
+                        received_at_ms: *received_at_ms,
+                    },
+                );
+            }
+        }
+        MarketDataEvent::CexVenueTradeUpdate {
+            exchange,
+            price,
+            timestamp_ms,
+            ..
+        } => {
+            record_connection_activity(observed, *exchange, *timestamp_ms);
+            update_observed_leg(
+                observed,
+                InstrumentKind::CexPerp,
+                price.0,
+                *timestamp_ms,
+                ObservedDataVersion {
+                    exchange_timestamp_ms: *timestamp_ms,
+                    sequence: 0,
+                    received_at_ms: *timestamp_ms,
+                },
+            );
+        }
+        MarketDataEvent::CexVenueFundingRate { exchange, .. } => {
+            record_connection_activity(observed, *exchange, now_millis());
+        }
         MarketDataEvent::FundingRate { exchange, .. } => {
             record_connection_activity(observed, *exchange, now_millis());
         }
@@ -10130,13 +10888,18 @@ fn observe_market_event(observed: &mut ObservedState, event: &MarketDataEvent) {
 }
 
 fn mid_from_book(snapshot: &polyalpha_core::OrderBookSnapshot) -> Option<Decimal> {
-    let best_bid = snapshot
-        .bids
+    mid_from_price_levels(&snapshot.bids, &snapshot.asks)
+}
+
+fn mid_from_price_levels(
+    bids: &[polyalpha_core::PriceLevel],
+    asks: &[polyalpha_core::PriceLevel],
+) -> Option<Decimal> {
+    let best_bid = bids
         .iter()
         .max_by(|left, right| left.price.cmp(&right.price))
         .map(|level| level.price.0);
-    let best_ask = snapshot
-        .asks
+    let best_ask = asks
         .iter()
         .min_by(|left, right| left.price.cmp(&right.price))
         .map(|level| level.price.0);
@@ -10478,6 +11241,15 @@ fn summarize_market_event(event: &MarketDataEvent) -> String {
             snapshot.symbol.0,
             format_instrument_label(snapshot.instrument)
         ),
+        MarketDataEvent::CexVenueOrderBookUpdate {
+            exchange,
+            venue_symbol,
+            ..
+        } => format!(
+            "订单簿更新 {} {}（交易所聚合）",
+            format_exchange_label(*exchange),
+            venue_symbol
+        ),
         MarketDataEvent::TradeUpdate {
             exchange,
             symbol,
@@ -10491,6 +11263,17 @@ fn summarize_market_event(event: &MarketDataEvent) -> String {
             format_instrument_label(*instrument),
             price.0.normalize()
         ),
+        MarketDataEvent::CexVenueTradeUpdate {
+            exchange,
+            venue_symbol,
+            price,
+            ..
+        } => format!(
+            "成交更新 {} {}（交易所聚合）@ {}",
+            format_exchange_label(*exchange),
+            venue_symbol,
+            price.0.normalize()
+        ),
         MarketDataEvent::FundingRate {
             exchange,
             symbol,
@@ -10500,6 +11283,17 @@ fn summarize_market_event(event: &MarketDataEvent) -> String {
             "资金费更新 {} {} {}",
             format_exchange_label(*exchange),
             symbol.0,
+            rate.normalize()
+        ),
+        MarketDataEvent::CexVenueFundingRate {
+            exchange,
+            venue_symbol,
+            rate,
+            ..
+        } => format!(
+            "资金费更新 {} {} {}（交易所聚合）",
+            format_exchange_label(*exchange),
+            venue_symbol,
             rate.normalize()
         ),
         MarketDataEvent::MarketLifecycle { symbol, phase, .. } => format!(
@@ -10861,6 +11655,13 @@ fn gate_reason_label_zh(gate: &str, reason: &str) -> String {
             "path_dependent_market_not_supported" => {
                 "触达类题型暂未纳入主策略，禁止新开仓".to_owned()
             }
+            "all_time_high_market_not_supported" => {
+                "历史新高类题型暂未纳入主策略，禁止新开仓".to_owned()
+            }
+            "non_price_market_not_supported" => "非价格事件题暂未纳入主策略，禁止新开仓".to_owned(),
+            "terminal_price_market_not_supported" => {
+                "该价格题型未纳入主策略，禁止新开仓".to_owned()
+            }
             _ => "价格过滤未通过".to_owned(),
         },
         "risk_guard" => {
@@ -11051,7 +11852,11 @@ fn add_trigger_details(details: &mut EventDetails, trigger: &RuntimeTrigger) {
             "买入方向",
             format_token_side_label(candidate.token_side),
         );
-        insert_detail(details, "模型参考价", format_detail_f64(candidate.fair_value));
+        insert_detail(
+            details,
+            "模型参考价",
+            format_detail_f64(candidate.fair_value),
+        );
         insert_detail(
             details,
             "模型价差",
@@ -11068,7 +11873,11 @@ fn add_trigger_details(details: &mut EventDetails, trigger: &RuntimeTrigger) {
             format_detail_f64(candidate.risk_budget_usd),
         );
         insert_detail_opt(details, "Z值", candidate.z_score.map(format_detail_f64));
-        insert_detail(details, "参考价状态", candidate_reference_price_state_label(candidate));
+        insert_detail(
+            details,
+            "参考价状态",
+            candidate_reference_price_state_label(candidate),
+        );
         insert_detail_opt(
             details,
             "当前参考波动",
@@ -11138,7 +11947,11 @@ fn add_trigger_details(details: &mut EventDetails, trigger: &RuntimeTrigger) {
                     "剩余敞口概况",
                     format_residual_snapshot_detail(residual_snapshot),
                 );
-                insert_detail(details, "处理原因", recovery_reason_label_zh(*recovery_reason));
+                insert_detail(
+                    details,
+                    "处理原因",
+                    recovery_reason_label_zh(*recovery_reason),
+                );
             }
             PlanningIntent::ForceExit {
                 force_reason,
@@ -12651,6 +13464,7 @@ fn now_millis() -> u64 {
 }
 
 fn audit_counter_snapshot(stats: &PaperStats) -> AuditCounterSnapshot {
+    let ws_diagnostics = stats.polymarket_ws_diagnostics.snapshot();
     AuditCounterSnapshot {
         ticks_processed: stats.ticks_processed as u64,
         market_events: stats.market_events as u64,
@@ -12668,6 +13482,14 @@ fn audit_counter_snapshot(stats: &PaperStats) -> AuditCounterSnapshot {
         snapshot_resync_count: stats.snapshot_resync_count as u64,
         funding_refresh_count: stats.funding_refresh_count as u64,
         trades_closed: stats.trades_closed as u64,
+        market_data_rx_lag_events: stats.market_data_rx_lag_events,
+        market_data_rx_lagged_messages: stats.market_data_rx_lagged_messages,
+        market_data_tick_drain_last: stats.market_data_tick_drain_last,
+        market_data_tick_drain_max: stats.market_data_tick_drain_max,
+        polymarket_ws_text_frames: ws_diagnostics.text_frames,
+        polymarket_ws_price_change_messages: ws_diagnostics.price_change_messages,
+        polymarket_ws_book_messages: ws_diagnostics.book_messages,
+        polymarket_ws_orderbook_updates: ws_diagnostics.orderbook_updates,
     }
 }
 
@@ -12785,12 +13607,11 @@ fn build_monitor_state(
     recent_events: &[MonitorEvent],
     trading_mode: polyalpha_core::TradingMode,
 ) -> MonitorState {
-    let observed_map = HashMap::from([(market.symbol.clone(), observed.clone())]);
-    build_monitor_state_common(
+    build_single_monitor_state_from_seed_cache(
         settings,
-        std::slice::from_ref(market),
+        market,
         engine,
-        &observed_map,
+        observed,
         stats,
         risk,
         execution,
@@ -12829,6 +13650,636 @@ fn group_positions_by_symbol(
     grouped
 }
 
+fn group_positions_from_snapshot(
+    snapshot: &polyalpha_core::RiskStateSnapshot,
+) -> HashMap<Symbol, GroupedPosition> {
+    let mut grouped: HashMap<Symbol, GroupedPosition> = HashMap::new();
+
+    for position in snapshot.positions.values() {
+        let quantity = quantity_to_f64(position.quantity);
+        if quantity <= f64::EPSILON {
+            continue;
+        }
+
+        let entry = grouped.entry(position.key.symbol.clone()).or_default();
+        match position.key.instrument {
+            InstrumentKind::PolyYes => entry.poly_yes = Some(position.clone()),
+            InstrumentKind::PolyNo => entry.poly_no = Some(position.clone()),
+            InstrumentKind::CexPerp => entry.cex = Some(position.clone()),
+        }
+    }
+
+    grouped
+}
+
+#[derive(Clone, Debug, Default)]
+struct MonitorMarketSeed {
+    observed: ObservedState,
+    basis_snapshot: Option<BasisStrategySnapshot>,
+    basis_history_len: usize,
+    has_position: bool,
+    active_plan_priority: Option<String>,
+}
+
+#[derive(Clone)]
+struct MultiMonitorRenderRequest {
+    settings: Settings,
+    stats: PaperStats,
+    performance: PerformanceMetrics,
+    position_views: Vec<polyalpha_core::PositionView>,
+    recent_events: Vec<MonitorEvent>,
+    recent_trades: Vec<TradeView>,
+    recent_commands: Vec<CommandView>,
+    paused: bool,
+    emergency: bool,
+    start_time_ms: u64,
+    now_ms: u64,
+    trading_mode: polyalpha_core::TradingMode,
+    warmup_status_by_symbol: HashMap<Symbol, MarketWarmupStatus>,
+    min_warmup_samples: usize,
+    warmup_total_markets: usize,
+    warmup_completed_markets: usize,
+    warmup_failed_markets: usize,
+    has_monitor_clients: bool,
+    emit_strategy_readiness_alert: bool,
+    tick_index: usize,
+    apply_strategy_health: bool,
+}
+
+#[derive(Clone)]
+struct MultiMonitorRenderResult {
+    monitor_state: MonitorState,
+    stats: PaperStats,
+    tick_index: usize,
+    now_ms: u64,
+    has_monitor_clients: bool,
+    readiness_alert: Option<StrategyReadinessAlert>,
+}
+
+fn build_monitor_market_seed_from_observed(
+    symbol: &Symbol,
+    observed: &ObservedState,
+    engine: &SimpleAlphaEngine,
+    execution: &ExecutionManager<RuntimeExecutor>,
+    risk: &InMemoryRiskManager,
+) -> MonitorMarketSeed {
+    let basis_snapshot = engine.basis_snapshot(symbol);
+    let (yes_basis_history_len, no_basis_history_len) = engine.basis_history_lengths(symbol);
+
+    MonitorMarketSeed {
+        observed: observed.clone(),
+        basis_snapshot,
+        basis_history_len: yes_basis_history_len.max(no_basis_history_len),
+        has_position: risk.position_tracker().symbol_has_open_position(symbol),
+        active_plan_priority: execution.active_plan_priority(symbol).map(str::to_owned),
+    }
+}
+
+fn build_monitor_market_seed(
+    symbol: &Symbol,
+    observed_map: &HashMap<Symbol, ObservedState>,
+    engine: &SimpleAlphaEngine,
+    execution: &ExecutionManager<RuntimeExecutor>,
+    risk: &InMemoryRiskManager,
+) -> MonitorMarketSeed {
+    let observed = observed_map.get(symbol).cloned().unwrap_or_default();
+    build_monitor_market_seed_from_observed(symbol, &observed, engine, execution, risk)
+}
+
+fn refresh_multi_monitor_cache(
+    cache: &Arc<std::sync::RwLock<HashMap<Symbol, MonitorMarketSeed>>>,
+    symbols: &[Symbol],
+    observed_map: &HashMap<Symbol, ObservedState>,
+    engine: &SimpleAlphaEngine,
+    execution: &ExecutionManager<RuntimeExecutor>,
+    risk: &InMemoryRiskManager,
+) {
+    if let Ok(mut guard) = cache.write() {
+        for symbol in symbols {
+            guard.insert(
+                symbol.clone(),
+                build_monitor_market_seed(symbol, observed_map, engine, execution, risk),
+            );
+        }
+    }
+}
+
+fn refresh_single_monitor_cache(
+    cache: &Arc<std::sync::RwLock<HashMap<Symbol, MonitorMarketSeed>>>,
+    symbol: &Symbol,
+    observed: &ObservedState,
+    engine: &SimpleAlphaEngine,
+    execution: &ExecutionManager<RuntimeExecutor>,
+    risk: &InMemoryRiskManager,
+) {
+    if let Ok(mut guard) = cache.write() {
+        guard.insert(
+            symbol.clone(),
+            build_monitor_market_seed_from_observed(symbol, observed, engine, execution, risk),
+        );
+    }
+}
+
+fn build_market_view_from_seed(
+    settings: &Settings,
+    market: &MarketConfig,
+    seed: Option<&MonitorMarketSeed>,
+    now_ms: u64,
+) -> MarketView {
+    let basis = effective_basis_config_for_market(settings, market);
+    let thresholds = freshness_thresholds(settings, &basis);
+    let require_connections = require_connected_inputs(&basis);
+    let observed = seed.map(|seed| &seed.observed);
+    let snapshot = seed.and_then(|seed| seed.basis_snapshot.as_ref());
+    let active_token_side_value = snapshot.map(|item| item.token_side);
+    let active_token_side = snapshot
+        .map(|item| format!("{:?}", item.token_side).to_ascii_uppercase());
+    let has_position = seed.map(|item| item.has_position).unwrap_or(false);
+    let poly_yes_price = observed.and_then(|item| item.poly_yes_mid.and_then(|value| value.to_f64()));
+    let poly_no_price = observed.and_then(|item| item.poly_no_mid.and_then(|value| value.to_f64()));
+    let poly_price = match snapshot.map(|item| item.token_side) {
+        Some(TokenSide::Yes) => poly_yes_price.or(poly_no_price),
+        Some(TokenSide::No) => poly_no_price.or(poly_yes_price),
+        None => poly_yes_price.or(poly_no_price),
+    };
+    let async_snapshot = observed.map(|item| {
+        classify_async_market(
+            now_ms,
+            market,
+            item,
+            thresholds,
+            active_token_side_value,
+            false,
+            require_connections,
+        )
+    });
+    let retention_reason = market_retention_reason(
+        has_position,
+        seed.and_then(|item| item.active_plan_priority.as_deref()),
+    );
+    let near_opportunity = market_is_near_opportunity(settings, snapshot);
+    let semantics_guard_active =
+        market_open_semantics_guard_reason(market, &settings.strategy.market_scope, now_ms)
+            .is_some();
+    let market_tier = determine_market_tier(
+        settings,
+        !semantics_guard_active
+            && async_snapshot
+                .as_ref()
+                .is_some_and(async_snapshot_is_tradeable),
+        retention_reason,
+        !semantics_guard_active && near_opportunity,
+        observed.and_then(|item| item.market_pool.last_focus_at_ms),
+        observed.and_then(|item| item.market_pool.last_tradeable_at_ms),
+        observed
+            .and_then(|item| market_pool_cooldown_reason(item, now_ms))
+            .is_some(),
+        now_ms,
+    );
+
+    MarketView {
+        symbol: market.symbol.0.clone(),
+        z_score: snapshot.and_then(|item| item.z_score),
+        basis_pct: snapshot.map(|item| item.signal_basis * 100.0),
+        poly_price,
+        poly_yes_price,
+        poly_no_price,
+        cex_price: observed.and_then(|item| item.cex_mid.and_then(|value| value.to_f64())),
+        fair_value: snapshot.map(|item| item.fair_value),
+        has_position,
+        minutes_to_expiry: snapshot.map(|item| item.minutes_to_expiry),
+        basis_history_len: seed.map(|item| item.basis_history_len).unwrap_or_default(),
+        raw_sigma: snapshot.and_then(|item| item.raw_sigma),
+        effective_sigma: snapshot.and_then(|item| item.sigma),
+        sigma_source: snapshot.map(|item| item.sigma_source.clone()),
+        returns_window_len: snapshot
+            .map(|item| item.returns_window_len)
+            .unwrap_or_default(),
+        active_token_side,
+        poly_updated_at_ms: async_snapshot
+            .as_ref()
+            .and_then(|item| item.poly_updated_at_ms),
+        cex_updated_at_ms: async_snapshot
+            .as_ref()
+            .and_then(|item| item.cex_updated_at_ms),
+        poly_quote_age_ms: async_snapshot
+            .as_ref()
+            .and_then(|item| item.poly_quote_age_ms),
+        cex_quote_age_ms: async_snapshot
+            .as_ref()
+            .and_then(|item| item.cex_quote_age_ms),
+        cross_leg_skew_ms: async_snapshot
+            .as_ref()
+            .and_then(|item| item.cross_leg_skew_ms),
+        evaluable_status: async_snapshot
+            .as_ref()
+            .map(|item| item.evaluable_status)
+            .unwrap_or_default(),
+        async_classification: async_snapshot
+            .as_ref()
+            .map(|item| item.async_classification)
+            .unwrap_or_default(),
+        market_tier,
+        retention_reason,
+        last_focus_at_ms: observed.and_then(|item| item.market_pool.last_focus_at_ms),
+        last_tradeable_at_ms: observed.and_then(|item| item.market_pool.last_tradeable_at_ms),
+    }
+}
+
+fn aggregate_connections_from_seed_cache(
+    market_seeds: &HashMap<Symbol, MonitorMarketSeed>,
+    now_ms: u64,
+) -> HashMap<String, ConnectionInfo> {
+    let mut out = HashMap::new();
+    for seed in market_seeds.values() {
+        for (name, status) in &seed.observed.connections {
+            let updated_at_ms = seed.observed.connection_updated_at_ms.get(name).copied();
+            let reconnect_count = seed
+                .observed
+                .connection_reconnect_count
+                .get(name)
+                .copied()
+                .unwrap_or_default();
+            let disconnect_count = seed
+                .observed
+                .connection_disconnect_count
+                .get(name)
+                .copied()
+                .unwrap_or_default();
+            let last_disconnect_at_ms = seed
+                .observed
+                .connection_last_disconnect_at_ms
+                .get(name)
+                .copied();
+
+            out.entry(name.clone())
+                .and_modify(|info: &mut ConnectionInfo| {
+                    info.status = *status;
+                    if updated_at_ms.unwrap_or_default() > info.updated_at_ms.unwrap_or_default() {
+                        info.updated_at_ms = updated_at_ms;
+                    }
+                    info.reconnect_count = info.reconnect_count.max(reconnect_count);
+                    info.disconnect_count = info.disconnect_count.max(disconnect_count);
+                    if last_disconnect_at_ms.unwrap_or_default()
+                        > info.last_disconnect_at_ms.unwrap_or_default()
+                    {
+                        info.last_disconnect_at_ms = last_disconnect_at_ms;
+                    }
+                })
+                .or_insert(ConnectionInfo {
+                    status: *status,
+                    latency_ms: None,
+                    updated_at_ms,
+                    transport_idle_ms: updated_at_ms.map(|ts| now_ms.saturating_sub(ts)),
+                    reconnect_count,
+                    disconnect_count,
+                    last_disconnect_at_ms,
+                });
+        }
+    }
+
+    for info in out.values_mut() {
+        info.transport_idle_ms = info.updated_at_ms.map(|ts| now_ms.saturating_sub(ts));
+    }
+
+    out
+}
+
+fn build_performance_metrics(
+    settings: &Settings,
+    trading_mode: polyalpha_core::TradingMode,
+    stats: &PaperStats,
+    risk_snapshot: &polyalpha_core::RiskStateSnapshot,
+    position_views: &[polyalpha_core::PositionView],
+    trade_book: &mut TradeBook,
+    now_ms: u64,
+) -> PerformanceMetrics {
+    let open_unrealized_pnl: f64 = position_views
+        .iter()
+        .map(|position| position.total_pnl_usd)
+        .sum();
+    let realized_pnl_usd: f64 = risk_snapshot
+        .positions
+        .values()
+        .map(|position| position.realized_pnl.0.to_f64().unwrap_or_default())
+        .sum();
+    let total_pnl_usd = stats.total_pnl_usd + realized_pnl_usd + open_unrealized_pnl;
+    let initial_capital = runtime_initial_capital(settings, trading_mode);
+    let equity = initial_capital + total_pnl_usd;
+    trade_book.push_equity(now_ms, equity);
+
+    PerformanceMetrics {
+        total_pnl_usd,
+        today_pnl_usd: trade_book.today_pnl_usd(equity, initial_capital, now_ms),
+        win_rate_pct: trade_book.win_rate_pct(),
+        max_drawdown_pct: trade_book.max_drawdown_pct(),
+        profit_factor: trade_book.profit_factor(),
+        equity,
+        initial_capital,
+    }
+}
+
+fn build_monitor_render_request(
+    settings: &Settings,
+    stats: &PaperStats,
+    observed_map: &HashMap<Symbol, ObservedState>,
+    engine: &SimpleAlphaEngine,
+    risk: &InMemoryRiskManager,
+    trade_book: &mut TradeBook,
+    command_center: &Arc<Mutex<CommandCenter>>,
+    paused: bool,
+    emergency: bool,
+    start_time_ms: u64,
+    now_ms: u64,
+    recent_events: &[MonitorEvent],
+    trading_mode: polyalpha_core::TradingMode,
+    warmup_status_by_symbol: HashMap<Symbol, MarketWarmupStatus>,
+    min_warmup_samples: usize,
+    warmup_total_markets: usize,
+    warmup_completed_markets: usize,
+    warmup_failed_markets: usize,
+    has_monitor_clients: bool,
+    emit_strategy_readiness_alert: bool,
+    tick_index: usize,
+    apply_strategy_health: bool,
+) -> MultiMonitorRenderRequest {
+    let risk_snapshot = risk.build_snapshot(now_ms);
+    let grouped_positions = group_positions_from_snapshot(&risk_snapshot);
+    let position_views = build_position_views(
+        settings,
+        &grouped_positions,
+        observed_map,
+        engine,
+        trade_book,
+        now_ms,
+    );
+    let performance = build_performance_metrics(
+        settings,
+        trading_mode,
+        stats,
+        &risk_snapshot,
+        &position_views,
+        trade_book,
+        now_ms,
+    );
+    let recent_commands = command_center
+        .lock()
+        .map(|center| center.recent_commands())
+        .unwrap_or_default();
+
+    MultiMonitorRenderRequest {
+        settings: settings.clone(),
+        stats: stats.clone(),
+        performance,
+        position_views,
+        recent_events: recent_events.to_vec(),
+        recent_trades: trade_book.recent_trades(),
+        recent_commands,
+        paused,
+        emergency,
+        start_time_ms,
+        now_ms,
+        trading_mode,
+        warmup_status_by_symbol,
+        min_warmup_samples,
+        warmup_total_markets,
+        warmup_completed_markets,
+        warmup_failed_markets,
+        has_monitor_clients,
+        emit_strategy_readiness_alert,
+        tick_index,
+        apply_strategy_health,
+    }
+}
+
+fn monitor_cache_symbols_for_market_event(
+    event: &MarketDataEvent,
+    registry: &SymbolRegistry,
+    all_symbols: &[Symbol],
+) -> Vec<Symbol> {
+    match event {
+        MarketDataEvent::ConnectionEvent { .. } => all_symbols.to_vec(),
+        _ => market_symbols_for_event(event, registry),
+    }
+}
+
+fn build_multi_monitor_state_from_seed_cache(
+    request: &MultiMonitorRenderRequest,
+    market_seeds: &HashMap<Symbol, MonitorMarketSeed>,
+) -> MultiMonitorRenderResult {
+    let market_views = request
+        .settings
+        .markets
+        .iter()
+        .map(|market| {
+            build_market_view_from_seed(
+                &request.settings,
+                market,
+                market_seeds.get(&market.symbol),
+                request.now_ms,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut monitor_state = MonitorState {
+        schema_version: PLANNING_SCHEMA_VERSION,
+        timestamp_ms: request.now_ms,
+        mode: request.trading_mode,
+        uptime_secs: (request.now_ms.saturating_sub(request.start_time_ms)) / 1000,
+        paused: request.paused,
+        emergency: request.emergency,
+        performance: request.performance.clone(),
+        positions: request.position_views.clone(),
+        markets: market_views,
+        signals: polyalpha_core::SignalStats {
+            seen: request.stats.signals_seen as u64,
+            rejected: request.stats.signals_rejected as u64,
+            rejection_reasons: request.stats.rejection_reasons.clone(),
+        },
+        evaluation: EvaluationStats {
+            attempts: request.stats.evaluation_attempts,
+            evaluable_passes: request.stats.evaluable_passes,
+            skipped: request.stats.evaluation_skipped,
+            execution_rejected: request.stats.execution_rejected,
+            skip_reasons: request.stats.skip_reasons.clone(),
+            evaluable_status_counts: request.stats.evaluable_status_counts.clone(),
+            async_classification_counts: request.stats.async_classification_counts.clone(),
+        },
+        config: build_monitor_strategy_config(&request.settings, &request.settings.markets),
+        runtime: MonitorRuntimeStats {
+            snapshot_resync_count: request.stats.snapshot_resync_count as u64,
+            funding_refresh_count: request.stats.funding_refresh_count as u64,
+            market_data_rx_lag_events: request.stats.market_data_rx_lag_events,
+            market_data_rx_lagged_messages: request.stats.market_data_rx_lagged_messages,
+            market_data_tick_drain_last: request.stats.market_data_tick_drain_last,
+            market_data_tick_drain_max: request.stats.market_data_tick_drain_max,
+            polymarket_ws_text_frames: request.stats.polymarket_ws_diagnostics.snapshot().text_frames,
+            polymarket_ws_price_change_messages: request
+                .stats
+                .polymarket_ws_diagnostics
+                .snapshot()
+                .price_change_messages,
+            polymarket_ws_book_messages: request.stats.polymarket_ws_diagnostics.snapshot().book_messages,
+            polymarket_ws_orderbook_updates: request
+                .stats
+                .polymarket_ws_diagnostics
+                .snapshot()
+                .orderbook_updates,
+            strategy_health: StrategyHealthView::default(),
+        },
+        connections: aggregate_connections_from_seed_cache(market_seeds, request.now_ms),
+        recent_events: request.recent_events.clone(),
+        recent_trades: request.recent_trades.clone(),
+        recent_commands: request.recent_commands.clone(),
+    };
+
+    if request.apply_strategy_health {
+        apply_strategy_health_to_monitor_state(
+            &mut monitor_state,
+            &request.warmup_status_by_symbol,
+            request.min_warmup_samples,
+            request.warmup_total_markets,
+            request.warmup_completed_markets,
+            request.warmup_failed_markets,
+        );
+    }
+
+    let readiness_alert = if request.apply_strategy_health && request.emit_strategy_readiness_alert
+    {
+        strategy_readiness_alert(
+            &monitor_state.runtime.strategy_health,
+            request.now_ms.saturating_sub(request.start_time_ms),
+            request.stats.signals_seen,
+        )
+    } else {
+        None
+    };
+
+    MultiMonitorRenderResult {
+        monitor_state,
+        stats: request.stats.clone(),
+        tick_index: request.tick_index,
+        now_ms: request.now_ms,
+        has_monitor_clients: request.has_monitor_clients,
+        readiness_alert,
+    }
+}
+
+fn build_single_monitor_state_from_seed_cache(
+    settings: &Settings,
+    market: &MarketConfig,
+    engine: &SimpleAlphaEngine,
+    observed: &ObservedState,
+    stats: &PaperStats,
+    risk: &InMemoryRiskManager,
+    execution: &ExecutionManager<RuntimeExecutor>,
+    trade_book: &mut TradeBook,
+    command_center: &Arc<Mutex<CommandCenter>>,
+    paused: bool,
+    emergency: bool,
+    start_time_ms: u64,
+    now_ms: u64,
+    recent_events: &[MonitorEvent],
+    trading_mode: polyalpha_core::TradingMode,
+) -> MonitorState {
+    let observed_map = HashMap::from([(market.symbol.clone(), observed.clone())]);
+    let mut render_settings = settings.clone();
+    render_settings.markets = vec![market.clone()];
+    let request = build_monitor_render_request(
+        &render_settings,
+        stats,
+        &observed_map,
+        engine,
+        risk,
+        trade_book,
+        command_center,
+        paused,
+        emergency,
+        start_time_ms,
+        now_ms,
+        recent_events,
+        trading_mode,
+        HashMap::new(),
+        0,
+        0,
+        0,
+        0,
+        true,
+        false,
+        0,
+        false,
+    );
+    let market_seeds = HashMap::from([(
+        market.symbol.clone(),
+        build_monitor_market_seed_from_observed(&market.symbol, observed, engine, execution, risk),
+    )]);
+
+    build_multi_monitor_state_from_seed_cache(&request, &market_seeds).monitor_state
+}
+
+fn build_multi_monitor_state_via_seed_cache(
+    settings: &Settings,
+    markets: &[MarketConfig],
+    engine: &SimpleAlphaEngine,
+    observed_map: &HashMap<Symbol, ObservedState>,
+    stats: &PaperStats,
+    risk: &InMemoryRiskManager,
+    execution: &ExecutionManager<RuntimeExecutor>,
+    trade_book: &mut TradeBook,
+    command_center: &Arc<Mutex<CommandCenter>>,
+    paused: bool,
+    emergency: bool,
+    start_time_ms: u64,
+    now_ms: u64,
+    recent_events: &[MonitorEvent],
+    trading_mode: polyalpha_core::TradingMode,
+) -> MonitorState {
+    let mut render_settings = settings.clone();
+    render_settings.markets = markets.to_vec();
+    let request = build_monitor_render_request(
+        &render_settings,
+        stats,
+        observed_map,
+        engine,
+        risk,
+        trade_book,
+        command_center,
+        paused,
+        emergency,
+        start_time_ms,
+        now_ms,
+        recent_events,
+        trading_mode,
+        HashMap::new(),
+        0,
+        0,
+        0,
+        0,
+        true,
+        false,
+        0,
+        false,
+    );
+    let market_seeds = markets
+        .iter()
+        .map(|market| {
+            (
+                market.symbol.clone(),
+                build_monitor_market_seed(
+                    &market.symbol,
+                    observed_map,
+                    engine,
+                    execution,
+                    risk,
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    build_multi_monitor_state_from_seed_cache(&request, &market_seeds).monitor_state
+}
+
+#[cfg(test)]
 fn build_monitor_state_common(
     settings: &Settings,
     markets: &[MarketConfig],
@@ -12846,6 +14297,7 @@ fn build_monitor_state_common(
     recent_events: &[MonitorEvent],
     trading_mode: polyalpha_core::TradingMode,
 ) -> MonitorState {
+    let ws_diagnostics = stats.polymarket_ws_diagnostics.snapshot();
     let grouped_positions = group_positions_by_symbol(risk, now_ms);
     let position_views = build_position_views(
         settings,
@@ -12921,6 +14373,14 @@ fn build_monitor_state_common(
         runtime: MonitorRuntimeStats {
             snapshot_resync_count: stats.snapshot_resync_count as u64,
             funding_refresh_count: stats.funding_refresh_count as u64,
+            market_data_rx_lag_events: stats.market_data_rx_lag_events,
+            market_data_rx_lagged_messages: stats.market_data_rx_lagged_messages,
+            market_data_tick_drain_last: stats.market_data_tick_drain_last,
+            market_data_tick_drain_max: stats.market_data_tick_drain_max,
+            polymarket_ws_text_frames: ws_diagnostics.text_frames,
+            polymarket_ws_price_change_messages: ws_diagnostics.price_change_messages,
+            polymarket_ws_book_messages: ws_diagnostics.book_messages,
+            polymarket_ws_orderbook_updates: ws_diagnostics.orderbook_updates,
             strategy_health: StrategyHealthView::default(),
         },
         connections,
@@ -12928,6 +14388,43 @@ fn build_monitor_state_common(
         recent_trades: trade_book.recent_trades(),
         recent_commands,
     }
+}
+
+#[cfg(test)]
+fn build_multi_monitor_state_legacy(
+    settings: &Settings,
+    markets: &[MarketConfig],
+    engine: &SimpleAlphaEngine,
+    observed_map: &HashMap<Symbol, ObservedState>,
+    stats: &PaperStats,
+    risk: &InMemoryRiskManager,
+    execution: &ExecutionManager<RuntimeExecutor>,
+    trade_book: &mut TradeBook,
+    command_center: &Arc<Mutex<CommandCenter>>,
+    paused: bool,
+    emergency: bool,
+    start_time_ms: u64,
+    now_ms: u64,
+    recent_events: &[MonitorEvent],
+    trading_mode: polyalpha_core::TradingMode,
+) -> MonitorState {
+    build_monitor_state_common(
+        settings,
+        markets,
+        engine,
+        observed_map,
+        stats,
+        risk,
+        execution,
+        trade_book,
+        command_center,
+        paused,
+        emergency,
+        start_time_ms,
+        now_ms,
+        recent_events,
+        trading_mode,
+    )
 }
 
 fn build_monitor_strategy_config(
@@ -12939,8 +14436,9 @@ fn build_monitor_strategy_config(
         let mut grouped = BTreeMap::new();
         for market in markets {
             let effective = effective_basis_config_for_market(settings, market);
-            grouped.entry(effective.asset_key.clone()).or_insert_with(|| {
-                MonitorAssetStrategyConfig {
+            grouped
+                .entry(effective.asset_key.clone())
+                .or_insert_with(|| MonitorAssetStrategyConfig {
                     asset: effective.asset_key.to_ascii_uppercase(),
                     entry_z: effective
                         .entry_z_score_threshold
@@ -12976,20 +14474,13 @@ fn build_monitor_strategy_config(
                     delta_rebalance_interval_secs: effective.delta_rebalance_interval_secs,
                     enable_freshness_check: effective.enable_freshness_check,
                     reject_on_disconnect: effective.reject_on_disconnect,
-                }
-            });
+                });
         }
         grouped.into_values().collect::<Vec<_>>()
     };
     MonitorStrategyConfig {
-        entry_z: basis
-            .entry_z_score_threshold
-            .to_f64()
-            .unwrap_or_default(),
-        exit_z: basis
-            .exit_z_score_threshold
-            .to_f64()
-            .unwrap_or_default(),
+        entry_z: basis.entry_z_score_threshold.to_f64().unwrap_or_default(),
+        exit_z: basis.exit_z_score_threshold.to_f64().unwrap_or_default(),
         position_notional_usd: basis.max_position_usd.0.to_f64().unwrap_or_default(),
         rolling_window: basis.rolling_window_secs,
         band_policy: basis.band_policy.to_string(),
@@ -13147,6 +14638,7 @@ fn monitor_event_correlation_id(event: &PaperEventLog) -> Option<String> {
     event.correlation_id.clone()
 }
 
+#[cfg(test)]
 fn build_market_views(
     settings: &Settings,
     markets: &[MarketConfig],
@@ -13199,7 +14691,8 @@ fn build_market_views(
             );
             let near_opportunity = market_is_near_opportunity(settings, snapshot.as_ref());
             let semantics_guard_active =
-                market_open_semantics_guard_reason(market, now_ms).is_some();
+                market_open_semantics_guard_reason(market, &settings.strategy.market_scope, now_ms)
+                    .is_some();
             let market_tier = determine_market_tier(
                 settings,
                 !semantics_guard_active
@@ -13515,6 +15008,78 @@ fn update_paper_orderbook(
     apply_orderbook_snapshot(provider, registry, snapshot);
 }
 
+fn market_symbols_for_event(event: &MarketDataEvent, registry: &SymbolRegistry) -> Vec<Symbol> {
+    match event {
+        MarketDataEvent::OrderBookUpdate { snapshot } => vec![snapshot.symbol.clone()],
+        MarketDataEvent::TradeUpdate { symbol, .. }
+        | MarketDataEvent::FundingRate { symbol, .. }
+        | MarketDataEvent::MarketLifecycle { symbol, .. } => vec![symbol.clone()],
+        MarketDataEvent::CexVenueOrderBookUpdate {
+            exchange,
+            venue_symbol,
+            ..
+        }
+        | MarketDataEvent::CexVenueTradeUpdate {
+            exchange,
+            venue_symbol,
+            ..
+        }
+        | MarketDataEvent::CexVenueFundingRate {
+            exchange,
+            venue_symbol,
+            ..
+        } => registry
+            .lookup_cex_symbols(*exchange, venue_symbol)
+            .map(|symbols| symbols.to_vec())
+            .unwrap_or_default(),
+        MarketDataEvent::ConnectionEvent { .. } => Vec::new(),
+    }
+}
+
+fn update_paper_orderbook_for_event(
+    provider: &InMemoryOrderbookProvider,
+    registry: &SymbolRegistry,
+    event: &MarketDataEvent,
+) {
+    match event {
+        MarketDataEvent::OrderBookUpdate { snapshot } => {
+            update_paper_orderbook(provider, registry, snapshot);
+        }
+        MarketDataEvent::CexVenueOrderBookUpdate {
+            exchange,
+            venue_symbol,
+            bids,
+            asks,
+            exchange_timestamp_ms,
+            received_at_ms,
+            sequence,
+        } => {
+            let Some(symbols) = registry.lookup_cex_symbols(*exchange, venue_symbol) else {
+                return;
+            };
+            let Some(first_symbol) = symbols.first() else {
+                return;
+            };
+            provider.update_cex_shared(
+                polyalpha_core::OrderBookSnapshot {
+                    exchange: *exchange,
+                    symbol: first_symbol.clone(),
+                    instrument: InstrumentKind::CexPerp,
+                    bids: bids.clone(),
+                    asks: asks.clone(),
+                    exchange_timestamp_ms: *exchange_timestamp_ms,
+                    received_at_ms: *received_at_ms,
+                    sequence: *sequence,
+                    last_trade_price: None,
+                },
+                venue_symbol.clone(),
+                symbols,
+            );
+        }
+        _ => {}
+    }
+}
+
 fn record_signal_rejection(stats: &mut PaperStats, reason: impl Into<String>) {
     let reason = reason.into();
     *stats.rejection_reasons.entry(reason).or_insert(0) += 1;
@@ -13529,6 +15094,9 @@ fn is_evaluation_attempt_event(event: &MarketDataEvent) -> bool {
         event,
         MarketDataEvent::TradeUpdate { instrument, .. }
             if matches!(instrument, InstrumentKind::CexPerp)
+    ) || matches!(
+        event,
+        MarketDataEvent::CexVenueOrderBookUpdate { .. } | MarketDataEvent::CexVenueTradeUpdate { .. }
     )
 }
 
@@ -13628,6 +15196,49 @@ fn record_evaluation_attempt(
             audit.record_evaluation_skip(event, warnings, observed.cloned())?;
         }
     }
+    Ok(())
+}
+
+fn record_evaluation_attempts_for_symbols(
+    stats: &mut PaperStats,
+    recent_events: &mut VecDeque<PaperEventLog>,
+    event: &MarketDataEvent,
+    symbols: &[Symbol],
+    warnings: &[EngineWarning],
+    observed_by_symbol: &HashMap<Symbol, AuditObservedMarket>,
+    audit: &mut Option<PaperAudit>,
+) -> Result<()> {
+    if !is_evaluation_attempt_event(event) {
+        return Ok(());
+    }
+
+    if symbols.is_empty() {
+        return record_evaluation_attempt(stats, recent_events, event, warnings, None, audit);
+    }
+
+    let mut warnings_by_symbol: HashMap<Symbol, Vec<EngineWarning>> = HashMap::new();
+    for warning in warnings {
+        warnings_by_symbol
+            .entry(warning_symbol(warning).clone())
+            .or_default()
+            .push(warning.clone());
+    }
+
+    for symbol in symbols {
+        let symbol_warnings = warnings_by_symbol
+            .get(symbol)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        record_evaluation_attempt(
+            stats,
+            recent_events,
+            event,
+            symbol_warnings,
+            observed_by_symbol.get(symbol),
+            audit,
+        )?;
+    }
+
     Ok(())
 }
 
@@ -13922,7 +15533,7 @@ fn build_multi_monitor_state(
     recent_events: &[MonitorEvent],
     trading_mode: polyalpha_core::TradingMode,
 ) -> MonitorState {
-    build_monitor_state_common(
+    build_multi_monitor_state_via_seed_cache(
         settings,
         markets,
         engine,
@@ -14038,10 +15649,12 @@ fn ws_connect_delay_ms(base_backoff_ms: u64, stream_key: &str) -> u64 {
 mod tests {
     use super::*;
     use polyalpha_core::{
-        AuditConfig, BasisStrategyConfig, BinanceConfig, DmmStrategyConfig, GeneralConfig,
-        MarketDataConfig, NegRiskStrategyConfig, OkxConfig, PaperSlippageConfig,
+        AuditConfig, BasisStrategyConfig, BinanceConfig, CexBaseQty, DmmStrategyConfig,
+        GeneralConfig, MarketDataConfig, NegRiskStrategyConfig, OkxConfig, PaperSlippageConfig,
         PaperTradingConfig, PolymarketConfig, RiskConfig, SettlementRules, StrategyConfig,
+        PolymarketIds,
     };
+    use polyalpha_executor::OrderbookProvider;
     use serde_json::json;
 
     fn cex_evaluation_event() -> MarketDataEvent {
@@ -14378,6 +15991,20 @@ mod tests {
     }
 
     fn test_market(symbol: &str, exchange: Exchange, cex_symbol: &str) -> MarketConfig {
+        let strike = match cex_symbol {
+            "BTCUSDT" => Decimal::new(70_000, 0),
+            "ETHUSDT" => Decimal::new(2_000, 0),
+            "SOLUSDT" => Decimal::new(100, 0),
+            "XRPUSDT" => Decimal::new(1, 0),
+            _ => Decimal::ONE,
+        };
+        let question = match cex_symbol {
+            "BTCUSDT" => "Will the price of Bitcoin be above $70,000 on April 7?",
+            "ETHUSDT" => "Will the price of Ethereum be above $2,000 on April 7?",
+            "SOLUSDT" => "Will the price of Solana be above $100 on April 7?",
+            "XRPUSDT" => "Will the price of XRP be above $1 on April 7?",
+            _ => "Will the price of this asset be above $1 on April 7?",
+        };
         MarketConfig {
             symbol: Symbol::new(symbol),
             poly_ids: polyalpha_core::PolymarketIds {
@@ -14385,11 +16012,15 @@ mod tests {
                 yes_token_id: format!("{symbol}-yes"),
                 no_token_id: format!("{symbol}-no"),
             },
-            market_question: None,
-            market_rule: None,
+            market_question: Some(question.to_owned()),
+            market_rule: Some(polyalpha_core::MarketRule {
+                kind: polyalpha_core::MarketRuleKind::Above,
+                lower_strike: Some(Price(strike)),
+                upper_strike: None,
+            }),
             cex_symbol: cex_symbol.to_owned(),
             hedge_exchange: exchange,
-            strike_price: None,
+            strike_price: Some(Price(strike)),
             settlement_timestamp: 0,
             min_tick_size: Price(Decimal::new(1, 2)),
             neg_risk: false,
@@ -14435,11 +16066,17 @@ mod tests {
                     yes_token_id: "yes".to_owned(),
                     no_token_id: "no".to_owned(),
                 },
-                market_question: None,
-                market_rule: None,
+                market_question: Some(
+                    "Will the price of Bitcoin be above $70,000 on April 7?".to_owned(),
+                ),
+                market_rule: Some(polyalpha_core::MarketRule {
+                    kind: polyalpha_core::MarketRuleKind::Above,
+                    lower_strike: Some(Price(Decimal::new(70_000, 0))),
+                    upper_strike: None,
+                }),
                 cex_symbol: "BTCUSDT".to_owned(),
                 hedge_exchange: Exchange::Binance,
-                strike_price: None,
+                strike_price: Some(Price(Decimal::new(70_000, 0))),
                 settlement_timestamp: 0,
                 min_tick_size: Price(Decimal::new(1, 2)),
                 neg_risk: false,
@@ -14482,6 +16119,7 @@ mod tests {
                     enable_inventory_backed_short: false,
                 },
                 settlement: SettlementRules::default(),
+                market_scope: StrategyMarketScopeConfig::default(),
                 market_data: MarketDataConfig::default(),
             },
             risk: RiskConfig {
@@ -14502,10 +16140,8 @@ mod tests {
     }
 
     fn test_settings_with_per_asset_basis_overrides() -> Settings {
-        let mut settings = test_settings_with_price_filter(
-            Some(Decimal::new(20, 2)),
-            Some(Decimal::new(50, 2)),
-        );
+        let mut settings =
+            test_settings_with_price_filter(Some(Decimal::new(20, 2)), Some(Decimal::new(50, 2)));
         settings.markets = vec![
             test_market("btc-test", Exchange::Binance, "BTCUSDT"),
             test_market("eth-test", Exchange::Binance, "ETHUSDT"),
@@ -14547,6 +16183,234 @@ mod tests {
         let warehouse_dir = PathBuf::from(data_dir).join("audit").join("warehouse");
         let _ = fs::remove_dir_all(&warehouse_dir);
         fs::write(&warehouse_dir, b"blocked").expect("replace warehouse dir with file");
+    }
+
+    #[test]
+    fn diagnostics_polymarket_ws_snapshot_accumulates_counts() {
+        let diagnostics = PolymarketWsDiagnostics::default();
+
+        diagnostics.record_text_frame();
+        diagnostics.record_text_frame();
+        diagnostics.record_price_change_message();
+        diagnostics.record_book_message();
+        diagnostics.add_orderbook_updates(3);
+
+        assert_eq!(
+            diagnostics.snapshot(),
+            PolymarketWsDiagnosticsSnapshot {
+                text_frames: 2,
+                price_change_messages: 1,
+                book_messages: 1,
+                orderbook_updates: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn diagnostics_market_data_lag_and_drain_helpers_accumulate() {
+        let mut stats = PaperStats::default();
+        let mut processed_since_last_tick = 2_u64;
+
+        record_market_data_rx_lag(&mut stats, 11);
+        record_market_data_rx_lag(&mut stats, 7);
+        record_market_data_tick_drain(&mut stats, &mut processed_since_last_tick);
+
+        assert_eq!(stats.market_data_rx_lag_events, 2);
+        assert_eq!(stats.market_data_rx_lagged_messages, 18);
+        assert_eq!(stats.market_data_tick_drain_last, 2);
+        assert_eq!(stats.market_data_tick_drain_max, 2);
+        assert_eq!(processed_since_last_tick, 0);
+
+        record_market_data_tick_drain(&mut stats, &mut processed_since_last_tick);
+        assert_eq!(stats.market_data_tick_drain_last, 0);
+        assert_eq!(stats.market_data_tick_drain_max, 2);
+    }
+
+    #[test]
+    fn diagnostics_audit_counter_snapshot_includes_runtime_counters() {
+        let mut stats = PaperStats::default();
+        stats.market_data_rx_lag_events = 4;
+        stats.market_data_rx_lagged_messages = 29;
+        stats.market_data_tick_drain_last = 9;
+        stats.market_data_tick_drain_max = 15;
+        stats.polymarket_ws_diagnostics.record_text_frame();
+        stats.polymarket_ws_diagnostics.record_text_frame();
+        stats
+            .polymarket_ws_diagnostics
+            .record_price_change_message();
+        stats.polymarket_ws_diagnostics.record_book_message();
+        stats.polymarket_ws_diagnostics.add_orderbook_updates(5);
+
+        let snapshot = audit_counter_snapshot(&stats);
+
+        assert_eq!(snapshot.market_data_rx_lag_events, 4);
+        assert_eq!(snapshot.market_data_rx_lagged_messages, 29);
+        assert_eq!(snapshot.market_data_tick_drain_last, 9);
+        assert_eq!(snapshot.market_data_tick_drain_max, 15);
+        assert_eq!(snapshot.polymarket_ws_text_frames, 2);
+        assert_eq!(snapshot.polymarket_ws_price_change_messages, 1);
+        assert_eq!(snapshot.polymarket_ws_book_messages, 1);
+        assert_eq!(snapshot.polymarket_ws_orderbook_updates, 5);
+    }
+
+    #[test]
+    fn diagnostics_build_multi_monitor_state_surfaces_runtime_counters() {
+        let settings = test_settings_with_price_filter(None, None);
+        let markets = settings.markets.clone();
+        let engine =
+            SimpleAlphaEngine::with_markets(build_paper_engine_config(&settings), markets.clone());
+        let observed = HashMap::from([(markets[0].symbol.clone(), ObservedState::default())]);
+        let mut stats = PaperStats::default();
+        stats.market_data_rx_lag_events = 3;
+        stats.market_data_rx_lagged_messages = 21;
+        stats.market_data_tick_drain_last = 6;
+        stats.market_data_tick_drain_max = 12;
+        stats.polymarket_ws_diagnostics.record_text_frame();
+        stats
+            .polymarket_ws_diagnostics
+            .record_price_change_message();
+        stats.polymarket_ws_diagnostics.record_book_message();
+        stats.polymarket_ws_diagnostics.add_orderbook_updates(4);
+
+        let risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        let execution = ExecutionManager::new(RuntimeExecutor::DryRun(DryRunExecutor::default()));
+        let command_center = Arc::new(Mutex::new(CommandCenter::default()));
+        let mut trade_book = TradeBook::default();
+
+        let monitor = build_multi_monitor_state(
+            &settings,
+            &markets,
+            &engine,
+            &observed,
+            &stats,
+            &risk,
+            &execution,
+            &mut trade_book,
+            &command_center,
+            false,
+            false,
+            0,
+            1_000,
+            &[],
+            polyalpha_core::TradingMode::Paper,
+        );
+
+        assert_eq!(monitor.runtime.market_data_rx_lag_events, 3);
+        assert_eq!(monitor.runtime.market_data_rx_lagged_messages, 21);
+        assert_eq!(monitor.runtime.market_data_tick_drain_last, 6);
+        assert_eq!(monitor.runtime.market_data_tick_drain_max, 12);
+        assert_eq!(monitor.runtime.polymarket_ws_text_frames, 1);
+        assert_eq!(monitor.runtime.polymarket_ws_price_change_messages, 1);
+        assert_eq!(monitor.runtime.polymarket_ws_book_messages, 1);
+        assert_eq!(monitor.runtime.polymarket_ws_orderbook_updates, 4);
+    }
+
+    #[test]
+    fn build_multi_monitor_state_via_seed_cache_matches_public_wrapper() {
+        let settings = test_settings_with_price_filter(None, None);
+        let markets = settings.markets.clone();
+        let engine =
+            SimpleAlphaEngine::with_markets(build_paper_engine_config(&settings), markets.clone());
+        let observed = HashMap::from([(
+            markets[0].symbol.clone(),
+            ObservedState {
+                poly_yes_mid: Some(Decimal::new(48, 2)),
+                poly_no_mid: Some(Decimal::new(52, 2)),
+                cex_mid: Some(Decimal::new(81_000, 0)),
+                poly_yes_updated_at_ms: Some(1_900),
+                cex_updated_at_ms: Some(1_950),
+                connections: HashMap::from([
+                    ("Polymarket".to_owned(), ConnectionStatus::Connected),
+                    ("Binance".to_owned(), ConnectionStatus::Connected),
+                ]),
+                connection_updated_at_ms: HashMap::from([
+                    ("Polymarket".to_owned(), 1_900),
+                    ("Binance".to_owned(), 1_950),
+                ]),
+                ..ObservedState::default()
+            },
+        )]);
+        let mut stats = PaperStats::default();
+        stats.market_data_rx_lag_events = 3;
+        stats.market_data_rx_lagged_messages = 21;
+        stats.market_data_tick_drain_last = 6;
+        stats.market_data_tick_drain_max = 12;
+        stats.polymarket_ws_diagnostics.record_text_frame();
+        stats
+            .polymarket_ws_diagnostics
+            .record_price_change_message();
+        stats.polymarket_ws_diagnostics.record_book_message();
+        stats.polymarket_ws_diagnostics.add_orderbook_updates(4);
+
+        let risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        let execution = ExecutionManager::new(RuntimeExecutor::DryRun(DryRunExecutor::default()));
+        let command_center = Arc::new(Mutex::new(CommandCenter::default()));
+
+        let mut legacy_trade_book = TradeBook::default();
+        let legacy = build_multi_monitor_state_legacy(
+            &settings,
+            &markets,
+            &engine,
+            &observed,
+            &stats,
+            &risk,
+            &execution,
+            &mut legacy_trade_book,
+            &command_center,
+            false,
+            false,
+            1_000,
+            2_000,
+            &[],
+            polyalpha_core::TradingMode::Paper,
+        );
+
+        let mut reused_trade_book = TradeBook::default();
+        let reused = build_multi_monitor_state_via_seed_cache(
+            &settings,
+            &markets,
+            &engine,
+            &observed,
+            &stats,
+            &risk,
+            &execution,
+            &mut reused_trade_book,
+            &command_center,
+            false,
+            false,
+            1_000,
+            2_000,
+            &[],
+            polyalpha_core::TradingMode::Paper,
+        );
+
+        assert_eq!(reused.markets.len(), legacy.markets.len());
+        assert_eq!(reused.markets[0].symbol, legacy.markets[0].symbol);
+        assert_eq!(reused.markets[0].poly_yes_price, legacy.markets[0].poly_yes_price);
+        assert_eq!(reused.markets[0].poly_no_price, legacy.markets[0].poly_no_price);
+        assert_eq!(reused.markets[0].cex_price, legacy.markets[0].cex_price);
+        assert_eq!(
+            reused
+                .connections
+                .get("Binance")
+                .and_then(|info| info.updated_at_ms),
+            legacy
+                .connections
+                .get("Binance")
+                .and_then(|info| info.updated_at_ms)
+        );
+        assert_eq!(
+            reused.runtime.market_data_rx_lag_events,
+            legacy.runtime.market_data_rx_lag_events
+        );
+        assert_eq!(
+            reused.runtime.polymarket_ws_orderbook_updates,
+            legacy.runtime.polymarket_ws_orderbook_updates
+        );
+        assert_eq!(
+            reused.performance.total_pnl_usd,
+            legacy.performance.total_pnl_usd
+        );
     }
 
     #[test]
@@ -15317,7 +17181,10 @@ mod tests {
             .find(|event| event.summary.contains("高于或等于最大 Poly 价格带"))
             .map(|event| event.summary.as_str())
             .expect("price filter summary");
-        assert!(summary.contains("0.1 - 0.45"), "unexpected summary: {summary}");
+        assert!(
+            summary.contains("0.1 - 0.45"),
+            "unexpected summary: {summary}"
+        );
     }
 
     #[tokio::test]
@@ -15459,7 +17326,10 @@ mod tests {
             .expect("residual snapshot detail");
         assert!(snapshot_detail.contains("剩余敞口=0.125"));
         assert!(snapshot_detail.contains("优先补对冲方向=买入"));
-        assert_eq!(details.get("处理原因").map(String::as_str), Some("补 CEX 更快"));
+        assert_eq!(
+            details.get("处理原因").map(String::as_str),
+            Some("补 CEX 更快")
+        );
     }
 
     #[tokio::test]
@@ -15548,7 +17418,7 @@ mod tests {
         let emergency = Arc::new(AtomicBool::new(false));
         let pre_emergency_paused = Arc::new(AtomicBool::new(false));
 
-        process_pending_command_single(
+        let _ = process_pending_command_single(
             &command_center,
             &paused,
             &emergency,
@@ -16001,6 +17871,11 @@ mod tests {
         )
         .await
         .expect("close rejection should be downgraded");
+        audit
+            .as_mut()
+            .expect("audit session")
+            .flush()
+            .expect("flush audit events");
 
         let events = polyalpha_audit::AuditReader::load_events(&data_dir, &session_id)
             .expect("load audit events");
@@ -16165,11 +18040,13 @@ mod tests {
         let channels = create_channels(std::slice::from_ref(&market.symbol));
         let manager = build_data_manager(&registry, channels.market_data_tx.clone());
         let books = Arc::new(Mutex::new(HashMap::new()));
+        let diagnostics = PolymarketWsDiagnostics::default();
         let mut market_data_rx = channels.market_data_tx.subscribe();
 
         handle_polymarket_ws_text(
             &manager,
             &books,
+            &diagnostics,
             r#"{
                 "asset_id": "yes",
                 "timestamp": "1715000000000",
@@ -16183,6 +18060,7 @@ mod tests {
         handle_polymarket_ws_text(
             &manager,
             &books,
+            &diagnostics,
             r#"{
                 "event_type": "price_change",
                 "asset_id": "yes",
@@ -16214,6 +18092,137 @@ mod tests {
 
         assert_eq!(observed_sequences.first().copied(), Some(7));
         assert_eq!(observed_sequences.get(1).copied(), Some(8));
+        assert_eq!(
+            diagnostics.snapshot(),
+            PolymarketWsDiagnosticsSnapshot {
+                text_frames: 0,
+                price_change_messages: 1,
+                book_messages: 1,
+                orderbook_updates: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn build_multi_monitor_state_from_seed_cache_uses_seeded_market_state() {
+        let settings = test_settings_with_price_filter(None, None);
+        let market = settings.markets[0].clone();
+        let mut market_seeds = HashMap::new();
+        market_seeds.insert(
+            market.symbol.clone(),
+            MonitorMarketSeed {
+                observed: ObservedState {
+                    poly_yes_mid: Some(Decimal::new(48, 2)),
+                    poly_no_mid: Some(Decimal::new(52, 2)),
+                    cex_mid: Some(Decimal::new(80_000, 0)),
+                    poly_yes_updated_at_ms: Some(1_900),
+                    cex_updated_at_ms: Some(1_950),
+                    connections: HashMap::from([
+                        ("Polymarket".to_owned(), ConnectionStatus::Connected),
+                        ("Binance".to_owned(), ConnectionStatus::Connected),
+                    ]),
+                    connection_updated_at_ms: HashMap::from([
+                        ("Polymarket".to_owned(), 1_900),
+                        ("Binance".to_owned(), 1_950),
+                    ]),
+                    ..ObservedState::default()
+                },
+                basis_snapshot: Some(BasisStrategySnapshot {
+                    token_side: TokenSide::Yes,
+                    poly_price: 0.48,
+                    fair_value: 0.51,
+                    signal_basis: 0.03,
+                    z_score: Some(2.4),
+                    delta: 0.12,
+                    cex_reference_price: 80_000.0,
+                    sigma: Some(0.2),
+                    raw_sigma: Some(0.18),
+                    sigma_source: "realized".to_owned(),
+                    returns_window_len: 90,
+                    minutes_to_expiry: 120.0,
+                    basis_history_len: 64,
+                }),
+                basis_history_len: 64,
+                has_position: true,
+                active_plan_priority: Some("open_position".to_owned()),
+            },
+        );
+        let request = MultiMonitorRenderRequest {
+            settings: settings.clone(),
+            stats: PaperStats::default(),
+            performance: PerformanceMetrics {
+                total_pnl_usd: 12.0,
+                today_pnl_usd: 3.0,
+                win_rate_pct: 50.0,
+                max_drawdown_pct: 1.0,
+                profit_factor: 1.2,
+                equity: 10_012.0,
+                initial_capital: 10_000.0,
+            },
+            position_views: vec![polyalpha_core::PositionView {
+                market: market.symbol.0.clone(),
+                poly_side: "LONG YES".to_owned(),
+                poly_entry_price: 0.45,
+                poly_current_price: 0.48,
+                poly_quantity: 100.0,
+                poly_pnl_usd: 3.0,
+                poly_spread_pct: 0.0,
+                poly_slippage_bps: 1.0,
+                cex_exchange: "Binance".to_owned(),
+                cex_side: "SHORT".to_owned(),
+                cex_entry_price: 79_000.0,
+                cex_current_price: 80_000.0,
+                cex_quantity: 0.01,
+                cex_pnl_usd: 9.0,
+                cex_spread_pct: 0.0,
+                cex_slippage_bps: 2.0,
+                basis_entry_bps: 120,
+                basis_current_bps: 300,
+                delta: 0.12,
+                hedge_ratio: 1.0,
+                total_pnl_usd: 12.0,
+                holding_secs: 60,
+            }],
+            recent_events: Vec::new(),
+            recent_trades: Vec::new(),
+            recent_commands: Vec::new(),
+            paused: false,
+            emergency: false,
+            start_time_ms: 1_000,
+            now_ms: 2_000,
+            trading_mode: polyalpha_core::TradingMode::Paper,
+            warmup_status_by_symbol: HashMap::new(),
+            min_warmup_samples: 30,
+            warmup_total_markets: 0,
+            warmup_completed_markets: 0,
+            warmup_failed_markets: 0,
+            has_monitor_clients: true,
+            emit_strategy_readiness_alert: false,
+            tick_index: 7,
+            apply_strategy_health: true,
+        };
+
+        let result = build_multi_monitor_state_from_seed_cache(&request, &market_seeds);
+        let rendered_market = result
+            .monitor_state
+            .markets
+            .iter()
+            .find(|item| item.symbol == market.symbol.0)
+            .expect("rendered market");
+
+        assert_eq!(result.tick_index, 7);
+        assert!(result.has_monitor_clients);
+        assert_eq!(rendered_market.z_score, Some(2.4));
+        assert!(rendered_market.has_position);
+        assert_eq!(rendered_market.basis_history_len, 64);
+        assert_eq!(
+            result
+                .monitor_state
+                .connections
+                .get("Binance")
+                .and_then(|info| info.updated_at_ms),
+            Some(1_950)
+        );
     }
 
     #[test]
@@ -16678,6 +18687,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_ws_request_includes_permessage_deflate_header() {
+        let request = build_ws_request_with_optional_extensions(
+            "wss://fstream.binance.com/stream?streams=btcusdt@depth5@100ms",
+            Some("permessage-deflate; client_max_window_bits"),
+        )
+        .expect("ws request");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("Sec-WebSocket-Extensions")
+                .and_then(|value| value.to_str().ok()),
+            Some("permessage-deflate; client_max_window_bits")
+        );
+    }
+
+    #[test]
+    fn response_negotiated_extensions_extracts_header_value() {
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(101)
+            .header(
+                "Sec-WebSocket-Extensions",
+                "permessage-deflate; server_no_context_takeover",
+            )
+            .body(())
+            .expect("response");
+
+        assert_eq!(
+            negotiated_ws_extensions(&response),
+            Some("permessage-deflate; server_no_context_takeover".to_owned())
+        );
+    }
+
     #[tokio::test]
     async fn run_ws_future_with_timeout_times_out_slow_connect_attempts() {
         let err = run_ws_future_with_timeout(
@@ -16848,7 +18891,10 @@ mod tests {
         let mut details = EventDetails::new();
         add_trigger_details(&mut details, &trigger);
 
-        assert_eq!(details.get("动作").map(String::as_str), Some("处理剩余敞口"));
+        assert_eq!(
+            details.get("动作").map(String::as_str),
+            Some("处理剩余敞口")
+        );
         assert_eq!(
             details.get("当前流程").map(String::as_str),
             Some("处理剩余敞口")
@@ -16857,7 +18903,9 @@ mod tests {
             details.get("处理原因").map(String::as_str),
             Some("补 CEX 更快")
         );
-        let snapshot_detail = details.get("剩余敞口概况").expect("residual snapshot detail");
+        let snapshot_detail = details
+            .get("剩余敞口概况")
+            .expect("residual snapshot detail");
         assert!(snapshot_detail.contains("剩余敞口=0.125"));
         assert!(snapshot_detail.contains("优先补对冲方向=买入"));
     }
@@ -16887,6 +18935,7 @@ mod tests {
                 start_ms + 2_000,
             )
             .expect("runtime warehouse sync failure should not abort");
+        audit.flush().expect("flush runtime audit state");
 
         let events = polyalpha_audit::AuditReader::load_events(&data_dir, &session_id)
             .expect("load raw audit events");
@@ -16973,6 +19022,7 @@ mod tests {
                 start_ms + 200,
             )
             .expect("first runtime state should update in-memory summary");
+        audit.flush().expect("flush throttled audit summary");
 
         let summary = polyalpha_audit::AuditReader::load_summary(&data_dir, &session_id)
             .expect("load throttled summary");
@@ -16986,6 +19036,7 @@ mod tests {
                 start_ms + 1_200,
             )
             .expect("summary write should happen after throttle window");
+        audit.flush().expect("flush summary write");
 
         let summary = polyalpha_audit::AuditReader::load_summary(&data_dir, &session_id)
             .expect("load flushed summary");
@@ -17249,6 +19300,156 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_single_monitor_state_from_seed_cache_matches_legacy_monitor_state() {
+        let settings = test_settings_with_price_filter(None, None);
+        let market = settings.markets[0].clone();
+        let engine =
+            SimpleAlphaEngine::with_markets(build_paper_engine_config(&settings), settings.markets.clone());
+        let observed = ObservedState {
+            poly_yes_mid: Some(Decimal::new(48, 2)),
+            poly_no_mid: Some(Decimal::new(52, 2)),
+            cex_mid: Some(Decimal::new(81_000, 0)),
+            poly_yes_updated_at_ms: Some(1_900),
+            cex_updated_at_ms: Some(1_950),
+            connections: HashMap::from([
+                ("Polymarket".to_owned(), ConnectionStatus::Connected),
+                ("Binance".to_owned(), ConnectionStatus::Connected),
+            ]),
+            connection_updated_at_ms: HashMap::from([
+                ("Polymarket".to_owned(), 1_900),
+                ("Binance".to_owned(), 1_950),
+            ]),
+            ..ObservedState::default()
+        };
+        let mut stats = PaperStats::default();
+        stats.market_data_rx_lag_events = 2;
+        stats.market_data_rx_lagged_messages = 9;
+        stats.market_data_tick_drain_last = 3;
+        stats.market_data_tick_drain_max = 7;
+        stats.polymarket_ws_diagnostics.record_text_frame();
+        stats
+            .polymarket_ws_diagnostics
+            .record_price_change_message();
+        stats.polymarket_ws_diagnostics.record_book_message();
+        stats.polymarket_ws_diagnostics.add_orderbook_updates(5);
+
+        let risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        let execution = ExecutionManager::new(RuntimeExecutor::DryRun(DryRunExecutor::default()));
+        let command_center = Arc::new(Mutex::new(CommandCenter::default()));
+
+        let mut legacy_trade_book = TradeBook::default();
+        let legacy = build_monitor_state(
+            &settings,
+            &market,
+            &engine,
+            &observed,
+            &stats,
+            &risk,
+            &execution,
+            &mut legacy_trade_book,
+            &command_center,
+            false,
+            false,
+            1_000,
+            2_000,
+            &[],
+            polyalpha_core::TradingMode::Paper,
+        );
+
+        let mut reused_trade_book = TradeBook::default();
+        let reused = build_single_monitor_state_from_seed_cache(
+            &settings,
+            &market,
+            &engine,
+            &observed,
+            &stats,
+            &risk,
+            &execution,
+            &mut reused_trade_book,
+            &command_center,
+            false,
+            false,
+            1_000,
+            2_000,
+            &[],
+            polyalpha_core::TradingMode::Paper,
+        );
+
+        assert_eq!(reused.markets.len(), legacy.markets.len());
+        assert_eq!(reused.markets[0].symbol, legacy.markets[0].symbol);
+        assert_eq!(reused.markets[0].poly_yes_price, legacy.markets[0].poly_yes_price);
+        assert_eq!(reused.markets[0].poly_no_price, legacy.markets[0].poly_no_price);
+        assert_eq!(reused.markets[0].cex_price, legacy.markets[0].cex_price);
+        assert_eq!(
+            reused
+                .connections
+                .get("Binance")
+                .and_then(|info| info.updated_at_ms),
+            legacy
+                .connections
+                .get("Binance")
+                .and_then(|info| info.updated_at_ms)
+        );
+        assert_eq!(
+            reused.runtime.market_data_rx_lag_events,
+            legacy.runtime.market_data_rx_lag_events
+        );
+        assert_eq!(
+            reused.runtime.polymarket_ws_orderbook_updates,
+            legacy.runtime.polymarket_ws_orderbook_updates
+        );
+        assert_eq!(
+            reused.performance.total_pnl_usd,
+            legacy.performance.total_pnl_usd
+        );
+        assert_eq!(reused.positions.len(), legacy.positions.len());
+    }
+
+    #[test]
+    fn build_single_monitor_state_from_seed_cache_limits_output_to_selected_market() {
+        let mut settings = test_settings_with_price_filter(None, None);
+        let mut other_market = settings.markets[0].clone();
+        other_market.symbol = Symbol::new("eth-test");
+        other_market.cex_symbol = "ETHUSDT".to_owned();
+        settings.markets.push(other_market);
+
+        let market = settings.markets[0].clone();
+        let engine =
+            SimpleAlphaEngine::with_markets(build_paper_engine_config(&settings), settings.markets.clone());
+        let observed = ObservedState {
+            poly_yes_mid: Some(Decimal::new(48, 2)),
+            cex_mid: Some(Decimal::new(81_000, 0)),
+            ..ObservedState::default()
+        };
+        let stats = PaperStats::default();
+        let risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        let execution = ExecutionManager::new(RuntimeExecutor::DryRun(DryRunExecutor::default()));
+        let command_center = Arc::new(Mutex::new(CommandCenter::default()));
+        let mut trade_book = TradeBook::default();
+
+        let monitor = build_single_monitor_state_from_seed_cache(
+            &settings,
+            &market,
+            &engine,
+            &observed,
+            &stats,
+            &risk,
+            &execution,
+            &mut trade_book,
+            &command_center,
+            false,
+            false,
+            1_000,
+            2_000,
+            &[],
+            polyalpha_core::TradingMode::Paper,
+        );
+
+        assert_eq!(monitor.markets.len(), 1);
+        assert_eq!(monitor.markets[0].symbol, market.symbol.0);
+    }
+
     #[tokio::test]
     async fn execution_result_funding_adjustment_hits_risk_accounting() {
         let settings = test_settings_with_price_filter(None, None);
@@ -17275,6 +19476,108 @@ mod tests {
         let snapshot = risk.build_snapshot(10);
         assert_eq!(snapshot.daily_pnl, UsdNotional(Decimal::new(-3, 0)));
         assert_eq!(stats.total_pnl_usd, -3.0);
+    }
+
+    #[tokio::test]
+    async fn handle_multi_market_event_updates_all_attached_markets_for_cex_venue_orderbook() {
+        let mut settings = test_settings_with_price_filter(None, None);
+        let mut second_market = settings.markets[0].clone();
+        second_market.symbol = Symbol::new("btc-test-2");
+        second_market.poly_ids = PolymarketIds {
+            condition_id: "condition-2".to_owned(),
+            yes_token_id: "yes-2".to_owned(),
+            no_token_id: "no-2".to_owned(),
+        };
+        settings.markets.push(second_market.clone());
+
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let (orderbook_provider, _executor, mut execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
+
+        let first_symbol = settings.markets[0].symbol.clone();
+        let second_symbol = second_market.symbol.clone();
+        let mut observed = HashMap::from([
+            (first_symbol.clone(), ObservedState::default()),
+            (second_symbol.clone(), ObservedState::default()),
+        ]);
+        let mut stats = PaperStats::default();
+        let mut recent_events = VecDeque::new();
+        let mut engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
+        let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        let mut trade_book = TradeBook::default();
+        let paused = Arc::new(AtomicBool::new(false));
+        let emergency = Arc::new(AtomicBool::new(false));
+        let mut audit = None;
+
+        handle_multi_market_event(
+            MarketDataEvent::CexVenueOrderBookUpdate {
+                exchange: Exchange::Binance,
+                venue_symbol: "BTCUSDT".to_owned(),
+                bids: vec![polyalpha_core::PriceLevel {
+                    price: Price(Decimal::new(100_000, 0)),
+                    quantity: VenueQuantity::CexBaseQty(CexBaseQty(Decimal::new(1, 0))),
+                }],
+                asks: vec![polyalpha_core::PriceLevel {
+                    price: Price(Decimal::new(100_010, 0)),
+                    quantity: VenueQuantity::CexBaseQty(CexBaseQty(Decimal::new(1, 0))),
+                }],
+                exchange_timestamp_ms: 10,
+                received_at_ms: 11,
+                sequence: 12,
+            },
+            &settings,
+            &registry,
+            &orderbook_provider,
+            &mut observed,
+            &mut stats,
+            &mut recent_events,
+            &mut engine,
+            &mut execution,
+            &mut risk,
+            &mut trade_book,
+            &paused,
+            &emergency,
+            false,
+            &mut audit,
+        )
+        .await
+        .expect("venue-level cex event should be handled");
+
+        assert_eq!(stats.market_events, 1);
+        assert_eq!(
+            observed
+                .get(&first_symbol)
+                .and_then(|state| state.cex_mid),
+            Some(Decimal::new(100_005, 0))
+        );
+        assert_eq!(
+            observed
+                .get(&second_symbol)
+                .and_then(|state| state.cex_mid),
+            Some(Decimal::new(100_005, 0))
+        );
+
+        let first_book = orderbook_provider
+            .get_orderbook(Exchange::Binance, &first_symbol, InstrumentKind::CexPerp)
+            .expect("first market should resolve shared cex book");
+        let second_book = orderbook_provider
+            .get_orderbook(Exchange::Binance, &second_symbol, InstrumentKind::CexPerp)
+            .expect("second market should resolve shared cex book");
+
+        assert_eq!(first_book.sequence, 12);
+        assert_eq!(first_book.symbol, first_symbol);
+        assert_eq!(second_book.sequence, 12);
+        assert_eq!(second_book.symbol, second_symbol);
     }
 
     #[test]
@@ -17396,7 +19699,11 @@ mod tests {
         market.settlement_timestamp = (1_700_000_000_000 / 1_000) + (31 * 24 * 60 * 60);
 
         assert_eq!(
-            market_open_semantics_guard_reason(&market, 1_700_000_000_000),
+            market_open_semantics_guard_reason(
+                &market,
+                &StrategyMarketScopeConfig::default(),
+                1_700_000_000_000,
+            ),
             Some("path_dependent_market_not_supported")
         );
     }
@@ -17413,7 +19720,11 @@ mod tests {
         market.settlement_timestamp = (1_700_000_000_000 / 1_000) + (7 * 24 * 60 * 60);
 
         assert_eq!(
-            market_open_semantics_guard_reason(&market, 1_700_000_000_000),
+            market_open_semantics_guard_reason(
+                &market,
+                &StrategyMarketScopeConfig::default(),
+                1_700_000_000_000,
+            ),
             Some("path_dependent_market_not_supported")
         );
     }
@@ -17456,8 +19767,7 @@ mod tests {
             lower_strike: Some(Price(Decimal::new(80_000, 0))),
             upper_strike: None,
         });
-        settings.markets[0].settlement_timestamp =
-            (1_700_000_000_000 / 1_000) + (7 * 24 * 60 * 60);
+        settings.markets[0].settlement_timestamp = (1_700_000_000_000 / 1_000) + (7 * 24 * 60 * 60);
         let observed = ObservedState {
             poly_yes_mid: Some(Decimal::new(4, 1)),
             ..ObservedState::default()
@@ -17469,6 +19779,140 @@ mod tests {
         assert_eq!(
             candidate_price_filter_rejection_reason(&candidate, &observed, &settings),
             Some("path_dependent_market_not_supported")
+        );
+    }
+
+    #[test]
+    fn market_open_semantics_guard_rejects_all_time_high_market() {
+        let mut market = test_market("sol-ath-2026", Exchange::Binance, "SOLUSDT");
+        market.market_question = Some("Solana all time high by December 31, 2026?".to_owned());
+        market.market_rule = Some(polyalpha_core::MarketRule {
+            kind: polyalpha_core::MarketRuleKind::Above,
+            lower_strike: Some(Price(Decimal::new(31, 0))),
+            upper_strike: None,
+        });
+        market.settlement_timestamp = (1_700_000_000_000 / 1_000) + (31 * 24 * 60 * 60);
+
+        assert_eq!(
+            market_open_semantics_guard_reason(
+                &market,
+                &StrategyMarketScopeConfig::default(),
+                1_700_000_000_000,
+            ),
+            Some("all_time_high_market_not_supported")
+        );
+    }
+
+    #[test]
+    fn market_open_semantics_guard_rejects_non_price_event_market() {
+        let mut market = test_market("btc-sha-2027", Exchange::Binance, "BTCUSDT");
+        market.market_question = Some("Will Bitcoin replace SHA-256 before 2027?".to_owned());
+        market.market_rule = Some(polyalpha_core::MarketRule {
+            kind: polyalpha_core::MarketRuleKind::Above,
+            lower_strike: Some(Price(Decimal::new(256, 0))),
+            upper_strike: None,
+        });
+        market.settlement_timestamp = (1_700_000_000_000 / 1_000) + (31 * 24 * 60 * 60);
+
+        assert_eq!(
+            market_open_semantics_guard_reason(
+                &market,
+                &StrategyMarketScopeConfig::default(),
+                1_700_000_000_000,
+            ),
+            Some("non_price_market_not_supported")
+        );
+    }
+
+    #[test]
+    fn candidate_price_filter_rejects_all_time_high_market() {
+        let mut settings = test_settings_with_price_filter(None, None);
+        settings.markets[0].symbol = Symbol::new("sol-ath-2026");
+        settings.markets[0].market_question =
+            Some("Solana all time high by December 31, 2026?".to_owned());
+        settings.markets[0].market_rule = Some(polyalpha_core::MarketRule {
+            kind: polyalpha_core::MarketRuleKind::Above,
+            lower_strike: Some(Price(Decimal::new(31, 0))),
+            upper_strike: None,
+        });
+        settings.markets[0].settlement_timestamp =
+            (1_700_000_000_000 / 1_000) + (31 * 24 * 60 * 60);
+        let observed = ObservedState {
+            poly_yes_mid: Some(Decimal::new(4, 1)),
+            ..ObservedState::default()
+        };
+        let mut candidate = open_candidate(TokenSide::Yes);
+        candidate.symbol = Symbol::new("sol-ath-2026");
+        candidate.timestamp_ms = 1_700_000_000_000;
+
+        assert_eq!(
+            candidate_price_filter_rejection_reason(&candidate, &observed, &settings),
+            Some("all_time_high_market_not_supported")
+        );
+    }
+
+    #[test]
+    fn candidate_price_filter_rejects_non_price_event_market() {
+        let mut settings = test_settings_with_price_filter(None, None);
+        settings.markets[0].symbol = Symbol::new("btc-sha-2027");
+        settings.markets[0].market_question =
+            Some("Will Bitcoin replace SHA-256 before 2027?".to_owned());
+        settings.markets[0].market_rule = Some(polyalpha_core::MarketRule {
+            kind: polyalpha_core::MarketRuleKind::Above,
+            lower_strike: Some(Price(Decimal::new(256, 0))),
+            upper_strike: None,
+        });
+        settings.markets[0].settlement_timestamp =
+            (1_700_000_000_000 / 1_000) + (31 * 24 * 60 * 60);
+        let observed = ObservedState {
+            poly_yes_mid: Some(Decimal::new(4, 1)),
+            ..ObservedState::default()
+        };
+        let mut candidate = open_candidate(TokenSide::Yes);
+        candidate.symbol = Symbol::new("btc-sha-2027");
+        candidate.timestamp_ms = 1_700_000_000_000;
+
+        assert_eq!(
+            candidate_price_filter_rejection_reason(&candidate, &observed, &settings),
+            Some("non_price_market_not_supported")
+        );
+    }
+
+    #[test]
+    fn market_runtime_expired_settlement_reason_flags_elapsed_market() {
+        let mut market = test_market("btc-apr-7", Exchange::Binance, "BTCUSDT");
+        market.settlement_timestamp = 1_700_000_000;
+
+        assert_eq!(
+            market_runtime_expired_settlement_reason(&market, 1_700_000_000),
+            Some("expired_settlement_market")
+        );
+        assert_eq!(
+            market_runtime_expired_settlement_reason(&market, 1_699_999_999),
+            None
+        );
+    }
+
+    #[test]
+    fn filter_runtime_markets_for_expired_settlement_removes_elapsed_markets() {
+        let mut settings = test_settings_with_price_filter(None, None);
+        settings.markets = vec![
+            test_market("btc-apr-7", Exchange::Binance, "BTCUSDT"),
+            test_market("eth-apr-8", Exchange::Binance, "ETHUSDT"),
+        ];
+        settings.markets[0].settlement_timestamp = 1_700_000_000;
+        settings.markets[1].settlement_timestamp = 1_700_086_400;
+
+        let skipped = filter_runtime_markets_for_expired_settlement(&mut settings, 1_700_000_000);
+
+        assert_eq!(skipped, vec![Symbol::new("btc-apr-7")]);
+        assert_eq!(
+            settings
+                .markets
+                .iter()
+                .map(|market| market.symbol.0.clone())
+                .collect::<Vec<_>>(),
+            vec!["eth-apr-8".to_owned()]
         );
     }
 
@@ -17644,7 +20088,10 @@ mod tests {
             1_500,
             &market,
             &observed,
-            freshness_thresholds(&settings, &effective_basis_config_for_market(&settings, &market)),
+            freshness_thresholds(
+                &settings,
+                &effective_basis_config_for_market(&settings, &market),
+            ),
             Some(TokenSide::Yes),
             false,
             true,
@@ -17703,6 +20150,41 @@ mod tests {
         tracker.mark_connecting();
 
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn exchange_connection_tracker_mark_disconnected_requires_all_streams_to_drop() {
+        let settings = test_settings_with_price_filter(None, None);
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let symbol = settings.markets[0].symbol.clone();
+        let channels = create_channels(std::slice::from_ref(&symbol));
+        let manager = build_data_manager(&registry, channels.market_data_tx.clone());
+        let tracker = ExchangeConnectionTracker::new(Exchange::Binance, manager);
+
+        tracker.mark_connected("btcusdt");
+        tracker.mark_connected("ethusdt");
+        tracker.mark_disconnected("btcusdt");
+
+        assert_eq!(
+            tracker.status.lock().map(|guard| *guard).ok(),
+            Some(ConnectionStatus::Connected)
+        );
+    }
+
+    #[test]
+    fn binance_transport_mode_uses_combined_when_flag_enabled() {
+        let mut settings = test_settings_with_price_filter(None, None);
+        settings.strategy.market_data.binance_combined_ws_enabled = true;
+
+        assert_eq!(
+            select_binance_ws_transport_mode(&settings),
+            BinanceWsTransportMode::Combined
+        );
+    }
+
+    #[test]
+    fn binance_combined_ws_extensions_are_disabled_for_current_client() {
+        assert_eq!(binance_combined_ws_requested_extensions(), None);
     }
 
     #[tokio::test]
@@ -17956,6 +20438,11 @@ mod tests {
             &mut audit,
         )
         .expect("record second evaluation skip");
+        audit
+            .as_mut()
+            .expect("audit session")
+            .flush()
+            .expect("flush evaluation skip audit");
 
         let events = polyalpha_audit::AuditReader::load_events(&data_dir, &session_id)
             .expect("load audit events");

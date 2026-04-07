@@ -9,6 +9,7 @@ mod monitor;
 mod paper;
 mod runtime;
 mod sim;
+mod strategy_scope;
 
 use anyhow::Result;
 use clap::Parser;

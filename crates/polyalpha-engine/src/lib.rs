@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use libm::erf;
@@ -6,10 +7,10 @@ use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 
 use polyalpha_core::{
-    AlphaEngine, AlphaEngineOutput, ConnectionStatus, DmmQuoteState, EngineParams, EngineWarning,
-    Exchange, InstrumentKind, MarketConfig, MarketDataEvent, MarketPhase, MarketRule,
-    MarketRuleKind, OpenCandidate, OrderBookSnapshot, PolyShares, Price, SignalStrength, Symbol,
-    TokenSide, UsdNotional, PLANNING_SCHEMA_VERSION,
+    cex_venue_symbol, AlphaEngine, AlphaEngineOutput, ConnectionStatus, DmmQuoteState,
+    EngineParams, EngineWarning, Exchange, InstrumentKind, MarketConfig, MarketDataEvent,
+    MarketPhase, MarketRule, MarketRuleKind, OpenCandidate, OrderBookSnapshot, PolyShares, Price,
+    SignalStrength, Symbol, TokenSide, UsdNotional, PLANNING_SCHEMA_VERSION,
 };
 
 const ONE_MINUTE_MS: u64 = 60_000;
@@ -316,6 +317,7 @@ pub struct MarketOverrideConfig {
 pub struct SimpleAlphaEngine {
     config: SimpleEngineConfig,
     markets: HashMap<Symbol, MarketConfig>,
+    cex_symbols_by_venue: HashMap<Exchange, HashMap<String, Arc<[Symbol]>>>,
     market_overrides: HashMap<Symbol, MarketOverrideConfig>,
     states: HashMap<Symbol, SymbolState>,
     poly_connected: bool,
@@ -336,12 +338,11 @@ impl SimpleAlphaEngine {
     }
 
     pub fn with_markets(config: SimpleEngineConfig, markets: Vec<MarketConfig>) -> Self {
+        let (markets, cex_symbols_by_venue) = Self::index_markets(markets);
         Self {
             config,
-            markets: markets
-                .into_iter()
-                .map(|market| (market.symbol.clone(), market))
-                .collect(),
+            markets,
+            cex_symbols_by_venue,
             market_overrides: HashMap::new(),
             states: HashMap::new(),
             poly_connected: true,
@@ -436,10 +437,9 @@ impl SimpleAlphaEngine {
     }
 
     pub fn replace_markets(&mut self, markets: Vec<MarketConfig>) {
-        self.markets = markets
-            .into_iter()
-            .map(|market| (market.symbol.clone(), market))
-            .collect();
+        let (markets, cex_symbols_by_venue) = Self::index_markets(markets);
+        self.markets = markets;
+        self.cex_symbols_by_venue = cex_symbols_by_venue;
     }
 
     pub fn basis_snapshot(&self, symbol: &Symbol) -> Option<BasisStrategySnapshot> {
@@ -453,6 +453,51 @@ impl SimpleAlphaEngine {
             .get(symbol)
             .map(|state| (state.yes.history.len(), state.no.history.len()))
             .unwrap_or_default()
+    }
+
+    fn index_markets(
+        markets: Vec<MarketConfig>,
+    ) -> (
+        HashMap<Symbol, MarketConfig>,
+        HashMap<Exchange, HashMap<String, Arc<[Symbol]>>>,
+    ) {
+        let mut market_map = HashMap::new();
+        let mut venue_index: HashMap<Exchange, HashMap<String, Vec<Symbol>>> = HashMap::new();
+
+        for market in markets {
+            let symbol = market.symbol.clone();
+            let exchange = market.hedge_exchange;
+            let venue_symbol = cex_venue_symbol(exchange, &market.cex_symbol);
+            venue_index
+                .entry(exchange)
+                .or_default()
+                .entry(venue_symbol)
+                .or_default()
+                .push(symbol.clone());
+            market_map.insert(symbol, market);
+        }
+
+        let cex_symbols_by_venue = venue_index
+            .into_iter()
+            .map(|(exchange, symbols)| {
+                (
+                    exchange,
+                    symbols
+                        .into_iter()
+                        .map(|(venue_symbol, symbols)| (venue_symbol, Arc::<[Symbol]>::from(symbols)))
+                        .collect(),
+                )
+            })
+            .collect();
+
+        (market_map, cex_symbols_by_venue)
+    }
+
+    fn cex_symbols_for_venue(&self, exchange: Exchange, venue_symbol: &str) -> Option<Arc<[Symbol]>> {
+        self.cex_symbols_by_venue
+            .get(&exchange)
+            .and_then(|symbols| symbols.get(venue_symbol))
+            .cloned()
     }
 
     fn sigma_context_from_raw(raw_sigma: Option<f64>, returns_window_len: usize) -> SigmaContext {
@@ -773,6 +818,85 @@ impl SimpleAlphaEngine {
         }
     }
 
+    fn ingest_cex_mid_for_symbol(
+        &self,
+        symbol: &Symbol,
+        state: &mut SymbolState,
+        updated_at_ms: u64,
+        mid: Decimal,
+    ) {
+        state.mark_cex_update(updated_at_ms);
+        state.cex_mid = Some(mid.max(Decimal::ZERO));
+        if let Some(price) = state.cex_mid.and_then(|value| value.to_f64()) {
+            let _ = state.cex_minutes.ingest_price(
+                updated_at_ms,
+                price,
+                self.history_capacity_for_symbol(symbol),
+            );
+        }
+    }
+
+    fn apply_cex_venue_event_to_symbol(&mut self, symbol: &Symbol, event: &MarketDataEvent) {
+        let mut state = self
+            .states
+            .remove(symbol)
+            .unwrap_or_else(|| self.state_for_symbol(symbol));
+
+        match event {
+            MarketDataEvent::CexVenueOrderBookUpdate {
+                bids,
+                asks,
+                exchange_timestamp_ms: _,
+                received_at_ms,
+                ..
+            } => {
+                state.last_update_ms = *received_at_ms;
+                if let Some(mid) = mid_from_price_levels(bids, asks) {
+                    self.ingest_cex_mid_for_symbol(symbol, &mut state, *received_at_ms, mid);
+                }
+            }
+            MarketDataEvent::CexVenueTradeUpdate {
+                price,
+                timestamp_ms,
+                ..
+            } => {
+                state.last_update_ms = *timestamp_ms;
+                self.ingest_cex_mid_for_symbol(symbol, &mut state, *timestamp_ms, price.0);
+            }
+            MarketDataEvent::CexVenueFundingRate {
+                next_funding_time_ms,
+                ..
+            } => {
+                state.last_update_ms = *next_funding_time_ms;
+            }
+            _ => return,
+        }
+
+        self.states.insert(symbol.clone(), state);
+    }
+
+    fn apply_cex_venue_market_event(
+        &mut self,
+        exchange: Exchange,
+        venue_symbol: &str,
+        event: &MarketDataEvent,
+        flush_pending: bool,
+    ) -> AlphaEngineOutput {
+        let Some(symbols) = self.cex_symbols_for_venue(exchange, venue_symbol) else {
+            return AlphaEngineOutput::default();
+        };
+
+        for symbol in symbols.iter() {
+            self.apply_cex_venue_event_to_symbol(symbol, event);
+        }
+
+        let mut output = AlphaEngineOutput::default();
+        for symbol in symbols.iter() {
+            output.extend(self.generate_output(symbol, flush_pending, false));
+        }
+        output
+    }
+
     fn apply_market_event(&mut self, event: &MarketDataEvent) -> Option<Symbol> {
         match event {
             MarketDataEvent::OrderBookUpdate { snapshot } => {
@@ -793,15 +917,12 @@ impl SimpleAlphaEngine {
                             state.no.update_mid(snapshot.received_at_ms, mid);
                         }
                         InstrumentKind::CexPerp => {
-                            state.mark_cex_update(snapshot.received_at_ms);
-                            state.cex_mid = Some(mid.max(Decimal::ZERO));
-                            if let Some(price) = state.cex_mid.and_then(|value| value.to_f64()) {
-                                let _ = state.cex_minutes.ingest_price(
-                                    snapshot.received_at_ms,
-                                    price,
-                                    self.history_capacity_for_symbol(&symbol),
-                                );
-                            }
+                            self.ingest_cex_mid_for_symbol(
+                                &symbol,
+                                &mut state,
+                                snapshot.received_at_ms,
+                                mid,
+                            );
                         }
                     }
                 }
@@ -832,20 +953,15 @@ impl SimpleAlphaEngine {
                         state.no.update_mid(*timestamp_ms, price.0);
                     }
                     InstrumentKind::CexPerp => {
-                        state.mark_cex_update(*timestamp_ms);
-                        state.cex_mid = Some(price.0.max(Decimal::ZERO));
-                        if let Some(value) = state.cex_mid.and_then(|item| item.to_f64()) {
-                            let _ = state.cex_minutes.ingest_price(
-                                *timestamp_ms,
-                                value,
-                                self.history_capacity_for_symbol(&symbol),
-                            );
-                        }
+                        self.ingest_cex_mid_for_symbol(&symbol, &mut state, *timestamp_ms, price.0);
                     }
                 }
                 self.states.insert(symbol.clone(), state);
                 Some(symbol)
             }
+            MarketDataEvent::CexVenueOrderBookUpdate { .. }
+            | MarketDataEvent::CexVenueTradeUpdate { .. }
+            | MarketDataEvent::CexVenueFundingRate { .. } => None,
             MarketDataEvent::FundingRate {
                 exchange: _,
                 symbol,
@@ -1291,6 +1407,31 @@ impl SimpleAlphaEngine {
 #[async_trait]
 impl AlphaEngine for SimpleAlphaEngine {
     async fn on_market_data(&mut self, event: &MarketDataEvent) -> AlphaEngineOutput {
+        match event {
+            MarketDataEvent::CexVenueOrderBookUpdate {
+                exchange,
+                venue_symbol,
+                ..
+            } => {
+                return self.apply_cex_venue_market_event(*exchange, venue_symbol, event, true);
+            }
+            MarketDataEvent::CexVenueTradeUpdate {
+                exchange,
+                venue_symbol,
+                ..
+            } => {
+                return self.apply_cex_venue_market_event(*exchange, venue_symbol, event, true);
+            }
+            MarketDataEvent::CexVenueFundingRate {
+                exchange,
+                venue_symbol,
+                ..
+            } => {
+                return self.apply_cex_venue_market_event(*exchange, venue_symbol, event, false);
+            }
+            _ => {}
+        }
+
         let Some(symbol) = self.apply_market_event(event) else {
             return AlphaEngineOutput::default();
         };
@@ -1415,13 +1556,18 @@ fn minute_bucket(ts_ms: u64) -> u64 {
 }
 
 fn mid_from_orderbook(snapshot: &OrderBookSnapshot) -> Option<Decimal> {
-    let best_bid = snapshot
-        .bids
+    mid_from_price_levels(&snapshot.bids, &snapshot.asks)
+}
+
+fn mid_from_price_levels(
+    bids: &[polyalpha_core::PriceLevel],
+    asks: &[polyalpha_core::PriceLevel],
+) -> Option<Decimal> {
+    let best_bid = bids
         .iter()
         .max_by(|left, right| left.price.cmp(&right.price))
         .map(|level| level.price.0);
-    let best_ask = snapshot
-        .asks
+    let best_ask = asks
         .iter()
         .min_by(|left, right| left.price.cmp(&right.price))
         .map(|level| level.price.0);
@@ -1652,6 +1798,38 @@ mod tests {
         }
     }
 
+    fn shared_cex_markets() -> Vec<MarketConfig> {
+        let mut first = sample_market();
+        first.symbol = Symbol::new("btc-price-only-a");
+        first.poly_ids = PolymarketIds {
+            condition_id: "condition-a".to_owned(),
+            yes_token_id: "yes-a".to_owned(),
+            no_token_id: "no-a".to_owned(),
+        };
+        first.market_rule = Some(MarketRule {
+            kind: MarketRuleKind::Above,
+            lower_strike: Some(Price(Decimal::new(98_000, 0))),
+            upper_strike: None,
+        });
+        first.strike_price = Some(Price(Decimal::new(98_000, 0)));
+
+        let mut second = sample_market();
+        second.symbol = Symbol::new("btc-price-only-b");
+        second.poly_ids = PolymarketIds {
+            condition_id: "condition-b".to_owned(),
+            yes_token_id: "yes-b".to_owned(),
+            no_token_id: "no-b".to_owned(),
+        };
+        second.market_rule = Some(MarketRule {
+            kind: MarketRuleKind::Above,
+            lower_strike: Some(Price(Decimal::new(102_000, 0))),
+            upper_strike: None,
+        });
+        second.strike_price = Some(Price(Decimal::new(102_000, 0)));
+
+        vec![first, second]
+    }
+
     fn short_dated_sigma_warmup_market() -> MarketConfig {
         MarketConfig {
             settlement_timestamp: 7_200,
@@ -1708,6 +1886,58 @@ mod tests {
                 asks: vec![PriceLevel {
                     price: Price(ask),
                     quantity: VenueQuantity::CexBaseQty(CexBaseQty(Decimal::new(1, 1))),
+                }],
+                exchange_timestamp_ms: ts,
+                received_at_ms: ts,
+                sequence: ts,
+                last_trade_price: None,
+            },
+        }
+    }
+
+    fn cex_venue_orderbook_event(
+        bid: Decimal,
+        ask: Decimal,
+        exchange_timestamp_ms: u64,
+        received_at_ms: u64,
+        sequence: u64,
+    ) -> MarketDataEvent {
+        MarketDataEvent::CexVenueOrderBookUpdate {
+            exchange: Exchange::Binance,
+            venue_symbol: "BTCUSDT".to_owned(),
+            bids: vec![PriceLevel {
+                price: Price(bid),
+                quantity: VenueQuantity::CexBaseQty(CexBaseQty(Decimal::new(1, 1))),
+            }],
+            asks: vec![PriceLevel {
+                price: Price(ask),
+                quantity: VenueQuantity::CexBaseQty(CexBaseQty(Decimal::new(1, 1))),
+            }],
+            exchange_timestamp_ms,
+            received_at_ms,
+            sequence,
+        }
+    }
+
+    fn poly_orderbook_event_for(
+        symbol: &str,
+        instrument: InstrumentKind,
+        bid: Decimal,
+        ask: Decimal,
+        ts: u64,
+    ) -> MarketDataEvent {
+        MarketDataEvent::OrderBookUpdate {
+            snapshot: OrderBookSnapshot {
+                exchange: Exchange::Polymarket,
+                symbol: Symbol::new(symbol),
+                instrument,
+                bids: vec![PriceLevel {
+                    price: Price(bid),
+                    quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(10, 0))),
+                }],
+                asks: vec![PriceLevel {
+                    price: Price(ask),
+                    quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(10, 0))),
                 }],
                 exchange_timestamp_ms: ts,
                 received_at_ms: ts,
@@ -1820,6 +2050,95 @@ mod tests {
             .into_iter()
             .next()
             .expect("expected an open candidate during warmup sequence")
+    }
+
+    #[tokio::test]
+    async fn cex_venue_orderbook_updates_all_markets_attached_to_same_symbol() {
+        let mut engine = SimpleAlphaEngine::with_markets(
+            SimpleEngineConfig {
+                min_signal_samples: 2,
+                rolling_window_minutes: 4,
+                entry_z: 2.0,
+                exit_z: 0.5,
+                position_notional_usd: UsdNotional(Decimal::new(1_000, 0)),
+                cex_hedge_ratio: 1.0,
+                dmm_half_spread: Decimal::new(1, 2),
+                dmm_quote_size: PolyShares::ZERO,
+                ..SimpleEngineConfig::default()
+            },
+            shared_cex_markets(),
+        );
+
+        let _ = engine
+            .on_market_data(&cex_venue_orderbook_event(
+                Decimal::new(100_000, 0),
+                Decimal::new(100_000, 0),
+                0,
+                0,
+                0,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&poly_orderbook_event_for(
+                "btc-price-only-a",
+                InstrumentKind::PolyYes,
+                Decimal::new(52, 2),
+                Decimal::new(54, 2),
+                60_100,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&poly_orderbook_event_for(
+                "btc-price-only-a",
+                InstrumentKind::PolyNo,
+                Decimal::new(46, 2),
+                Decimal::new(48, 2),
+                60_120,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&poly_orderbook_event_for(
+                "btc-price-only-b",
+                InstrumentKind::PolyYes,
+                Decimal::new(32, 2),
+                Decimal::new(34, 2),
+                60_140,
+            ))
+            .await;
+        let _ = engine
+            .on_market_data(&poly_orderbook_event_for(
+                "btc-price-only-b",
+                InstrumentKind::PolyNo,
+                Decimal::new(66, 2),
+                Decimal::new(68, 2),
+                60_160,
+            ))
+            .await;
+
+        let output = engine
+            .on_market_data(&cex_venue_orderbook_event(
+                Decimal::new(100_100, 0),
+                Decimal::new(100_100, 0),
+                120_100,
+                120_100,
+                2,
+            ))
+            .await;
+
+        assert!(
+            output.warnings.is_empty(),
+            "shared venue update should refresh both attached markets without freshness warnings"
+        );
+
+        let first_snapshot = engine
+            .basis_snapshot(&Symbol::new("btc-price-only-a"))
+            .expect("first market should get refreshed cex reference");
+        let second_snapshot = engine
+            .basis_snapshot(&Symbol::new("btc-price-only-b"))
+            .expect("second market should get refreshed cex reference");
+
+        assert_eq!(first_snapshot.cex_reference_price, 100_000.0);
+        assert_eq!(second_snapshot.cex_reference_price, 100_000.0);
     }
 
     #[tokio::test]

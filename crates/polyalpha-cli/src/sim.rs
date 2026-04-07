@@ -407,8 +407,14 @@ fn sync_engine_position_state(
 fn event_timestamp_ms(event: &MarketDataEvent) -> u64 {
     match event {
         MarketDataEvent::OrderBookUpdate { snapshot } => snapshot.received_at_ms,
+        MarketDataEvent::CexVenueOrderBookUpdate { received_at_ms, .. } => *received_at_ms,
         MarketDataEvent::TradeUpdate { timestamp_ms, .. } => *timestamp_ms,
+        MarketDataEvent::CexVenueTradeUpdate { timestamp_ms, .. } => *timestamp_ms,
         MarketDataEvent::FundingRate {
+            next_funding_time_ms,
+            ..
+        } => *next_funding_time_ms,
+        MarketDataEvent::CexVenueFundingRate {
             next_funding_time_ms,
             ..
         } => *next_funding_time_ms,
@@ -473,109 +479,116 @@ async fn run_sim_with_mock_ticks(
         loop {
             match market_data_rx.try_recv() {
                 Ok(event) => {
-                    stats.market_events += 1;
-                    if let MarketDataEvent::OrderBookUpdate { snapshot } = &event {
-                        apply_orderbook_snapshot(&orderbook_provider, &registry, snapshot);
-                    }
-                    observe_market_event(&mut observed, &event);
-                    push_event(
-                        &mut recent_events,
-                        "market_data",
-                        summarize_market_event(&event),
-                    );
-
-                    if let MarketDataEvent::MarketLifecycle { symbol, phase, .. } = &event {
-                        risk.update_market_phase(symbol.clone(), phase.clone());
-                    }
-
-                    let output = engine.on_market_data(&event).await;
-                    for warning in &output.warnings {
+                    for event in event.into_expanded_for_registry(&registry) {
+                        stats.market_events += 1;
+                        if let MarketDataEvent::OrderBookUpdate { snapshot } = &event {
+                            apply_orderbook_snapshot(&orderbook_provider, &registry, snapshot);
+                        }
+                        observe_market_event(&mut observed, &event);
                         push_event(
                             &mut recent_events,
-                            "warning",
-                            summarize_engine_warning(warning),
-                        );
-                    }
-                    for update in output.dmm_updates {
-                        let events = execution.apply_dmm_quote_update(update).await?;
-                        apply_execution_events(&mut risk, &mut stats, &mut recent_events, events)
-                            .await?;
-                        sync_engine_position_state(&mut engine, &risk, &market.symbol);
-                    }
-
-                    for candidate in output.open_candidates {
-                        stats.signals_seen += 1;
-                        push_event(
-                            &mut recent_events,
-                            "signal",
-                            summarize_candidate(&candidate),
+                            "market_data",
+                            summarize_market_event(&event),
                         );
 
-                        clear_expired_open_cooldown(
-                            &mut observed.market_pool,
-                            candidate.timestamp_ms,
-                        );
-                        if let Some(reason) = active_open_cooldown_reason(
-                            &observed.market_pool,
-                            candidate.timestamp_ms,
-                        ) {
-                            stats.signals_rejected += 1;
-                            let remaining_ms = active_open_cooldown_remaining_ms(
-                                &observed.market_pool,
-                                candidate.timestamp_ms,
-                            )
-                            .unwrap_or_default();
-                            push_event(
-                                &mut recent_events,
-                                "risk",
-                                format!(
-                                    "候选被拒绝：市场处于冷却期 {}（{}，剩余冷却 {}ms）",
-                                    candidate.candidate_id, reason, remaining_ms
-                                ),
-                            );
-                            continue;
+                        if let MarketDataEvent::MarketLifecycle { symbol, phase, .. } = &event {
+                            risk.update_market_phase(symbol.clone(), phase.clone());
                         }
 
-                        let plan = match preview_open_plan(&mut execution, &risk, &candidate) {
-                            Ok(plan) => plan,
-                            Err(err) => {
+                        let output = engine.on_market_data(&event).await;
+                        for warning in &output.warnings {
+                            push_event(
+                                &mut recent_events,
+                                "warning",
+                                summarize_engine_warning(warning),
+                            );
+                        }
+                        for update in output.dmm_updates {
+                            let events = execution.apply_dmm_quote_update(update).await?;
+                            apply_execution_events(
+                                &mut risk,
+                                &mut stats,
+                                &mut recent_events,
+                                events,
+                            )
+                            .await?;
+                            sync_engine_position_state(&mut engine, &risk, &market.symbol);
+                        }
+
+                        for candidate in output.open_candidates {
+                            stats.signals_seen += 1;
+                            push_event(
+                                &mut recent_events,
+                                "signal",
+                                summarize_candidate(&candidate),
+                            );
+
+                            clear_expired_open_cooldown(
+                                &mut observed.market_pool,
+                                candidate.timestamp_ms,
+                            );
+                            if let Some(reason) = active_open_cooldown_reason(
+                                &observed.market_pool,
+                                candidate.timestamp_ms,
+                            ) {
                                 stats.signals_rejected += 1;
-                                let reason_code =
-                                    extract_plan_rejection_reason_code(&err.to_string())
-                                        .unwrap_or_else(|| "trade_plan_rejected".to_owned());
-                                let _ = maybe_start_market_pool_cooldown(
-                                    settings,
-                                    &mut observed,
+                                let remaining_ms = active_open_cooldown_remaining_ms(
+                                    &observed.market_pool,
                                     candidate.timestamp_ms,
-                                    &reason_code,
-                                );
+                                )
+                                .unwrap_or_default();
                                 push_event(
                                     &mut recent_events,
                                     "risk",
                                     format!(
-                                        "候选被交易规划拒绝 {}（{}）",
-                                        candidate.candidate_id, err
+                                        "候选被拒绝：市场处于冷却期 {}（{}，剩余冷却 {}ms）",
+                                        candidate.candidate_id, reason, remaining_ms
                                     ),
                                 );
                                 continue;
                             }
-                        };
 
-                        if let Some(risk_rejection) = open_plan_risk_rejection_reason(&risk, &plan)
-                        {
-                            stats.signals_rejected += 1;
-                            push_event(
-                                &mut recent_events,
-                                "risk",
-                                format!(
-                                    "候选被拒绝：未通过风控检查 {}（{}）",
-                                    candidate.candidate_id, risk_rejection
-                                ),
-                            );
-                            continue;
-                        }
+                            let plan = match preview_open_plan(&mut execution, &risk, &candidate) {
+                                Ok(plan) => plan,
+                                Err(err) => {
+                                    stats.signals_rejected += 1;
+                                    let reason_code =
+                                        extract_plan_rejection_reason_code(&err.to_string())
+                                            .unwrap_or_else(|| "trade_plan_rejected".to_owned());
+                                    let _ = maybe_start_market_pool_cooldown(
+                                        settings,
+                                        &mut observed,
+                                        candidate.timestamp_ms,
+                                        &reason_code,
+                                    );
+                                    push_event(
+                                        &mut recent_events,
+                                        "risk",
+                                        format!(
+                                            "候选被交易规划拒绝 {}（{}）",
+                                            candidate.candidate_id, err
+                                        ),
+                                    );
+                                    continue;
+                                }
+                            };
 
-                        match execution.process_plan(plan).await {
+                            if let Some(risk_rejection) =
+                                open_plan_risk_rejection_reason(&risk, &plan)
+                            {
+                                stats.signals_rejected += 1;
+                                push_event(
+                                    &mut recent_events,
+                                    "risk",
+                                    format!(
+                                        "候选被拒绝：未通过风控检查 {}（{}）",
+                                        candidate.candidate_id, risk_rejection
+                                    ),
+                                );
+                                continue;
+                            }
+
+                            match execution.process_plan(plan).await {
                             Ok(events) => {
                                 if execution_events_include_trade_plan_created(&events) {
                                     note_tradeable_activity(
@@ -633,6 +646,7 @@ async fn run_sim_with_mock_ticks(
                         apply_execution_events(&mut risk, &mut stats, &mut recent_events, events)
                             .await?;
                         sync_engine_position_state(&mut engine, &risk, &market.symbol);
+                    }
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -932,6 +946,9 @@ fn observe_market_event(observed: &mut ObservedState, event: &MarketDataEvent) {
             InstrumentKind::PolyNo => observed.poly_no_mid = Some(price.0),
             InstrumentKind::CexPerp => observed.cex_mid = Some(price.0),
         },
+        MarketDataEvent::CexVenueOrderBookUpdate { .. }
+        | MarketDataEvent::CexVenueTradeUpdate { .. }
+        | MarketDataEvent::CexVenueFundingRate { .. } => {}
         MarketDataEvent::FundingRate { .. } => {}
         MarketDataEvent::MarketLifecycle { phase, .. } => {
             observed.market_phase = Some(phase.clone());
@@ -1236,6 +1253,15 @@ fn summarize_market_event(event: &MarketDataEvent) -> String {
             snapshot.symbol.0,
             format_instrument_label(snapshot.instrument)
         ),
+        MarketDataEvent::CexVenueOrderBookUpdate {
+            exchange,
+            venue_symbol,
+            ..
+        } => format!(
+            "订单簿更新 {} {}（交易所聚合）",
+            format_exchange_label(*exchange),
+            venue_symbol
+        ),
         MarketDataEvent::TradeUpdate {
             exchange,
             symbol,
@@ -1249,6 +1275,17 @@ fn summarize_market_event(event: &MarketDataEvent) -> String {
             format_instrument_label(*instrument),
             price.0.normalize()
         ),
+        MarketDataEvent::CexVenueTradeUpdate {
+            exchange,
+            venue_symbol,
+            price,
+            ..
+        } => format!(
+            "成交更新 {} {}（交易所聚合）@ {}",
+            format_exchange_label(*exchange),
+            venue_symbol,
+            price.0.normalize()
+        ),
         MarketDataEvent::FundingRate {
             exchange,
             symbol,
@@ -1258,6 +1295,17 @@ fn summarize_market_event(event: &MarketDataEvent) -> String {
             "资金费更新 {} {} {}",
             format_exchange_label(*exchange),
             symbol.0,
+            rate.normalize()
+        ),
+        MarketDataEvent::CexVenueFundingRate {
+            exchange,
+            venue_symbol,
+            rate,
+            ..
+        } => format!(
+            "资金费更新 {} {} {}（交易所聚合）",
+            format_exchange_label(*exchange),
+            venue_symbol,
             rate.normalize()
         ),
         MarketDataEvent::MarketLifecycle { symbol, phase, .. } => format!(
@@ -1666,7 +1714,8 @@ mod tests {
         Exchange, ExecutionEvent, GeneralConfig, MarketDataConfig, MarketRule,
         NegRiskStrategyConfig, OkxConfig, OrderId, OrderResponse, OrderStatus, PaperSlippageConfig,
         PaperTradingConfig, PolyShares, PolymarketConfig, PolymarketIds, RiskConfig,
-        SettlementRules, StrategyConfig, Symbol, UsdNotional, VenueQuantity,
+        SettlementRules, StrategyConfig, StrategyMarketScopeConfig, Symbol, UsdNotional,
+        VenueQuantity,
     };
 
     fn test_market(cex_qty_step: Decimal) -> MarketConfig {
@@ -1753,6 +1802,7 @@ mod tests {
                     enable_inventory_backed_short: false,
                 },
                 settlement: SettlementRules::default(),
+                market_scope: StrategyMarketScopeConfig::default(),
                 market_data: MarketDataConfig::default(),
             },
             risk: RiskConfig {

@@ -611,6 +611,22 @@ pub struct MonitorRuntimeStats {
     #[serde(default)]
     pub funding_refresh_count: u64,
     #[serde(default)]
+    pub market_data_rx_lag_events: u64,
+    #[serde(default)]
+    pub market_data_rx_lagged_messages: u64,
+    #[serde(default)]
+    pub market_data_tick_drain_last: u64,
+    #[serde(default)]
+    pub market_data_tick_drain_max: u64,
+    #[serde(default)]
+    pub polymarket_ws_text_frames: u64,
+    #[serde(default)]
+    pub polymarket_ws_price_change_messages: u64,
+    #[serde(default)]
+    pub polymarket_ws_book_messages: u64,
+    #[serde(default)]
+    pub polymarket_ws_orderbook_updates: u64,
+    #[serde(default)]
     pub strategy_health: StrategyHealthView,
 }
 

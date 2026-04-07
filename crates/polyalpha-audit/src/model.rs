@@ -56,6 +56,14 @@ pub struct AuditCounterSnapshot {
     pub snapshot_resync_count: u64,
     pub funding_refresh_count: u64,
     pub trades_closed: u64,
+    pub market_data_rx_lag_events: u64,
+    pub market_data_rx_lagged_messages: u64,
+    pub market_data_tick_drain_last: u64,
+    pub market_data_tick_drain_max: u64,
+    pub polymarket_ws_text_frames: u64,
+    pub polymarket_ws_price_change_messages: u64,
+    pub polymarket_ws_book_messages: u64,
+    pub polymarket_ws_orderbook_updates: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

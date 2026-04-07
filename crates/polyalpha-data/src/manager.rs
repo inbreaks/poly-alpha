@@ -35,30 +35,18 @@ impl DataManager {
     }
 
     pub fn normalize_and_publish_cex_orderbook(&self, update: CexBookUpdate) -> Result<usize> {
-        let events = self.normalizer.normalize_cex_orderbook(update)?;
-        let mut total = 0;
-        for event in events {
-            total += self.publish(event)?;
-        }
-        Ok(total)
+        let event = self.normalizer.normalize_cex_orderbook(update)?;
+        self.publish(event)
     }
 
     pub fn normalize_and_publish_cex_trade(&self, update: CexTradeUpdate) -> Result<usize> {
-        let events = self.normalizer.normalize_cex_trade(update)?;
-        let mut total = 0;
-        for event in events {
-            total += self.publish(event)?;
-        }
-        Ok(total)
+        let event = self.normalizer.normalize_cex_trade(update)?;
+        self.publish(event)
     }
 
     pub fn normalize_and_publish_cex_funding(&self, update: CexFundingUpdate) -> Result<usize> {
-        let events = self.normalizer.normalize_cex_funding(update)?;
-        let mut total = 0;
-        for event in events {
-            total += self.publish(event)?;
-        }
-        Ok(total)
+        let event = self.normalizer.normalize_cex_funding(update)?;
+        self.publish(event)
     }
 
     pub fn publish_market_lifecycle(

@@ -115,6 +115,10 @@ fn open_cooldown_policy(base_stale_ms: u64, reason: &str) -> Option<CooldownPoli
         | "insufficient_poly_depth"
         | "insufficient_cex_depth"
         | "poly_max_price_exceeded"
+        | "path_dependent_market_not_supported"
+        | "all_time_high_market_not_supported"
+        | "non_price_market_not_supported"
+        | "terminal_price_market_not_supported"
         | "adapter_cannot_preserve_constraints" => Some(CooldownPolicy {
             family: CooldownFamily::Structural,
             base_duration_ms: base_ms.saturating_mul(12).max(15 * 60 * 1_000),

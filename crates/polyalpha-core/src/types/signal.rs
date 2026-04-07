@@ -89,6 +89,12 @@ impl AlphaEngineOutput {
         self.dmm_updates.is_empty() && self.open_candidates.is_empty() && self.warnings.is_empty()
     }
 
+    pub fn extend(&mut self, mut other: AlphaEngineOutput) {
+        self.dmm_updates.append(&mut other.dmm_updates);
+        self.open_candidates.append(&mut other.open_candidates);
+        self.warnings.append(&mut other.warnings);
+    }
+
     pub fn push_dmm_update(&mut self, update: DmmQuoteUpdate) {
         self.dmm_updates.push(update);
     }

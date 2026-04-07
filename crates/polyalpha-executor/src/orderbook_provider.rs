@@ -95,6 +95,25 @@ impl InMemoryOrderbookProvider {
         }
     }
 
+    /// Update the canonical CEX snapshot once and refresh all market-symbol aliases that share it.
+    pub fn update_cex_shared(
+        &self,
+        snapshot: OrderBookSnapshot,
+        venue_symbol: String,
+        symbols: &[Symbol],
+    ) {
+        let exchange = snapshot.exchange;
+        if let Ok(mut cex_map) = self.cex_orderbooks.write() {
+            cex_map.insert((exchange, venue_symbol.clone()), snapshot);
+        }
+
+        if let Ok(mut symbol_index) = self.cex_symbol_index.write() {
+            for symbol in symbols {
+                symbol_index.insert((exchange, symbol.clone()), venue_symbol.clone());
+            }
+        }
+    }
+
     /// Get a clone of the internal storage for use in other contexts.
     pub fn clone_storage(&self) -> Arc<RwLock<HashMap<OrderbookKey, OrderBookSnapshot>>> {
         Arc::clone(&self.orderbooks)

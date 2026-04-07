@@ -16,6 +16,18 @@ fn default_reject_on_disconnect() -> bool {
     true
 }
 
+fn default_allow_terminal_above_markets() -> bool {
+    true
+}
+
+fn default_allow_terminal_below_markets() -> bool {
+    true
+}
+
+fn default_allow_terminal_between_markets() -> bool {
+    true
+}
+
 fn default_max_data_age_minutes() -> u64 {
     1
 }
@@ -73,6 +85,10 @@ impl FromStr for BandPolicyMode {
 
 fn default_market_data_mode() -> MarketDataMode {
     MarketDataMode::Poll
+}
+
+fn default_binance_combined_ws_enabled() -> bool {
+    false
 }
 
 fn default_max_stale_ms() -> u64 {
@@ -197,6 +213,8 @@ pub enum MarketDataMode {
 pub struct MarketDataConfig {
     #[serde(default = "default_market_data_mode")]
     pub mode: MarketDataMode,
+    #[serde(default = "default_binance_combined_ws_enabled")]
+    pub binance_combined_ws_enabled: bool,
     #[serde(default = "default_max_stale_ms")]
     pub max_stale_ms: u64,
     #[serde(default = "default_planner_depth_levels")]
@@ -223,6 +241,7 @@ impl Default for MarketDataConfig {
     fn default() -> Self {
         Self {
             mode: default_market_data_mode(),
+            binance_combined_ws_enabled: default_binance_combined_ws_enabled(),
             max_stale_ms: default_max_stale_ms(),
             planner_depth_levels: default_planner_depth_levels(),
             poly_open_max_quote_age_ms: None,
@@ -489,12 +508,43 @@ pub struct NegRiskStrategyConfig {
     pub enable_inventory_backed_short: bool,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StrategyMarketScopeConfig {
+    #[serde(default = "default_allow_terminal_above_markets")]
+    pub allow_terminal_above_markets: bool,
+    #[serde(default = "default_allow_terminal_below_markets")]
+    pub allow_terminal_below_markets: bool,
+    #[serde(default = "default_allow_terminal_between_markets")]
+    pub allow_terminal_between_markets: bool,
+    #[serde(default)]
+    pub allow_path_dependent_touch_markets: bool,
+    #[serde(default)]
+    pub allow_all_time_high_markets: bool,
+    #[serde(default)]
+    pub allow_non_price_event_markets: bool,
+}
+
+impl Default for StrategyMarketScopeConfig {
+    fn default() -> Self {
+        Self {
+            allow_terminal_above_markets: default_allow_terminal_above_markets(),
+            allow_terminal_below_markets: default_allow_terminal_below_markets(),
+            allow_terminal_between_markets: default_allow_terminal_between_markets(),
+            allow_path_dependent_touch_markets: false,
+            allow_all_time_high_markets: false,
+            allow_non_price_event_markets: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StrategyConfig {
     pub basis: BasisStrategyConfig,
     pub dmm: DmmStrategyConfig,
     pub negrisk: NegRiskStrategyConfig,
     pub settlement: SettlementRules,
+    #[serde(default)]
+    pub market_scope: StrategyMarketScopeConfig,
     #[serde(default)]
     pub market_data: MarketDataConfig,
 }
@@ -745,6 +795,7 @@ mod tests {
         let config: MarketDataConfig =
             serde_json::from_str("{}").expect("default market data config");
         assert_eq!(config.mode, MarketDataMode::Poll);
+        assert!(!config.binance_combined_ws_enabled);
         assert_eq!(config.max_stale_ms, 5_000);
         assert_eq!(config.planner_depth_levels, 5);
         assert_eq!(config.resolved_poly_open_max_quote_age_ms(), 5_000);
@@ -762,6 +813,7 @@ mod tests {
         let config: MarketDataConfig = serde_json::from_str(
             r#"{
                 "mode":"ws",
+                "binance_combined_ws_enabled":true,
                 "max_stale_ms":1500,
                 "poly_open_max_quote_age_ms":2500,
                 "cex_open_max_quote_age_ms":1200,
@@ -775,6 +827,7 @@ mod tests {
         )
         .expect("ws market data config");
         assert_eq!(config.mode, MarketDataMode::Ws);
+        assert!(config.binance_combined_ws_enabled);
         assert_eq!(config.max_stale_ms, 1_500);
         assert_eq!(config.planner_depth_levels, 5);
         assert_eq!(config.resolved_poly_open_max_quote_age_ms(), 2_500);

@@ -42,6 +42,14 @@ max_time_diff_minutes = 1
 enable_freshness_check = true
 reject_on_disconnect = true
 
+[strategy.market_scope]
+allow_terminal_above_markets = true
+allow_terminal_below_markets = true
+allow_terminal_between_markets = true
+allow_path_dependent_touch_markets = false
+allow_all_time_high_markets = false
+allow_non_price_event_markets = false
+
 [strategy.basis.overrides]
 
 [strategy.basis.overrides.btc]

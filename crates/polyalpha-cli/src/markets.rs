@@ -11,10 +11,16 @@ use std::fs;
 use std::path::Path;
 use std::str::FromStr;
 
-use polyalpha_core::{MarketConfig, MarketRule, MarketRuleKind, Price, Settings, Symbol};
+use polyalpha_core::{
+    MarketConfig, MarketRule, MarketRuleKind, Price, Settings, StrategyMarketScopeConfig, Symbol,
+};
 
 use crate::args::MarketAsset;
 use crate::commands::select_market;
+use crate::strategy_scope::{
+    looks_like_any_price_market_text, main_strategy_rejection_reason,
+    parse_supported_terminal_market_rule, strategy_rejection_label_zh,
+};
 
 const GAMMA_EVENTS_URL: &str = "https://gamma-api.polymarket.com/events";
 const GAMMA_PUBLIC_SEARCH_URL: &str = "https://gamma-api.polymarket.com/public-search";
@@ -93,6 +99,7 @@ struct MarketValidationPolicy {
     min_minutes_to_settlement: i64,
     min_liquidity_usd: f64,
     min_volume_24h_usd: f64,
+    market_scope: StrategyMarketScopeConfig,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -103,6 +110,10 @@ enum ValidationRejectionReason {
     OrderBookDisabled,
     Settled,
     SettlesTooSoon,
+    PathDependentMarketNotSupported,
+    AllTimeHighMarketNotSupported,
+    NonPriceMarketNotSupported,
+    TerminalPriceMarketNotSupported,
     MissingTradabilitySignal,
     NoClobOrderbook,
     ClobProbeFailed,
@@ -117,6 +128,10 @@ impl ValidationRejectionReason {
             Self::OrderBookDisabled => "orderbook_disabled",
             Self::Settled => "settled",
             Self::SettlesTooSoon => "settles_too_soon",
+            Self::PathDependentMarketNotSupported => "path_dependent_market_not_supported",
+            Self::AllTimeHighMarketNotSupported => "all_time_high_market_not_supported",
+            Self::NonPriceMarketNotSupported => "non_price_market_not_supported",
+            Self::TerminalPriceMarketNotSupported => "terminal_price_market_not_supported",
             Self::MissingTradabilitySignal => "missing_tradability_signal",
             Self::NoClobOrderbook => "no_clob_orderbook",
             Self::ClobProbeFailed => "clob_probe_failed",
@@ -131,6 +146,18 @@ impl ValidationRejectionReason {
             Self::OrderBookDisabled => "订单簿未启用",
             Self::Settled => "市场已结算/到期",
             Self::SettlesTooSoon => "距离结算过近",
+            Self::PathDependentMarketNotSupported => {
+                strategy_rejection_label_zh("path_dependent_market_not_supported")
+            }
+            Self::AllTimeHighMarketNotSupported => {
+                strategy_rejection_label_zh("all_time_high_market_not_supported")
+            }
+            Self::NonPriceMarketNotSupported => {
+                strategy_rejection_label_zh("non_price_market_not_supported")
+            }
+            Self::TerminalPriceMarketNotSupported => {
+                strategy_rejection_label_zh("terminal_price_market_not_supported")
+            }
             Self::MissingTradabilitySignal => "缺少流动性/成交活跃信号",
             Self::NoClobOrderbook => "CLOB 无可用订单簿",
             Self::ClobProbeFailed => "CLOB 探测失败",
@@ -146,6 +173,18 @@ fn validation_reason_from_code(code: &str) -> Option<ValidationRejectionReason> 
         "orderbook_disabled" => Some(ValidationRejectionReason::OrderBookDisabled),
         "settled" => Some(ValidationRejectionReason::Settled),
         "settles_too_soon" => Some(ValidationRejectionReason::SettlesTooSoon),
+        "path_dependent_market_not_supported" => {
+            Some(ValidationRejectionReason::PathDependentMarketNotSupported)
+        }
+        "all_time_high_market_not_supported" => {
+            Some(ValidationRejectionReason::AllTimeHighMarketNotSupported)
+        }
+        "non_price_market_not_supported" => {
+            Some(ValidationRejectionReason::NonPriceMarketNotSupported)
+        }
+        "terminal_price_market_not_supported" => {
+            Some(ValidationRejectionReason::TerminalPriceMarketNotSupported)
+        }
         "missing_tradability_signal" => Some(ValidationRejectionReason::MissingTradabilitySignal),
         "no_clob_orderbook" => Some(ValidationRejectionReason::NoClobOrderbook),
         "clob_probe_failed" => Some(ValidationRejectionReason::ClobProbeFailed),
@@ -532,6 +571,7 @@ pub async fn run_refresh_active(
         min_minutes_to_settlement,
         min_liquidity_usd: min_liquidity_usd.max(0.0),
         min_volume_24h_usd: min_volume_24h_usd.max(0.0),
+        market_scope: base_settings.strategy.market_scope.clone(),
     };
     let output_path = output
         .map(str::to_owned)
@@ -1203,7 +1243,7 @@ fn extract_markets_from_event(event: &Value, warnings: &mut Vec<String>) -> Vec<
             neg_risk: bool_field(market, "negRisk")
                 .or_else(|| bool_field(event, "negRisk"))
                 .unwrap_or(false),
-            market_rule: market_rule.or_else(|| strike_price.map(MarketRule::fallback_above)),
+            market_rule,
             strike_price,
             event_archived,
             market_archived,
@@ -1559,6 +1599,25 @@ fn validate_discovered_market(
     }
     if market.settlement_timestamp as i64 <= min_settlement_ts {
         return Err(ValidationRejectionReason::SettlesTooSoon);
+    }
+    if let Some(reason) = main_strategy_rejection_reason(
+        &policy.market_scope,
+        Some(&market.question),
+        &market.market_slug,
+        market.market_rule.as_ref(),
+    ) {
+        return Err(match reason {
+            "path_dependent_market_not_supported" => {
+                ValidationRejectionReason::PathDependentMarketNotSupported
+            }
+            "all_time_high_market_not_supported" => {
+                ValidationRejectionReason::AllTimeHighMarketNotSupported
+            }
+            "terminal_price_market_not_supported" => {
+                ValidationRejectionReason::TerminalPriceMarketNotSupported
+            }
+            _ => ValidationRejectionReason::NonPriceMarketNotSupported,
+        });
     }
     if !market.accepting_orders {
         return Err(ValidationRejectionReason::NotAcceptingOrders);
@@ -2187,6 +2246,9 @@ fn normalize_symbol(slug: &str) -> String {
 }
 
 fn parse_strike_price(question: &str, slug: &str) -> Option<Price> {
+    if !looks_like_any_price_market_text(question, slug) {
+        return None;
+    }
     parse_market_rule(question)
         .as_ref()
         .and_then(primary_strike_from_rule)
@@ -2195,52 +2257,41 @@ fn parse_strike_price(question: &str, slug: &str) -> Option<Price> {
 }
 
 fn parse_market_rule(question: &str) -> Option<MarketRule> {
-    let normalized = question
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
+    parse_supported_terminal_market_rule(question).or_else(|| {
+        let normalized = question
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
 
-    let between = Regex::new(&format!(
-        r"between\s+\$?{money}\s+and\s+\$?{money}",
-        money = MONEY_CAPTURE_RE
-    ))
-    .ok()?;
-    if let Some(captures) = between.captures(&normalized) {
-        return Some(MarketRule {
-            kind: MarketRuleKind::Between,
-            lower_strike: Some(Price(parse_money_capture(captures.get(1)?.as_str())?)),
-            upper_strike: Some(Price(parse_money_capture(captures.get(2)?.as_str())?)),
-        });
-    }
+        let above = Regex::new(&format!(
+            r"(reach(?:es)?|hit(?:s)?|touch(?:es)?)\s+\$?{money}",
+            money = MONEY_CAPTURE_RE
+        ))
+        .ok()?;
+        if let Some(captures) = above.captures(&normalized) {
+            return Some(MarketRule {
+                kind: MarketRuleKind::Above,
+                lower_strike: Some(Price(parse_money_capture(captures.get(2)?.as_str())?)),
+                upper_strike: None,
+            });
+        }
 
-    let above = Regex::new(&format!(
-        r"(above|greater than|reach(?:es)?|hit(?:s)?|touch(?:es)?)\s+\$?{money}",
-        money = MONEY_CAPTURE_RE
-    ))
-    .ok()?;
-    if let Some(captures) = above.captures(&normalized) {
-        return Some(MarketRule {
-            kind: MarketRuleKind::Above,
-            lower_strike: Some(Price(parse_money_capture(captures.get(2)?.as_str())?)),
-            upper_strike: None,
-        });
-    }
+        let below = Regex::new(&format!(
+            r"(dip to|fall to|falls to|drop to|drops to)\s+\$?{money}",
+            money = MONEY_CAPTURE_RE
+        ))
+        .ok()?;
+        if let Some(captures) = below.captures(&normalized) {
+            return Some(MarketRule {
+                kind: MarketRuleKind::Below,
+                lower_strike: None,
+                upper_strike: Some(Price(parse_money_capture(captures.get(2)?.as_str())?)),
+            });
+        }
 
-    let below = Regex::new(&format!(
-        r"(below|less than|dip to|fall to|falls to|drop to|drops to)\s+\$?{money}",
-        money = MONEY_CAPTURE_RE
-    ))
-    .ok()?;
-    if let Some(captures) = below.captures(&normalized) {
-        return Some(MarketRule {
-            kind: MarketRuleKind::Below,
-            lower_strike: None,
-            upper_strike: Some(Price(parse_money_capture(captures.get(2)?.as_str())?)),
-        });
-    }
-
-    None
+        None
+    })
 }
 
 fn parse_money_capture(raw: &str) -> Option<Decimal> {
@@ -2620,6 +2671,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_strike_price_rejects_non_price_event_numbers() {
+        assert_eq!(
+            parse_strike_price(
+                "Will Bitcoin replace SHA-256 before 2027?",
+                "will-bitcoin-replace-sha-256-before-2027",
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_strike_price_rejects_all_time_high_date_numbers() {
+        assert_eq!(
+            parse_strike_price(
+                "Ethereum all time high by September 30, 2026?",
+                "ethereum-all-time-high-by-september-30-2026",
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn resolve_assets_defaults_to_mainstream_universe() {
         let assets = resolve_assets(&[]);
         let labels = assets
@@ -2793,6 +2866,11 @@ mod tests {
     #[test]
     fn validate_and_select_markets_filters_stale_or_dead_candidates() {
         let base_ts = (Utc::now() + chrono::Duration::days(10)).timestamp() as u64;
+        let supported_rule = MarketRule {
+            kind: MarketRuleKind::Above,
+            lower_strike: Some(Price(Decimal::new(70_000, 0))),
+            upper_strike: None,
+        };
         let mk = |slug: &str,
                   accepting_orders: bool,
                   liquidity_num: f64,
@@ -2803,7 +2881,7 @@ mod tests {
             event_title: format!("title-{slug}"),
             event_slug: format!("event-{slug}"),
             market_id: format!("mkt-{slug}"),
-            question: format!("Will {slug}?"),
+            question: "Will the price of Bitcoin be above $70,000 on April 7?".to_owned(),
             market_slug: slug.to_owned(),
             condition_id: format!("cond-{slug}"),
             yes_token_id: format!("yes-{slug}"),
@@ -2811,8 +2889,8 @@ mod tests {
             settlement_timestamp: base_ts,
             settlement_iso: "2030-01-01T00:00:00Z".to_owned(),
             neg_risk: false,
-            strike_price: None,
-            market_rule: None,
+            strike_price: supported_rule.lower_strike,
+            market_rule: Some(supported_rule.clone()),
             event_archived: false,
             market_archived: false,
             accepting_orders,
@@ -2836,6 +2914,7 @@ mod tests {
                 min_minutes_to_settlement: 15,
                 min_liquidity_usd: 1_000.0,
                 min_volume_24h_usd: 1_000.0,
+                market_scope: StrategyMarketScopeConfig::default(),
             },
         );
 
@@ -2851,6 +2930,147 @@ mod tests {
             vec!["strong-a", "strong-b"]
         );
         assert_eq!(rejected.len(), 2);
+    }
+
+    #[test]
+    fn validate_and_select_markets_rejects_path_dependent_touch_markets() {
+        let base_ts = (Utc::now() + chrono::Duration::days(10)).timestamp() as u64;
+        let market = DiscoveredMarket {
+            event_id: "evt-touch".to_owned(),
+            event_title: "BTC touch".to_owned(),
+            event_slug: "btc-touch".to_owned(),
+            market_id: "mkt-touch".to_owned(),
+            question: "Will Bitcoin reach $80,000 by December 31, 2026?".to_owned(),
+            market_slug: "will-bitcoin-reach-80k-by-december-31-2026".to_owned(),
+            condition_id: "cond-touch".to_owned(),
+            yes_token_id: "yes-touch".to_owned(),
+            no_token_id: "no-touch".to_owned(),
+            settlement_timestamp: base_ts,
+            settlement_iso: "2030-01-01T00:00:00Z".to_owned(),
+            neg_risk: false,
+            strike_price: parse_strike_price(
+                "Will Bitcoin reach $80,000 by December 31, 2026?",
+                "will-bitcoin-reach-80k-by-december-31-2026",
+            ),
+            market_rule: parse_market_rule("Will Bitcoin reach $80,000 by December 31, 2026?"),
+            event_archived: false,
+            market_archived: false,
+            accepting_orders: true,
+            enable_orderbook: true,
+            best_bid: Some(0.45),
+            best_ask: Some(0.46),
+            liquidity_num: Some(25_000.0),
+            volume_num: Some(120_000.0),
+            volume_24h: Some(40_000.0),
+        };
+
+        let (selection, rejected) = validate_and_select_markets(
+            vec![market],
+            MarketValidationPolicy {
+                max_markets_per_asset: 8,
+                min_minutes_to_settlement: 15,
+                min_liquidity_usd: 1_000.0,
+                min_volume_24h_usd: 1_000.0,
+                market_scope: StrategyMarketScopeConfig::default(),
+            },
+        );
+
+        assert_eq!(selection.validated_total, 0);
+        assert_eq!(rejected.len(), 1);
+    }
+
+    #[test]
+    fn validate_and_select_markets_rejects_all_time_high_markets() {
+        let base_ts = (Utc::now() + chrono::Duration::days(10)).timestamp() as u64;
+        let market = DiscoveredMarket {
+            event_id: "evt-ath".to_owned(),
+            event_title: "SOL ATH".to_owned(),
+            event_slug: "sol-ath".to_owned(),
+            market_id: "mkt-ath".to_owned(),
+            question: "Solana all time high by December 31, 2026?".to_owned(),
+            market_slug: "solana-all-time-high-by-december-31-2026".to_owned(),
+            condition_id: "cond-ath".to_owned(),
+            yes_token_id: "yes-ath".to_owned(),
+            no_token_id: "no-ath".to_owned(),
+            settlement_timestamp: base_ts,
+            settlement_iso: "2030-01-01T00:00:00Z".to_owned(),
+            neg_risk: false,
+            strike_price: parse_strike_price(
+                "Solana all time high by December 31, 2026?",
+                "solana-all-time-high-by-december-31-2026",
+            ),
+            market_rule: parse_market_rule("Solana all time high by December 31, 2026?"),
+            event_archived: false,
+            market_archived: false,
+            accepting_orders: true,
+            enable_orderbook: true,
+            best_bid: Some(0.45),
+            best_ask: Some(0.46),
+            liquidity_num: Some(25_000.0),
+            volume_num: Some(120_000.0),
+            volume_24h: Some(40_000.0),
+        };
+
+        let (selection, rejected) = validate_and_select_markets(
+            vec![market],
+            MarketValidationPolicy {
+                max_markets_per_asset: 8,
+                min_minutes_to_settlement: 15,
+                min_liquidity_usd: 1_000.0,
+                min_volume_24h_usd: 1_000.0,
+                market_scope: StrategyMarketScopeConfig::default(),
+            },
+        );
+
+        assert_eq!(selection.validated_total, 0);
+        assert_eq!(rejected.len(), 1);
+    }
+
+    #[test]
+    fn validate_and_select_markets_rejects_non_price_event_markets() {
+        let base_ts = (Utc::now() + chrono::Duration::days(10)).timestamp() as u64;
+        let market = DiscoveredMarket {
+            event_id: "evt-non-price".to_owned(),
+            event_title: "BTC SHA".to_owned(),
+            event_slug: "btc-sha".to_owned(),
+            market_id: "mkt-non-price".to_owned(),
+            question: "Will Bitcoin replace SHA-256 before 2027?".to_owned(),
+            market_slug: "will-bitcoin-replace-sha-256-before-2027".to_owned(),
+            condition_id: "cond-non-price".to_owned(),
+            yes_token_id: "yes-non-price".to_owned(),
+            no_token_id: "no-non-price".to_owned(),
+            settlement_timestamp: base_ts,
+            settlement_iso: "2030-01-01T00:00:00Z".to_owned(),
+            neg_risk: false,
+            strike_price: parse_strike_price(
+                "Will Bitcoin replace SHA-256 before 2027?",
+                "will-bitcoin-replace-sha-256-before-2027",
+            ),
+            market_rule: parse_market_rule("Will Bitcoin replace SHA-256 before 2027?"),
+            event_archived: false,
+            market_archived: false,
+            accepting_orders: true,
+            enable_orderbook: true,
+            best_bid: Some(0.45),
+            best_ask: Some(0.46),
+            liquidity_num: Some(25_000.0),
+            volume_num: Some(120_000.0),
+            volume_24h: Some(40_000.0),
+        };
+
+        let (selection, rejected) = validate_and_select_markets(
+            vec![market],
+            MarketValidationPolicy {
+                max_markets_per_asset: 8,
+                min_minutes_to_settlement: 15,
+                min_liquidity_usd: 1_000.0,
+                min_volume_24h_usd: 1_000.0,
+                market_scope: StrategyMarketScopeConfig::default(),
+            },
+        );
+
+        assert_eq!(selection.validated_total, 0);
+        assert_eq!(rejected.len(), 1);
     }
 
     #[test]
@@ -3045,8 +3265,10 @@ mod tests {
                     enable_inventory_backed_short: false,
                 },
                 settlement: polyalpha_core::SettlementRules::default(),
+                market_scope: StrategyMarketScopeConfig::default(),
                 market_data: MarketDataConfig {
                     mode: polyalpha_core::MarketDataMode::Ws,
+                    binance_combined_ws_enabled: false,
                     max_stale_ms: 5_000,
                     planner_depth_levels: 5,
                     poly_open_max_quote_age_ms: Some(3_000),
@@ -3085,6 +3307,7 @@ mod tests {
                 min_minutes_to_settlement: 30,
                 min_liquidity_usd: 1_000.0,
                 min_volume_24h_usd: 1_000.0,
+                market_scope: StrategyMarketScopeConfig::default(),
             },
         )
         .expect("render generated settings");

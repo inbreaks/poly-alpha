@@ -609,8 +609,8 @@ mod tests {
         ClientOrderId, CoreError, DmmStrategyConfig, Fill, MarketConfig, NegRiskStrategyConfig,
         OpenCandidate, OrderExecutor, OrderId, OrderRequest, OrderResponse, OrderSide, OrderStatus,
         OrderType, PolyShares, PolymarketConfig, PolymarketIds, Price, RiskConfig, RiskManager,
-        RiskRejection, Settings, SettlementRules, StrategyConfig, TimeInForce, TokenSide,
-        UsdNotional, VenueQuantity,
+        RiskRejection, Settings, SettlementRules, StrategyConfig, StrategyMarketScopeConfig,
+        TimeInForce, TokenSide, UsdNotional, VenueQuantity,
     };
     use polyalpha_data::{CexBookLevel, CexBookUpdate, PolyBookLevel, PolyBookUpdate};
     use polyalpha_risk::{InMemoryRiskManager, RiskLimits};
@@ -700,6 +700,7 @@ mod tests {
                     enable_inventory_backed_short: false,
                 },
                 settlement: SettlementRules::default(),
+                market_scope: StrategyMarketScopeConfig::default(),
                 market_data: polyalpha_core::MarketDataConfig::default(),
             },
             risk: RiskConfig {
@@ -1359,10 +1360,13 @@ mod tests {
 
         loop {
             match market_data_rx.try_recv() {
-                Ok(MarketDataEvent::OrderBookUpdate { snapshot }) => {
-                    apply_orderbook_snapshot(&provider, &registry, &snapshot);
+                Ok(event) => {
+                    for expanded in event.into_expanded_for_registry(&registry) {
+                        if let MarketDataEvent::OrderBookUpdate { snapshot } = expanded {
+                            apply_orderbook_snapshot(&provider, &registry, &snapshot);
+                        }
+                    }
                 }
-                Ok(_) => continue,
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty)
                 | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
@@ -1454,10 +1458,13 @@ mod tests {
 
         loop {
             match market_data_rx.try_recv() {
-                Ok(MarketDataEvent::OrderBookUpdate { snapshot }) => {
-                    apply_orderbook_snapshot(&provider, &registry, &snapshot);
+                Ok(event) => {
+                    for expanded in event.into_expanded_for_registry(&registry) {
+                        if let MarketDataEvent::OrderBookUpdate { snapshot } = expanded {
+                            apply_orderbook_snapshot(&provider, &registry, &snapshot);
+                        }
+                    }
                 }
-                Ok(_) => continue,
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty)
                 | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
@@ -1572,10 +1579,13 @@ mod tests {
 
         loop {
             match market_data_rx.try_recv() {
-                Ok(MarketDataEvent::OrderBookUpdate { snapshot }) => {
-                    apply_orderbook_snapshot(&provider, &registry, &snapshot);
+                Ok(event) => {
+                    for expanded in event.into_expanded_for_registry(&registry) {
+                        if let MarketDataEvent::OrderBookUpdate { snapshot } = expanded {
+                            apply_orderbook_snapshot(&provider, &registry, &snapshot);
+                        }
+                    }
                 }
-                Ok(_) => continue,
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty)
                 | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,

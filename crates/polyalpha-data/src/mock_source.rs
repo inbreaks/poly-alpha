@@ -345,11 +345,11 @@ mod tests {
         ));
         assert!(matches!(
             rx.try_recv().expect("expected cex trade event"),
-            MarketDataEvent::TradeUpdate { .. }
+            MarketDataEvent::CexVenueTradeUpdate { .. }
         ));
         assert!(matches!(
             rx.try_recv().expect("expected cex funding event"),
-            MarketDataEvent::FundingRate { .. }
+            MarketDataEvent::CexVenueFundingRate { .. }
         ));
         assert!(matches!(
             rx.try_recv().expect("expected lifecycle event"),
