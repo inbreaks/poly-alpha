@@ -12,7 +12,8 @@ use std::path::Path;
 use std::str::FromStr;
 
 use polyalpha_core::{
-    MarketConfig, MarketRule, MarketRuleKind, Price, Settings, StrategyMarketScopeConfig, Symbol,
+    Exchange, MarketConfig, MarketRule, MarketRuleKind, Price, Settings, StrategyMarketScopeConfig,
+    Symbol,
 };
 
 use crate::args::MarketAsset;
@@ -24,6 +25,7 @@ use crate::strategy_scope::{
 
 const GAMMA_EVENTS_URL: &str = "https://gamma-api.polymarket.com/events";
 const GAMMA_PUBLIC_SEARCH_URL: &str = "https://gamma-api.polymarket.com/public-search";
+const BINANCE_EXCHANGE_INFO_PATH: &str = "/fapi/v1/exchangeInfo";
 const MAX_PUBLIC_SEARCH_PAGES: usize = 10;
 const EVENT_FETCH_CONCURRENCY: usize = 12;
 const HTTP_GET_RETRY_ATTEMPTS: usize = 3;
@@ -41,6 +43,8 @@ const ETH_SEARCH_QUERIES: [&str; 1] = ["ethereum"];
 const SOL_SEARCH_QUERIES: [&str; 1] = ["solana"];
 const XRP_SEARCH_QUERIES: [&str; 2] = ["xrp", "ripple"];
 const MONEY_CAPTURE_RE: &str = r"([0-9][0-9,]*(?:\.\d+)?(?:[kmb])?)";
+
+type CexQtyStepSyncMap = HashMap<(Exchange, String), Decimal>;
 
 #[derive(Clone, Debug)]
 struct DiscoveredMarket {
@@ -592,6 +596,7 @@ pub async fn run_refresh_active(
     let mut summaries = Vec::new();
     let mut asset_reports = Vec::new();
     let mut warnings = Vec::new();
+    let mut templates = Vec::with_capacity(selected_assets.len());
 
     for asset in selected_assets.iter().copied() {
         let template = find_asset_template_market(&catalog_settings, asset)
@@ -604,12 +609,27 @@ pub async fn run_refresh_active(
                     base_env
                 )
             })?;
+        templates.push((asset, template));
+    }
 
+    let synced_cex_qty_steps = fetch_binance_cex_qty_steps(
+        &client,
+        &base_settings.binance.rest_url,
+        &templates
+            .iter()
+            .filter(|(_, template)| template.hedge_exchange == Exchange::Binance)
+            .map(|(_, template)| template.cex_symbol.clone())
+            .collect::<Vec<_>>(),
+    )
+    .await?;
+
+    for (asset, template) in templates {
         let artifact = refresh_asset_markets(
             &client,
             &base_settings.polymarket.clob_api_url,
             asset,
             &template,
+            &synced_cex_qty_steps,
             &catalog_by_condition,
             limit_per_asset.max(1),
             validation_policy,
@@ -705,6 +725,7 @@ async fn refresh_asset_markets(
     clob_api_url: &str,
     asset: AssetSpec,
     template: &MarketConfig,
+    synced_cex_qty_steps: &CexQtyStepSyncMap,
     catalog_by_condition: &HashMap<String, MarketConfig>,
     limit_per_asset: usize,
     validation_policy: MarketValidationPolicy,
@@ -838,11 +859,20 @@ async fn refresh_asset_markets(
             .cloned()
         {
             summary.matched_catalog += 1;
-            let existing = refresh_catalog_market_config(existing, &discovered_market);
+            let existing = apply_synced_cex_qty_step(
+                refresh_catalog_market_config(existing, &discovered_market),
+                synced_cex_qty_steps,
+            );
             mark_candidate_selected(&mut candidates, candidate_index, "catalog".to_owned(), None);
             existing
         } else {
-            match synthesize_market_config(&discovered_market, template) {
+            let synced_cex_qty_step = synced_cex_qty_step(
+                synced_cex_qty_steps,
+                template.hedge_exchange,
+                &template.cex_symbol,
+                template.cex_qty_step,
+            );
+            match synthesize_market_config(&discovered_market, template, synced_cex_qty_step) {
                 Ok(market) => {
                     summary.synthesized += 1;
                     mark_candidate_selected(
@@ -1320,6 +1350,102 @@ async fn http_get_json(client: &Client, url: &str, params: &[(&str, String)]) ->
     }
 
     Err(last_error.unwrap_or_else(|| anyhow!("GET {} failed after retries", url)))
+}
+
+async fn fetch_binance_cex_qty_steps(
+    client: &Client,
+    rest_url: &str,
+    symbols: &[String],
+) -> Result<CexQtyStepSyncMap> {
+    let mut synced_steps = HashMap::new();
+    let mut seen_symbols = HashSet::new();
+    let url = format!(
+        "{}/{}",
+        rest_url.trim_end_matches('/'),
+        BINANCE_EXCHANGE_INFO_PATH.trim_start_matches('/')
+    );
+
+    for symbol in symbols {
+        let symbol = symbol.trim().to_ascii_uppercase();
+        if symbol.is_empty() || !seen_symbols.insert(symbol.clone()) {
+            continue;
+        }
+
+        let payload = http_get_json(client, &url, &[("symbol", symbol.clone())])
+            .await
+            .with_context(|| format!("failed to fetch Binance exchangeInfo for {}", symbol))?;
+        let step_size = parse_binance_exchange_info_step_size(&payload, &symbol)
+            .with_context(|| format!("failed to parse Binance exchangeInfo for {}", symbol))?;
+        synced_steps.insert((Exchange::Binance, symbol), step_size);
+    }
+
+    Ok(synced_steps)
+}
+
+fn parse_binance_exchange_info_step_size(payload: &Value, symbol: &str) -> Result<Decimal> {
+    let symbols = payload
+        .get("symbols")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Binance exchangeInfo missing symbols array for {}", symbol))?;
+    let symbol_payload = symbols
+        .iter()
+        .find(|entry| string_field(entry, "symbol").eq_ignore_ascii_case(symbol))
+        .ok_or_else(|| anyhow!("Binance exchangeInfo missing symbol {}", symbol))?;
+    let filters = symbol_payload
+        .get("filters")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Binance exchangeInfo missing filters for {}", symbol))?;
+    let lot_size_filter = filters
+        .iter()
+        .find(|entry| string_field(entry, "filterType") == "LOT_SIZE")
+        .ok_or_else(|| {
+            anyhow!(
+                "Binance exchangeInfo missing LOT_SIZE filter for {}",
+                symbol
+            )
+        })?;
+    let raw_step_size = lot_size_filter
+        .get("stepSize")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "Binance exchangeInfo missing LOT_SIZE.stepSize for {}",
+                symbol
+            )
+        })?;
+
+    Decimal::from_str(raw_step_size).with_context(|| {
+        format!(
+            "invalid Binance LOT_SIZE.stepSize `{}` for {}",
+            raw_step_size, symbol
+        )
+    })
+}
+
+fn synced_cex_qty_step(
+    synced_steps: &CexQtyStepSyncMap,
+    exchange: Exchange,
+    cex_symbol: &str,
+    fallback: Decimal,
+) -> Decimal {
+    synced_steps
+        .get(&(exchange, cex_symbol.trim().to_ascii_uppercase()))
+        .copied()
+        .unwrap_or(fallback)
+}
+
+fn apply_synced_cex_qty_step(
+    mut market: MarketConfig,
+    synced_steps: &CexQtyStepSyncMap,
+) -> MarketConfig {
+    market.cex_qty_step = synced_cex_qty_step(
+        synced_steps,
+        market.hedge_exchange,
+        &market.cex_symbol,
+        market.cex_qty_step,
+    );
+    market
 }
 
 fn validate_and_select_markets(
@@ -2469,6 +2595,7 @@ fn resolve_assets(assets: &[MarketAsset]) -> Vec<AssetSpec> {
 fn synthesize_market_config(
     discovered: &DiscoveredMarket,
     template: &MarketConfig,
+    cex_qty_step: Decimal,
 ) -> Result<MarketConfig> {
     let market_rule = discovered.market_rule.clone();
     let strike_price = discovered
@@ -2492,7 +2619,7 @@ fn synthesize_market_config(
         min_tick_size: template.min_tick_size,
         neg_risk: discovered.neg_risk,
         cex_price_tick: template.cex_price_tick,
-        cex_qty_step: template.cex_qty_step,
+        cex_qty_step,
         cex_contract_multiplier: template.cex_contract_multiplier,
     })
 }
@@ -2571,6 +2698,32 @@ mod tests {
         PolymarketConfig, PolymarketIds, RiskConfig, Settings, StrategyConfig, UsdNotional,
     };
     use rust_decimal::Decimal;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn spawn_static_http_server(status_line: &str, body: &str, max_requests: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let status_line = status_line.to_owned();
+        let body = body.to_owned();
+        thread::spawn(move || {
+            for _ in 0..max_requests {
+                let (mut stream, _) = listener.accept().expect("accept test connection");
+                let mut buffer = [0_u8; 1024];
+                let _ = stream.read(&mut buffer);
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write test response");
+            }
+        });
+        format!("http://{}", addr)
+    }
 
     #[test]
     fn parse_token_ids_handles_json_string_array() {
@@ -2778,14 +2931,15 @@ mod tests {
             volume_24h: Some(40_000.0),
         };
 
-        let market = synthesize_market_config(&discovered, &template).expect("synthesized market");
+        let market = synthesize_market_config(&discovered, &template, Decimal::new(1, 3))
+            .expect("synthesized market");
         assert_eq!(market.symbol.0, discovered.market_slug);
         assert_eq!(market.poly_ids.condition_id, "new-condition");
         assert_eq!(market.poly_ids.yes_token_id, "new-yes");
         assert_eq!(market.poly_ids.no_token_id, "new-no");
         assert_eq!(market.cex_symbol, "ETHUSDT");
         assert_eq!(market.cex_price_tick, Decimal::new(1, 2));
-        assert_eq!(market.cex_qty_step, Decimal::new(1, 2));
+        assert_eq!(market.cex_qty_step, Decimal::new(1, 3));
         assert_eq!(
             market
                 .market_rule
@@ -2797,6 +2951,96 @@ mod tests {
                 .to_string(),
             "1800"
         );
+    }
+
+    #[test]
+    fn parse_binance_exchange_info_step_size_extracts_lot_size_step() {
+        let payload = serde_json::json!({
+            "symbols": [{
+                "symbol": "ETHUSDT",
+                "filters": [
+                    {
+                        "filterType": "PRICE_FILTER",
+                        "tickSize": "0.01"
+                    },
+                    {
+                        "filterType": "LOT_SIZE",
+                        "stepSize": "0.001"
+                    }
+                ]
+            }]
+        });
+
+        let step = parse_binance_exchange_info_step_size(&payload, "ETHUSDT")
+            .expect("step size should parse");
+
+        assert_eq!(step, Decimal::new(1, 3));
+    }
+
+    #[test]
+    fn apply_synced_cex_qty_step_prefers_synced_binance_value() {
+        let market = MarketConfig {
+            symbol: Symbol::new("eth-template"),
+            poly_ids: PolymarketIds {
+                condition_id: "condition-1".to_owned(),
+                yes_token_id: "yes-1".to_owned(),
+                no_token_id: "no-1".to_owned(),
+            },
+            market_question: Some("template question".to_owned()),
+            market_rule: None,
+            cex_symbol: "ETHUSDT".to_owned(),
+            hedge_exchange: Exchange::Binance,
+            strike_price: Some(Price(Decimal::from(3_000u32))),
+            settlement_timestamp: 1_775_016_000,
+            min_tick_size: Price(Decimal::new(1, 2)),
+            neg_risk: false,
+            cex_price_tick: Decimal::new(1, 2),
+            cex_qty_step: Decimal::new(1, 2),
+            cex_contract_multiplier: Decimal::ONE,
+        };
+        let synced = HashMap::from([(
+            (Exchange::Binance, "ETHUSDT".to_owned()),
+            Decimal::new(1, 3),
+        )]);
+
+        let market = apply_synced_cex_qty_step(market, &synced);
+
+        assert_eq!(market.cex_qty_step, Decimal::new(1, 3));
+    }
+
+    #[tokio::test]
+    async fn fetch_binance_cex_qty_steps_reads_exchange_info_step_size() {
+        let base_url = spawn_static_http_server(
+            "200 OK",
+            r#"{"symbols":[{"symbol":"ETHUSDT","filters":[{"filterType":"LOT_SIZE","stepSize":"0.001"}]}]}"#,
+            1,
+        );
+        let client = Client::builder().build().expect("reqwest client");
+
+        let steps = fetch_binance_cex_qty_steps(&client, &base_url, &[String::from("ETHUSDT")])
+            .await
+            .expect("exchange info fetch should succeed");
+
+        assert_eq!(
+            steps.get(&(Exchange::Binance, String::from("ETHUSDT"))),
+            Some(&Decimal::new(1, 3))
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_binance_cex_qty_steps_hard_fails_when_exchange_info_fails() {
+        let base_url = spawn_static_http_server(
+            "500 Internal Server Error",
+            r#"{"code":"boom"}"#,
+            HTTP_GET_RETRY_ATTEMPTS,
+        );
+        let client = Client::builder().build().expect("reqwest client");
+
+        let err = fetch_binance_cex_qty_steps(&client, &base_url, &[String::from("ETHUSDT")])
+            .await
+            .expect_err("500 exchange info should fail refresh");
+
+        assert!(err.to_string().contains("exchangeInfo"));
     }
 
     #[test]

@@ -1328,7 +1328,7 @@ settlement_timestamp = 1775361600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1348,7 +1348,7 @@ settlement_timestamp = 1775361600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1368,7 +1368,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1388,7 +1388,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1409,7 +1409,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1429,7 +1429,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1449,7 +1449,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1470,7 +1470,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1490,7 +1490,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1511,7 +1511,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1531,7 +1531,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1552,7 +1552,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1572,7 +1572,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1592,7 +1592,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1613,7 +1613,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1633,7 +1633,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1654,7 +1654,7 @@ settlement_timestamp = 1775448000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1674,7 +1674,7 @@ settlement_timestamp = 1775448000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1694,7 +1694,7 @@ settlement_timestamp = 1775448000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1714,7 +1714,7 @@ settlement_timestamp = 1775448000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1734,7 +1734,7 @@ settlement_timestamp = 1775448000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1754,7 +1754,7 @@ settlement_timestamp = 1775448000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1774,7 +1774,7 @@ settlement_timestamp = 1775448000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1794,7 +1794,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1814,7 +1814,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1834,7 +1834,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1854,7 +1854,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1874,7 +1874,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1894,7 +1894,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1914,7 +1914,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1934,7 +1934,7 @@ settlement_timestamp = 1775577600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1954,7 +1954,7 @@ settlement_timestamp = 1775577600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1974,7 +1974,7 @@ settlement_timestamp = 1775664000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -1994,7 +1994,7 @@ settlement_timestamp = 1775664000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2014,7 +2014,7 @@ settlement_timestamp = 1775664000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2034,7 +2034,7 @@ settlement_timestamp = 1775664000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2054,7 +2054,7 @@ settlement_timestamp = 1775750400
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2074,7 +2074,7 @@ settlement_timestamp = 1775836800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2094,7 +2094,7 @@ settlement_timestamp = 1775836800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2114,7 +2114,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2134,7 +2134,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2154,7 +2154,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2174,7 +2174,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2194,7 +2194,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2214,7 +2214,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2234,7 +2234,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2254,7 +2254,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2274,7 +2274,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2294,7 +2294,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2314,7 +2314,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2334,7 +2334,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2354,7 +2354,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2374,7 +2374,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2394,7 +2394,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2414,7 +2414,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2434,7 +2434,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2454,7 +2454,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2474,7 +2474,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2494,7 +2494,7 @@ settlement_timestamp = 1790830800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2514,7 +2514,7 @@ settlement_timestamp = 1798779600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2534,7 +2534,7 @@ settlement_timestamp = 1798779600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2554,7 +2554,7 @@ settlement_timestamp = 1798779600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2574,7 +2574,7 @@ settlement_timestamp = 1798779600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2594,7 +2594,7 @@ settlement_timestamp = 1798779600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.01"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2614,7 +2614,7 @@ settlement_timestamp = 1775361600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2634,7 +2634,7 @@ settlement_timestamp = 1775361600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2654,7 +2654,7 @@ settlement_timestamp = 1775361600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2674,7 +2674,7 @@ settlement_timestamp = 1775361600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2694,7 +2694,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2714,7 +2714,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2735,7 +2735,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2755,7 +2755,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2776,7 +2776,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2796,7 +2796,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2817,7 +2817,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2837,7 +2837,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2858,7 +2858,7 @@ settlement_timestamp = 1775448000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2878,7 +2878,7 @@ settlement_timestamp = 1775448000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2898,7 +2898,7 @@ settlement_timestamp = 1775448000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2918,7 +2918,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2938,7 +2938,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2958,7 +2958,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2978,7 +2978,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -2999,7 +2999,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3019,7 +3019,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3039,7 +3039,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3060,7 +3060,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3080,7 +3080,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3100,7 +3100,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3120,7 +3120,7 @@ settlement_timestamp = 1775577600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3140,7 +3140,7 @@ settlement_timestamp = 1775577600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3160,7 +3160,7 @@ settlement_timestamp = 1775577600
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3181,7 +3181,7 @@ settlement_timestamp = 1775577600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3201,7 +3201,7 @@ settlement_timestamp = 1775577600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3221,7 +3221,7 @@ settlement_timestamp = 1775664000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3241,7 +3241,7 @@ settlement_timestamp = 1775664000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3261,7 +3261,7 @@ settlement_timestamp = 1775664000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3281,7 +3281,7 @@ settlement_timestamp = 1775750400
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3301,7 +3301,7 @@ settlement_timestamp = 1775750400
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3321,7 +3321,7 @@ settlement_timestamp = 1775750400
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3341,7 +3341,7 @@ settlement_timestamp = 1775750400
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3361,7 +3361,7 @@ settlement_timestamp = 1775750400
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3381,7 +3381,7 @@ settlement_timestamp = 1775750400
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3401,7 +3401,7 @@ settlement_timestamp = 1775750400
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3421,7 +3421,7 @@ settlement_timestamp = 1775750400
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3441,7 +3441,7 @@ settlement_timestamp = 1775836800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3461,7 +3461,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3481,7 +3481,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3501,7 +3501,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3521,7 +3521,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3541,7 +3541,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3561,7 +3561,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3581,7 +3581,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3601,7 +3601,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3621,7 +3621,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3641,7 +3641,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3661,7 +3661,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3681,7 +3681,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3701,7 +3701,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3721,7 +3721,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3741,7 +3741,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3761,7 +3761,7 @@ settlement_timestamp = 1782882000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3781,7 +3781,7 @@ settlement_timestamp = 1798779600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3801,7 +3801,7 @@ settlement_timestamp = 1798779600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3821,7 +3821,7 @@ settlement_timestamp = 1798779600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3841,7 +3841,7 @@ settlement_timestamp = 1798779600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3861,7 +3861,7 @@ settlement_timestamp = 1798779600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3881,7 +3881,7 @@ settlement_timestamp = 1798779600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.01"
-cex_qty_step = "0.1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3901,7 +3901,7 @@ settlement_timestamp = 1775361600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3921,7 +3921,7 @@ settlement_timestamp = 1775361600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3941,7 +3941,7 @@ settlement_timestamp = 1775361600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3961,7 +3961,7 @@ settlement_timestamp = 1775361600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -3981,7 +3981,7 @@ settlement_timestamp = 1775361600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4001,7 +4001,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4022,7 +4022,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4042,7 +4042,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4063,7 +4063,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4083,7 +4083,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4104,7 +4104,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4124,7 +4124,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4145,7 +4145,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4165,7 +4165,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4186,7 +4186,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4206,7 +4206,7 @@ settlement_timestamp = 1775404800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4227,7 +4227,7 @@ settlement_timestamp = 1775448000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4247,7 +4247,7 @@ settlement_timestamp = 1775448000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4267,7 +4267,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4287,7 +4287,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4308,7 +4308,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4328,7 +4328,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4349,7 +4349,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4369,7 +4369,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4390,7 +4390,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4410,7 +4410,7 @@ settlement_timestamp = 1775491200
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4430,7 +4430,7 @@ settlement_timestamp = 1775577600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4450,7 +4450,7 @@ settlement_timestamp = 1775577600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4470,7 +4470,7 @@ settlement_timestamp = 1775664000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4490,7 +4490,7 @@ settlement_timestamp = 1775664000
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4511,7 +4511,7 @@ settlement_timestamp = 1775664000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4531,7 +4531,7 @@ settlement_timestamp = 1775664000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4551,7 +4551,7 @@ settlement_timestamp = 1775664000
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4571,7 +4571,7 @@ settlement_timestamp = 1775750400
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4591,7 +4591,7 @@ settlement_timestamp = 1775750400
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4611,7 +4611,7 @@ settlement_timestamp = 1775750400
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4631,7 +4631,7 @@ settlement_timestamp = 1775750400
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4651,7 +4651,7 @@ settlement_timestamp = 1775836800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4672,7 +4672,7 @@ settlement_timestamp = 1775836800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4692,7 +4692,7 @@ settlement_timestamp = 1775836800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4713,7 +4713,7 @@ settlement_timestamp = 1775836800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4733,7 +4733,7 @@ settlement_timestamp = 1775836800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4753,7 +4753,7 @@ settlement_timestamp = 1775836800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4773,7 +4773,7 @@ settlement_timestamp = 1775836800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4793,7 +4793,7 @@ settlement_timestamp = 1775836800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4814,7 +4814,7 @@ settlement_timestamp = 1775836800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4835,7 +4835,7 @@ settlement_timestamp = 1775836800
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4855,7 +4855,7 @@ settlement_timestamp = 1775836800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4876,7 +4876,7 @@ settlement_timestamp = 1775836800
 min_tick_size = "0.01"
 neg_risk = true
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4896,7 +4896,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4916,7 +4916,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4936,7 +4936,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4956,7 +4956,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4976,7 +4976,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -4996,7 +4996,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -5016,7 +5016,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -5036,7 +5036,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -5056,7 +5056,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -5076,7 +5076,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -5096,7 +5096,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -5116,7 +5116,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -5136,7 +5136,7 @@ settlement_timestamp = 1777608000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -5156,7 +5156,7 @@ settlement_timestamp = 1782882000
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
@@ -5176,7 +5176,7 @@ settlement_timestamp = 1798779600
 min_tick_size = "0.01"
 neg_risk = false
 cex_price_tick = "0.0001"
-cex_qty_step = "1"
+cex_qty_step = "0.001"
 cex_contract_multiplier = "1"
 
 [markets.market_rule]
