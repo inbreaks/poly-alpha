@@ -131,16 +131,16 @@ fn open_cooldown_policy(base_stale_ms: u64, reason: &str) -> Option<CooldownPoli
         | "planned_edge_deteriorated"
         | "residual_risk_deteriorated" => Some(CooldownPolicy {
             family: CooldownFamily::Edge,
-            base_duration_ms: base_ms.saturating_mul(6).max(3 * 60 * 1_000),
+            base_duration_ms: base_ms.saturating_mul(6).max(30 * 1_000),
             repeat_window_ms: Some(10 * 60 * 1_000),
-            max_duration_ms: 15 * 60 * 1_000,
+            max_duration_ms: 3 * 60 * 1_000,
         }),
         "below_min_poly_price" | "above_or_equal_max_poly_price" | "missing_poly_quote" => {
             Some(CooldownPolicy {
                 family: CooldownFamily::Edge,
-                base_duration_ms: base_ms.saturating_mul(6).max(3 * 60 * 1_000),
+                base_duration_ms: base_ms.saturating_mul(6).max(30 * 1_000),
                 repeat_window_ms: Some(10 * 60 * 1_000),
-                max_duration_ms: 15 * 60 * 1_000,
+                max_duration_ms: 3 * 60 * 1_000,
             })
         }
         "missing_poly"
@@ -281,6 +281,39 @@ mod tests {
         assert_eq!(
             active_open_cooldown_reason(&band_state, 2_001),
             Some("above_or_equal_max_poly_price")
+        );
+    }
+
+    #[test]
+    fn edge_rejections_use_shorter_cooldown_than_before() {
+        let mut state = MarketPoolState::default();
+
+        assert!(maybe_start_open_cooldown(
+            &mut state,
+            5_000,
+            "non_positive_planned_edge",
+            1_000,
+        ));
+        let first_until_ms = state.open_cooldown_until_ms.expect("first edge cooldown");
+
+        assert_eq!(
+            first_until_ms.saturating_sub(1_000),
+            30_000,
+            "edge cooldown should be short enough to avoid missing fast-repricing opportunities",
+        );
+
+        assert!(maybe_start_open_cooldown(
+            &mut state,
+            5_000,
+            "planned_edge_deteriorated",
+            31_001,
+        ));
+        let second_until_ms = state.open_cooldown_until_ms.expect("second edge cooldown");
+
+        assert_eq!(
+            second_until_ms.saturating_sub(31_001),
+            60_000,
+            "repeated edge failures should still back off, but stay much shorter than structural cooldowns",
         );
     }
 
