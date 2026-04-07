@@ -629,9 +629,77 @@ struct AsyncMarketSnapshot {
     poly_quote_age_ms: Option<u64>,
     cex_quote_age_ms: Option<u64>,
     cross_leg_skew_ms: Option<u64>,
-    transport_idle_ms_by_connection: HashMap<String, u64>,
     evaluable_status: EvaluableStatus,
     async_classification: AsyncClassification,
+}
+
+#[derive(Clone, Debug)]
+struct AsyncMarketCoreSnapshot {
+    poly_updated_at_ms: Option<u64>,
+    cex_updated_at_ms: Option<u64>,
+    poly_quote_age_ms: Option<u64>,
+    cex_quote_age_ms: Option<u64>,
+    cross_leg_skew_ms: Option<u64>,
+    evaluable_status: EvaluableStatus,
+    async_classification: AsyncClassification,
+}
+
+#[derive(Debug)]
+struct EvaluationObservedContext<'a> {
+    now_ms: u64,
+    market: &'a MarketConfig,
+    observed: &'a ObservedState,
+    core_snapshot: AsyncMarketCoreSnapshot,
+}
+
+impl<'a> EvaluationObservedContext<'a> {
+    fn new(
+        now_ms: u64,
+        settings: &Settings,
+        market: &'a MarketConfig,
+        observed: &'a ObservedState,
+        token_side: Option<TokenSide>,
+        use_close_thresholds: bool,
+    ) -> Self {
+        let basis = effective_basis_config_for_market(settings, market);
+        let core_snapshot = classify_async_market_core(
+            now_ms,
+            market,
+            observed,
+            freshness_thresholds(settings, &basis),
+            token_side,
+            use_close_thresholds,
+            require_connected_inputs(&basis),
+        );
+        Self {
+            now_ms,
+            market,
+            observed,
+            core_snapshot,
+        }
+    }
+
+    fn build_audit_observed(&self) -> AuditObservedMarket {
+        build_audit_observed_market_from_core_snapshot(
+            self.now_ms,
+            self.market,
+            self.observed,
+            &self.core_snapshot,
+        )
+    }
+}
+
+#[cfg(test)]
+static BUILD_AUDIT_OBSERVED_MARKET_CALLS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn reset_build_audit_observed_market_calls() {
+    BUILD_AUDIT_OBSERVED_MARKET_CALLS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn build_audit_observed_market_calls() -> u64 {
+    BUILD_AUDIT_OBSERVED_MARKET_CALLS.load(Ordering::Relaxed)
 }
 
 fn global_basis_config(settings: &Settings) -> EffectiveBasisConfig {
@@ -727,7 +795,15 @@ fn connection_is_impaired(status: Option<ConnectionStatus>) -> bool {
     )
 }
 
-fn classify_async_market(
+fn transport_idle_ms_by_connection(observed: &ObservedState, now_ms: u64) -> HashMap<String, u64> {
+    observed
+        .connection_updated_at_ms
+        .iter()
+        .map(|(name, updated_at_ms)| (name.clone(), now_ms.saturating_sub(*updated_at_ms)))
+        .collect::<HashMap<_, _>>()
+}
+
+fn classify_async_market_core(
     now_ms: u64,
     market: &MarketConfig,
     observed: &ObservedState,
@@ -735,17 +811,12 @@ fn classify_async_market(
     token_side: Option<TokenSide>,
     use_close_thresholds: bool,
     require_connections: bool,
-) -> AsyncMarketSnapshot {
+) -> AsyncMarketCoreSnapshot {
     let poly_updated_at_ms = preferred_poly_update_ms(observed, token_side);
     let cex_updated_at_ms = observed.cex_updated_at_ms;
     let poly_quote_age_ms = quote_age_ms(now_ms, poly_updated_at_ms);
     let cex_quote_age_ms = quote_age_ms(now_ms, cex_updated_at_ms);
     let cross_leg_skew_ms = absolute_time_diff_ms(poly_updated_at_ms, cex_updated_at_ms);
-    let transport_idle_ms_by_connection = observed
-        .connection_updated_at_ms
-        .iter()
-        .map(|(name, updated_at_ms)| (name.clone(), now_ms.saturating_sub(*updated_at_ms)))
-        .collect::<HashMap<_, _>>();
     let poly_limit = if use_close_thresholds {
         thresholds.close_max_quote_age_ms
     } else {
@@ -811,15 +882,74 @@ fn classify_async_market(
         (EvaluableStatus::Evaluable, classification)
     };
 
-    AsyncMarketSnapshot {
+    AsyncMarketCoreSnapshot {
         poly_updated_at_ms,
         cex_updated_at_ms,
         poly_quote_age_ms,
         cex_quote_age_ms,
         cross_leg_skew_ms,
-        transport_idle_ms_by_connection,
         evaluable_status,
         async_classification,
+    }
+}
+
+fn classify_async_market(
+    now_ms: u64,
+    market: &MarketConfig,
+    observed: &ObservedState,
+    thresholds: FreshnessThresholds,
+    token_side: Option<TokenSide>,
+    use_close_thresholds: bool,
+    require_connections: bool,
+) -> AsyncMarketSnapshot {
+    let core_snapshot = classify_async_market_core(
+        now_ms,
+        market,
+        observed,
+        thresholds,
+        token_side,
+        use_close_thresholds,
+        require_connections,
+    );
+
+    AsyncMarketSnapshot {
+        poly_updated_at_ms: core_snapshot.poly_updated_at_ms,
+        cex_updated_at_ms: core_snapshot.cex_updated_at_ms,
+        poly_quote_age_ms: core_snapshot.poly_quote_age_ms,
+        cex_quote_age_ms: core_snapshot.cex_quote_age_ms,
+        cross_leg_skew_ms: core_snapshot.cross_leg_skew_ms,
+        evaluable_status: core_snapshot.evaluable_status,
+        async_classification: core_snapshot.async_classification,
+    }
+}
+
+fn build_audit_observed_market_from_core_snapshot(
+    now_ms: u64,
+    market: &MarketConfig,
+    observed: &ObservedState,
+    core_snapshot: &AsyncMarketCoreSnapshot,
+) -> AuditObservedMarket {
+    #[cfg(test)]
+    BUILD_AUDIT_OBSERVED_MARKET_CALLS.fetch_add(1, Ordering::Relaxed);
+
+    AuditObservedMarket {
+        symbol: market.symbol.0.clone(),
+        poly_yes_mid: observed.poly_yes_mid.and_then(|value| value.to_f64()),
+        poly_no_mid: observed.poly_no_mid.and_then(|value| value.to_f64()),
+        cex_mid: observed.cex_mid.and_then(|value| value.to_f64()),
+        poly_updated_at_ms: core_snapshot.poly_updated_at_ms,
+        cex_updated_at_ms: core_snapshot.cex_updated_at_ms,
+        poly_quote_age_ms: core_snapshot.poly_quote_age_ms,
+        cex_quote_age_ms: core_snapshot.cex_quote_age_ms,
+        cross_leg_skew_ms: core_snapshot.cross_leg_skew_ms,
+        market_phase: observed
+            .market_phase
+            .as_ref()
+            .map(|phase| format!("{phase:?}")),
+        connections: observed.connections.clone(),
+        transport_idle_ms_by_connection: transport_idle_ms_by_connection(observed, now_ms),
+        evaluable_status: core_snapshot.evaluable_status,
+        async_classification: core_snapshot.async_classification,
     }
 }
 
@@ -832,7 +962,7 @@ fn build_audit_observed_market(
     use_close_thresholds: bool,
     basis: &EffectiveBasisConfig,
 ) -> AuditObservedMarket {
-    let async_snapshot = classify_async_market(
+    let core_snapshot = classify_async_market_core(
         now_ms,
         market,
         observed,
@@ -842,25 +972,7 @@ fn build_audit_observed_market(
         require_connected_inputs(basis),
     );
 
-    AuditObservedMarket {
-        symbol: market.symbol.0.clone(),
-        poly_yes_mid: observed.poly_yes_mid.and_then(|value| value.to_f64()),
-        poly_no_mid: observed.poly_no_mid.and_then(|value| value.to_f64()),
-        cex_mid: observed.cex_mid.and_then(|value| value.to_f64()),
-        poly_updated_at_ms: async_snapshot.poly_updated_at_ms,
-        cex_updated_at_ms: async_snapshot.cex_updated_at_ms,
-        poly_quote_age_ms: async_snapshot.poly_quote_age_ms,
-        cex_quote_age_ms: async_snapshot.cex_quote_age_ms,
-        cross_leg_skew_ms: async_snapshot.cross_leg_skew_ms,
-        market_phase: observed
-            .market_phase
-            .as_ref()
-            .map(|phase| format!("{phase:?}")),
-        connections: observed.connections.clone(),
-        transport_idle_ms_by_connection: async_snapshot.transport_idle_ms_by_connection,
-        evaluable_status: async_snapshot.evaluable_status,
-        async_classification: async_snapshot.async_classification,
-    }
+    build_audit_observed_market_from_core_snapshot(now_ms, market, observed, &core_snapshot)
 }
 
 fn require_connected_inputs(basis: &EffectiveBasisConfig) -> bool {
@@ -1637,13 +1749,13 @@ impl PaperAudit {
         tick_index: usize,
         now_ms: u64,
     ) -> Result<()> {
-        let record_marks = if now_ms.saturating_sub(self.last_snapshot_ms) >= self.snapshot_interval_ms
-        {
-            self.last_snapshot_ms = now_ms;
-            true
-        } else {
-            false
-        };
+        let record_marks =
+            if now_ms.saturating_sub(self.last_snapshot_ms) >= self.snapshot_interval_ms {
+                self.last_snapshot_ms = now_ms;
+                true
+            } else {
+                false
+            };
 
         let write_checkpoint =
             if now_ms.saturating_sub(self.last_checkpoint_ms) >= self.checkpoint_interval_ms {
@@ -1655,8 +1767,7 @@ impl PaperAudit {
             };
 
         let write_summary = if !write_checkpoint
-            && now_ms.saturating_sub(self.last_summary_write_ms)
-                >= AUDIT_SUMMARY_WRITE_THROTTLE_MS
+            && now_ms.saturating_sub(self.last_summary_write_ms) >= AUDIT_SUMMARY_WRITE_THROTTLE_MS
         {
             self.last_summary_write_ms = now_ms;
             true
@@ -1869,10 +1980,7 @@ fn run_paper_audit_worker(
     let _ = worker.flush();
 }
 
-fn store_paper_audit_worker_error(
-    worker_error: &Arc<Mutex<Option<String>>>,
-    err: &anyhow::Error,
-) {
+fn store_paper_audit_worker_error(worker_error: &Arc<Mutex<Option<String>>>, err: &anyhow::Error) {
     if let Ok(mut guard) = worker_error.lock() {
         if guard.is_none() {
             *guard = Some(format!("{err:#}"));
@@ -8963,23 +9071,16 @@ async fn handle_single_market_event(
     }
 
     let output = engine.on_market_data(&event).await;
+    let evaluation_observed = (touches_market && is_evaluation_attempt_event(&event)).then(|| {
+        EvaluationObservedContext::new(now_millis(), settings, market, observed, None, false)
+    });
     if touches_market {
-        let basis = effective_basis_config_for_market(settings, market);
-        let evaluation_observed = build_audit_observed_market(
-            now_millis(),
-            market,
-            observed,
-            settings,
-            None,
-            false,
-            &basis,
-        );
         record_evaluation_attempt(
             stats,
             recent_events,
             &event,
             &output.warnings,
-            Some(&evaluation_observed),
+            evaluation_observed.as_ref(),
             audit,
         )?;
     }
@@ -9139,30 +9240,6 @@ async fn handle_multi_market_event(
         risk.update_market_phase(symbol.clone(), phase.clone());
     }
 
-    let evaluation_observed_by_symbol = event_symbols
-        .iter()
-        .filter_map(|symbol| {
-            observed
-                .get(symbol)
-                .and_then(|obs| registry.get_config(symbol).map(|market| (obs, market)))
-                .map(|(obs, market)| {
-                    let basis = effective_basis_config_for_market(settings, market);
-                    (
-                        symbol.clone(),
-                        build_audit_observed_market(
-                            now_millis(),
-                            market,
-                            obs,
-                            settings,
-                            None,
-                            false,
-                            &basis,
-                        ),
-                    )
-                })
-        })
-        .collect::<HashMap<_, _>>();
-
     let output = engine.on_market_data(&event).await;
     record_evaluation_attempts_for_symbols(
         stats,
@@ -9170,7 +9247,9 @@ async fn handle_multi_market_event(
         &event,
         &event_symbols,
         &output.warnings,
-        &evaluation_observed_by_symbol,
+        settings,
+        registry,
+        observed,
         audit,
     )?;
     for update in output.dmm_updates {
@@ -9398,8 +9477,7 @@ async fn run_paper_ws_mode(
         &execution,
         &risk,
     );
-    let (monitor_render_tx, mut monitor_render_rx) =
-        mpsc::channel::<MultiMonitorRenderRequest>(1);
+    let (monitor_render_tx, mut monitor_render_rx) = mpsc::channel::<MultiMonitorRenderRequest>(1);
     let (monitor_render_result_tx, mut monitor_render_result_rx) =
         mpsc::channel::<MultiMonitorRenderResult>(1);
     let monitor_market_cache_clone = Arc::clone(&monitor_market_cache);
@@ -9982,8 +10060,7 @@ async fn run_paper_multi_ws_mode(
         &execution,
         &risk,
     );
-    let (monitor_render_tx, mut monitor_render_rx) =
-        mpsc::channel::<MultiMonitorRenderRequest>(1);
+    let (monitor_render_tx, mut monitor_render_rx) = mpsc::channel::<MultiMonitorRenderRequest>(1);
     let (monitor_render_result_tx, mut monitor_render_result_rx) =
         mpsc::channel::<MultiMonitorRenderResult>(1);
     let monitor_market_cache_clone = Arc::clone(&monitor_market_cache);
@@ -13792,10 +13869,11 @@ fn build_market_view_from_seed(
     let observed = seed.map(|seed| &seed.observed);
     let snapshot = seed.and_then(|seed| seed.basis_snapshot.as_ref());
     let active_token_side_value = snapshot.map(|item| item.token_side);
-    let active_token_side = snapshot
-        .map(|item| format!("{:?}", item.token_side).to_ascii_uppercase());
+    let active_token_side =
+        snapshot.map(|item| format!("{:?}", item.token_side).to_ascii_uppercase());
     let has_position = seed.map(|item| item.has_position).unwrap_or(false);
-    let poly_yes_price = observed.and_then(|item| item.poly_yes_mid.and_then(|value| value.to_f64()));
+    let poly_yes_price =
+        observed.and_then(|item| item.poly_yes_mid.and_then(|value| value.to_f64()));
     let poly_no_price = observed.and_then(|item| item.poly_no_mid.and_then(|value| value.to_f64()));
     let poly_price = match snapshot.map(|item| item.token_side) {
         Some(TokenSide::Yes) => poly_yes_price.or(poly_no_price),
@@ -14113,13 +14191,21 @@ fn build_multi_monitor_state_from_seed_cache(
             market_data_rx_lagged_messages: request.stats.market_data_rx_lagged_messages,
             market_data_tick_drain_last: request.stats.market_data_tick_drain_last,
             market_data_tick_drain_max: request.stats.market_data_tick_drain_max,
-            polymarket_ws_text_frames: request.stats.polymarket_ws_diagnostics.snapshot().text_frames,
+            polymarket_ws_text_frames: request
+                .stats
+                .polymarket_ws_diagnostics
+                .snapshot()
+                .text_frames,
             polymarket_ws_price_change_messages: request
                 .stats
                 .polymarket_ws_diagnostics
                 .snapshot()
                 .price_change_messages,
-            polymarket_ws_book_messages: request.stats.polymarket_ws_diagnostics.snapshot().book_messages,
+            polymarket_ws_book_messages: request
+                .stats
+                .polymarket_ws_diagnostics
+                .snapshot()
+                .book_messages,
             polymarket_ws_orderbook_updates: request
                 .stats
                 .polymarket_ws_diagnostics
@@ -14265,13 +14351,7 @@ fn build_multi_monitor_state_via_seed_cache(
         .map(|market| {
             (
                 market.symbol.clone(),
-                build_monitor_market_seed(
-                    &market.symbol,
-                    observed_map,
-                    engine,
-                    execution,
-                    risk,
-                ),
+                build_monitor_market_seed(&market.symbol, observed_map, engine, execution, risk),
             )
         })
         .collect::<HashMap<_, _>>();
@@ -15096,7 +15176,8 @@ fn is_evaluation_attempt_event(event: &MarketDataEvent) -> bool {
             if matches!(instrument, InstrumentKind::CexPerp)
     ) || matches!(
         event,
-        MarketDataEvent::CexVenueOrderBookUpdate { .. } | MarketDataEvent::CexVenueTradeUpdate { .. }
+        MarketDataEvent::CexVenueOrderBookUpdate { .. }
+            | MarketDataEvent::CexVenueTradeUpdate { .. }
     )
 }
 
@@ -15145,7 +15226,7 @@ fn record_evaluation_attempt(
     recent_events: &mut VecDeque<PaperEventLog>,
     event: &MarketDataEvent,
     warnings: &[EngineWarning],
-    observed: Option<&AuditObservedMarket>,
+    observed_context: Option<&EvaluationObservedContext<'_>>,
     audit: &mut Option<PaperAudit>,
 ) -> Result<()> {
     if !is_evaluation_attempt_event(event) {
@@ -15153,14 +15234,14 @@ fn record_evaluation_attempt(
     }
 
     stats.evaluation_attempts += 1;
-    if let Some(observed) = observed {
+    if let Some(observed_context) = observed_context {
         increment_counter(
             &mut stats.evaluable_status_counts,
-            observed.evaluable_status.as_str(),
+            observed_context.core_snapshot.evaluable_status.as_str(),
         );
         increment_counter(
             &mut stats.async_classification_counts,
-            observed.async_classification.as_str(),
+            observed_context.core_snapshot.async_classification.as_str(),
         );
     }
 
@@ -15183,6 +15264,7 @@ fn record_evaluation_attempt(
 
     if should_emit {
         stats.last_skip_event_ms.insert(dedupe_key, now_ms);
+        let observed = observed_context.map(EvaluationObservedContext::build_audit_observed);
         push_event_with_context(
             recent_events,
             "skip",
@@ -15190,10 +15272,10 @@ fn record_evaluation_attempt(
             Some(symbol.0.clone()),
             None,
             None,
-            build_skip_event_details(reason, warning, observed),
+            build_skip_event_details(reason, warning, observed.as_ref()),
         );
         if let Some(audit) = audit.as_mut() {
-            audit.record_evaluation_skip(event, warnings, observed.cloned())?;
+            audit.record_evaluation_skip(event, warnings, observed)?;
         }
     }
     Ok(())
@@ -15205,7 +15287,9 @@ fn record_evaluation_attempts_for_symbols(
     event: &MarketDataEvent,
     symbols: &[Symbol],
     warnings: &[EngineWarning],
-    observed_by_symbol: &HashMap<Symbol, AuditObservedMarket>,
+    settings: &Settings,
+    registry: &SymbolRegistry,
+    observed_by_symbol: &HashMap<Symbol, ObservedState>,
     audit: &mut Option<PaperAudit>,
 ) -> Result<()> {
     if !is_evaluation_attempt_event(event) {
@@ -15216,25 +15300,35 @@ fn record_evaluation_attempts_for_symbols(
         return record_evaluation_attempt(stats, recent_events, event, warnings, None, audit);
     }
 
-    let mut warnings_by_symbol: HashMap<Symbol, Vec<EngineWarning>> = HashMap::new();
-    for warning in warnings {
+    let warnings_by_symbol = (!warnings.is_empty()).then(|| {
+        let mut warnings_by_symbol: HashMap<Symbol, Vec<EngineWarning>> = HashMap::new();
+        for warning in warnings {
+            warnings_by_symbol
+                .entry(warning_symbol(warning).clone())
+                .or_default()
+                .push(warning.clone());
+        }
         warnings_by_symbol
-            .entry(warning_symbol(warning).clone())
-            .or_default()
-            .push(warning.clone());
-    }
+    });
+    let now_ms = now_millis();
 
     for symbol in symbols {
         let symbol_warnings = warnings_by_symbol
-            .get(symbol)
+            .as_ref()
+            .and_then(|warnings_by_symbol| warnings_by_symbol.get(symbol))
             .map(Vec::as_slice)
             .unwrap_or(&[]);
+        let observed_context = observed_by_symbol.get(symbol).and_then(|observed| {
+            registry.get_config(symbol).map(|market| {
+                EvaluationObservedContext::new(now_ms, settings, market, observed, None, false)
+            })
+        });
         record_evaluation_attempt(
             stats,
             recent_events,
             event,
             symbol_warnings,
-            observed_by_symbol.get(symbol),
+            observed_context.as_ref(),
             audit,
         )?;
     }
@@ -15651,8 +15745,8 @@ mod tests {
     use polyalpha_core::{
         AuditConfig, BasisStrategyConfig, BinanceConfig, CexBaseQty, DmmStrategyConfig,
         GeneralConfig, MarketDataConfig, NegRiskStrategyConfig, OkxConfig, PaperSlippageConfig,
-        PaperTradingConfig, PolymarketConfig, RiskConfig, SettlementRules, StrategyConfig,
-        PolymarketIds,
+        PaperTradingConfig, PolymarketConfig, PolymarketIds, RiskConfig, SettlementRules,
+        StrategyConfig,
     };
     use polyalpha_executor::OrderbookProvider;
     use serde_json::json;
@@ -16386,8 +16480,14 @@ mod tests {
 
         assert_eq!(reused.markets.len(), legacy.markets.len());
         assert_eq!(reused.markets[0].symbol, legacy.markets[0].symbol);
-        assert_eq!(reused.markets[0].poly_yes_price, legacy.markets[0].poly_yes_price);
-        assert_eq!(reused.markets[0].poly_no_price, legacy.markets[0].poly_no_price);
+        assert_eq!(
+            reused.markets[0].poly_yes_price,
+            legacy.markets[0].poly_yes_price
+        );
+        assert_eq!(
+            reused.markets[0].poly_no_price,
+            legacy.markets[0].poly_no_price
+        );
         assert_eq!(reused.markets[0].cex_price, legacy.markets[0].cex_price);
         assert_eq!(
             reused
@@ -19304,8 +19404,10 @@ mod tests {
     fn build_single_monitor_state_from_seed_cache_matches_legacy_monitor_state() {
         let settings = test_settings_with_price_filter(None, None);
         let market = settings.markets[0].clone();
-        let engine =
-            SimpleAlphaEngine::with_markets(build_paper_engine_config(&settings), settings.markets.clone());
+        let engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
         let observed = ObservedState {
             poly_yes_mid: Some(Decimal::new(48, 2)),
             poly_no_mid: Some(Decimal::new(52, 2)),
@@ -19378,8 +19480,14 @@ mod tests {
 
         assert_eq!(reused.markets.len(), legacy.markets.len());
         assert_eq!(reused.markets[0].symbol, legacy.markets[0].symbol);
-        assert_eq!(reused.markets[0].poly_yes_price, legacy.markets[0].poly_yes_price);
-        assert_eq!(reused.markets[0].poly_no_price, legacy.markets[0].poly_no_price);
+        assert_eq!(
+            reused.markets[0].poly_yes_price,
+            legacy.markets[0].poly_yes_price
+        );
+        assert_eq!(
+            reused.markets[0].poly_no_price,
+            legacy.markets[0].poly_no_price
+        );
         assert_eq!(reused.markets[0].cex_price, legacy.markets[0].cex_price);
         assert_eq!(
             reused
@@ -19415,8 +19523,10 @@ mod tests {
         settings.markets.push(other_market);
 
         let market = settings.markets[0].clone();
-        let engine =
-            SimpleAlphaEngine::with_markets(build_paper_engine_config(&settings), settings.markets.clone());
+        let engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
         let observed = ObservedState {
             poly_yes_mid: Some(Decimal::new(48, 2)),
             cex_mid: Some(Decimal::new(81_000, 0)),
@@ -19555,15 +19665,11 @@ mod tests {
 
         assert_eq!(stats.market_events, 1);
         assert_eq!(
-            observed
-                .get(&first_symbol)
-                .and_then(|state| state.cex_mid),
+            observed.get(&first_symbol).and_then(|state| state.cex_mid),
             Some(Decimal::new(100_005, 0))
         );
         assert_eq!(
-            observed
-                .get(&second_symbol)
-                .and_then(|state| state.cex_mid),
+            observed.get(&second_symbol).and_then(|state| state.cex_mid),
             Some(Decimal::new(100_005, 0))
         );
 
@@ -19578,6 +19684,70 @@ mod tests {
         assert_eq!(first_book.symbol, first_symbol);
         assert_eq!(second_book.sequence, 12);
         assert_eq!(second_book.symbol, second_symbol);
+    }
+
+    #[tokio::test]
+    async fn handle_multi_market_event_skips_audit_observed_build_for_non_evaluation_events() {
+        reset_build_audit_observed_market_calls();
+
+        let settings = test_settings_with_price_filter(None, None);
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let (orderbook_provider, _executor, mut execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
+
+        let symbol = settings.markets[0].symbol.clone();
+        let mut observed = HashMap::from([(
+            symbol.clone(),
+            ObservedState {
+                poly_yes_mid: Some(Decimal::new(45, 2)),
+                cex_mid: Some(Decimal::new(100_000, 0)),
+                ..ObservedState::default()
+            },
+        )]);
+        let mut stats = PaperStats::default();
+        let mut recent_events = VecDeque::new();
+        let mut engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
+        let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        let mut trade_book = TradeBook::default();
+        let paused = Arc::new(AtomicBool::new(false));
+        let emergency = Arc::new(AtomicBool::new(false));
+        let mut audit = None;
+
+        handle_multi_market_event(
+            MarketDataEvent::MarketLifecycle {
+                symbol: symbol.clone(),
+                phase: MarketPhase::Trading,
+                timestamp_ms: 10,
+            },
+            &settings,
+            &registry,
+            &orderbook_provider,
+            &mut observed,
+            &mut stats,
+            &mut recent_events,
+            &mut engine,
+            &mut execution,
+            &mut risk,
+            &mut trade_book,
+            &paused,
+            &emergency,
+            false,
+            &mut audit,
+        )
+        .await
+        .expect("lifecycle event should be handled");
+
+        assert_eq!(build_audit_observed_market_calls(), 0);
     }
 
     #[test]
@@ -20391,6 +20561,75 @@ mod tests {
         assert_eq!(stats.evaluable_passes, 1);
         assert_eq!(stats.evaluation_skipped, 0);
         assert!(stats.skip_reasons.is_empty());
+        assert!(recent_events.is_empty());
+    }
+
+    #[test]
+    fn evaluation_attempt_without_warning_keeps_status_counts_without_building_full_observed() {
+        reset_build_audit_observed_market_calls();
+
+        let settings = test_settings_with_price_filter(None, None);
+        let market = settings.markets[0].clone();
+        let event = cex_evaluation_event();
+        let now_ms = now_millis();
+        let mut observed = ObservedState {
+            poly_yes_mid: Some(Decimal::new(45, 2)),
+            cex_mid: Some(Decimal::new(100_000, 0)),
+            poly_yes_updated_at_ms: Some(now_ms.saturating_sub(20)),
+            cex_updated_at_ms: Some(now_ms.saturating_sub(10)),
+            ..ObservedState::default()
+        };
+        record_connection_status(
+            &mut observed,
+            "Polymarket".to_owned(),
+            ConnectionStatus::Connected,
+            now_ms.saturating_sub(20),
+        );
+        record_connection_status(
+            &mut observed,
+            "Binance".to_owned(),
+            ConnectionStatus::Connected,
+            now_ms.saturating_sub(10),
+        );
+
+        let evaluation_observed =
+            EvaluationObservedContext::new(now_ms, &settings, &market, &observed, None, false);
+        let mut stats = PaperStats::default();
+        let mut recent_events = VecDeque::new();
+        let mut audit = None;
+
+        record_evaluation_attempt(
+            &mut stats,
+            &mut recent_events,
+            &event,
+            &[],
+            Some(&evaluation_observed),
+            &mut audit,
+        )
+        .expect("record evaluation without warning");
+
+        assert_eq!(stats.evaluation_attempts, 1);
+        assert_eq!(stats.evaluable_passes, 1);
+        assert_eq!(
+            stats
+                .evaluable_status_counts
+                .get(evaluation_observed.core_snapshot.evaluable_status.as_str())
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(
+            stats
+                .async_classification_counts
+                .get(
+                    evaluation_observed
+                        .core_snapshot
+                        .async_classification
+                        .as_str()
+                )
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(build_audit_observed_market_calls(), 0);
         assert!(recent_events.is_empty());
     }
 

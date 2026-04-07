@@ -121,6 +121,44 @@ impl CexMinuteState {
         }
     }
 
+    fn warmup_from_klines(klines: &[(u64, f64)], max_returns: usize) -> Self {
+        let mut state = Self::new();
+        for (ts_ms, close) in klines {
+            let _ = state.ingest_price(*ts_ms, *close, max_returns);
+        }
+
+        // Keep the latest kline available as the last completed close so reference_close()
+        // can work immediately after warmup, matching the pre-existing warmup behavior.
+        if let Some(last_close) = state.current_minute_last_close {
+            state.previous_completed_close = Some(last_close);
+            state.previous_completed_minute_ms = state.current_minute_ms;
+        }
+
+        state
+    }
+
+    fn absorb_warmup(&mut self, warmed: Self) {
+        if warmed.returns_window.len() > self.returns_window.len() {
+            self.returns_window = warmed.returns_window;
+        }
+
+        let warmed_previous_minute_ms = warmed.previous_completed_minute_ms.unwrap_or_default();
+        let current_previous_minute_ms = self.previous_completed_minute_ms.unwrap_or_default();
+        if self.previous_completed_minute_ms.is_none()
+            || warmed_previous_minute_ms > current_previous_minute_ms
+        {
+            self.previous_completed_close = warmed.previous_completed_close;
+            self.previous_completed_minute_ms = warmed.previous_completed_minute_ms;
+        }
+
+        let warmed_current_minute_ms = warmed.current_minute_ms.unwrap_or_default();
+        let current_minute_ms = self.current_minute_ms.unwrap_or_default();
+        if self.current_minute_ms.is_none() || warmed_current_minute_ms > current_minute_ms {
+            self.current_minute_ms = warmed.current_minute_ms;
+            self.current_minute_last_close = warmed.current_minute_last_close;
+        }
+    }
+
     fn ingest_price(&mut self, ts_ms: u64, price: f64, max_returns: usize) -> Result<(), String> {
         if !price.is_finite() || price <= 0.0 {
             return Err(format!("Invalid price: {}", price));
@@ -583,23 +621,16 @@ impl SimpleAlphaEngine {
         let capacity = self.history_capacity_for_symbol(symbol);
         let default_state = self.state_for_symbol(symbol);
         let state = self.states.entry(symbol.clone()).or_insert(default_state);
+        let warmed = CexMinuteState::warmup_from_klines(klines, capacity);
 
-        // Ingest klines in chronological order
-        for (ts_ms, close) in klines {
-            let _ = state.cex_minutes.ingest_price(*ts_ms, *close, capacity);
-        }
+        state.cex_minutes.absorb_warmup(warmed);
 
-        // After ingesting, the last close is in current_minute_last_close.
-        // We need to finalize it to previous_completed_close for reference_close() to work.
-        if let Some(last_close) = state.cex_minutes.current_minute_last_close {
-            state.cex_minutes.previous_completed_close = Some(last_close);
-            state.cex_minutes.previous_completed_minute_ms = state.cex_minutes.current_minute_ms;
-        }
-
-        // Set last known price as current mid
+        // Keep the freshest live quote if one already arrived before warmup finished.
         if let Some((ts_ms, last_close)) = klines.last() {
-            state.cex_mid = Some(Decimal::from_f64(*last_close).unwrap_or(Decimal::ZERO));
-            state.mark_cex_update(*ts_ms);
+            if state.last_cex_update_ms <= *ts_ms || state.cex_mid.is_none() {
+                state.cex_mid = Some(Decimal::from_f64(*last_close).unwrap_or(Decimal::ZERO));
+                state.mark_cex_update(*ts_ms);
+            }
         }
     }
 
@@ -2322,6 +2353,71 @@ mod tests {
         assert_eq!(candidate.token_side, TokenSide::Yes);
         assert!(candidate.fair_value < 0.5);
         assert!(candidate.delta_estimate.abs() > 1e-6);
+    }
+
+    #[tokio::test]
+    async fn late_cex_warmup_backfills_returns_window_without_regressing_live_minute() {
+        let market = sample_market();
+        let symbol = market.symbol.clone();
+        let mut engine = SimpleAlphaEngine::with_markets(
+            SimpleEngineConfig {
+                min_signal_samples: 2,
+                rolling_window_minutes: 600,
+                ..SimpleEngineConfig::default()
+            },
+            vec![market],
+        );
+
+        for minute in 0..=10_u64 {
+            let ts = (minute + 1_000) * ONE_MINUTE_MS;
+            let _ = engine
+                .on_market_data(&cex_orderbook_event(
+                    Decimal::new(100_000 + minute as i64, 0),
+                    Decimal::new(100_000 + minute as i64, 0),
+                    ts,
+                ))
+                .await;
+        }
+
+        let live_state = engine
+            .states
+            .get(&symbol)
+            .expect("state after live cex events");
+        let live_current_minute_ms = live_state
+            .cex_minutes
+            .current_minute_ms
+            .expect("current minute after live cex events");
+        let live_returns_len = live_state.cex_minutes.returns_window.len();
+        let live_cex_mid = live_state.cex_mid;
+        let live_last_cex_update_ms = live_state.last_cex_update_ms;
+        assert!(live_returns_len >= 9);
+
+        let historical_klines = (0..750_u64)
+            .map(|minute| {
+                (
+                    minute * ONE_MINUTE_MS,
+                    90_000.0 + (minute as f64 * 0.5),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        engine.warmup_cex_prices(&symbol, &historical_klines);
+
+        let warmed_state = engine
+            .states
+            .get(&symbol)
+            .expect("state after late cex warmup");
+        assert_eq!(
+            warmed_state.cex_minutes.current_minute_ms,
+            Some(live_current_minute_ms)
+        );
+        assert_eq!(warmed_state.cex_mid, live_cex_mid);
+        assert_eq!(warmed_state.last_cex_update_ms, live_last_cex_update_ms);
+        assert!(
+            warmed_state.cex_minutes.returns_window.len() >= 100,
+            "expected historical warmup to backfill returns window, got {}",
+            warmed_state.cex_minutes.returns_window.len()
+        );
     }
 
     #[tokio::test]
