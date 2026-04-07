@@ -522,7 +522,9 @@ impl SimpleAlphaEngine {
                     exchange,
                     symbols
                         .into_iter()
-                        .map(|(venue_symbol, symbols)| (venue_symbol, Arc::<[Symbol]>::from(symbols)))
+                        .map(|(venue_symbol, symbols)| {
+                            (venue_symbol, Arc::<[Symbol]>::from(symbols))
+                        })
                         .collect(),
                 )
             })
@@ -531,7 +533,11 @@ impl SimpleAlphaEngine {
         (market_map, cex_symbols_by_venue)
     }
 
-    fn cex_symbols_for_venue(&self, exchange: Exchange, venue_symbol: &str) -> Option<Arc<[Symbol]>> {
+    fn cex_symbols_for_venue(
+        &self,
+        exchange: Exchange,
+        venue_symbol: &str,
+    ) -> Option<Arc<[Symbol]>> {
         self.cex_symbols_by_venue
             .get(&exchange)
             .and_then(|symbols| symbols.get(venue_symbol))
@@ -562,7 +568,14 @@ impl SimpleAlphaEngine {
         let state = self.states.get(symbol)?;
         state.active_token_side?;
 
-        if !state.market_phase.allows_new_positions() {
+        if matches!(
+            state.market_phase,
+            MarketPhase::ForceReduce { .. }
+                | MarketPhase::CloseOnly { .. }
+                | MarketPhase::SettlementPending
+                | MarketPhase::Disputed
+                | MarketPhase::Resolved
+        ) {
             return Some("market phase blocks new exposure".to_owned());
         }
 
@@ -2393,12 +2406,7 @@ mod tests {
         assert!(live_returns_len >= 9);
 
         let historical_klines = (0..750_u64)
-            .map(|minute| {
-                (
-                    minute * ONE_MINUTE_MS,
-                    90_000.0 + (minute as f64 * 0.5),
-                )
-            })
+            .map(|minute| (minute * ONE_MINUTE_MS, 90_000.0 + (minute as f64 * 0.5)))
             .collect::<Vec<_>>();
 
         engine.warmup_cex_prices(&symbol, &historical_klines);
@@ -2656,6 +2664,26 @@ mod tests {
             engine.close_reason(&symbol).as_deref(),
             Some("market phase blocks new exposure")
         );
+    }
+
+    #[tokio::test]
+    async fn pre_settlement_phase_does_not_force_close_synced_position() {
+        let mut engine = test_engine();
+        let candidate = seed_basis_long_yes_candidate(&mut engine).await;
+        let symbol = Symbol::new("btc-price-only");
+        engine.sync_position_state(&symbol, Some(candidate.token_side));
+
+        let close = engine
+            .on_market_data(&lifecycle_event(
+                MarketPhase::PreSettlement {
+                    hours_remaining: 20.0,
+                },
+                180_300,
+            ))
+            .await;
+
+        assert!(close.open_candidates.is_empty());
+        assert_eq!(engine.close_reason(&symbol), None);
     }
 
     #[tokio::test]

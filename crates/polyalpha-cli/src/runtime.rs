@@ -526,13 +526,23 @@ pub fn close_intent_for_symbol(
     correlation_id: &str,
     now_ms: u64,
 ) -> PlanningIntent {
+    close_intent_for_symbol_with_ratio(symbol, reason, correlation_id, now_ms, 1.0)
+}
+
+pub fn close_intent_for_symbol_with_ratio(
+    symbol: &Symbol,
+    reason: &str,
+    correlation_id: &str,
+    now_ms: u64,
+    target_close_ratio: f64,
+) -> PlanningIntent {
     PlanningIntent::ClosePosition {
         schema_version: PLANNING_SCHEMA_VERSION,
         intent_id: format!("intent-close-{}-{now_ms}", symbol.0),
         correlation_id: correlation_id.to_owned(),
         symbol: symbol.clone(),
         close_reason: reason.to_owned(),
-        target_close_ratio: 1.0,
+        target_close_ratio,
     }
 }
 

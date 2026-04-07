@@ -589,64 +589,70 @@ async fn run_sim_with_mock_ticks(
                             }
 
                             match execution.process_plan(plan).await {
-                            Ok(events) => {
-                                if execution_events_include_trade_plan_created(&events) {
-                                    note_tradeable_activity(
-                                        &mut observed.market_pool,
-                                        candidate.timestamp_ms,
-                                    );
+                                Ok(events) => {
+                                    if execution_events_include_trade_plan_created(&events) {
+                                        note_tradeable_activity(
+                                            &mut observed.market_pool,
+                                            candidate.timestamp_ms,
+                                        );
+                                    }
+                                    let rejection_reasons =
+                                        opening_signal_rejection_reasons(&events);
+                                    if !rejection_reasons.is_empty() {
+                                        let _ = maybe_start_market_pool_cooldown_from_rejections(
+                                            settings,
+                                            &mut observed,
+                                            candidate.timestamp_ms,
+                                            &rejection_reasons,
+                                        );
+                                    }
+                                    apply_execution_events(
+                                        &mut risk,
+                                        &mut stats,
+                                        &mut recent_events,
+                                        events,
+                                    )
+                                    .await?;
+                                    sync_engine_position_state(&mut engine, &risk, &market.symbol);
                                 }
-                                let rejection_reasons = opening_signal_rejection_reasons(&events);
-                                if !rejection_reasons.is_empty() {
+                                Err(err) => {
+                                    stats.signals_rejected += 1;
+                                    let rejection_reasons = vec![err.to_string()];
                                     let _ = maybe_start_market_pool_cooldown_from_rejections(
                                         settings,
                                         &mut observed,
                                         candidate.timestamp_ms,
                                         &rejection_reasons,
                                     );
+                                    push_event(
+                                        &mut recent_events,
+                                        "risk",
+                                        format!(
+                                            "候选被执行规划拒绝 {}（{}）",
+                                            candidate.candidate_id, err
+                                        ),
+                                    );
                                 }
-                                apply_execution_events(
-                                    &mut risk,
-                                    &mut stats,
-                                    &mut recent_events,
-                                    events,
-                                )
-                                .await?;
-                                sync_engine_position_state(&mut engine, &risk, &market.symbol);
-                            }
-                            Err(err) => {
-                                stats.signals_rejected += 1;
-                                let rejection_reasons = vec![err.to_string()];
-                                let _ = maybe_start_market_pool_cooldown_from_rejections(
-                                    settings,
-                                    &mut observed,
-                                    candidate.timestamp_ms,
-                                    &rejection_reasons,
-                                );
-                                push_event(
-                                    &mut recent_events,
-                                    "risk",
-                                    format!(
-                                        "候选被执行规划拒绝 {}（{}）",
-                                        candidate.candidate_id, err
-                                    ),
-                                );
                             }
                         }
-                    }
 
-                    if let Some(reason) = engine.close_reason(&market.symbol) {
-                        let events = execution
-                            .process_intent(close_intent_for_symbol(
-                                &market.symbol,
-                                &reason,
-                                event_timestamp_ms(&event),
-                            ))
+                        if let Some(reason) = engine.close_reason(&market.symbol) {
+                            let events = execution
+                                .process_intent(close_intent_for_symbol(
+                                    &market.symbol,
+                                    &reason,
+                                    event_timestamp_ms(&event),
+                                ))
+                                .await?;
+                            apply_execution_events(
+                                &mut risk,
+                                &mut stats,
+                                &mut recent_events,
+                                events,
+                            )
                             .await?;
-                        apply_execution_events(&mut risk, &mut stats, &mut recent_events, events)
-                            .await?;
-                        sync_engine_position_state(&mut engine, &risk, &market.symbol);
-                    }
+                            sync_engine_position_state(&mut engine, &risk, &market.symbol);
+                        }
                     }
                 }
                 Err(TryRecvError::Empty) => break,

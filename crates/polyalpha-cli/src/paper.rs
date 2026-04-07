@@ -78,6 +78,7 @@ use crate::runtime::open_intent_from_candidate as runtime_open_intent_from_candi
 use crate::runtime::{
     apply_orderbook_snapshot, build_data_manager, build_execution_stack,
     close_intent_for_symbol as runtime_close_intent_for_symbol,
+    close_intent_for_symbol_with_ratio as runtime_close_intent_for_symbol_with_ratio,
     delta_rebalance_intent_for_symbol as runtime_delta_rebalance_intent_for_symbol,
     force_exit_intent_for_symbol as runtime_force_exit_intent_for_symbol, RuntimeExecutionMode,
     RuntimeExecutor,
@@ -108,6 +109,8 @@ const MAX_WARMUP_FETCH_KLINES: u16 = 1_500;
 const MIN_WARMUP_FETCH_HEADROOM: u16 = 60;
 const STRATEGY_READINESS_ALERT_GRACE_MS: u64 = 45_000;
 const STRATEGY_READINESS_ALERT_INTERVAL_MS: u64 = 60_000;
+const AUTO_EXIT_PARTIAL_CLOSE_RATIO: f64 = 0.5;
+const AUTO_EXIT_PARTIAL_CLOSE_PRICE_GAP_BPS: u64 = 75;
 
 type EventDetails = HashMap<String, String>;
 const PAPER_ARTIFACT_SCHEMA_VERSION: u32 = PLANNING_SCHEMA_VERSION;
@@ -2735,6 +2738,8 @@ struct OpenTradeInfo {
     poly_exit_price: Option<f64>,
     cex_entry_price: Option<f64>,
     cex_exit_price: Option<f64>,
+    active_auto_exit_key: Option<String>,
+    auto_partial_close_used: bool,
 }
 
 impl Default for OpenTradeInfo {
@@ -2753,6 +2758,8 @@ impl Default for OpenTradeInfo {
             poly_exit_price: None,
             cex_entry_price: None,
             cex_exit_price: None,
+            active_auto_exit_key: None,
+            auto_partial_close_used: false,
         }
     }
 }
@@ -2809,6 +2816,28 @@ impl TradeBook {
 
     fn discard_open_trade(&mut self, symbol: &Symbol) {
         self.open.remove(symbol);
+    }
+
+    fn clear_auto_exit_state(&mut self, symbol: &Symbol) {
+        let Some(open) = self.open.get_mut(symbol) else {
+            return;
+        };
+        open.active_auto_exit_key = None;
+        open.auto_partial_close_used = false;
+    }
+
+    fn auto_partial_close_used_for_key(&self, symbol: &Symbol, key: &str) -> bool {
+        self.open.get(symbol).is_some_and(|open| {
+            open.active_auto_exit_key.as_deref() == Some(key) && open.auto_partial_close_used
+        })
+    }
+
+    fn mark_auto_partial_close_used(&mut self, symbol: &Symbol, key: &str) {
+        let Some(open) = self.open.get_mut(symbol) else {
+            return;
+        };
+        open.active_auto_exit_key = Some(key.to_owned());
+        open.auto_partial_close_used = true;
     }
 
     fn record_trade_plan(&mut self, plan: &TradePlan) {
@@ -3948,6 +3977,188 @@ fn close_intent_for_symbol(
     now_ms: u64,
 ) -> PlanningIntent {
     runtime_close_intent_for_symbol(symbol, reason, correlation_id, now_ms)
+}
+
+fn close_intent_for_symbol_with_ratio(
+    symbol: &Symbol,
+    reason: &str,
+    correlation_id: &str,
+    now_ms: u64,
+    target_close_ratio: f64,
+) -> PlanningIntent {
+    runtime_close_intent_for_symbol_with_ratio(
+        symbol,
+        reason,
+        correlation_id,
+        now_ms,
+        target_close_ratio,
+    )
+}
+
+fn auto_exit_partial_close_friction_multiplier() -> Decimal {
+    Decimal::new(125, 2)
+}
+
+fn phase_force_reduce_close_ratio(phase: Option<&MarketPhase>) -> Option<f64> {
+    match phase {
+        Some(MarketPhase::ForceReduce { target_ratio, .. }) => (Decimal::ONE - *target_ratio)
+            .clamp(Decimal::ZERO, Decimal::ONE)
+            .to_f64()
+            .filter(|ratio| *ratio > f64::EPSILON),
+        _ => None,
+    }
+}
+
+fn phase_requires_full_close(phase: Option<&MarketPhase>) -> bool {
+    matches!(
+        phase,
+        Some(
+            MarketPhase::CloseOnly { .. }
+                | MarketPhase::SettlementPending
+                | MarketPhase::Disputed
+                | MarketPhase::Resolved
+        )
+    )
+}
+
+fn close_plan_friction_per_share(plan: &TradePlan) -> Option<Decimal> {
+    (plan.poly_planned_shares.0 > Decimal::ZERO).then_some(
+        (plan.poly_friction_cost_usd.0 + plan.cex_friction_cost_usd.0) / plan.poly_planned_shares.0,
+    )
+}
+
+fn close_plan_price_gap_bps(better: &TradePlan, worse: &TradePlan) -> Option<Decimal> {
+    let better_price = better.poly_executable_price.0;
+    let worse_price = worse.poly_executable_price.0;
+    if better_price <= Decimal::ZERO || worse_price <= Decimal::ZERO || worse_price >= better_price
+    {
+        return Some(Decimal::ZERO);
+    }
+
+    Some((better_price - worse_price) * Decimal::from(10_000u32) / better_price)
+}
+
+fn should_prefer_partial_close(partial: &TradePlan, full: &TradePlan) -> bool {
+    if partial.poly_planned_shares.0 <= Decimal::ZERO
+        || full.poly_planned_shares.0 <= partial.poly_planned_shares.0
+    {
+        return false;
+    }
+
+    let friction_trigger = match (
+        close_plan_friction_per_share(partial),
+        close_plan_friction_per_share(full),
+    ) {
+        (Some(partial_cost), Some(full_cost)) if partial_cost <= Decimal::ZERO => {
+            full_cost > Decimal::ZERO
+        }
+        (Some(partial_cost), Some(full_cost)) => {
+            full_cost >= partial_cost * auto_exit_partial_close_friction_multiplier()
+        }
+        _ => false,
+    };
+    let price_trigger = close_plan_price_gap_bps(partial, full)
+        .is_some_and(|gap| gap >= Decimal::from(AUTO_EXIT_PARTIAL_CLOSE_PRICE_GAP_BPS));
+
+    friction_trigger || price_trigger
+}
+
+fn auto_exit_reason(base_reason: &str, action: &str) -> String {
+    format!("{base_reason} | {action}")
+}
+
+fn auto_exit_cycle_key(close_reason: &str, phase: Option<&MarketPhase>) -> String {
+    match phase {
+        Some(MarketPhase::ForceReduce { .. }) => "phase_force_reduce".to_owned(),
+        Some(
+            MarketPhase::CloseOnly { .. }
+            | MarketPhase::SettlementPending
+            | MarketPhase::Disputed
+            | MarketPhase::Resolved,
+        ) => "phase_close_only".to_owned(),
+        _ => format!("signal:{close_reason}"),
+    }
+}
+
+fn preview_intent_plan(
+    execution: &mut ExecutionManager<RuntimeExecutor>,
+    intent: &PlanningIntent,
+) -> Option<TradePlan> {
+    execution
+        .preview_intent_detailed(intent)
+        .ok()
+        .map(|plan| plan)
+}
+
+fn choose_auto_exit_intent(
+    symbol: &Symbol,
+    close_reason: &str,
+    phase: Option<&MarketPhase>,
+    trade_book: &TradeBook,
+    execution: &mut ExecutionManager<RuntimeExecutor>,
+    now_ms: u64,
+) -> Option<PlanningIntent> {
+    let correlation_id = format!("corr-close-{}-{now_ms}", symbol.0);
+    let cycle_key = auto_exit_cycle_key(close_reason, phase);
+    let build_close_intent = |reason: String, ratio: f64| {
+        close_intent_for_symbol_with_ratio(symbol, &reason, &correlation_id, now_ms, ratio)
+    };
+
+    if let Some(close_ratio) = phase_force_reduce_close_ratio(phase) {
+        if trade_book.auto_partial_close_used_for_key(symbol, &cycle_key) {
+            return None;
+        }
+        let intent = build_close_intent(
+            auto_exit_reason(
+                close_reason,
+                &format!("auto_exit=force_reduce_{close_ratio:.2}"),
+            ),
+            close_ratio,
+        );
+        if execution.preview_intent_detailed(&intent).is_ok() {
+            return Some(intent);
+        }
+    }
+
+    if phase_requires_full_close(phase) {
+        return Some(build_close_intent(close_reason.to_owned(), 1.0));
+    }
+
+    let full_intent = build_close_intent(close_reason.to_owned(), 1.0);
+    if trade_book.auto_partial_close_used_for_key(symbol, &cycle_key) {
+        return Some(full_intent);
+    }
+    let partial_intent = build_close_intent(
+        auto_exit_reason(
+            close_reason,
+            &format!("auto_exit=partial_close_{AUTO_EXIT_PARTIAL_CLOSE_RATIO:.2}"),
+        ),
+        AUTO_EXIT_PARTIAL_CLOSE_RATIO,
+    );
+
+    match (
+        preview_intent_plan(execution, &full_intent),
+        preview_intent_plan(execution, &partial_intent),
+    ) {
+        (Some(full_plan), Some(partial_plan))
+            if should_prefer_partial_close(&partial_plan, &full_plan) =>
+        {
+            Some(partial_intent)
+        }
+        (None, Some(_)) => Some(partial_intent),
+        _ => Some(full_intent),
+    }
+}
+
+fn partial_close_ratio(intent: &PlanningIntent) -> Option<f64> {
+    match intent {
+        PlanningIntent::ClosePosition {
+            target_close_ratio, ..
+        } if *target_close_ratio > f64::EPSILON && *target_close_ratio < 1.0 => {
+            Some(*target_close_ratio)
+        }
+        _ => None,
+    }
 }
 
 fn delta_rebalance_intent_for_symbol(
@@ -9111,24 +9322,50 @@ async fn handle_single_market_event(
 
     if let Some(reason) = engine.close_reason(&market.symbol) {
         let now_ms = now_millis();
-        execute_intent_trigger(
-            close_intent_for_symbol(
-                &market.symbol,
-                &reason,
-                &format!("corr-close-{}-{now_ms}", market.symbol.0),
-                now_ms,
-            ),
-            now_ms,
-            engine,
-            execution,
-            risk,
-            stats,
-            recent_events,
+        let phase = observed.market_phase.as_ref();
+        let cycle_key = auto_exit_cycle_key(&reason, phase);
+        let close_intent = choose_auto_exit_intent(
+            &market.symbol,
+            &reason,
+            phase,
             trade_book,
-            audit,
-        )
-        .await?;
+            execution,
+            now_ms,
+        );
+        if let Some(close_intent) = close_intent {
+            if partial_close_ratio(&close_intent).is_some() {
+                trade_book.mark_auto_partial_close_used(&market.symbol, &cycle_key);
+            }
+            execute_intent_trigger(
+                close_intent,
+                now_ms,
+                engine,
+                execution,
+                risk,
+                stats,
+                recent_events,
+                trade_book,
+                audit,
+            )
+            .await?;
+        } else {
+            maybe_execute_delta_rebalance(
+                settings,
+                &HashMap::from([(market.symbol.clone(), observed.clone())]),
+                &market.symbol,
+                engine,
+                execution,
+                risk,
+                stats,
+                recent_events,
+                trade_book,
+                audit,
+                now_millis(),
+            )
+            .await?;
+        }
     } else {
+        trade_book.clear_auto_exit_state(&market.symbol);
         maybe_execute_delta_rebalance(
             settings,
             &HashMap::from([(market.symbol.clone(), observed.clone())]),
@@ -9281,24 +9518,46 @@ async fn handle_multi_market_event(
     for symbol in &event_symbols {
         if let Some(reason) = engine.close_reason(symbol) {
             let now_ms = now_millis();
-            execute_intent_trigger(
-                close_intent_for_symbol(
-                    symbol,
-                    &reason,
-                    &format!("corr-close-{}-{now_ms}", symbol.0),
+            let phase = observed
+                .get(symbol)
+                .and_then(|state| state.market_phase.as_ref());
+            let cycle_key = auto_exit_cycle_key(&reason, phase);
+            let close_intent =
+                choose_auto_exit_intent(symbol, &reason, phase, trade_book, execution, now_ms);
+            if let Some(close_intent) = close_intent {
+                if partial_close_ratio(&close_intent).is_some() {
+                    trade_book.mark_auto_partial_close_used(symbol, &cycle_key);
+                }
+                execute_intent_trigger(
+                    close_intent,
                     now_ms,
-                ),
-                now_ms,
-                engine,
-                execution,
-                risk,
-                stats,
-                recent_events,
-                trade_book,
-                audit,
-            )
-            .await?;
+                    engine,
+                    execution,
+                    risk,
+                    stats,
+                    recent_events,
+                    trade_book,
+                    audit,
+                )
+                .await?;
+            } else {
+                maybe_execute_delta_rebalance(
+                    settings,
+                    observed,
+                    symbol,
+                    engine,
+                    execution,
+                    risk,
+                    stats,
+                    recent_events,
+                    trade_book,
+                    audit,
+                    now_millis(),
+                )
+                .await?;
+            }
         } else {
+            trade_book.clear_auto_exit_state(symbol);
             maybe_execute_delta_rebalance(
                 settings,
                 observed,
@@ -17705,6 +17964,243 @@ mod tests {
             .get("CEX计划数量")
             .and_then(|qty| Decimal::from_str(qty).ok())
             .is_some_and(|qty| qty > Decimal::ZERO));
+    }
+
+    #[tokio::test]
+    async fn choose_auto_exit_intent_prefers_partial_close_when_full_exit_walks_book() {
+        let settings = test_settings_with_price_filter(None, None);
+        let market = settings.markets[0].clone();
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let (provider, _executor, mut execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
+        seed_runtime_books(&provider, &registry, 2);
+
+        let mut candidate = open_candidate(TokenSide::Yes);
+        candidate.fair_value = 0.70;
+        candidate.raw_mispricing = 0.24;
+        candidate.delta_estimate = 0.0005;
+        execution
+            .process_intent(open_intent_from_candidate(&candidate))
+            .await
+            .expect("seed open position");
+        let trade_book = TradeBook::default();
+
+        update_paper_orderbook(
+            &provider,
+            &registry,
+            &polyalpha_core::OrderBookSnapshot {
+                exchange: Exchange::Polymarket,
+                symbol: market.symbol.clone(),
+                instrument: InstrumentKind::PolyYes,
+                bids: vec![
+                    polyalpha_core::PriceLevel {
+                        price: Price(Decimal::new(56, 2)),
+                        quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(60, 0))),
+                    },
+                    polyalpha_core::PriceLevel {
+                        price: Price(Decimal::new(48, 2)),
+                        quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(500, 0))),
+                    },
+                ],
+                asks: vec![polyalpha_core::PriceLevel {
+                    price: Price(Decimal::new(58, 2)),
+                    quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(500, 0))),
+                }],
+                exchange_timestamp_ms: 2_000,
+                received_at_ms: 2_100,
+                sequence: 3,
+                last_trade_price: None,
+            },
+        );
+
+        let intent = choose_auto_exit_intent(
+            &market.symbol,
+            "signal basis reverted inside exit band",
+            Some(&MarketPhase::Trading),
+            &trade_book,
+            &mut execution,
+            10_000,
+        );
+
+        match intent.expect("partial close intent") {
+            PlanningIntent::ClosePosition {
+                close_reason,
+                target_close_ratio,
+                ..
+            } => {
+                assert_eq!(target_close_ratio, AUTO_EXIT_PARTIAL_CLOSE_RATIO);
+                assert!(close_reason.contains("auto_exit=partial_close_0.50"));
+            }
+            other => panic!("unexpected intent: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn choose_auto_exit_intent_uses_force_reduce_target_ratio() {
+        let settings = test_settings_with_price_filter(None, None);
+        let market = settings.markets[0].clone();
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let (provider, _executor, mut execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
+        seed_runtime_books(&provider, &registry, 2);
+
+        let mut candidate = open_candidate(TokenSide::Yes);
+        candidate.fair_value = 0.70;
+        candidate.raw_mispricing = 0.24;
+        candidate.delta_estimate = 0.0005;
+        execution
+            .process_intent(open_intent_from_candidate(&candidate))
+            .await
+            .expect("seed open position");
+        let trade_book = TradeBook::default();
+
+        let intent = choose_auto_exit_intent(
+            &market.symbol,
+            "market phase blocks new exposure",
+            Some(&MarketPhase::ForceReduce {
+                target_ratio: Decimal::new(5, 1),
+                hours_remaining: 8.0,
+            }),
+            &trade_book,
+            &mut execution,
+            10_000,
+        );
+
+        match intent.expect("force reduce close intent") {
+            PlanningIntent::ClosePosition {
+                close_reason,
+                target_close_ratio,
+                ..
+            } => {
+                assert_eq!(target_close_ratio, 0.5);
+                assert!(close_reason.contains("auto_exit=force_reduce_0.50"));
+            }
+            other => panic!("unexpected intent: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn choose_auto_exit_intent_for_signal_upgrades_to_full_after_partial_used() {
+        let settings = test_settings_with_price_filter(None, None);
+        let market = settings.markets[0].clone();
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let (provider, _executor, mut execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
+        seed_runtime_books(&provider, &registry, 2);
+
+        let mut candidate = open_candidate(TokenSide::Yes);
+        candidate.fair_value = 0.70;
+        candidate.raw_mispricing = 0.24;
+        candidate.delta_estimate = 0.0005;
+        execution
+            .process_intent(open_intent_from_candidate(&candidate))
+            .await
+            .expect("seed open position");
+
+        let mut trade_book = TradeBook::default();
+        trade_book.register_open_signal(&candidate, 0, 1.0, candidate.delta_estimate);
+        trade_book.mark_auto_partial_close_used(
+            &market.symbol,
+            &auto_exit_cycle_key(
+                "signal basis reverted inside exit band",
+                Some(&MarketPhase::Trading),
+            ),
+        );
+
+        let intent = choose_auto_exit_intent(
+            &market.symbol,
+            "signal basis reverted inside exit band",
+            Some(&MarketPhase::Trading),
+            &trade_book,
+            &mut execution,
+            10_000,
+        );
+
+        match intent.expect("full close intent") {
+            PlanningIntent::ClosePosition {
+                close_reason,
+                target_close_ratio,
+                ..
+            } => {
+                assert_eq!(target_close_ratio, 1.0);
+                assert_eq!(close_reason, "signal basis reverted inside exit band");
+            }
+            other => panic!("unexpected intent: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn choose_auto_exit_intent_for_force_reduce_skips_repeat_partial() {
+        let settings = test_settings_with_price_filter(None, None);
+        let market = settings.markets[0].clone();
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let (provider, _executor, mut execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
+        seed_runtime_books(&provider, &registry, 2);
+
+        let mut candidate = open_candidate(TokenSide::Yes);
+        candidate.fair_value = 0.70;
+        candidate.raw_mispricing = 0.24;
+        candidate.delta_estimate = 0.0005;
+        execution
+            .process_intent(open_intent_from_candidate(&candidate))
+            .await
+            .expect("seed open position");
+
+        let mut trade_book = TradeBook::default();
+        trade_book.register_open_signal(&candidate, 0, 1.0, candidate.delta_estimate);
+        trade_book.mark_auto_partial_close_used(
+            &market.symbol,
+            &auto_exit_cycle_key(
+                "market phase blocks new exposure",
+                Some(&MarketPhase::ForceReduce {
+                    target_ratio: Decimal::new(5, 1),
+                    hours_remaining: 8.0,
+                }),
+            ),
+        );
+
+        let intent = choose_auto_exit_intent(
+            &market.symbol,
+            "market phase blocks new exposure",
+            Some(&MarketPhase::ForceReduce {
+                target_ratio: Decimal::new(5, 1),
+                hours_remaining: 8.0,
+            }),
+            &trade_book,
+            &mut execution,
+            10_000,
+        );
+
+        assert!(intent.is_none());
     }
 
     #[tokio::test]
