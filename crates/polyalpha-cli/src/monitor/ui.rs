@@ -782,12 +782,55 @@ pub fn render_position_detail(state: &TuiState) -> Paragraph<'static> {
                 Style::default().fg(pnl_color(position.cex_pnl_usd)),
             ),
             Span::raw("  "),
-            Span::styled("总盈亏 ", Style::default().fg(Color::DarkGray)),
+            Span::styled("盯市总盈亏 ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format_signed_usd(position.total_pnl_usd),
                 Style::default()
                     .fg(pnl_color(position.total_pnl_usd))
                     .bold(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("已实现盈亏 ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_signed_usd(position.realized_pnl_so_far_usd),
+                Style::default().fg(pnl_color(position.realized_pnl_so_far_usd)),
+            ),
+            Span::raw("  "),
+            Span::styled("立即平仓毛值 ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_signed_usd(position.realized_pnl_so_far_usd + position.total_pnl_usd),
+                Style::default().fg(pnl_color(
+                    position.realized_pnl_so_far_usd + position.total_pnl_usd,
+                )),
+            ),
+            Span::raw("  "),
+            Span::styled("平仓预估成本 ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_optional_cost_usd(position.close_cost_preview_usd),
+                Style::default().fg(if position.close_cost_preview_usd.is_some() {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("立即平仓净值 ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_optional_signed_usd(position.exit_now_net_pnl_usd),
+                Style::default().fg(
+                    position
+                        .exit_now_net_pnl_usd
+                        .map(pnl_color)
+                        .unwrap_or(Color::DarkGray),
+                ),
+            ),
+            Span::raw("  "),
+            Span::styled("说明 ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "毛值=已实现+盯市",
+                Style::default().fg(Color::DarkGray),
             ),
         ]),
         Line::from(vec![
@@ -2086,6 +2129,18 @@ fn format_signed_usd(value: f64) -> String {
     }
 }
 
+fn format_optional_signed_usd(value: Option<f64>) -> String {
+    value
+        .map(format_signed_usd)
+        .unwrap_or_else(|| "--".to_owned())
+}
+
+fn format_optional_cost_usd(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("${:.2}", value.abs()))
+        .unwrap_or_else(|| "--".to_owned())
+}
+
 fn top_count_key(values: &HashMap<String, u64>) -> Option<(&str, u64)> {
     values
         .iter()
@@ -2148,94 +2203,97 @@ fn detail_rank(key: &str) -> usize {
         "恢复原因" => 31,
         "强退原因" => 32,
         "允许负边际" => 33,
-        "Poly定价模式" => 34,
-        "Poly请求股数" => 35,
-        "Poly计划股数" => 36,
-        "Poly预算上限USD" => 37,
-        "Poly最大均价" => 38,
-        "Poly最小均价" => 39,
-        "Poly最小收入USD" => 40,
-        "Poly簿面均价" => 41,
-        "Poly可成交价" => 42,
-        "Poly吃簿成本USD" => 43,
-        "Poly手续费USD" => 44,
-        "CEX计划数量" => 45,
-        "CEX簿面均价" => 46,
-        "CEX可成交价" => 47,
-        "CEX摩擦成本USD" => 48,
-        "CEX手续费USD" => 49,
-        "理论边际USD" => 50,
-        "计划边际USD" => 51,
-        "Funding成本USD" => 52,
-        "残余风险惩罚USD" => 53,
-        "计划残余Delta" => 54,
-        "计划冲击亏损+1%USD" => 55,
-        "计划冲击亏损-1%USD" => 56,
-        "计划冲击亏损+2%USD" => 57,
-        "计划冲击亏损-2%USD" => 58,
-        "计划TTL" => 59,
-        "结果状态" => 60,
-        "实际Poly成本USD" => 61,
-        "实际CEX成本USD" => 62,
-        "实际Poly手续费USD" => 63,
-        "实际CEX手续费USD" => 64,
-        "实际Funding成本USD" => 65,
-        "实际边际USD" => 66,
-        "计划偏差USD" => 67,
-        "实际残余Delta" => 68,
-        "实际冲击亏损+1%USD" => 69,
-        "实际冲击亏损-1%USD" => 70,
-        "实际冲击亏损+2%USD" => 71,
-        "实际冲击亏损-2%USD" => 72,
-        "需要恢复" => 73,
-        "Poly账本条数" => 74,
-        "CEX账本条数" => 75,
-        "结果时间" => 76,
-        "市场阶段" => 77,
-        "评估状态" => 78,
-        "异步分类" => 79,
-        "Polymarket YES" => 80,
-        "Polymarket NO" => 81,
-        "CEX中价" => 82,
-        "过滤价格" => 83,
-        "价格窗口" => 84,
-        "Polymarket更新时间" => 85,
-        "CEX更新时间" => 86,
-        "Polymarket报价龄" => 87,
-        "CEX报价龄" => 88,
-        "双腿时差" => 89,
-        "Poly序列" => 90,
-        "Poly交易所时间" => 91,
-        "Poly接收时间" => 92,
-        "CEX序列" => 93,
-        "CEX交易所时间" => 94,
-        "CEX接收时间" => 95,
-        "连接状态" => 96,
-        "连接空闲" => 97,
-        "当前总敞口" => 98,
-        "当前单市场敞口" => 99,
-        "当日已实现盈亏" => 100,
-        "熔断器" => 101,
-        "熔断原因" => 102,
-        "总敞口上限" => 103,
-        "单市场上限" => 104,
-        "日亏损上限" => 105,
-        "交易所" => 106,
-        "订单状态" => 107,
-        "订单ID" => 108,
-        "成交ID" => 109,
-        "价格" => 110,
-        "数量" => 111,
-        "名义" => 112,
-        "手续费" => 113,
-        "已实现盈亏" => 114,
-        "时间" => 115,
-        "更新时间" => 116,
-        "空闲时长" => 117,
-        "重连次数" => 118,
-        "断开次数" => 119,
-        "最近断开" => 120,
-        "影响市场数" => 121,
+        "计划毛EdgeUSD" => 34,
+        "计划费用USD" => 35,
+        "计划净EdgeUSD" => 36,
+        "Poly定价模式" => 37,
+        "Poly请求股数" => 38,
+        "Poly计划股数" => 39,
+        "Poly预算上限USD" => 40,
+        "Poly最大均价" => 41,
+        "Poly最小均价" => 42,
+        "Poly最小收入USD" => 43,
+        "Poly簿面均价" => 44,
+        "Poly可成交价" => 45,
+        "Poly吃簿成本USD" => 46,
+        "Poly手续费USD" => 47,
+        "CEX计划数量" => 48,
+        "CEX簿面均价" => 49,
+        "CEX可成交价" => 50,
+        "CEX摩擦成本USD" => 51,
+        "CEX手续费USD" => 52,
+        "理论边际USD" => 53,
+        "计划边际USD" => 54,
+        "Funding成本USD" => 55,
+        "残余风险惩罚USD" => 56,
+        "计划残余Delta" => 57,
+        "计划冲击亏损+1%USD" => 58,
+        "计划冲击亏损-1%USD" => 59,
+        "计划冲击亏损+2%USD" => 60,
+        "计划冲击亏损-2%USD" => 61,
+        "计划TTL" => 62,
+        "结果状态" => 63,
+        "实际Poly成本USD" => 64,
+        "实际CEX成本USD" => 65,
+        "实际Poly手续费USD" => 66,
+        "实际CEX手续费USD" => 67,
+        "实际Funding成本USD" => 68,
+        "实际边际USD" => 69,
+        "计划偏差USD" => 70,
+        "实际残余Delta" => 71,
+        "实际冲击亏损+1%USD" => 72,
+        "实际冲击亏损-1%USD" => 73,
+        "实际冲击亏损+2%USD" => 74,
+        "实际冲击亏损-2%USD" => 75,
+        "需要恢复" => 76,
+        "Poly账本条数" => 77,
+        "CEX账本条数" => 78,
+        "结果时间" => 79,
+        "市场阶段" => 80,
+        "评估状态" => 81,
+        "异步分类" => 82,
+        "Polymarket YES" => 83,
+        "Polymarket NO" => 84,
+        "CEX中价" => 85,
+        "过滤价格" => 86,
+        "价格窗口" => 87,
+        "Polymarket更新时间" => 88,
+        "CEX更新时间" => 89,
+        "Polymarket报价龄" => 90,
+        "CEX报价龄" => 91,
+        "双腿时差" => 92,
+        "Poly序列" => 93,
+        "Poly交易所时间" => 94,
+        "Poly接收时间" => 95,
+        "CEX序列" => 96,
+        "CEX交易所时间" => 97,
+        "CEX接收时间" => 98,
+        "连接状态" => 99,
+        "连接空闲" => 100,
+        "当前总敞口" => 101,
+        "当前单市场敞口" => 102,
+        "当日已实现盈亏" => 103,
+        "熔断器" => 104,
+        "熔断原因" => 105,
+        "总敞口上限" => 106,
+        "单市场上限" => 107,
+        "日亏损上限" => 108,
+        "交易所" => 109,
+        "订单状态" => 110,
+        "订单ID" => 111,
+        "成交ID" => 112,
+        "价格" => 113,
+        "数量" => 114,
+        "名义" => 115,
+        "手续费" => 116,
+        "已实现盈亏" => 117,
+        "时间" => 118,
+        "更新时间" => 119,
+        "空闲时长" => 120,
+        "重连次数" => 121,
+        "断开次数" => 122,
+        "最近断开" => 123,
+        "影响市场数" => 124,
         _ => 1000,
     }
 }
@@ -2726,7 +2784,7 @@ fn clamp_rect_to_area(rect: Rect, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use polyalpha_core::{CommandView, EventKind, MonitorEvent};
+    use polyalpha_core::{CommandView, EventKind, MonitorEvent, PositionView};
     use ratatui::{buffer::Buffer, widgets::Widget};
 
     #[test]
@@ -2943,10 +3001,14 @@ mod tests {
     fn sorted_detail_items_prioritize_plan_and_result_economics() {
         let items = HashMap::from([
             ("结果状态".to_owned(), "completed".to_owned()),
+            ("计划毛EdgeUSD".to_owned(), "14".to_owned()),
+            ("计划费用USD".to_owned(), "2".to_owned()),
+            ("计划净EdgeUSD".to_owned(), "12".to_owned()),
             ("计划边际USD".to_owned(), "12".to_owned()),
             ("计划ID".to_owned(), "plan-1".to_owned()),
             ("实际边际USD".to_owned(), "11".to_owned()),
             ("市场".to_owned(), "btc-test".to_owned()),
+            ("Poly吃簿成本USD".to_owned(), "1.2".to_owned()),
             ("Poly账本条数".to_owned(), "1".to_owned()),
         ]);
 
@@ -2963,7 +3025,11 @@ mod tests {
         };
 
         assert!(index("市场") < index("计划ID"));
-        assert!(index("计划ID") < index("计划边际USD"));
+        assert!(index("计划ID") < index("计划毛EdgeUSD"));
+        assert!(index("计划毛EdgeUSD") < index("计划费用USD"));
+        assert!(index("计划费用USD") < index("计划净EdgeUSD"));
+        assert!(index("计划净EdgeUSD") < index("计划边际USD"));
+        assert!(index("计划净EdgeUSD") < index("Poly吃簿成本USD"));
         assert!(index("计划边际USD") < index("结果状态"));
         assert!(index("结果状态") < index("Poly账本条数"));
         assert!(index("结果状态") < index("实际边际USD"));
@@ -3027,6 +3093,53 @@ mod tests {
         assert!(compact.contains("NoPoly62"));
         assert!(compact.contains("历史失败CEX3/Poly7"));
         assert!(compact.contains("门槛600"));
+    }
+
+    #[test]
+    fn render_position_detail_shows_exit_now_economics() {
+        let mut state = TuiState::default();
+        state.monitor.positions = vec![PositionView {
+            market: "btc-test".to_owned(),
+            poly_side: "LONG YES".to_owned(),
+            poly_entry_price: 0.45,
+            poly_current_price: 0.48,
+            poly_quantity: 100.0,
+            poly_pnl_usd: 3.0,
+            poly_spread_pct: 0.0,
+            poly_slippage_bps: 1.0,
+            cex_exchange: "Binance".to_owned(),
+            cex_side: "SHORT".to_owned(),
+            cex_entry_price: 79_000.0,
+            cex_current_price: 80_000.0,
+            cex_quantity: 0.01,
+            cex_pnl_usd: 9.0,
+            cex_spread_pct: 0.0,
+            cex_slippage_bps: 2.0,
+            basis_entry_bps: 120,
+            basis_current_bps: 300,
+            delta: 0.12,
+            hedge_ratio: 1.0,
+            total_pnl_usd: 12.0,
+            realized_pnl_so_far_usd: -1.25,
+            close_cost_preview_usd: Some(3.31),
+            exit_now_net_pnl_usd: Some(7.44),
+            holding_secs: 60,
+        }];
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 180, 12));
+        render_position_detail(&state).render(buffer.area, &mut buffer);
+
+        let compact = compact_text(&buffer_text(&buffer));
+        assert!(compact.contains("盯市总盈亏"));
+        assert!(compact.contains("已实现盈亏"));
+        assert!(compact.contains("立即平仓毛值"));
+        assert!(compact.contains("平仓预估成本"));
+        assert!(compact.contains("立即平仓净值"));
+        assert!(compact.contains("+$12.00"));
+        assert!(compact.contains("-$1.25"));
+        assert!(compact.contains("+$10.75"));
+        assert!(compact.contains("$3.31"));
+        assert!(compact.contains("+$7.44"));
     }
 
     #[test]

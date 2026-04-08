@@ -378,6 +378,12 @@ pub struct PositionView {
     pub delta: f64,
     pub hedge_ratio: f64,
     pub total_pnl_usd: f64,
+    #[serde(default)]
+    pub realized_pnl_so_far_usd: f64,
+    #[serde(default)]
+    pub close_cost_preview_usd: Option<f64>,
+    #[serde(default)]
+    pub exit_now_net_pnl_usd: Option<f64>,
     pub holding_secs: u64,
 }
 
@@ -1226,6 +1232,9 @@ mod tests {
                 delta: -0.1,
                 hedge_ratio: 1.0,
                 total_pnl_usd: 1.5,
+                realized_pnl_so_far_usd: -0.3,
+                close_cost_preview_usd: Some(0.2),
+                exit_now_net_pnl_usd: Some(1.0),
                 holding_secs: 60,
             },
             PositionView {
@@ -1252,6 +1261,9 @@ mod tests {
                     delta: -0.1,
                     hedge_ratio: 1.0,
                     total_pnl_usd: 1.5,
+                    realized_pnl_so_far_usd: -0.3,
+                    close_cost_preview_usd: Some(0.2),
+                    exit_now_net_pnl_usd: Some(1.0),
                     holding_secs: 60,
                 }
             },

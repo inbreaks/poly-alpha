@@ -487,7 +487,8 @@ pub async fn build_execution_stack(
     Ok((orderbook_provider, executor, execution))
 }
 
-pub fn open_intent_from_candidate(candidate: &OpenCandidate) -> PlanningIntent {
+#[cfg(test)]
+pub(crate) fn open_intent_from_candidate(candidate: &OpenCandidate) -> PlanningIntent {
     open_intent_from_candidate_with_budget(candidate, candidate.risk_budget_usd)
 }
 

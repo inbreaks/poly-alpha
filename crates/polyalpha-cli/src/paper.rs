@@ -2738,6 +2738,7 @@ struct OpenTradeInfo {
     poly_exit_price: Option<f64>,
     cex_entry_price: Option<f64>,
     cex_exit_price: Option<f64>,
+    funding_pnl_usd: f64,
     active_auto_exit_key: Option<String>,
     auto_partial_close_used: bool,
 }
@@ -2758,6 +2759,7 @@ impl Default for OpenTradeInfo {
             poly_exit_price: None,
             cex_entry_price: None,
             cex_exit_price: None,
+            funding_pnl_usd: 0.0,
             active_auto_exit_key: None,
             auto_partial_close_used: false,
         }
@@ -2885,6 +2887,13 @@ impl TradeBook {
             }
             _ => {}
         }
+    }
+
+    fn record_funding_adjustment(&mut self, symbol: &Symbol, adjustment_usd: f64) {
+        let Some(open) = self.open.get_mut(symbol) else {
+            return;
+        };
+        open.funding_pnl_usd += adjustment_usd;
     }
 
     fn close_trade(
@@ -5635,7 +5644,7 @@ async fn run_runtime_single(
                 &observed,
                 &stats,
                 &risk,
-                &execution,
+                &mut execution,
                 &mut trade_book,
                 &command_center,
                 paused.load(Ordering::SeqCst),
@@ -5683,7 +5692,7 @@ async fn run_runtime_single(
                 &observed,
                 &stats,
                 &risk,
-                &execution,
+                &mut execution,
                 &mut trade_book,
                 &command_center,
                 paused.load(Ordering::SeqCst),
@@ -6297,7 +6306,7 @@ async fn run_runtime_multi(
                 &observed,
                 &stats,
                 &risk,
-                &execution,
+                &mut execution,
                 &mut trade_book,
                 &command_center,
                 paused.load(Ordering::SeqCst),
@@ -6343,7 +6352,7 @@ async fn run_runtime_multi(
                 &observed,
                 &stats,
                 &risk,
-                &execution,
+                &mut execution,
                 &mut trade_book,
                 &command_center,
                 paused.load(Ordering::SeqCst),
@@ -9970,6 +9979,7 @@ async fn run_paper_ws_mode(
                         &observed_map,
                         &engine,
                         &risk,
+                        &mut execution,
                         &mut trade_book,
                         &command_center,
                         paused.load(Ordering::SeqCst),
@@ -10049,7 +10059,7 @@ async fn run_paper_ws_mode(
                 &observed,
                 &stats,
                 &risk,
-                &execution,
+                &mut execution,
                 &mut trade_book,
                 &command_center,
                 paused.load(Ordering::SeqCst),
@@ -10286,7 +10296,7 @@ async fn run_paper_multi_ws_mode(
         &observed,
         &stats,
         &risk,
-        &execution,
+        &mut execution,
         &mut trade_book,
         &command_center,
         paused.load(Ordering::SeqCst),
@@ -10794,6 +10804,7 @@ async fn run_paper_multi_ws_mode(
                         &observed,
                         &engine,
                         &risk,
+                        &mut execution,
                         &mut trade_book,
                         &command_center,
                         paused.load(Ordering::SeqCst),
@@ -10895,7 +10906,7 @@ async fn run_paper_multi_ws_mode(
                 &observed,
                 &stats,
                 &risk,
-                &execution,
+                &mut execution,
                 &mut trade_book,
                 &command_center,
                 paused.load(Ordering::SeqCst),
@@ -11375,6 +11386,10 @@ async fn apply_execution_events(
                     risk.apply_realized_pnl_adjustment(UsdNotional(funding_adjustment.0))
                         .await?;
                     stats.total_pnl_usd += funding_adjustment.0.to_f64().unwrap_or_default();
+                    trade_book.record_funding_adjustment(
+                        &result.symbol,
+                        funding_adjustment.0.to_f64().unwrap_or_default(),
+                    );
                 }
                 push_event_with_context_and_payload(
                     recent_events,
@@ -12462,6 +12477,15 @@ fn add_risk_details(
     }
 }
 
+fn trade_plan_total_cost_usd(plan: &TradePlan) -> Decimal {
+    plan.poly_friction_cost_usd.0
+        + plan.poly_fee_usd.0
+        + plan.cex_friction_cost_usd.0
+        + plan.cex_fee_usd.0
+        + plan.expected_funding_cost_usd.0
+        + plan.residual_risk_penalty_usd.0
+}
+
 fn add_trade_plan_details(details: &mut EventDetails, plan: &TradePlan) {
     insert_detail(details, "Schema版本", plan.schema_version.to_string());
     insert_detail(details, "计划哈希", plan.plan_hash.clone());
@@ -12543,6 +12567,21 @@ fn add_trade_plan_details(details: &mut EventDetails, plan: &TradePlan) {
         details,
         "CEX手续费USD",
         format_detail_decimal(plan.cex_fee_usd.0),
+    );
+    insert_detail(
+        details,
+        "计划毛EdgeUSD",
+        format_detail_decimal(plan.raw_edge_usd.0),
+    );
+    insert_detail(
+        details,
+        "计划费用USD",
+        format_detail_decimal(trade_plan_total_cost_usd(plan)),
+    );
+    insert_detail(
+        details,
+        "计划净EdgeUSD",
+        format_detail_decimal(plan.planned_edge_usd.0),
     );
     insert_detail(
         details,
@@ -13933,7 +13972,7 @@ fn build_monitor_state(
     observed: &ObservedState,
     stats: &PaperStats,
     risk: &InMemoryRiskManager,
-    execution: &ExecutionManager<RuntimeExecutor>,
+    execution: &mut ExecutionManager<RuntimeExecutor>,
     trade_book: &mut TradeBook,
     command_center: &Arc<Mutex<CommandCenter>>,
     paused: bool,
@@ -14322,6 +14361,7 @@ fn build_monitor_render_request(
     observed_map: &HashMap<Symbol, ObservedState>,
     engine: &SimpleAlphaEngine,
     risk: &InMemoryRiskManager,
+    execution: &mut ExecutionManager<RuntimeExecutor>,
     trade_book: &mut TradeBook,
     command_center: &Arc<Mutex<CommandCenter>>,
     paused: bool,
@@ -14347,6 +14387,7 @@ fn build_monitor_render_request(
         &grouped_positions,
         observed_map,
         engine,
+        execution,
         trade_book,
         now_ms,
     );
@@ -14517,7 +14558,7 @@ fn build_single_monitor_state_from_seed_cache(
     observed: &ObservedState,
     stats: &PaperStats,
     risk: &InMemoryRiskManager,
-    execution: &ExecutionManager<RuntimeExecutor>,
+    execution: &mut ExecutionManager<RuntimeExecutor>,
     trade_book: &mut TradeBook,
     command_center: &Arc<Mutex<CommandCenter>>,
     paused: bool,
@@ -14536,6 +14577,7 @@ fn build_single_monitor_state_from_seed_cache(
         &observed_map,
         engine,
         risk,
+        execution,
         trade_book,
         command_center,
         paused,
@@ -14569,7 +14611,7 @@ fn build_multi_monitor_state_via_seed_cache(
     observed_map: &HashMap<Symbol, ObservedState>,
     stats: &PaperStats,
     risk: &InMemoryRiskManager,
-    execution: &ExecutionManager<RuntimeExecutor>,
+    execution: &mut ExecutionManager<RuntimeExecutor>,
     trade_book: &mut TradeBook,
     command_center: &Arc<Mutex<CommandCenter>>,
     paused: bool,
@@ -14587,6 +14629,7 @@ fn build_multi_monitor_state_via_seed_cache(
         observed_map,
         engine,
         risk,
+        execution,
         trade_book,
         command_center,
         paused,
@@ -14626,7 +14669,7 @@ fn build_monitor_state_common(
     observed_map: &HashMap<Symbol, ObservedState>,
     stats: &PaperStats,
     risk: &InMemoryRiskManager,
-    execution: &ExecutionManager<RuntimeExecutor>,
+    execution: &mut ExecutionManager<RuntimeExecutor>,
     trade_book: &mut TradeBook,
     command_center: &Arc<Mutex<CommandCenter>>,
     paused: bool,
@@ -14643,6 +14686,7 @@ fn build_monitor_state_common(
         &grouped_positions,
         observed_map,
         engine,
+        execution,
         trade_book,
         now_ms,
     );
@@ -14737,7 +14781,7 @@ fn build_multi_monitor_state_legacy(
     observed_map: &HashMap<Symbol, ObservedState>,
     stats: &PaperStats,
     risk: &InMemoryRiskManager,
-    execution: &ExecutionManager<RuntimeExecutor>,
+    execution: &mut ExecutionManager<RuntimeExecutor>,
     trade_book: &mut TradeBook,
     command_center: &Arc<Mutex<CommandCenter>>,
     paused: bool,
@@ -15100,11 +15144,37 @@ fn build_market_views(
         .collect()
 }
 
+fn grouped_position_realized_pnl_usd(grouped: &GroupedPosition) -> f64 {
+    [
+        grouped.poly_yes.as_ref(),
+        grouped.poly_no.as_ref(),
+        grouped.cex.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|position| position.realized_pnl.0.to_f64().unwrap_or_default())
+    .sum()
+}
+
+fn preview_close_cost_usd(
+    execution: &mut ExecutionManager<RuntimeExecutor>,
+    symbol: &Symbol,
+    now_ms: u64,
+) -> Option<f64> {
+    let preview_intent =
+        close_intent_for_symbol(symbol, "monitor_preview", "monitor-preview", now_ms);
+    execution
+        .preview_intent_detailed(&preview_intent)
+        .ok()
+        .and_then(|plan| (-plan.planned_edge_usd.0).max(Decimal::ZERO).to_f64())
+}
+
 fn build_position_views(
     settings: &Settings,
     grouped_positions: &HashMap<Symbol, GroupedPosition>,
     observed_map: &HashMap<Symbol, ObservedState>,
     engine: &SimpleAlphaEngine,
+    execution: &mut ExecutionManager<RuntimeExecutor>,
     trade_book: &TradeBook,
     now_ms: u64,
 ) -> Vec<polyalpha_core::PositionView> {
@@ -15186,6 +15256,12 @@ fn build_position_views(
                 )
             })
             .unwrap_or_default();
+        let total_pnl_usd = poly_pnl_usd + cex_pnl_usd;
+        let realized_pnl_so_far_usd = grouped_position_realized_pnl_usd(grouped)
+            + open_trade.map(|trade| trade.funding_pnl_usd).unwrap_or_default();
+        let close_cost_preview_usd = preview_close_cost_usd(execution, symbol, now_ms);
+        let exit_now_net_pnl_usd = close_cost_preview_usd
+            .map(|close_cost| realized_pnl_so_far_usd + total_pnl_usd - close_cost);
 
         out.push(polyalpha_core::PositionView {
             market: symbol.0.clone(),
@@ -15216,7 +15292,10 @@ fn build_position_views(
                 .or_else(|| signal_snapshot.as_ref().map(|item| item.delta))
                 .unwrap_or_default(),
             hedge_ratio: open_trade.map(|item| item.hedge_ratio).unwrap_or(1.0),
-            total_pnl_usd: poly_pnl_usd + cex_pnl_usd,
+            total_pnl_usd,
+            realized_pnl_so_far_usd,
+            close_cost_preview_usd,
+            exit_now_net_pnl_usd,
             holding_secs: open_trade
                 .filter(|item| item.opened_at_ms > 0)
                 .map(|item| now_ms.saturating_sub(item.opened_at_ms) / 1000)
@@ -15876,7 +15955,7 @@ fn build_multi_monitor_state(
     observed_map: &HashMap<Symbol, ObservedState>,
     stats: &PaperStats,
     risk: &InMemoryRiskManager,
-    execution: &ExecutionManager<RuntimeExecutor>,
+    execution: &mut ExecutionManager<RuntimeExecutor>,
     trade_book: &mut TradeBook,
     command_center: &Arc<Mutex<CommandCenter>>,
     paused: bool,
@@ -16626,7 +16705,8 @@ mod tests {
         stats.polymarket_ws_diagnostics.add_orderbook_updates(4);
 
         let risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
-        let execution = ExecutionManager::new(RuntimeExecutor::DryRun(DryRunExecutor::default()));
+        let mut execution =
+            ExecutionManager::new(RuntimeExecutor::DryRun(DryRunExecutor::default()));
         let command_center = Arc::new(Mutex::new(CommandCenter::default()));
         let mut trade_book = TradeBook::default();
 
@@ -16637,7 +16717,7 @@ mod tests {
             &observed,
             &stats,
             &risk,
-            &execution,
+            &mut execution,
             &mut trade_book,
             &command_center,
             false,
@@ -16696,7 +16776,8 @@ mod tests {
         stats.polymarket_ws_diagnostics.add_orderbook_updates(4);
 
         let risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
-        let execution = ExecutionManager::new(RuntimeExecutor::DryRun(DryRunExecutor::default()));
+        let mut execution =
+            ExecutionManager::new(RuntimeExecutor::DryRun(DryRunExecutor::default()));
         let command_center = Arc::new(Mutex::new(CommandCenter::default()));
 
         let mut legacy_trade_book = TradeBook::default();
@@ -16707,7 +16788,7 @@ mod tests {
             &observed,
             &stats,
             &risk,
-            &execution,
+            &mut execution,
             &mut legacy_trade_book,
             &command_center,
             false,
@@ -16726,7 +16807,7 @@ mod tests {
             &observed,
             &stats,
             &risk,
-            &execution,
+            &mut execution,
             &mut reused_trade_book,
             &command_center,
             false,
@@ -18777,6 +18858,9 @@ mod tests {
                 delta: 0.12,
                 hedge_ratio: 1.0,
                 total_pnl_usd: 12.0,
+                realized_pnl_so_far_usd: -1.0,
+                close_cost_preview_usd: Some(2.5),
+                exit_now_net_pnl_usd: Some(8.5),
                 holding_secs: 60,
             }],
             recent_events: Vec::new(),
@@ -18920,6 +19004,20 @@ mod tests {
             view.recovery_decision_reason.as_deref(),
             Some("cex_top_up_faster")
         );
+    }
+
+    #[test]
+    fn build_execution_event_details_includes_normalized_plan_economics() {
+        let mut plan = sample_trade_plan();
+        plan.raw_edge_usd = UsdNotional(Decimal::new(108, 1));
+        plan.planned_edge_usd = UsdNotional(Decimal::new(10, 0));
+
+        let details = build_execution_event_details(&ExecutionEvent::TradePlanCreated { plan }, None)
+            .expect("trade plan details");
+
+        assert_eq!(details.get("计划毛EdgeUSD").map(String::as_str), Some("10.8"));
+        assert_eq!(details.get("计划费用USD").map(String::as_str), Some("0.8"));
+        assert_eq!(details.get("计划净EdgeUSD").map(String::as_str), Some("10"));
     }
 
     #[test]
@@ -19866,7 +19964,8 @@ mod tests {
         let observed = ObservedState::default();
         let mut trade_book = TradeBook::default();
         let command_center = Arc::new(Mutex::new(CommandCenter::default()));
-        let execution = ExecutionManager::new(RuntimeExecutor::DryRun(DryRunExecutor::default()));
+        let mut execution =
+            ExecutionManager::new(RuntimeExecutor::DryRun(DryRunExecutor::default()));
         let monitor = build_monitor_state(
             &settings,
             &market,
@@ -19874,7 +19973,7 @@ mod tests {
             &observed,
             &PaperStats::default(),
             &risk,
-            &execution,
+            &mut execution,
             &mut trade_book,
             &command_center,
             false,
@@ -19894,6 +19993,136 @@ mod tests {
             (monitor.performance.total_pnl_usd - 10.0).abs() < f64::EPSILON,
             "closed-position realized pnl should still contribute to monitor equity"
         );
+    }
+
+    #[tokio::test]
+    async fn build_monitor_state_position_view_includes_exit_now_economics() {
+        let settings = test_settings_with_price_filter(None, None);
+        let market = settings.markets[0].clone();
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let (provider, _executor, mut execution) = build_paper_execution_stack(
+            &settings,
+            &registry,
+            1_700_000_000_000,
+            RuntimeExecutionMode::Paper,
+            None,
+        )
+        .await
+        .expect("paper execution stack");
+        seed_runtime_books(&provider, &registry, 2);
+
+        let mut engine = SimpleAlphaEngine::with_markets(
+            build_paper_engine_config(&settings),
+            settings.markets.clone(),
+        );
+        let mut risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
+        let mut stats = PaperStats::default();
+        let mut recent_events = VecDeque::new();
+        let mut trade_book = TradeBook::default();
+        let mut audit = None;
+        let mut candidate = open_candidate(TokenSide::Yes);
+        candidate.fair_value = 0.70;
+        candidate.raw_mispricing = 0.24;
+        candidate.delta_estimate = 0.0005;
+        trade_book.register_open_signal(&candidate, 0, 1.0, candidate.delta_estimate);
+        let open_trigger = RuntimeTrigger::Candidate(candidate.clone());
+        let open_events = execution
+            .process_intent(open_intent_from_candidate(&candidate))
+            .await
+            .expect("seed open position");
+        apply_execution_events(
+            &mut risk,
+            &mut stats,
+            &mut recent_events,
+            &mut trade_book,
+            Some(&open_trigger),
+            open_events,
+            &mut audit,
+        )
+        .await
+        .expect("apply open execution events");
+        apply_execution_events(
+            &mut risk,
+            &mut stats,
+            &mut recent_events,
+            &mut trade_book,
+            None,
+            vec![ExecutionEvent::ExecutionResultRecorded {
+                result: sample_execution_result_with_funding(3),
+            }],
+            &mut audit,
+        )
+        .await
+        .expect("apply funding adjustment");
+        sync_engine_position_state_from_runtime(
+            &mut engine,
+            &risk,
+            &trade_book,
+            &market.symbol,
+            Some(TokenSide::Yes),
+        );
+
+        let observed = ObservedState {
+            poly_yes_mid: Some(Decimal::new(46, 2)),
+            poly_no_mid: Some(Decimal::new(54, 2)),
+            cex_mid: Some(Decimal::new(100_500, 0)),
+            ..ObservedState::default()
+        };
+        let preview_intent =
+            close_intent_for_symbol(&market.symbol, "preview", "corr-preview", 2_000);
+        let preview_plan = execution
+            .preview_intent_detailed(&preview_intent)
+            .expect("close preview plan");
+        let command_center = Arc::new(Mutex::new(CommandCenter::default()));
+        let monitor = build_monitor_state(
+            &settings,
+            &market,
+            &engine,
+            &observed,
+            &stats,
+            &risk,
+            &mut execution,
+            &mut trade_book,
+            &command_center,
+            false,
+            false,
+            1_000,
+            2_000,
+            &[],
+            polyalpha_core::TradingMode::Paper,
+        );
+
+        let position = monitor
+            .positions
+            .iter()
+            .find(|position| position.market == market.symbol.0)
+            .expect("position view");
+        let leg_realized_pnl: f64 = risk
+            .build_snapshot(2_000)
+            .positions
+            .values()
+            .filter(|position| position.key.symbol == market.symbol)
+            .map(|position| position.realized_pnl.0.to_f64().unwrap_or_default())
+            .sum();
+        let expected_realized_pnl_so_far = leg_realized_pnl
+            + trade_book
+                .open
+                .get(&market.symbol)
+                .map(|open| open.funding_pnl_usd)
+                .unwrap_or_default();
+        let expected_close_cost = (-preview_plan.planned_edge_usd.0)
+            .max(Decimal::ZERO)
+            .to_f64()
+            .unwrap_or_default();
+        let expected_exit_now =
+            expected_realized_pnl_so_far + position.total_pnl_usd - expected_close_cost;
+
+        assert!(
+            (position.realized_pnl_so_far_usd - expected_realized_pnl_so_far).abs() < 1e-9,
+            "expected realized pnl so far to include leg realized pnl plus funding adjustments"
+        );
+        assert_eq!(position.close_cost_preview_usd, Some(expected_close_cost));
+        assert_eq!(position.exit_now_net_pnl_usd, Some(expected_exit_now));
     }
 
     #[test]
@@ -19933,7 +20162,8 @@ mod tests {
         stats.polymarket_ws_diagnostics.add_orderbook_updates(5);
 
         let risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
-        let execution = ExecutionManager::new(RuntimeExecutor::DryRun(DryRunExecutor::default()));
+        let mut execution =
+            ExecutionManager::new(RuntimeExecutor::DryRun(DryRunExecutor::default()));
         let command_center = Arc::new(Mutex::new(CommandCenter::default()));
 
         let mut legacy_trade_book = TradeBook::default();
@@ -19944,7 +20174,7 @@ mod tests {
             &observed,
             &stats,
             &risk,
-            &execution,
+            &mut execution,
             &mut legacy_trade_book,
             &command_center,
             false,
@@ -19963,7 +20193,7 @@ mod tests {
             &observed,
             &stats,
             &risk,
-            &execution,
+            &mut execution,
             &mut reused_trade_book,
             &command_center,
             false,
@@ -20030,7 +20260,8 @@ mod tests {
         };
         let stats = PaperStats::default();
         let risk = InMemoryRiskManager::new(RiskLimits::from(settings.risk.clone()));
-        let execution = ExecutionManager::new(RuntimeExecutor::DryRun(DryRunExecutor::default()));
+        let mut execution =
+            ExecutionManager::new(RuntimeExecutor::DryRun(DryRunExecutor::default()));
         let command_center = Arc::new(Mutex::new(CommandCenter::default()));
         let mut trade_book = TradeBook::default();
 
@@ -20041,7 +20272,7 @@ mod tests {
             &observed,
             &stats,
             &risk,
-            &execution,
+            &mut execution,
             &mut trade_book,
             &command_center,
             false,
