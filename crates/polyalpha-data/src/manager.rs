@@ -1,14 +1,33 @@
-use polyalpha_core::{MarketDataEvent, MarketDataTx, SettlementRules, Symbol};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use polyalpha_core::{
+    Exchange, InstrumentKind, MarketDataEvent, MarketDataTx, SettlementRules, Symbol,
+};
 
 use crate::error::{DataError, Result};
 use crate::normalizer::{
     CexBookUpdate, CexFundingUpdate, CexTradeUpdate, MarketDataNormalizer, PolyBookUpdate,
 };
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+enum OrderbookSequenceKey {
+    Symbol {
+        exchange: Exchange,
+        symbol: Symbol,
+        instrument: InstrumentKind,
+    },
+    CexVenue {
+        exchange: Exchange,
+        venue_symbol: String,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct DataManager {
     normalizer: MarketDataNormalizer,
     market_data_tx: MarketDataTx,
+    last_orderbook_sequences: Arc<Mutex<HashMap<OrderbookSequenceKey, u64>>>,
 }
 
 impl DataManager {
@@ -16,6 +35,7 @@ impl DataManager {
         Self {
             normalizer,
             market_data_tx,
+            last_orderbook_sequences: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -24,9 +44,29 @@ impl DataManager {
     }
 
     pub fn publish(&self, event: MarketDataEvent) -> Result<usize> {
+        if self.should_suppress_orderbook_event(&event) {
+            return Ok(0);
+        }
         self.market_data_tx
             .send(event)
             .map_err(|_| DataError::ChannelClosed)
+    }
+
+    fn should_suppress_orderbook_event(&self, event: &MarketDataEvent) -> bool {
+        let Some((key, sequence)) = orderbook_sequence_key(event) else {
+            return false;
+        };
+        let mut guard = self
+            .last_orderbook_sequences
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match guard.get(&key) {
+            Some(previous_sequence) if sequence < *previous_sequence => true,
+            _ => {
+                guard.insert(key, sequence);
+                false
+            }
+        }
     }
 
     pub fn normalize_and_publish_poly_orderbook(&self, update: PolyBookUpdate) -> Result<usize> {
@@ -63,17 +103,44 @@ impl DataManager {
     }
 }
 
+fn orderbook_sequence_key(event: &MarketDataEvent) -> Option<(OrderbookSequenceKey, u64)> {
+    match event {
+        MarketDataEvent::OrderBookUpdate { snapshot } => Some((
+            OrderbookSequenceKey::Symbol {
+                exchange: snapshot.exchange,
+                symbol: snapshot.symbol.clone(),
+                instrument: snapshot.instrument,
+            },
+            snapshot.sequence,
+        )),
+        MarketDataEvent::CexVenueOrderBookUpdate {
+            exchange,
+            venue_symbol,
+            sequence,
+            ..
+        } => Some((
+            OrderbookSequenceKey::CexVenue {
+                exchange: *exchange,
+                venue_symbol: venue_symbol.clone(),
+            },
+            *sequence,
+        )),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rust_decimal::Decimal;
+    use tokio::sync::broadcast::error::TryRecvError;
 
     use polyalpha_core::{
-        create_channels, Exchange, MarketConfig, MarketDataEvent, PolyShares, PolymarketIds, Price,
-        SymbolRegistry,
+        create_channels, CexBaseQty, Exchange, MarketConfig, MarketDataEvent, PolyShares,
+        PolymarketIds, Price, SymbolRegistry,
     };
 
     use super::*;
-    use crate::normalizer::{PolyBookLevel, PolyBookUpdate};
+    use crate::normalizer::{CexBookLevel, CexBookUpdate, PolyBookLevel, PolyBookUpdate};
 
     fn sample_registry() -> SymbolRegistry {
         SymbolRegistry::new(vec![MarketConfig {
@@ -95,6 +162,42 @@ mod tests {
             cex_qty_step: Decimal::new(1, 3),
             cex_contract_multiplier: Decimal::ONE,
         }])
+    }
+
+    fn sample_poly_update(sequence: u64, price_cents: i64) -> PolyBookUpdate {
+        PolyBookUpdate {
+            asset_id: "yes-1".to_owned(),
+            bids: vec![PolyBookLevel {
+                price: Price(Decimal::new(price_cents - 1, 2)),
+                shares: PolyShares(Decimal::new(5, 0)),
+            }],
+            asks: vec![PolyBookLevel {
+                price: Price(Decimal::new(price_cents + 1, 2)),
+                shares: PolyShares(Decimal::new(5, 0)),
+            }],
+            exchange_timestamp_ms: sequence,
+            received_at_ms: sequence + 1,
+            sequence,
+            last_trade_price: None,
+        }
+    }
+
+    fn sample_cex_update(sequence: u64, price_tenths: i64) -> CexBookUpdate {
+        CexBookUpdate {
+            exchange: Exchange::Binance,
+            venue_symbol: "BTCUSDT".to_owned(),
+            bids: vec![CexBookLevel {
+                price: Price(Decimal::new(price_tenths - 1, 1)),
+                base_qty: CexBaseQty(Decimal::new(5, 0)),
+            }],
+            asks: vec![CexBookLevel {
+                price: Price(Decimal::new(price_tenths + 1, 1)),
+                base_qty: CexBaseQty(Decimal::new(5, 0)),
+            }],
+            exchange_timestamp_ms: sequence,
+            received_at_ms: sequence + 1,
+            sequence,
+        }
     }
 
     #[test]
@@ -129,5 +232,69 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn stale_poly_orderbook_update_is_not_published() {
+        let channels = create_channels(&[Symbol::new("btc-100k-mar-2026")]);
+        let manager = DataManager::new(
+            MarketDataNormalizer::new(sample_registry()),
+            channels.market_data_tx.clone(),
+        );
+        let mut rx = channels.market_data_tx.subscribe();
+
+        let first = manager
+            .normalize_and_publish_poly_orderbook(sample_poly_update(10, 50))
+            .expect("first poly update should publish");
+        let second = manager
+            .normalize_and_publish_poly_orderbook(sample_poly_update(9, 40))
+            .expect("stale poly update should be ignored cleanly");
+
+        assert!(first >= 1);
+        assert_eq!(second, 0);
+
+        match rx.try_recv().expect("fresh poly event should be available") {
+            MarketDataEvent::OrderBookUpdate { snapshot } => {
+                assert_eq!(snapshot.sequence, 10);
+                assert_eq!(snapshot.asks[0].price, Price(Decimal::new(51, 2)));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn stale_cex_orderbook_update_is_not_published() {
+        let channels = create_channels(&[Symbol::new("btc-100k-mar-2026")]);
+        let manager = DataManager::new(
+            MarketDataNormalizer::new(sample_registry()),
+            channels.market_data_tx.clone(),
+        );
+        let mut rx = channels.market_data_tx.subscribe();
+
+        let first = manager
+            .normalize_and_publish_cex_orderbook(sample_cex_update(10, 1_000))
+            .expect("first cex update should publish");
+        let second = manager
+            .normalize_and_publish_cex_orderbook(sample_cex_update(9, 900))
+            .expect("stale cex update should be ignored cleanly");
+
+        assert!(first >= 1);
+        assert_eq!(second, 0);
+
+        match rx.try_recv().expect("fresh cex event should be available") {
+            MarketDataEvent::CexVenueOrderBookUpdate {
+                sequence,
+                asks,
+                venue_symbol,
+                ..
+            } => {
+                assert_eq!(sequence, 10);
+                assert_eq!(venue_symbol, "BTCUSDT");
+                assert_eq!(asks[0].price, Price(Decimal::new(1001, 1)));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 }

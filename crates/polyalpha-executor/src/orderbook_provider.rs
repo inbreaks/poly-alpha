@@ -76,7 +76,7 @@ impl InMemoryOrderbookProvider {
             instrument: snapshot.instrument,
         };
         if let Ok(mut map) = self.orderbooks.write() {
-            map.insert(key, snapshot);
+            upsert_if_not_stale(&mut map, key, snapshot);
         }
     }
 
@@ -87,7 +87,7 @@ impl InMemoryOrderbookProvider {
         let exchange = snapshot.exchange;
         let symbol = snapshot.symbol.clone();
         if let Ok(mut cex_map) = self.cex_orderbooks.write() {
-            cex_map.insert((exchange, venue_symbol.clone()), snapshot);
+            upsert_if_not_stale(&mut cex_map, (exchange, venue_symbol.clone()), snapshot);
         }
 
         if let Ok(mut symbol_index) = self.cex_symbol_index.write() {
@@ -104,7 +104,7 @@ impl InMemoryOrderbookProvider {
     ) {
         let exchange = snapshot.exchange;
         if let Ok(mut cex_map) = self.cex_orderbooks.write() {
-            cex_map.insert((exchange, venue_symbol.clone()), snapshot);
+            upsert_if_not_stale(&mut cex_map, (exchange, venue_symbol.clone()), snapshot);
         }
 
         if let Ok(mut symbol_index) = self.cex_symbol_index.write() {
@@ -117,6 +117,21 @@ impl InMemoryOrderbookProvider {
     /// Get a clone of the internal storage for use in other contexts.
     pub fn clone_storage(&self) -> Arc<RwLock<HashMap<OrderbookKey, OrderBookSnapshot>>> {
         Arc::clone(&self.orderbooks)
+    }
+}
+
+fn upsert_if_not_stale<K>(
+    map: &mut HashMap<K, OrderBookSnapshot>,
+    key: K,
+    snapshot: OrderBookSnapshot,
+) where
+    K: Eq + std::hash::Hash,
+{
+    match map.get(&key) {
+        Some(current) if snapshot.sequence < current.sequence => {}
+        _ => {
+            map.insert(key, snapshot);
+        }
     }
 }
 
@@ -193,7 +208,27 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::*;
-    use polyalpha_core::{CexBaseQty, Price, PriceLevel, VenueQuantity};
+    use polyalpha_core::{CexBaseQty, PolyShares, Price, PriceLevel, VenueQuantity};
+
+    fn sample_poly_snapshot(sequence: u64) -> OrderBookSnapshot {
+        OrderBookSnapshot {
+            exchange: Exchange::Polymarket,
+            symbol: Symbol::new("market-a"),
+            instrument: InstrumentKind::PolyYes,
+            bids: vec![PriceLevel {
+                price: Price(Decimal::new(490, 3)),
+                quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(5, 0))),
+            }],
+            asks: vec![PriceLevel {
+                price: Price(Decimal::new(510, 3)),
+                quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(5, 0))),
+            }],
+            exchange_timestamp_ms: sequence,
+            received_at_ms: sequence,
+            sequence,
+            last_trade_price: None,
+        }
+    }
 
     fn sample_cex_snapshot(symbol: &str, sequence: u64) -> OrderBookSnapshot {
         OrderBookSnapshot {
@@ -216,6 +251,23 @@ mod tests {
     }
 
     #[test]
+    fn stale_poly_update_does_not_replace_newer_snapshot() {
+        let provider = InMemoryOrderbookProvider::new();
+        provider.update(sample_poly_snapshot(10));
+        provider.update(sample_poly_snapshot(9));
+
+        let book = provider
+            .get_orderbook(
+                Exchange::Polymarket,
+                &Symbol::new("market-a"),
+                InstrumentKind::PolyYes,
+            )
+            .expect("poly book should remain available");
+
+        assert_eq!(book.sequence, 10);
+    }
+
+    #[test]
     fn cex_symbol_lookup_reads_latest_shared_venue_snapshot() {
         let provider = InMemoryOrderbookProvider::new();
         provider.update_cex(sample_cex_snapshot("market-a", 1), "BTCUSDT".to_owned());
@@ -235,5 +287,18 @@ mod tests {
         assert_eq!(symbol_book.sequence, 2);
         assert_eq!(symbol_book.symbol, Symbol::new("market-a"));
         assert_eq!(venue_book.sequence, 2);
+    }
+
+    #[test]
+    fn stale_cex_update_does_not_replace_newer_snapshot() {
+        let provider = InMemoryOrderbookProvider::new();
+        provider.update_cex(sample_cex_snapshot("market-a", 10), "BTCUSDT".to_owned());
+        provider.update_cex(sample_cex_snapshot("market-a", 9), "BTCUSDT".to_owned());
+
+        let venue_book = provider
+            .get_cex_orderbook(Exchange::Binance, "BTCUSDT")
+            .expect("venue lookup should keep the newest cex snapshot");
+
+        assert_eq!(venue_book.sequence, 10);
     }
 }
