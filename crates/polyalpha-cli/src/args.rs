@@ -602,8 +602,12 @@ pub enum BacktestCommand {
         cex_fee_bps: Option<f64>,
         #[arg(long, help = "默认取自 config/default.toml")]
         cex_slippage_bps: Option<f64>,
+        #[arg(long, help = "可选覆盖 replay planner 的 fallback funding bps/day")]
+        fallback_funding_bps_per_day: Option<f64>,
         #[arg(long, default_value_t = 1.0)]
         entry_fill_ratio: f64,
+        #[arg(long, help = "可选覆盖 replay planner 的 instant-loss budget 比例上限")]
+        max_open_instant_loss_pct_of_budget: Option<f64>,
         #[arg(long, help = "默认取自 config/default.toml")]
         planner_depth_levels: Option<usize>,
         #[arg(
@@ -817,6 +821,52 @@ mod live_command_tests {
             Command::Backtest {
                 command: BacktestCommand::RustReplay { band_policy, .. },
             } => assert_eq!(band_policy.as_deref(), Some("disabled")),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_backtest_rust_replay_instant_loss_override() {
+        let cli = Cli::try_parse_from([
+            "polyalpha-cli",
+            "backtest",
+            "rust-replay",
+            "--max-open-instant-loss-pct-of-budget",
+            "0.02",
+        ])
+        .expect("backtest rust-replay instant-loss override should parse");
+
+        match cli.command {
+            Command::Backtest {
+                command:
+                    BacktestCommand::RustReplay {
+                        max_open_instant_loss_pct_of_budget,
+                        ..
+                    },
+            } => assert_eq!(max_open_instant_loss_pct_of_budget, Some(0.02)),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_backtest_rust_replay_funding_override() {
+        let cli = Cli::try_parse_from([
+            "polyalpha-cli",
+            "backtest",
+            "rust-replay",
+            "--fallback-funding-bps-per-day",
+            "1",
+        ])
+        .expect("backtest rust-replay funding override should parse");
+
+        match cli.command {
+            Command::Backtest {
+                command:
+                    BacktestCommand::RustReplay {
+                        fallback_funding_bps_per_day,
+                        ..
+                    },
+            } => assert_eq!(fallback_funding_bps_per_day, Some(1.0)),
             other => panic!("unexpected command: {other:?}"),
         }
     }

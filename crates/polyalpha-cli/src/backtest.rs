@@ -252,7 +252,9 @@ pub async fn run_backtest_command(command: BacktestCommand) -> Result<()> {
             poly_slippage_bps,
             cex_fee_bps,
             cex_slippage_bps,
+            fallback_funding_bps_per_day,
             entry_fill_ratio,
+            max_open_instant_loss_pct_of_budget,
             planner_depth_levels,
             band_policy,
             min_poly_price,
@@ -285,7 +287,9 @@ pub async fn run_backtest_command(command: BacktestCommand) -> Result<()> {
                 poly_slippage_bps: poly_slippage_bps.unwrap_or(defaults.poly_slippage_bps),
                 cex_fee_bps: cex_fee_bps.unwrap_or(defaults.cex_fee_bps),
                 cex_slippage_bps: cex_slippage_bps.unwrap_or(defaults.cex_slippage_bps),
+                fallback_funding_bps_per_day,
                 entry_fill_ratio,
+                max_open_instant_loss_pct_of_budget,
                 planner_depth_levels: planner_depth_levels.unwrap_or(defaults.planner_depth_levels),
                 band_policy: band_policy
                     .as_deref()

@@ -15258,7 +15258,9 @@ fn build_position_views(
             .unwrap_or_default();
         let total_pnl_usd = poly_pnl_usd + cex_pnl_usd;
         let realized_pnl_so_far_usd = grouped_position_realized_pnl_usd(grouped)
-            + open_trade.map(|trade| trade.funding_pnl_usd).unwrap_or_default();
+            + open_trade
+                .map(|trade| trade.funding_pnl_usd)
+                .unwrap_or_default();
         let close_cost_preview_usd = preview_close_cost_usd(execution, symbol, now_ms);
         let exit_now_net_pnl_usd = close_cost_preview_usd
             .map(|close_cost| realized_pnl_so_far_usd + total_pnl_usd - close_cost);
@@ -19012,10 +19014,14 @@ mod tests {
         plan.raw_edge_usd = UsdNotional(Decimal::new(108, 1));
         plan.planned_edge_usd = UsdNotional(Decimal::new(10, 0));
 
-        let details = build_execution_event_details(&ExecutionEvent::TradePlanCreated { plan }, None)
-            .expect("trade plan details");
+        let details =
+            build_execution_event_details(&ExecutionEvent::TradePlanCreated { plan }, None)
+                .expect("trade plan details");
 
-        assert_eq!(details.get("计划毛EdgeUSD").map(String::as_str), Some("10.8"));
+        assert_eq!(
+            details.get("计划毛EdgeUSD").map(String::as_str),
+            Some("10.8")
+        );
         assert_eq!(details.get("计划费用USD").map(String::as_str), Some("0.8"));
         assert_eq!(details.get("计划净EdgeUSD").map(String::as_str), Some("10"));
     }

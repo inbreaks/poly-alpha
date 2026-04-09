@@ -63,7 +63,9 @@ pub struct RustReplayCommandArgs {
     pub poly_slippage_bps: f64,
     pub cex_fee_bps: f64,
     pub cex_slippage_bps: f64,
+    pub fallback_funding_bps_per_day: Option<f64>,
     pub entry_fill_ratio: f64,
+    pub max_open_instant_loss_pct_of_budget: Option<f64>,
     pub planner_depth_levels: usize,
     pub band_policy: BandPolicyMode,
     pub min_poly_price: Option<f64>,
@@ -110,6 +112,7 @@ struct ExecutionStressConfig {
     poly_slippage_bps: f64,
     cex_fee_bps: f64,
     cex_slippage_bps: f64,
+    fallback_funding_bps_per_day: f64,
     entry_fill_ratio: f64,
 }
 
@@ -129,6 +132,7 @@ struct ResolvedReplayConfig {
     min_poly_price: Option<f64>,
     max_poly_price: Option<f64>,
     max_holding_bars: Option<usize>,
+    max_open_instant_loss_pct_of_budget: Decimal,
     stress: ExecutionStressConfig,
 }
 
@@ -519,12 +523,14 @@ pub async fn run_rust_replay_command(args: RustReplayCommandArgs) -> Result<()> 
         args.min_poly_price,
         args.max_poly_price,
         args.max_holding_bars,
+        args.max_open_instant_loss_pct_of_budget,
         ExecutionStressConfig {
             label: "custom".to_owned(),
             poly_fee_bps: args.poly_fee_bps,
             poly_slippage_bps: args.poly_slippage_bps,
             cex_fee_bps: args.cex_fee_bps,
             cex_slippage_bps: args.cex_slippage_bps,
+            fallback_funding_bps_per_day: args.fallback_funding_bps_per_day.unwrap_or(0.0),
             entry_fill_ratio: args.entry_fill_ratio,
         },
     )?;
@@ -607,6 +613,7 @@ pub async fn run_rust_stress_command(args: RustStressCommandArgs) -> Result<()> 
             None, // min_poly_price - not available in stress test
             None, // max_poly_price - not available in stress test
             None, // max_holding_bars - not available in stress test
+            None, // preserve default replay instant-loss cap in stress presets
             preset,
         )?;
         let run = run_single_replay(&dataset, &config, false).await?;
@@ -654,6 +661,7 @@ fn resolve_replay_config(
     min_poly_price: Option<f64>,
     max_poly_price: Option<f64>,
     max_holding_bars: Option<usize>,
+    max_open_instant_loss_pct_of_budget: Option<f64>,
     stress: ExecutionStressConfig,
 ) -> Result<ResolvedReplayConfig> {
     let initial_capital = initial_capital.max(0.0);
@@ -670,6 +678,8 @@ fn resolve_replay_config(
     } else {
         planner_depth_levels
     };
+    let max_open_instant_loss_pct_of_budget =
+        decimal_from_f64(max_open_instant_loss_pct_of_budget.unwrap_or(0.04).max(0.0))?;
 
     Ok(ResolvedReplayConfig {
         db_path: db_path.to_owned(),
@@ -686,12 +696,14 @@ fn resolve_replay_config(
         min_poly_price,
         max_poly_price,
         max_holding_bars,
+        max_open_instant_loss_pct_of_budget,
         stress: ExecutionStressConfig {
             label: stress.label,
             poly_fee_bps: stress.poly_fee_bps.max(0.0),
             poly_slippage_bps: stress.poly_slippage_bps.max(0.0),
             cex_fee_bps: stress.cex_fee_bps.max(0.0),
             cex_slippage_bps: stress.cex_slippage_bps.max(0.0),
+            fallback_funding_bps_per_day: stress.fallback_funding_bps_per_day.max(0.0),
             entry_fill_ratio: stress.entry_fill_ratio.clamp(0.0, 1.0),
         },
     })
@@ -705,6 +717,7 @@ fn resolve_stress_presets(selected: Option<RustStressPreset>) -> Vec<ExecutionSt
             poly_slippage_bps: 10.0,
             cex_fee_bps: 2.0,
             cex_slippage_bps: 10.0,
+            fallback_funding_bps_per_day: 0.0,
             entry_fill_ratio: 1.0,
         },
         ExecutionStressConfig {
@@ -713,6 +726,7 @@ fn resolve_stress_presets(selected: Option<RustStressPreset>) -> Vec<ExecutionSt
             poly_slippage_bps: 20.0,
             cex_fee_bps: 4.0,
             cex_slippage_bps: 12.0,
+            fallback_funding_bps_per_day: 0.0,
             entry_fill_ratio: 0.8,
         },
         ExecutionStressConfig {
@@ -721,6 +735,7 @@ fn resolve_stress_presets(selected: Option<RustStressPreset>) -> Vec<ExecutionSt
             poly_slippage_bps: 40.0,
             cex_fee_bps: 6.0,
             cex_slippage_bps: 20.0,
+            fallback_funding_bps_per_day: 0.0,
             entry_fill_ratio: 0.6,
         },
     ];
@@ -1615,10 +1630,10 @@ fn replay_execution_planner(config: &ResolvedReplayConfig) -> ExecutionPlanner {
         cex_taker_fee_bps: rounded_bps(config.stress.cex_fee_bps),
         cex_maker_fee_bps: rounded_bps(config.stress.cex_fee_bps),
         funding_mode: polyalpha_core::FundingCostMode::FallbackBps,
-        fallback_funding_bps_per_day: 0,
+        fallback_funding_bps_per_day: rounded_bps(config.stress.fallback_funding_bps_per_day),
         poly_slippage_bps: rounded_bps(config.stress.poly_slippage_bps),
         cex_slippage_bps: rounded_bps(config.stress.cex_slippage_bps),
-        max_open_instant_loss_pct_of_budget: Decimal::new(4, 2),
+        max_open_instant_loss_pct_of_budget: config.max_open_instant_loss_pct_of_budget,
         ..ExecutionPlanner::default()
     }
 }
@@ -4114,12 +4129,14 @@ mod tests {
             min_poly_price: None,
             max_poly_price: None,
             max_holding_bars: None,
+            max_open_instant_loss_pct_of_budget: Decimal::new(4, 2),
             stress: ExecutionStressConfig {
                 label: "stress".to_owned(),
                 poly_fee_bps,
                 poly_slippage_bps,
                 cex_fee_bps,
                 cex_slippage_bps,
+                fallback_funding_bps_per_day: 0.0,
                 entry_fill_ratio,
             },
         }
@@ -4184,8 +4201,104 @@ mod tests {
             poly_slippage_bps: 50.0,
             cex_fee_bps: 2.0,
             cex_slippage_bps: 2.0,
+            fallback_funding_bps_per_day: 0.0,
             entry_fill_ratio: 1.0,
         }
+    }
+
+    #[test]
+    fn resolve_replay_config_defaults_instant_loss_cap_to_four_pct() {
+        let config = resolve_replay_config(
+            ":memory:",
+            10_000.0,
+            60,
+            2.0,
+            0.5,
+            Some(100.0),
+            1.0,
+            1.0,
+            0.1,
+            5,
+            BandPolicyMode::ConfiguredBand,
+            None,
+            None,
+            None,
+            None,
+            sample_replay_stress(),
+        )
+        .expect("resolve replay config");
+
+        assert_eq!(
+            config.max_open_instant_loss_pct_of_budget,
+            Decimal::new(4, 2)
+        );
+        assert_eq!(
+            replay_execution_planner(&config).max_open_instant_loss_pct_of_budget,
+            Decimal::new(4, 2)
+        );
+    }
+
+    #[test]
+    fn resolve_replay_config_accepts_instant_loss_cap_override() {
+        let config = resolve_replay_config(
+            ":memory:",
+            10_000.0,
+            60,
+            2.0,
+            0.5,
+            Some(100.0),
+            1.0,
+            1.0,
+            0.1,
+            5,
+            BandPolicyMode::ConfiguredBand,
+            None,
+            None,
+            None,
+            Some(0.02),
+            sample_replay_stress(),
+        )
+        .expect("resolve replay config");
+
+        assert_eq!(
+            config.max_open_instant_loss_pct_of_budget,
+            Decimal::new(2, 2)
+        );
+        assert_eq!(
+            replay_execution_planner(&config).max_open_instant_loss_pct_of_budget,
+            Decimal::new(2, 2)
+        );
+    }
+
+    #[test]
+    fn resolve_replay_config_accepts_funding_override() {
+        let config = resolve_replay_config(
+            ":memory:",
+            10_000.0,
+            60,
+            2.0,
+            0.5,
+            Some(100.0),
+            1.0,
+            1.0,
+            0.1,
+            5,
+            BandPolicyMode::ConfiguredBand,
+            None,
+            None,
+            None,
+            None,
+            ExecutionStressConfig {
+                fallback_funding_bps_per_day: 1.0,
+                ..sample_replay_stress()
+            },
+        )
+        .expect("resolve replay config");
+
+        assert_eq!(
+            replay_execution_planner(&config).fallback_funding_bps_per_day,
+            1
+        );
     }
 
     async fn diagnose_planner_rejections_for_window(
@@ -4215,6 +4328,7 @@ mod tests {
             0.1,
             5,
             BandPolicyMode::ConfiguredBand,
+            None,
             None,
             None,
             None,

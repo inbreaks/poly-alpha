@@ -819,19 +819,14 @@ pub fn render_position_detail(state: &TuiState) -> Paragraph<'static> {
             Span::styled("立即平仓净值 ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format_optional_signed_usd(position.exit_now_net_pnl_usd),
-                Style::default().fg(
-                    position
-                        .exit_now_net_pnl_usd
-                        .map(pnl_color)
-                        .unwrap_or(Color::DarkGray),
-                ),
+                Style::default().fg(position
+                    .exit_now_net_pnl_usd
+                    .map(pnl_color)
+                    .unwrap_or(Color::DarkGray)),
             ),
             Span::raw("  "),
             Span::styled("说明 ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                "毛值=已实现+盯市",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("毛值=已实现+盯市", Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(vec![
             Span::styled("入场基差 ", Style::default().fg(Color::DarkGray)),
