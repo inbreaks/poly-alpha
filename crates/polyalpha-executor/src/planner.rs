@@ -25,10 +25,10 @@ const DEFAULT_MAX_SEQUENCE_DRIFT: u64 = 2;
 const DEFAULT_POLY_SLIPPAGE_BPS: u64 = 50;
 const DEFAULT_CEX_SLIPPAGE_BPS: u64 = 2;
 const OPEN_INSTANT_LOSS_BINARY_SEARCH_STEPS: usize = 32;
-const MAX_OPEN_POLY_PRICE_IMPACT_BPS: u64 = 320;
-const MIN_OPEN_POLY_PRICE_IMPACT_BPS_FOR_EDGE_GUARD: u64 = 300;
+const DEFAULT_MAX_OPEN_POLY_PRICE_IMPACT_BPS: u64 = 320;
+const DEFAULT_MIN_OPEN_POLY_PRICE_IMPACT_BPS_FOR_EDGE_GUARD: u64 = 300;
 
-fn max_open_instant_loss_pct_of_planned_edge() -> Decimal {
+fn default_max_open_instant_loss_pct_of_planned_edge() -> Decimal {
     Decimal::new(5, 2)
 }
 
@@ -118,6 +118,9 @@ pub struct ExecutionPlanner {
     pub fallback_funding_bps_per_day: u32,
     pub poly_slippage_bps: u32,
     pub cex_slippage_bps: u32,
+    pub max_open_poly_price_impact_bps: u64,
+    pub min_open_poly_price_impact_bps_for_edge_guard: u64,
+    pub max_open_instant_loss_pct_of_planned_edge: Decimal,
     pub max_open_instant_loss_pct_of_budget: Decimal,
 }
 
@@ -131,6 +134,11 @@ impl Default for ExecutionPlanner {
             fallback_funding_bps_per_day: 1,
             poly_slippage_bps: DEFAULT_POLY_SLIPPAGE_BPS as u32,
             cex_slippage_bps: DEFAULT_CEX_SLIPPAGE_BPS as u32,
+            max_open_poly_price_impact_bps: DEFAULT_MAX_OPEN_POLY_PRICE_IMPACT_BPS,
+            min_open_poly_price_impact_bps_for_edge_guard:
+                DEFAULT_MIN_OPEN_POLY_PRICE_IMPACT_BPS_FOR_EDGE_GUARD,
+            max_open_instant_loss_pct_of_planned_edge:
+                default_max_open_instant_loss_pct_of_planned_edge(),
             max_open_instant_loss_pct_of_budget: Decimal::new(4, 2),
         }
     }
@@ -179,6 +187,11 @@ impl ExecutionPlanner {
             cex_maker_fee_bps: config.cex_maker_fee_bps,
             funding_mode: config.funding_mode,
             fallback_funding_bps_per_day: config.fallback_funding_bps_per_day,
+            max_open_poly_price_impact_bps: config.max_open_poly_price_impact_bps,
+            min_open_poly_price_impact_bps_for_edge_guard: config
+                .min_open_poly_price_impact_bps_for_edge_guard,
+            max_open_instant_loss_pct_of_planned_edge: config
+                .max_open_instant_loss_pct_of_planned_edge,
             ..Self::default()
         }
     }
@@ -804,13 +817,13 @@ impl ExecutionPlanner {
         let poly_executable_price = poly_estimate.executable_price.unwrap_or(poly_best_ask);
         let poly_price_impact_bps = open_poly_price_impact_bps(poly_book, poly_executable_price);
         if let Some(poly_price_impact_bps) = poly_price_impact_bps {
-            if poly_price_impact_bps > Decimal::from(MAX_OPEN_POLY_PRICE_IMPACT_BPS) {
+            if poly_price_impact_bps > Decimal::from(self.max_open_poly_price_impact_bps) {
                 return Err(PlanRejection::new(
                     PlanRejectionReason::PolyPriceImpactTooLarge,
                     format!(
                         "poly price impact {} bps exceeds cap of {} bps",
                         poly_price_impact_bps.round_dp(2),
-                        MAX_OPEN_POLY_PRICE_IMPACT_BPS
+                        self.max_open_poly_price_impact_bps
                     ),
                 )
                 .with_diagnostics(self.open_planning_diagnostics(
@@ -833,9 +846,9 @@ impl ExecutionPlanner {
             ));
         }
         let max_instant_loss_vs_edge =
-            planned_edge_usd.0 * max_open_instant_loss_pct_of_planned_edge();
+            planned_edge_usd.0 * self.max_open_instant_loss_pct_of_planned_edge;
         if poly_price_impact_bps.is_some_and(|value| {
-            value >= Decimal::from(MIN_OPEN_POLY_PRICE_IMPACT_BPS_FOR_EDGE_GUARD)
+            value >= Decimal::from(self.min_open_poly_price_impact_bps_for_edge_guard)
         }) && instant_open_loss_usd.0 > max_instant_loss_vs_edge
         {
             return Err(PlanRejection::new(
@@ -2591,6 +2604,35 @@ mod tests {
             PlanRejectionReason::OpenInstantLossTooLarge
         );
         assert!(rejection.detail.contains("planned edge"));
+    }
+
+    #[test]
+    fn planner_allows_open_when_configured_open_quality_thresholds_are_relaxed() {
+        let mut planner = ExecutionPlanner::default();
+        planner.max_open_instant_loss_pct_of_budget = Decimal::ONE;
+        planner.max_open_poly_price_impact_bps = 100_000;
+        planner.min_open_poly_price_impact_bps_for_edge_guard = 250;
+        planner.max_open_instant_loss_pct_of_planned_edge = Decimal::new(1000, 1);
+        let mut intent = sample_open_intent();
+        let PlanningIntent::OpenPosition { candidate, .. } = &mut intent else {
+            panic!("expected open intent");
+        };
+        candidate.raw_mispricing = 0.08;
+        let mut context = sample_context();
+        context.poly_yes_book.asks = vec![
+            PriceLevel {
+                price: Price(Decimal::new(47, 2)),
+                quantity: VenueQuantity::PolyShares(PolyShares(Decimal::ONE)),
+            },
+            PriceLevel {
+                price: Price(Decimal::new(472, 3)),
+                quantity: VenueQuantity::PolyShares(PolyShares(Decimal::new(5_000, 0))),
+            },
+        ];
+
+        let plan = planner.plan(&intent, &context).expect("open plan");
+
+        assert_eq!(plan.intent_type, "open_position");
     }
 
     #[test]

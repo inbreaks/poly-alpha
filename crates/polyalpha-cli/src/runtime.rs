@@ -1178,6 +1178,13 @@ mod tests {
         settings.execution_costs.cex_taker_fee_bps = 9;
         settings.execution_costs.cex_maker_fee_bps = 3;
         settings.execution_costs.fallback_funding_bps_per_day = 4;
+        settings.execution_costs.max_open_poly_price_impact_bps = 100_000;
+        settings
+            .execution_costs
+            .min_open_poly_price_impact_bps_for_edge_guard = 250;
+        settings
+            .execution_costs
+            .max_open_instant_loss_pct_of_planned_edge = Decimal::new(1000, 1);
         let registry = SymbolRegistry::new(settings.markets.clone());
         let (_provider, _executor, execution) = tokio::runtime::Runtime::new()
             .expect("runtime")
@@ -1195,6 +1202,12 @@ mod tests {
         assert_eq!(planner.cex_taker_fee_bps, 9);
         assert_eq!(planner.cex_maker_fee_bps, 3);
         assert_eq!(planner.fallback_funding_bps_per_day, 4);
+        assert_eq!(planner.max_open_poly_price_impact_bps, 100_000);
+        assert_eq!(planner.min_open_poly_price_impact_bps_for_edge_guard, 250);
+        assert_eq!(
+            planner.max_open_instant_loss_pct_of_planned_edge,
+            Decimal::new(1000, 1)
+        );
     }
 
     #[test]

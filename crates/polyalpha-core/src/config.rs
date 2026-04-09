@@ -151,6 +151,18 @@ fn default_execution_cost_fallback_funding_bps_per_day() -> u32 {
     1
 }
 
+fn default_execution_cost_max_open_poly_price_impact_bps() -> u64 {
+    320
+}
+
+fn default_execution_cost_min_open_poly_price_impact_bps_for_edge_guard() -> u64 {
+    300
+}
+
+fn default_execution_cost_max_open_instant_loss_pct_of_planned_edge() -> Decimal {
+    Decimal::new(5, 2)
+}
+
 fn default_max_open_instant_loss_pct_of_budget() -> Decimal {
     Decimal::new(4, 2)
 }
@@ -630,6 +642,12 @@ pub struct ExecutionCostConfig {
     pub funding_mode: FundingCostMode,
     #[serde(default = "default_execution_cost_fallback_funding_bps_per_day")]
     pub fallback_funding_bps_per_day: u32,
+    #[serde(default = "default_execution_cost_max_open_poly_price_impact_bps")]
+    pub max_open_poly_price_impact_bps: u64,
+    #[serde(default = "default_execution_cost_min_open_poly_price_impact_bps_for_edge_guard")]
+    pub min_open_poly_price_impact_bps_for_edge_guard: u64,
+    #[serde(default = "default_execution_cost_max_open_instant_loss_pct_of_planned_edge")]
+    pub max_open_instant_loss_pct_of_planned_edge: Decimal,
 }
 
 impl Default for ExecutionCostConfig {
@@ -640,6 +658,11 @@ impl Default for ExecutionCostConfig {
             cex_maker_fee_bps: default_execution_cost_cex_maker_fee_bps(),
             funding_mode: FundingCostMode::default(),
             fallback_funding_bps_per_day: default_execution_cost_fallback_funding_bps_per_day(),
+            max_open_poly_price_impact_bps: default_execution_cost_max_open_poly_price_impact_bps(),
+            min_open_poly_price_impact_bps_for_edge_guard:
+                default_execution_cost_min_open_poly_price_impact_bps_for_edge_guard(),
+            max_open_instant_loss_pct_of_planned_edge:
+                default_execution_cost_max_open_instant_loss_pct_of_planned_edge(),
         }
     }
 }
@@ -871,6 +894,12 @@ mod tests {
         assert_eq!(config.cex_maker_fee_bps, 5);
         assert_eq!(config.funding_mode, FundingCostMode::FallbackBps);
         assert_eq!(config.fallback_funding_bps_per_day, 1);
+        assert_eq!(config.max_open_poly_price_impact_bps, 320);
+        assert_eq!(config.min_open_poly_price_impact_bps_for_edge_guard, 300);
+        assert_eq!(
+            config.max_open_instant_loss_pct_of_planned_edge,
+            Decimal::new(5, 2)
+        );
     }
 
     #[test]
@@ -881,7 +910,10 @@ mod tests {
                 "cex_taker_fee_bps": 9,
                 "cex_maker_fee_bps": 2,
                 "funding_mode": "observed_rate",
-                "fallback_funding_bps_per_day": 4
+                "fallback_funding_bps_per_day": 4,
+                "max_open_poly_price_impact_bps": 100000,
+                "min_open_poly_price_impact_bps_for_edge_guard": 250,
+                "max_open_instant_loss_pct_of_planned_edge": "100.0"
             }"#,
         )
         .expect("execution cost config");
@@ -890,5 +922,11 @@ mod tests {
         assert_eq!(config.cex_maker_fee_bps, 2);
         assert_eq!(config.funding_mode, FundingCostMode::ObservedRate);
         assert_eq!(config.fallback_funding_bps_per_day, 4);
+        assert_eq!(config.max_open_poly_price_impact_bps, 100_000);
+        assert_eq!(config.min_open_poly_price_impact_bps_for_edge_guard, 250);
+        assert_eq!(
+            config.max_open_instant_loss_pct_of_planned_edge,
+            Decimal::new(1000, 1)
+        );
     }
 }
