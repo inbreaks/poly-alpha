@@ -11847,6 +11847,7 @@ fn extract_reason_code(message: &str, prefix: &str) -> Option<String> {
 
 fn extract_direct_plan_rejection_reason(message: &str) -> Option<String> {
     extract_reason_code(message, "plan rejected [")
+        .or_else(|| extract_reason_code(message, "planning context rejected ["))
 }
 
 fn extract_revalidation_failure_reason(message: &str) -> Option<String> {
@@ -18914,6 +18915,16 @@ mod tests {
                 "plan revalidation failed [poly_price_move_exceeded] and replan rejected [non_positive_planned_edge]: price drift exceeded tolerance"
             ),
             Some("poly_price_move_exceeded".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_plan_rejection_reason_recognizes_planning_context_rejection_codes() {
+        assert_eq!(
+            extract_plan_rejection_reason(
+                "planning context rejected [book_conflict_same_sequence]: instrument=PolyYes sequence=1775750706444"
+            ),
+            Some("book_conflict_same_sequence".to_owned())
         );
     }
 

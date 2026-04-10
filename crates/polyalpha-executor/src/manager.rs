@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+use serde::Serialize;
 use uuid::Uuid;
 
 use polyalpha_core::{
@@ -84,6 +85,12 @@ impl SessionBookkeeping {
 struct ObservedBookState {
     sequence: u64,
     fingerprint: String,
+}
+
+#[derive(Serialize)]
+struct PlanningBookFingerprint<'a> {
+    bids: &'a [polyalpha_core::PriceLevel],
+    asks: &'a [polyalpha_core::PriceLevel],
 }
 
 #[derive(Clone, Debug)]
@@ -592,9 +599,11 @@ impl<E: OrderExecutor> ExecutionManager<E> {
             symbol: book.symbol.clone(),
             instrument: book.instrument,
         };
-        let fingerprint = serde_json::to_string(book).map_err(|err| {
-            CoreError::Generic(format!("failed to fingerprint planning book: {err}"))
-        })?;
+        let fingerprint = serde_json::to_string(&PlanningBookFingerprint {
+            bids: &book.bids,
+            asks: &book.asks,
+        })
+        .map_err(|err| CoreError::Generic(format!("failed to fingerprint planning book: {err}")))?;
         if let Some(previous) = self.observed_books.get(&key) {
             if book.sequence < previous.sequence {
                 return Err(CoreError::Generic(format!(
@@ -2019,6 +2028,58 @@ mod tests {
         assert_eq!(deep_context.planner_depth_levels, 2);
         assert_eq!(deep_context.poly_yes_book.asks.len(), 2);
         assert_eq!(deep_context.cex_book.asks.len(), 2);
+    }
+
+    #[test]
+    fn planning_context_accepts_same_sequence_when_only_received_at_changes() {
+        let provider = sample_planning_provider(Decimal::new(500, 0), Decimal::new(5, 0));
+        let executor = DryRunExecutor::with_orderbook(provider.clone(), SlippageConfig::default());
+        let mut manager = ExecutionManager::with_orderbook_provider(executor, provider.clone());
+
+        manager
+            .build_planning_context_for_symbol(&sample_symbol())
+            .expect("initial planning context");
+
+        let mut repeated_yes = provider
+            .get_orderbook(
+                Exchange::Polymarket,
+                &sample_symbol(),
+                InstrumentKind::PolyYes,
+            )
+            .expect("poly yes snapshot");
+        repeated_yes.received_at_ms += 1_000;
+        provider.update(repeated_yes);
+
+        manager
+            .build_planning_context_for_symbol(&sample_symbol())
+            .expect("same-sequence snapshot with newer received_at should not conflict");
+    }
+
+    #[test]
+    fn planning_context_rejects_same_sequence_when_book_levels_change() {
+        let provider = sample_planning_provider(Decimal::new(500, 0), Decimal::new(5, 0));
+        let executor = DryRunExecutor::with_orderbook(provider.clone(), SlippageConfig::default());
+        let mut manager = ExecutionManager::with_orderbook_provider(executor, provider.clone());
+
+        manager
+            .build_planning_context_for_symbol(&sample_symbol())
+            .expect("initial planning context");
+
+        let mut conflicting_yes = provider
+            .get_orderbook(
+                Exchange::Polymarket,
+                &sample_symbol(),
+                InstrumentKind::PolyYes,
+            )
+            .expect("poly yes snapshot");
+        conflicting_yes.bids[0].price = Price(Decimal::new(48, 2));
+        provider.update(conflicting_yes);
+
+        let err = manager
+            .build_planning_context_for_symbol(&sample_symbol())
+            .expect_err("same-sequence level change should still conflict");
+
+        assert!(err.to_string().contains("book_conflict_same_sequence"));
     }
 
     #[tokio::test]
