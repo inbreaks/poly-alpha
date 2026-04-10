@@ -10,6 +10,7 @@ use super::Price;
 pub enum Exchange {
     Polymarket,
     Binance,
+    Deribit,
     Okx,
 }
 

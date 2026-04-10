@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/polyalpha-audit",
+    "crates/polyalpha-pulse",
     "crates/polyalpha-core",
     "crates/polyalpha-data",
     "crates/polyalpha-engine",

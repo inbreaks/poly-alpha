@@ -213,6 +213,12 @@ pub struct OkxConfig {
     pub ws_private_url: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeribitConfig {
+    pub rest_url: String,
+    pub ws_url: String,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum MarketDataMode {
@@ -520,6 +526,72 @@ pub struct NegRiskStrategyConfig {
     pub enable_inventory_backed_short: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PulseRuntimeConfig {
+    pub enabled: bool,
+    pub max_concurrent_sessions_per_asset: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PulseSessionConfig {
+    pub max_holding_secs: u64,
+    pub min_opening_notional_usd: UsdNotional,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PulseEntryConfig {
+    pub min_net_session_edge_bps: Decimal,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PulseRehedgeConfig {
+    pub delta_drift_threshold: Decimal,
+    pub delta_bump_mode: String,
+    pub delta_bump_ratio_bps: u64,
+    pub min_abs_bump: Decimal,
+    pub max_abs_bump: Decimal,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PulsePinRiskConfig {
+    pub gamma_cap_mode: String,
+    pub max_abs_event_delta: Decimal,
+    pub pin_risk_zone_bps: u64,
+    pub pin_risk_time_window_secs: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PulseProviderConfig {
+    pub kind: String,
+    pub enabled: bool,
+    pub max_anchor_age_ms: u64,
+    pub soft_mismatch_window_minutes: u64,
+    pub hard_expiry_mismatch_minutes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PulseRoutingConfig {
+    pub enabled: bool,
+    pub anchor_provider: String,
+    pub hedge_venue: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PulseAssetPolicyConfig {}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PulseArbStrategyConfig {
+    pub runtime: PulseRuntimeConfig,
+    pub session: PulseSessionConfig,
+    pub entry: PulseEntryConfig,
+    pub rehedge: PulseRehedgeConfig,
+    pub pin_risk: PulsePinRiskConfig,
+    pub providers: HashMap<String, PulseProviderConfig>,
+    pub routing: HashMap<String, PulseRoutingConfig>,
+    #[serde(default)]
+    pub asset_policy: HashMap<String, PulseAssetPolicyConfig>,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StrategyMarketScopeConfig {
     #[serde(default = "default_allow_terminal_above_markets")]
@@ -554,6 +626,7 @@ pub struct StrategyConfig {
     pub basis: BasisStrategyConfig,
     pub dmm: DmmStrategyConfig,
     pub negrisk: NegRiskStrategyConfig,
+    pub pulse_arb: PulseArbStrategyConfig,
     pub settlement: SettlementRules,
     #[serde(default)]
     pub market_scope: StrategyMarketScopeConfig,
@@ -672,6 +745,7 @@ pub struct Settings {
     pub general: GeneralConfig,
     pub polymarket: PolymarketConfig,
     pub binance: BinanceConfig,
+    pub deribit: DeribitConfig,
     pub okx: OkxConfig,
     pub markets: Vec<MarketConfig>,
     pub strategy: StrategyConfig,
@@ -927,6 +1001,169 @@ mod tests {
         assert_eq!(
             config.max_open_instant_loss_pct_of_planned_edge,
             Decimal::new(1000, 1)
+        );
+    }
+
+    #[test]
+    fn pulse_arb_config_deserializes_deribit_binance_routing() {
+        let config: PulseArbStrategyConfig = serde_json::from_value(serde_json::json!({
+            "runtime": { "enabled": true, "max_concurrent_sessions_per_asset": 2 },
+            "session": { "max_holding_secs": 900, "min_opening_notional_usd": "250" },
+            "entry": { "min_net_session_edge_bps": "25" },
+            "rehedge": {
+                "delta_drift_threshold": "0.03",
+                "delta_bump_mode": "relative_with_clamp",
+                "delta_bump_ratio_bps": 1,
+                "min_abs_bump": "5",
+                "max_abs_bump": "25"
+            },
+            "pin_risk": {
+                "gamma_cap_mode": "delta_clamp",
+                "max_abs_event_delta": "0.75",
+                "pin_risk_zone_bps": 15,
+                "pin_risk_time_window_secs": 1800
+            },
+            "providers": {
+                "deribit_primary": {
+                    "kind": "deribit",
+                    "enabled": true,
+                    "max_anchor_age_ms": 250,
+                    "soft_mismatch_window_minutes": 360,
+                    "hard_expiry_mismatch_minutes": 720
+                }
+            },
+            "routing": {
+                "btc": { "enabled": true, "anchor_provider": "deribit_primary", "hedge_venue": "binance_perp" },
+                "eth": { "enabled": true, "anchor_provider": "deribit_primary", "hedge_venue": "binance_perp" },
+                "sol": { "enabled": false, "anchor_provider": "binance_options_primary", "hedge_venue": "binance_perp" }
+            }
+        }))
+        .expect("pulse config should deserialize");
+
+        assert_eq!(config.routing["btc"].anchor_provider, "deribit_primary");
+        assert_eq!(config.routing["eth"].hedge_venue.as_str(), "binance_perp");
+        assert!(!config.routing["sol"].enabled);
+    }
+
+    #[test]
+    fn exchange_deribit_round_trips_in_config_models() {
+        let exchange: Exchange = serde_json::from_str("\"Deribit\"").expect("deserialize exchange");
+        assert_eq!(exchange, Exchange::Deribit);
+        assert_eq!(serde_json::to_string(&exchange).unwrap(), "\"Deribit\"");
+    }
+
+    #[test]
+    fn settings_and_strategy_include_deribit_and_pulse_arb_surfaces() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "general": {
+                "log_level": "info",
+                "data_dir": "./data",
+                "monitor_socket_path": "/tmp/polyalpha.sock"
+            },
+            "polymarket": {
+                "clob_api_url": "https://clob.polymarket.com",
+                "ws_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+                "chain_id": 137
+            },
+            "binance": {
+                "rest_url": "https://fapi.binance.com",
+                "ws_url": "wss://fstream.binance.com"
+            },
+            "deribit": {
+                "rest_url": "https://www.deribit.com/api/v2",
+                "ws_url": "wss://www.deribit.com/ws/api/v2"
+            },
+            "okx": {
+                "rest_url": "https://www.okx.com",
+                "ws_public_url": "wss://ws.okx.com:8443/ws/v5/public",
+                "ws_private_url": "wss://ws.okx.com:8443/ws/v5/private"
+            },
+            "markets": [],
+            "strategy": {
+                "basis": {
+                    "entry_z_score_threshold": "4.0",
+                    "exit_z_score_threshold": "0.5",
+                    "rolling_window_secs": 36000,
+                    "min_warmup_samples": 600,
+                    "min_basis_bps": "50.0",
+                    "max_position_usd": "200",
+                    "delta_rebalance_threshold": "0.05",
+                    "delta_rebalance_interval_secs": 60
+                },
+                "dmm": {
+                    "gamma": "0.1",
+                    "sigma_window_secs": 300,
+                    "max_inventory": "5000",
+                    "order_refresh_secs": 10,
+                    "num_levels": 3,
+                    "level_spacing_bps": "10.0",
+                    "min_spread_bps": "20.0"
+                },
+                "negrisk": {
+                    "min_arb_bps": "30.0",
+                    "max_legs": 8,
+                    "enable_inventory_backed_short": false
+                },
+                "pulse_arb": {
+                    "runtime": { "enabled": true, "max_concurrent_sessions_per_asset": 2 },
+                    "session": { "max_holding_secs": 900, "min_opening_notional_usd": "250" },
+                    "entry": { "min_net_session_edge_bps": "25" },
+                    "rehedge": {
+                        "delta_drift_threshold": "0.03",
+                        "delta_bump_mode": "relative_with_clamp",
+                        "delta_bump_ratio_bps": 1,
+                        "min_abs_bump": "5",
+                        "max_abs_bump": "25"
+                    },
+                    "pin_risk": {
+                        "gamma_cap_mode": "delta_clamp",
+                        "max_abs_event_delta": "0.75",
+                        "pin_risk_zone_bps": 15,
+                        "pin_risk_time_window_secs": 1800
+                    },
+                    "providers": {
+                        "deribit_primary": {
+                            "kind": "deribit",
+                            "enabled": true,
+                            "max_anchor_age_ms": 250,
+                            "soft_mismatch_window_minutes": 360,
+                            "hard_expiry_mismatch_minutes": 720
+                        }
+                    },
+                    "routing": {
+                        "btc": {
+                            "enabled": true,
+                            "anchor_provider": "deribit_primary",
+                            "hedge_venue": "binance_perp"
+                        }
+                    }
+                },
+                "settlement": {
+                    "stop_new_position_hours": 24,
+                    "force_reduce_hours": 12,
+                    "force_reduce_target_ratio": "0.5",
+                    "close_only_hours": 6,
+                    "emergency_close_hours": 1,
+                    "dispute_close_only": true
+                }
+            },
+            "risk": {
+                "max_total_exposure_usd": "10000",
+                "max_single_position_usd": "200",
+                "max_daily_loss_usd": "500",
+                "max_drawdown_pct": "10.0",
+                "max_open_orders": 50,
+                "circuit_breaker_cooldown_secs": 300,
+                "rate_limit_orders_per_sec": 5,
+                "max_persistence_lag_secs": 10
+            }
+        }))
+        .expect("settings should deserialize with pulse/deribit");
+
+        assert_eq!(settings.deribit.rest_url, "https://www.deribit.com/api/v2");
+        assert_eq!(
+            settings.strategy.pulse_arb.routing["btc"].anchor_provider,
+            "deribit_primary"
         );
     }
 }

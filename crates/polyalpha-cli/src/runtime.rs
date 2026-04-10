@@ -384,6 +384,9 @@ fn required_env(name: &str) -> Result<String> {
 fn ensure_live_hedge_exchange(exchange: Exchange) -> Result<Exchange> {
     match exchange {
         Exchange::Binance | Exchange::Okx => Ok(exchange),
+        Exchange::Deribit => Err(anyhow!(
+            "armed live execution does not support deribit hedge venue yet"
+        )),
         Exchange::Polymarket => Err(anyhow!(
             "armed live execution requires a hedge venue, got polymarket"
         )),
@@ -395,6 +398,7 @@ fn live_exchange_sort_key(exchange: Exchange) -> u8 {
         Exchange::Polymarket => 0,
         Exchange::Binance => 1,
         Exchange::Okx => 2,
+        Exchange::Deribit => 3,
     }
 }
 
@@ -469,6 +473,11 @@ pub async fn build_execution_stack(
                         required_env("OKX_PASSPHRASE")?,
                     ),
                 ),
+                Exchange::Deribit => {
+                    return Err(anyhow!(
+                        "armed live execution does not support deribit hedge venue yet"
+                    ))
+                }
                 Exchange::Polymarket => unreachable!("polymarket hedge exchange rejected above"),
             };
             RuntimeExecutor::Live(LiveRuntimeExecutor::new(router))
@@ -671,6 +680,10 @@ mod tests {
                 rest_url: "https://example.com".to_owned(),
                 ws_url: "wss://example.com/ws".to_owned(),
             },
+            deribit: polyalpha_core::DeribitConfig {
+                rest_url: "https://example.com/deribit".to_owned(),
+                ws_url: "wss://example.com/deribit/ws".to_owned(),
+            },
             okx: polyalpha_core::OkxConfig {
                 rest_url: "https://example.com".to_owned(),
                 ws_public_url: "wss://example.com/public".to_owned(),
@@ -709,6 +722,51 @@ mod tests {
                     min_arb_bps: Decimal::new(10, 0),
                     max_legs: 2,
                     enable_inventory_backed_short: false,
+                },
+                pulse_arb: polyalpha_core::PulseArbStrategyConfig {
+                    runtime: polyalpha_core::PulseRuntimeConfig {
+                        enabled: true,
+                        max_concurrent_sessions_per_asset: 2,
+                    },
+                    session: polyalpha_core::PulseSessionConfig {
+                        max_holding_secs: 900,
+                        min_opening_notional_usd: UsdNotional(Decimal::new(250, 0)),
+                    },
+                    entry: polyalpha_core::PulseEntryConfig {
+                        min_net_session_edge_bps: Decimal::new(25, 0),
+                    },
+                    rehedge: polyalpha_core::PulseRehedgeConfig {
+                        delta_drift_threshold: Decimal::new(3, 2),
+                        delta_bump_mode: "relative_with_clamp".to_owned(),
+                        delta_bump_ratio_bps: 1,
+                        min_abs_bump: Decimal::new(5, 0),
+                        max_abs_bump: Decimal::new(25, 0),
+                    },
+                    pin_risk: polyalpha_core::PulsePinRiskConfig {
+                        gamma_cap_mode: "delta_clamp".to_owned(),
+                        max_abs_event_delta: Decimal::new(75, 2),
+                        pin_risk_zone_bps: 15,
+                        pin_risk_time_window_secs: 1_800,
+                    },
+                    providers: std::collections::HashMap::from([(
+                        "deribit_primary".to_owned(),
+                        polyalpha_core::PulseProviderConfig {
+                            kind: "deribit".to_owned(),
+                            enabled: true,
+                            max_anchor_age_ms: 250,
+                            soft_mismatch_window_minutes: 360,
+                            hard_expiry_mismatch_minutes: 720,
+                        },
+                    )]),
+                    routing: std::collections::HashMap::from([(
+                        "btc".to_owned(),
+                        polyalpha_core::PulseRoutingConfig {
+                            enabled: true,
+                            anchor_provider: "deribit_primary".to_owned(),
+                            hedge_venue: "binance_perp".to_owned(),
+                        },
+                    )]),
+                    asset_policy: std::collections::HashMap::new(),
                 },
                 settlement: SettlementRules::default(),
                 market_scope: StrategyMarketScopeConfig::default(),

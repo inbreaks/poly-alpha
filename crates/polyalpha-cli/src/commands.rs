@@ -325,6 +325,9 @@ pub async fn run_live_data_check(env: &str, market_index: usize, depth: u16) -> 
         Exchange::Polymarket => {
             println!("cex: unsupported hedge exchange polymarket");
         }
+        Exchange::Deribit => {
+            println!("cex: unsupported hedge exchange deribit");
+        }
     }
 
     drain_orderbook_updates(&mut market_data_rx, &orderbook_provider, &registry);

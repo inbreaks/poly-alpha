@@ -19,6 +19,7 @@ polyalpha-core = { path = "../polyalpha-core" }
 polyalpha-data = { path = "../polyalpha-data" }
 polyalpha-engine = { path = "../polyalpha-engine" }
 polyalpha-executor = { path = "../polyalpha-executor" }
+polyalpha-pulse = { path = "../polyalpha-pulse" }
 polyalpha-risk = { path = "../polyalpha-risk" }
 ratatui = "0.28"
 regex = "1"

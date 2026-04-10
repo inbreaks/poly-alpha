@@ -338,6 +338,10 @@ pub enum LiveCommand {
         #[arg(long, value_enum, default_value_t = PaperInspectFormat::Table)]
         format: PaperInspectFormat,
     },
+    Pulse {
+        #[command(subcommand)]
+        command: PulseCommand,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Default, PartialEq, Eq)]
@@ -429,6 +433,10 @@ pub enum PaperCommand {
         #[arg(long, value_enum, default_value_t = PaperInspectFormat::Table)]
         format: PaperInspectFormat,
     },
+    Pulse {
+        #[command(subcommand)]
+        command: PulseCommand,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Default)]
@@ -436,6 +444,16 @@ pub enum PaperInspectFormat {
     #[default]
     Table,
     Json,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PulseCommand {
+    Run {
+        #[arg(long, default_value = "default")]
+        env: String,
+        #[arg(long)]
+        assets: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Default)]
@@ -972,7 +990,7 @@ pub enum MarketAsset {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command};
+    use super::{Cli, Command, PaperCommand};
     use clap::{error::ErrorKind, Parser};
 
     #[test]
@@ -1126,5 +1144,26 @@ mod tests {
             Command::Audit { .. } => {}
             other => panic!("expected audit command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_paper_pulse_run_command() {
+        let cli = Cli::parse_from([
+            "polyalpha-cli",
+            "paper",
+            "pulse",
+            "run",
+            "--env",
+            "default",
+            "--assets",
+            "btc,eth",
+        ]);
+
+        assert!(matches!(
+            cli.command,
+            Command::Paper {
+                command: PaperCommand::Pulse { .. }
+            }
+        ));
     }
 }

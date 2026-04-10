@@ -1448,6 +1448,7 @@ fn format_exchange_label(exchange: Exchange) -> &'static str {
     match exchange {
         Exchange::Polymarket => "Polymarket",
         Exchange::Binance => "Binance",
+        Exchange::Deribit => "Deribit (unsupported)",
         Exchange::Okx => "OKX",
     }
 }

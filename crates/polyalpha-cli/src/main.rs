@@ -14,7 +14,7 @@ mod strategy_scope;
 use anyhow::Result;
 use clap::Parser;
 
-use args::{Cli, Command, LiveCommand, MarketCommand, PaperCommand, SimCommand};
+use args::{Cli, Command, LiveCommand, MarketCommand, PaperCommand, PulseCommand, SimCommand};
 
 fn install_rustls_crypto_provider() -> Result<()> {
     if rustls::crypto::CryptoProvider::get_default().is_some() {
@@ -26,6 +26,12 @@ fn install_rustls_crypto_provider() -> Result<()> {
         Err(_) if rustls::crypto::CryptoProvider::get_default().is_some() => Ok(()),
         Err(_) => Err(anyhow::anyhow!("failed to install rustls crypto provider")),
     }
+}
+
+async fn run_pulse_runtime_stub(mode: &str, env: &str, assets: &str) -> Result<()> {
+    anyhow::bail!(
+        "pulse runtime entrypoint not wired yet (mode={mode}, env={env}, assets={assets})"
+    );
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -120,6 +126,11 @@ async fn main() -> Result<()> {
                 .await?
             }
             LiveCommand::Inspect { env, format } => paper::inspect_live(&env, format)?,
+            LiveCommand::Pulse { command } => match command {
+                PulseCommand::Run { env, assets } => {
+                    run_pulse_runtime_stub("live", &env, &assets).await?
+                }
+            },
         },
         Command::LiveDataCheck {
             env,
@@ -327,6 +338,11 @@ async fn main() -> Result<()> {
                 .await?
             }
             PaperCommand::Inspect { env, format } => paper::inspect_paper(&env, format)?,
+            PaperCommand::Pulse { command } => match command {
+                PulseCommand::Run { env, assets } => {
+                    run_pulse_runtime_stub("paper", &env, &assets).await?
+                }
+            },
         },
         Command::Backtest { command } => backtest::run_backtest_command(command).await?,
         Command::Monitor {
