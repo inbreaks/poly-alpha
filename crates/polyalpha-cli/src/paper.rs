@@ -5385,7 +5385,7 @@ async fn run_runtime_single(
         settings.polymarket.clob_api_url.clone(),
         settings.strategy.settlement.clone(),
     );
-    let mut cex_source = build_cex_source(manager.clone(), &market, &settings);
+    let mut cex_source = build_cex_source(manager.clone(), &market, &settings)?;
     poly_source.connect().await?;
     cex_source.connect().await?;
     poly_source.subscribe_market(&market.symbol).await?;
@@ -5957,7 +5957,7 @@ async fn run_runtime_multi(
     let mut cex_sources: HashMap<Exchange, CexLiveSource> = HashMap::new();
     for market in &markets {
         if !cex_sources.contains_key(&market.hedge_exchange) {
-            let source = build_cex_source(manager.clone(), market, &settings);
+            let source = build_cex_source(manager.clone(), market, &settings)?;
             cex_sources.insert(market.hedge_exchange, source);
         }
     }
@@ -9648,7 +9648,7 @@ async fn run_paper_ws_mode(
         settings.polymarket.clob_api_url.clone(),
         settings.strategy.settlement.clone(),
     );
-    let cex_source = build_cex_source(manager.clone(), &market, &settings);
+    let cex_source = build_cex_source(manager.clone(), &market, &settings)?;
 
     let mut market_data_rx = channels.market_data_tx.subscribe();
     let engine_config = build_paper_engine_config(&settings);
@@ -10196,7 +10196,7 @@ async fn run_paper_multi_ws_mode(
         if !cex_sources.contains_key(&market.hedge_exchange) {
             cex_sources.insert(
                 market.hedge_exchange,
-                build_cex_source(manager.clone(), market, &settings),
+                build_cex_source(manager.clone(), market, &settings)?,
             );
         }
     }
@@ -11021,19 +11021,19 @@ fn build_cex_source(
     manager: DataManager,
     market: &MarketConfig,
     settings: &Settings,
-) -> CexLiveSource {
+) -> Result<CexLiveSource> {
     match market.hedge_exchange {
-        Exchange::Binance => CexLiveSource::Binance(BinanceFuturesDataSource::new(
+        Exchange::Binance => Ok(CexLiveSource::Binance(BinanceFuturesDataSource::new(
             manager,
             settings.binance.rest_url.clone(),
-        )),
-        Exchange::Okx => CexLiveSource::Okx(OkxMarketDataSource::new(
+        ))),
+        Exchange::Okx => Ok(CexLiveSource::Okx(OkxMarketDataSource::new(
             manager,
             settings.okx.rest_url.clone(),
-        )),
-        _ => CexLiveSource::Binance(BinanceFuturesDataSource::new(
-            manager,
-            settings.binance.rest_url.clone(),
+        ))),
+        Exchange::Deribit | Exchange::Polymarket => Err(anyhow!(
+            "paper 模式暂不支持 {:?} 作为 CEX 对冲数据源",
+            market.hedge_exchange
         )),
     }
 }
@@ -16669,6 +16669,21 @@ mod tests {
         let warehouse_dir = PathBuf::from(data_dir).join("audit").join("warehouse");
         let _ = fs::remove_dir_all(&warehouse_dir);
         fs::write(&warehouse_dir, b"blocked").expect("replace warehouse dir with file");
+    }
+
+    #[test]
+    fn build_cex_source_rejects_deribit_instead_of_falling_back_to_binance() {
+        let mut settings = test_settings_with_price_filter(None, None);
+        settings.markets = vec![test_market("btc-test", Exchange::Deribit, "BTCUSDT")];
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let symbol = settings.markets[0].symbol.clone();
+        let channels = create_channels(std::slice::from_ref(&symbol));
+        let manager = build_data_manager(&registry, channels.market_data_tx.clone());
+
+        match build_cex_source(manager, &settings.markets[0], &settings) {
+            Ok(_) => panic!("Deribit should be rejected in paper CEX source selection"),
+            Err(err) => assert!(err.to_string().contains("Deribit")),
+        }
     }
 
     #[test]

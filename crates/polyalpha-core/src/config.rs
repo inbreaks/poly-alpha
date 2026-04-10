@@ -1030,6 +1030,13 @@ mod tests {
                     "max_anchor_age_ms": 250,
                     "soft_mismatch_window_minutes": 360,
                     "hard_expiry_mismatch_minutes": 720
+                },
+                "binance_options_primary": {
+                    "kind": "binance_options",
+                    "enabled": false,
+                    "max_anchor_age_ms": 250,
+                    "soft_mismatch_window_minutes": 360,
+                    "hard_expiry_mismatch_minutes": 720
                 }
             },
             "routing": {
