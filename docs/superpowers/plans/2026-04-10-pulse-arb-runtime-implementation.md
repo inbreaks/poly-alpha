@@ -327,10 +327,21 @@ Implementation notes:
   - subscribe to ticker channels
   - parse raw ticker / order book payloads
   - expose a cache/query API for the pulse provider
+- Add a `DiscoveryFilter` so the client never subscribes to the full Deribit options universe.
+  - initial filter: only keep contracts where `abs(strike - index_price) / index_price < 0.15`
+  - initial filter: only keep contracts with `expiry <= 30 days`
+  - refresh policy: re-prune the subscription set at least every `10 minutes`
+  - refresh policy: allow an earlier re-prune when index price drifts far enough from the last prune anchor
 - Do **not** force Deribit options data into old `MarketDataEvent`; pulse anchor snapshots should travel on a pulse-local channel instead.
 - Export a small raw client surface:
 
 ```rust
+pub struct DiscoveryFilter {
+    pub max_relative_strike_distance: f64,
+    pub max_expiry_days: u32,
+    pub reprune_interval_secs: u64,
+}
+
 pub struct DeribitOptionsClient {
     // reqwest client, ws task handles, instrument cache, latest ticker cache
 }
@@ -339,6 +350,7 @@ impl DeribitOptionsClient {
     pub async fn connect(&mut self) -> Result<()>;
     pub async fn prime_asset(&self, asset: DeribitAsset) -> Result<()>;
     pub fn latest_tickers(&self, asset: DeribitAsset) -> Vec<DeribitTickerMessage>;
+    pub async fn refresh_subscriptions(&self, asset: DeribitAsset) -> Result<()>;
 }
 ```
 
@@ -584,11 +596,13 @@ fn global_hedge_aggregator_nets_opposing_session_targets() {
     let mut aggregator = GlobalHedgeAggregator::new(Decimal::new(1, 3), 100);
     aggregator.upsert("session-a", PulseAsset::Btc, Decimal::new(35, 2));
     aggregator.upsert("session-b", PulseAsset::Btc, Decimal::new(-20, 2));
+    aggregator.sync_actual_position(PulseAsset::Btc, Decimal::new(8, 2));
 
-    let order = aggregator.reconcile(PulseAsset::Btc, Decimal::ZERO).expect("net order");
+    let order = aggregator.reconcile(PulseAsset::Btc).expect("net order");
 
     assert_eq!(order.net_target_delta, Decimal::new(15, 2));
-    assert_eq!(order.order_qty, Decimal::new(15, 2));
+    assert_eq!(order.actual_exchange_position, Decimal::new(8, 2));
+    assert_eq!(order.order_qty, Decimal::new(7, 2));
 }
 ```
 
@@ -644,11 +658,18 @@ pub enum SessionCommand {
 }
 ```
 
+- `EmergencyFlatten` is **not** a direct Binance flatten order.
+  - session side effect 1: set this session's `target_delta_exposure` to `0`
+  - session side effect 2: move the session into closing / closed state so it stops contributing hedge intent
+  - hedge side effect: let `GlobalHedgeAggregator` release the residual hedge on the next reconcile pass
+  - if the Poly leg must be force-closed, that remains a session-local aggressive Poly exit path; only the hedge leg is forbidden from bypassing the aggregator
+
 - [ ] **Step 5: Implement `GlobalHedgeAggregator`**
 
 Implementation notes:
 - Keep it in `polyalpha-pulse`, not `polyalpha-executor`.
 - Input: per-session `target_delta_exposure`
+- Input: fresh actual exchange position samples from `paper` / `live-mock` account state
 - Output: per-asset incremental hedge order plus attribution
 
 ```rust
@@ -662,6 +683,8 @@ pub struct GlobalHedgeAggregator {
 
 - Required behavior:
   - net same-asset opposing targets
+  - compute `order_qty = net_target_delta - actual_exchange_position`
+  - own an explicit `ActualPositionSync` path; never rely only on internally inferred nominal hedge state
   - suppress dust orders below min quantity
   - throttle repeated reconcile attempts
   - retain per-session attribution for audit
