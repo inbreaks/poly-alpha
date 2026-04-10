@@ -1,174 +1,174 @@
-# Pulse Arb Runtime Design
+# Pulse 套利 Runtime 设计
 
-## Goal
+## 目标
 
-Add a new independent short-horizon strategy runtime that harvests short-lived Polymarket sentiment overshoots by:
+新增一条独立的短周期策略 runtime，用来收割 Polymarket 上短时情绪脉冲带来的定价超调。
 
-- using options-derived fair probability as the pricing anchor
-- using Binance USD-M perpetuals for fast delta hedging
-- managing a full 15-minute trading session lifecycle with maker exit, pegging, rehedging, timeout, and emergency flatten logic
+这条 runtime 的核心机制是：
 
-The MVP must trade only:
+- 用期权市场推导出来的公允概率作为定价锚
+- 用 Binance USD-M 永续合约做快速 Delta 对冲
+- 用完整的 15 分钟会话生命周期管理开仓、挂单止盈、动态 peg、补对冲、超时追价和平仓
+
+MVP 只交易：
 
 - `BTC`
 - `ETH`
 
-The architecture must preserve native extension points for future support of:
+但架构必须从第一天就保留下面这些扩展位，后面接进去时不能大拆：
 
 - `SOL`
 - `XRP`
-- additional options anchor providers
-- additional emergency hedge venues
+- 新的期权锚 provider
+- 新的应急对冲 venue
 
-without requiring a large-scale rewrite of the runtime.
+## 策略 Thesis
 
-## Thesis
+这条 runtime 不是现有 `price-only basis` 的一个变体。
 
-This runtime is not a variant of the existing `price-only basis` strategy.
+它属于另一类策略，核心 thesis 是：
 
-It is a separate strategy family with a different economic thesis:
+- `Polymarket` 是零售情绪溢价发生地
+- `Options anchor` 是更冷静、更接近机构定价的公允概率锚
+- `Binance perp` 是对冲执行腿，用来快速把方向暴露压平
 
-- `Polymarket` is the sentiment venue where retail overshoot occurs
-- `Options anchor` is the fair-value venue that expresses a more disciplined probability surface
-- `Binance perp` is the execution venue that neutralizes directional delta quickly
+所以这条 runtime 必须是：
 
-The runtime therefore must be:
+- 以会话为中心，而不是以 signal 为中心
+- 以 options anchor 为中心，而不是以 realized vol 近似为中心
+- 以完整执行生命周期为中心，而不是只做“入场-回归-离场”的轻量逻辑
 
-- session-centric, not signal-centric
-- options-anchor-driven, not realized-vol-only-driven
-- execution-lifecycle-aware, not just entry/exit-band-aware
+## 已确认范围
 
-## Approved Scope
+### MVP 范围
 
-### MVP Scope
+- 运行模式：`paper` 和 `live-mock`
+- 资产范围：`BTC`、`ETH`
+- 期权定价锚：`Deribit`
+- 对冲 venue：`Binance USD-M perpetual`
+- Poly 执行：由新 runtime 自己管理完整订单生命周期
+- 单笔最长持仓：`15 分钟`
+- maker 止盈：必须支持
+- pegging：必须支持
+- 会话期内 Delta rehedge：必须支持
+- 紧急 flatten：必须支持
+- 结构化 audit 和 monitor：必须支持
 
-- runtime mode: `paper` and `live-mock` only
-- assets: `BTC`, `ETH`
-- options anchor provider: `Deribit`
-- hedge venue: `Binance USD-M perpetual`
-- Polymarket execution: independent runtime-owned order lifecycle
-- session max holding time: `15 minutes`
-- maker exit management: included
-- pegging: included
-- delta rehedging during the session: included
-- emergency flatten: included
-- structured audit and monitor support: included
+### 明确保留的未来扩展能力
 
-### Required Future Extension Capability
+MVP 虽然只做 `BTC/ETH`，但设计上必须明确支持以后扩到：
 
-The MVP design must explicitly preserve extension points for:
+- `SOL`、`XRP`
+- `Binance Options` 作为新的 anchor provider
+- 按资产分配不同 routing 策略
+- 增加 `OKX` 等次级应急 hedge venue
 
-- `SOL` and `XRP`
-- `Binance Options` as an anchor provider
-- asset-specific routing policies
-- secondary emergency hedge venues such as `OKX`
+未来扩展时，允许发生的变化只有：
 
-Future extension must require only:
+- 新增 provider 实现
+- 新增或修改 routing 配置
+- 新增资产级策略参数
 
-- adding a new provider implementation
-- adding or updating routing config
-- adding asset-level policy config
+未来扩展时，不允许必须重做的东西包括：
 
-Future extension must not require:
+- 重写会话状态机
+- 重写 `EventPricer` 的接口
+- 重做 audit schema
+- 把这条 runtime 强行揉回旧的 basis 策略链
 
-- replacing the session state machine
-- rewriting the event pricer interface
-- redesigning the audit schema
-- merging this runtime into the old basis strategy path
+## 非目标
 
-## Non-Goals
+- 不把这条策略 retrofit 进现有 `basis` engine
+- 不改变现有 `TradePlan` 驱动 basis runtime 的语义
+- MVP 不做真钱 live trading
+- MVP 不承诺 `SOL/XRP` 已经可交易
+- MVP 不做完整 queue reconstruction
+- MVP 不要求上来就做完整 volatility surface calibration
 
-- do not retrofit this strategy into the existing `basis` engine path
-- do not change the meaning of the existing `TradePlan`-driven basis runtime
-- do not implement live money trading in the MVP
-- do not promise `SOL` or `XRP` tradability in the MVP
-- do not implement full queue reconstruction in the MVP
-- do not require a full volatility-surface calibration framework in the MVP
+## 总体架构
 
-## High-Level Architecture
+建议新增一条独立的策略栈，暂定名 `pulse_arb`，拥有自己的 runtime 和 session 模型。
 
-Introduce a new strategy stack, tentatively named `pulse_arb`, with its own runtime and session model.
-
-Recommended crate/module split:
+推荐的 crate / 模块拆分：
 
 - `polyalpha-data`
-  Continues to provide normalized market data feeds for Polymarket, Binance perp, and options anchor venues.
-- `polyalpha-pulse` new crate
-  Owns the strategy-specific runtime, pricing, session state machine, execution logic, and audit model.
+  继续负责 Polymarket、Binance perp、options anchor feeds 的行情接入和归一化。
+- `polyalpha-pulse` 新 crate
+  负责这条策略的 runtime、定价、会话状态机、执行逻辑和审计模型。
 - `polyalpha-cli`
-  Adds dedicated entrypoints for `paper pulse` and `live-mock pulse`.
+  新增独立入口，比如 `paper pulse` 和 `live-mock pulse`。
 - `polyalpha-executor`
-  Reused only as a bottom-layer venue adapter capability where practical, not as the strategy lifecycle owner.
+  只在能复用底层 adapter 的地方复用，不再承担这条策略的上层生命周期管理。
 
-### Core Runtime Components
+### 核心模块职责
 
 - `AnchorProvider`
-  Normalized interface for retrieving options-anchor market data.
+  抽象 options anchor 的统一接口。
 - `AnchorRouter`
-  Maps an asset to its configured anchor provider.
+  根据资产把请求路由到对应 provider。
 - `EventPricer`
-  Converts normalized anchor data plus market-rule metadata into fair probability and event Greeks.
+  把归一化后的 anchor 数据和 market rule 映射成公允概率与事件 Greeks。
 - `PulseDetector`
-  Decides whether a fresh Polymarket overshoot is tradable after friction and session reserves.
+  判断一次 Polymarket 偏离在扣掉完整会话摩擦后是否还值得做。
 - `SessionFSM`
-  Owns one active trading session from creation to closure.
+  管理一笔交易从创建到收尾的完整生命周期。
 - `HedgeExecutor`
-  Manages Binance perp hedge open and rehedge actions.
+  管理 Binance perp 的开仓 hedge 和会话期内 rehedge。
 - `ExitManager`
-  Manages Poly maker take-profit, pegging, timeout chase, and forced exit.
+  管理 Poly maker 止盈、peg、超时追价和平仓。
 - `PulseAuditSink`
-  Writes session-centric audit artifacts and summary events.
+  写出 session 级别的审计产物和统计摘要。
 
-This split is the main mechanism that prevents future large refactors.
+这个拆法是后面避免大规模重构的核心。
 
-## Provider And Routing Model
+## Provider 和 Routing 模型
 
-The design must treat anchor providers and asset routing as first-class runtime objects.
+这条 runtime 从第一天就必须把 `anchor provider` 和 `asset routing` 做成一等对象。
 
 ### Provider Registry
 
-The runtime owns a provider registry keyed by logical provider id.
+runtime 内部维护一个 provider registry，以逻辑 provider id 为键。
 
-MVP provider instances:
+MVP 实例：
 
 - `deribit_primary`
 
-Future provider instances:
+未来实例：
 
 - `binance_options_primary`
-- additional providers as needed
+- 其他 provider
 
-Every provider must expose the same normalized output schema so that:
+所有 provider 必须输出同一套归一化结构，这样：
 
-- routing changes do not affect session logic
-- session logic does not care whether the anchor came from Deribit or Binance Options
+- routing 变化不会影响会话状态机
+- 会话状态机不需要关心 anchor 来自 Deribit 还是 Binance Options
 
 ### Asset Routing
 
-Each asset resolves through routing config:
+每个资产都通过 routing 配置明确：
 
 - `anchor_provider`
 - `hedge_venue`
 - `enabled`
-- optional asset-level overrides
+- 可选资产级 override
 
-MVP routing:
+MVP routing：
 
 - `BTC -> Deribit anchor + Binance perp`
 - `ETH -> Deribit anchor + Binance perp`
 
-Planned future routing:
+未来 routing：
 
 - `SOL -> Binance Options anchor + Binance perp`
 - `XRP -> Binance Options anchor + Binance perp`
 
-The runtime must allow an asset to be disabled without affecting other assets.
+runtime 必须允许某个资产被单独 disable，而不影响其他资产。
 
-## Normalized Anchor Output
+## 归一化 Anchor 输出
 
-`AnchorProvider` must output a normalized `AnchorSnapshot` rather than raw venue-specific IV fields.
+`AnchorProvider` 不能直接把交易所原始 IV 字段向上抛，而应该统一输出 `AnchorSnapshot`。
 
-Required fields:
+`AnchorSnapshot` 至少包含：
 
 - `asset`
 - `provider_id`
@@ -179,7 +179,7 @@ Required fields:
 - `local_surface_points`
 - `quality_metrics`
 
-Each `local_surface_point` should contain:
+每个 `local_surface_point` 至少包含：
 
 - `strike`
 - `bid_iv`
@@ -190,9 +190,9 @@ Each `local_surface_point` should contain:
 - `best_bid`
 - `best_ask`
 
-Quality metrics must include enough detail to disable trading when the anchor is not trustworthy.
+`quality_metrics` 必须足够支撑“是否暂停交易”的判断。
 
-Minimum quality dimensions:
+最低质量维度：
 
 - anchor age
 - bid/ask spread quality
@@ -201,122 +201,120 @@ Minimum quality dimensions:
 - expiry mismatch
 - required Greeks availability
 
-## Pricing Model
+## 定价模型
 
-This runtime prices binary event claims, not vanilla options.
+这条 runtime 定价的是二元事件 claim，不是 vanilla option。
 
-### Supported Market Rules
+### 支持的 market rule
 
 - `Above K`
 - `Below K`
 - `Between [K1, K2)`
 
-### Fair Probability
+### 公允概率定义
 
-For each market:
+对任意市场：
 
-- `fair_prob_yes` is the risk-neutral probability of the event payout being `1`
+- `fair_prob_yes` 表示事件 payout 为 `1` 的风险中性概率
 - `fair_prob_no = 1 - fair_prob_yes`
 
-The anchor provider does not directly supply event probability.
+anchor provider 不直接给事件概率。
 
-Instead:
+正确链路应该是：
 
-- the provider supplies local options-surface information
-- `EventPricer` reconstructs a local risk-neutral view for the relevant expiry
-- the market rule maps that view into event probability
+- provider 提供局部 options 链面
+- `EventPricer` 恢复该 expiry 的局部风险中性视图
+- market rule 再把这个视图映射成事件概率
 
-### MVP Pricing Complexity
+### MVP 的数学复杂度控制
 
-The MVP must use a local-chain approximation, not a full global surface calibration.
+MVP 不要求上来就做全局 surface calibration。
 
-Recommended MVP approach:
+MVP 推荐做法：
 
-- choose the nearest acceptable expiry to the Polymarket settlement
-- use strikes around the relevant event threshold
-- interpolate locally rather than calibrating a full volatility surface
-- for `Between`, use both boundary strikes and compute interval probability
+- 选取与 Polymarket 结算日最接近且满足质量门槛的 expiry
+- 取目标 strike 附近若干个 strikes
+- 做局部插值，而不是全局拟合
+- 对 `Between` 命题，用两个边界 strike 计算区间概率
 
-This keeps the interface forward-compatible with a future richer surface model.
+这样接口和未来更复杂的 surface 模型仍然兼容。
 
-## Delta And Rehedge Model
+## Delta 和 Rehedge 模型
 
-The runtime must not use vanilla-option `N(d1)` as the hedge quantity for a binary claim.
+这条 runtime 不能用 vanilla option 的 `N(d1)` 直接当 binary claim 的 hedge qty。
 
-Instead:
+正确口径是：
 
-- define event value as `fair_prob_yes`
-- compute event delta numerically:
-  - price the event at `S + dS`
-  - price the event at `S - dS`
-  - use central difference
+- 先把事件价值定义成 `fair_prob_yes`
+- 再对事件价值做数值微分
 
-This yields:
+具体做法：
 
-- `event_delta_yes`
-- `event_delta_no = -event_delta_yes`
+- 计算 `fair_prob_yes(S + dS)`
+- 计算 `fair_prob_yes(S - dS)`
+- 用中心差分得到：
+  - `event_delta_yes`
+- `event_delta_no = - event_delta_yes`
 
-Target hedge quantity:
+目标 hedge 数量定义为：
 
 - `target_hedge_qty = poly_shares * event_delta`
 
-### Rehedge Trigger
+### Rehedge 触发规则
 
-Rehedging must be driven by target hedge drift, not by raw spot movement alone.
+rehedge 不能只看现货价格变了多少，而应该看目标 hedge 漂移了多少。
 
-Minimum trigger inputs:
+最少要参考：
 
-- current target hedge quantity
-- current actual hedge quantity
-- delta-drift threshold
-- gamma-sensitive zone handling near critical strike levels
+- 当前目标 hedge qty
+- 当前实际 hedge qty
+- delta drift threshold
+- 靠近关键 strike 时的 gamma-sensitive zone
 - throttle interval
 
-The runtime should allow tighter rehedge thresholds when price moves into a gamma-sensitive zone.
+当价格进入 gamma 敏感区时，可以自动缩小 rehedge 触发阈值。
 
-## Entry Economics
+## 入场经济学
 
-Entry must be based on executable session economics, not on a raw probability gap alone.
+入场不能只看一个粗糙的概率差。
 
-The runtime should compute a session-level quantity such as:
+runtime 应该计算一个完整会话级的准入量，例如：
 
 - `net_session_edge`
 
-This should include:
+它至少应包含：
 
-- Poly executable entry VWAP using top `N` levels
-- expected Binance hedge execution cost
+- Poly 侧按 top `N` 档算出来的真实入场 VWAP
+- Binance hedge 侧的预估可执行成本
 - fees
-- estimated slippage
+- slippage
 - perp/index basis penalty
-- reserve for expected rehedges
-- reserve for timeout exit
+- 会话期内预估 rehedge reserve
+- timeout exit reserve
 
-The session should open only if:
+只有在下面这些条件同时成立时才允许开会话：
 
-- anchor quality passes
-- Poly and hedge data freshness pass
-- required depth passes
+- anchor quality 通过
+- Poly 和 hedge 数据新鲜度通过
+- 必要深度通过
 - `net_session_edge > configured_entry_threshold`
 
-## Session-Centric Runtime
+## 以会话为中心的 Runtime
 
-The central runtime object should be `PulseSession`, not a basis-style open candidate.
+这条 runtime 的主对象应该是 `PulseSession`，而不是 basis 风格的 open candidate。
 
-Each session contains:
+每个 `PulseSession` 至少包含：
 
 - `session_id`
-- market and asset identity
+- market / asset 身份
 - token side
 - entry snapshot
-- target deadline
+- deadline
 - target take-profit state
 - current hedge state
 - current lifecycle state
 
-### Session State Machine
-
-Recommended states:
+### 推荐状态机
 
 - `Idle`
 - `PreTradeAudit`
@@ -330,73 +328,73 @@ Recommended states:
 - `ChasingExit`
 - `Closed`
 
-### Lifecycle Summary
+### 生命周期摘要
 
 1. `PreTradeAudit`
-   Freeze all required input snapshots and compute final session economics.
+   冻结本次入场依赖的所有关键 snapshot，并计算最终会话经济学。
 2. `PolyOpening`
-   Open the Poly leg aggressively with full-fill semantics.
+   用抢脉冲语义去开 Poly 腿。
 3. `HedgeOpening`
-   Immediately hedge on Binance perp after confirmed Poly fill.
+   Poly 成交确认后，立刻在 Binance perp 补上 hedge。
 4. `MakerExitWorking`
-   Post a Poly maker take-profit order.
+   双腿建立后立刻挂 Poly 的 post-only 止盈单。
 5. `Pegging`
-   Cancel and replace the maker exit order when anchor and market movement materially invalidate the old quote.
+   当 anchor 和市场波动让原挂单明显失真时，撤旧单、重算、重挂。
 6. `Rehedging`
-   Adjust the Binance hedge if event delta drifts enough during the session.
+   会话期内当事件 Delta 漂移过大时，微调 Binance hedge。
 7. `Emergency*`
-   Recover from legging failures or force flatten if the risk thesis breaks.
+   残腿、补腿失败、信息性跳变等危险情况进入应急处理。
 8. `ChasingExit`
-   On timeout, aggressively close the remaining position instead of waiting for maker fill.
+   到了 deadline 还没 maker 成交，就撤单并 aggressive 平掉。
 9. `Closed`
-   Finalize economics and audit.
+   计算最终经济学并完成审计落盘。
 
-This state machine must remain independent from the existing basis runtime semantics.
+这套状态机必须独立存在，不能借现有 basis runtime 的 close-band 语义来凑。
 
-## Execution Semantics
+## 执行语义
 
-### Poly Open
+### Poly 开仓
 
-The Poly open leg should use a full-fill-first aggressive execution style with:
+Poly 开仓应当采用“全成优先、失败优先”的抢脉冲语义，并显式约束：
 
-- explicit max average price
-- explicit max shares / budget
-- fail-fast behavior if the pulse cannot be captured cleanly
+- 最大平均成交价
+- 最大 shares / budget
+- 如果吃不到干净仓位就快速失败
 
-### Hedge Open
+### Hedge 开仓
 
-The Binance hedge leg should use a bounded aggressive execution style.
+Binance hedge 腿应采用有界 aggressive 执行。
 
-Recommended MVP choice:
+MVP 推荐：
 
 - aggressive limit + `IOC`
 
-Reason:
+原因：
 
-- bounded slippage is more important than uncapped market execution for a short-horizon edge-capture strategy
-- this avoids pretending that `MARKET + IOC` is a distinct venue capability
+- 这类短周期 edge 更怕无界滑点，而不是怕少一点成交确定性
+- 也避免把不存在的 `MARKET + IOC` 误写成一种独立 API 语义
 
 ### Maker Exit
 
-The first exit path is always:
+默认第一退出路径始终是：
 
-- post-only maker take-profit on Polymarket
+- 在 Poly 挂 post-only maker 止盈单
 
 ### Timeout Exit
 
-At the holding deadline:
+到了 deadline：
 
-- cancel the working maker order
-- execute aggressive exit logic
-- prioritize closure and risk release over waiting for a better fill
+- 撤销工作中的 maker 单
+- 进入 aggressive exit
+- 优先释放风险和资金，不再等更好成交
 
-## Configuration Model
+## 配置模型
 
-The runtime must have its own top-level config domain such as:
+这条 runtime 必须有独立配置域，例如：
 
 - `[strategy.pulse_arb]`
 
-Recommended config groups:
+建议配置组：
 
 - `runtime`
 - `session`
@@ -406,41 +404,41 @@ Recommended config groups:
 - `routing`
 - `asset_policy`
 
-### Required Config Capabilities
+### 配置必须具备的能力
 
-- enable/disable by strategy
-- enable/disable by asset
-- provider-specific quality thresholds
-- routing by asset
-- per-asset session and economics overrides
-- explicit max holding time
-- explicit timeout exit mode
-- explicit rehedge throttles and thresholds
+- 策略级 enable/disable
+- 资产级 enable/disable
+- provider 级质量门槛
+- 按资产 routing
+- 按资产的会话和经济学 override
+- 显式最大持仓时间
+- 显式 timeout exit mode
+- 显式 rehedge 阈值和 throttle
 
-MVP behavior should be narrow, but config schema should already be wide enough for future providers and assets.
+MVP 的实际行为可以很窄，但配置 schema 一开始就必须足够宽。
 
-## Observability And Audit
+## 可观测性和审计
 
-This runtime needs a session-centric observability model.
+这条 runtime 必须是 session-centric observability，而不是只记录订单事件。
 
-### Primary Audit Object
+### 主审计对象
 
-Introduce a session-level audit record such as:
+建议引入独立的会话级审计对象，例如：
 
 - `PulseSessionRecord`
 
-It should contain:
+它至少包含：
 
 - `session_header`
 - `entry_snapshot`
 - `lifecycle_events`
 - `final_economics`
 
-### Entry Timing Metrics
+### 入场时延指标
 
-The audit schema must record raw timing samples, not just aggregated latency scores.
+审计层必须记录原始 timing sample，而不是只记录汇总分数。
 
-Required raw timing fields:
+必记字段：
 
 - `anchor_ts_ms`
 - `anchor_recv_ts_ms`
@@ -458,19 +456,19 @@ Required raw timing fields:
 - `poly_fill_latency_ms`
 - `hedge_fill_latency_ms`
 
-Offline reports may then compute derived statistics such as:
+离线报表再基于这些原始字段去算：
 
 - latency percentiles
-- win rate by latency bucket
+- 分桶胜率
 - information lag entropy
 
-The raw samples must be kept even if the entropy-style summary is not rendered in the MVP UI.
+`information lag entropy` 更适合作为离线聚合指标名，而不是单笔字段名。
 
-### Maker-Quality Metrics
+### Maker 质量指标
 
-The MVP should use stable proxy metrics rather than claiming perfect queue reconstruction.
+MVP 应当先上稳定可落地的代理指标，而不是一开始就宣称能精确重建 queue rank。
 
-Required proxy fields:
+必记代理字段：
 
 - `tp_post_price`
 - `tp_post_ts_ms`
@@ -485,24 +483,24 @@ Required proxy fields:
 - `post_tp_adverse_move_bps_5s`
 - `fill_then_reversal_flag`
 
-### Raw Tape Retention For Future Queue Reconstruction
+### 为未来 Queue Reconstruction 预留原始数据
 
-Even though the MVP uses proxy metrics, the audit layer must retain enough raw market tape to support future queue-reconstruction work without redesigning the schema.
+虽然 MVP 只上代理指标，但 audit 层必须保留足够的原始 tape，保证未来要做 queue reconstruction 时不需要重做采集链路。
 
-Required retained data:
+至少保留：
 
-- top-`N` Poly book snapshots at post/cancel/replace/fill boundaries
-- relevant Poly book deltas during maker-order lifetime
-- relevant trade summaries during maker-order lifetime
-- pre- and post-peg local book context
+- post / cancel / replace / fill 边界时刻的 Poly top-`N` book snapshot
+- maker 挂单存活期间的相关 Poly book delta
+- maker 挂单存活期间的相关 trade summary
+- 每次 peg 前后的局部盘口上下文
 
-This is a required future-proofing constraint.
+这是必须写进设计里的 future-proofing 约束。
 
-### Failure Taxonomy
+### 失败原因码
 
-The runtime must emit machine-readable failure codes.
+runtime 必须输出机器可读的 failure reason code。
 
-Minimum codes:
+最少包含：
 
 - `anchor_stale`
 - `anchor_surface_insufficient`
@@ -520,11 +518,11 @@ Minimum codes:
 - `hedge_disconnect`
 - `poly_disconnect`
 
-## Monitor Model
+## Monitor 模型
 
-This strategy should appear in monitor as a dedicated strategy view, not as a lightly renamed basis panel.
+这条策略应当有自己的 monitor 视图，不应该只是 basis 面板改几个字段名。
 
-Recommended monitor sections:
+建议至少有三块：
 
 - active session list
 - single-session detail
@@ -532,128 +530,133 @@ Recommended monitor sections:
 
 ### Active Session List
 
-Each row should show:
+每一行至少展示：
 
 - symbol
 - side
 - state
-- remaining holding time
-- current delta drift
-- current session net PnL
-- current maker working status
+- 剩余持仓时间
+- 当前 delta drift
+- 当前 session net pnl
+- 当前 maker 工作状态
 
 ### Session Detail
 
-Should show:
+至少展示：
 
 - entry snapshot
-- anchor provider and quality
-- current TP price
-- peg history
-- rehedge history
+- anchor provider 和质量
+- 当前 TP 价格
+- peg 历史
+- rehedge 历史
 - timeout countdown
-- emergency state history
+- emergency 状态历史
 
 ### Asset Health
 
-Should show:
+至少展示：
 
-- enabled / degraded / disabled state
-- current anchor provider
-- anchor quality summary
-- current disable reason if any
-- recent session failure rate
+- enabled / degraded / disabled
+- 当前 anchor provider
+- 当前 anchor quality summary
+- 当前 disable reason
+- 最近 session failure rate
 - timeout ratio
-- average rehedge count
+- 平均 rehedge count
 
-## Health, Degrade, And Disable Semantics
+## 健康、降级和禁用语义
 
-Each asset must support independent lifecycle gating:
+每个资产必须支持独立的运行状态：
 
 - `Enabled`
 - `Degraded`
 - `Disabled`
 
-### Degrade
+### Degraded
 
-Use when the runtime should keep observing but trade more conservatively.
+表示：
 
-Examples:
+- 继续观察
+- 但以更保守的参数交易
 
-- anchor quality weak but not fully broken
-- repeated timeout exits
-- rehedge drag consistently high
+触发例子：
 
-### Disable
+- anchor 质量弱但没坏透
+- timeout exit 比例过高
+- rehedge drag 持续过高
 
-Use when new sessions must stop.
+### Disabled
 
-Examples:
+表示：
 
-- anchor disconnected or stale
-- insufficient strike coverage
-- hedge venue unavailable
-- repeated severe legging failures
+- 该资产停止新开会话
 
-The runtime must not silently switch providers or trade with a weak fallback path unless routing config explicitly allows that behavior.
+触发例子：
 
-## Reused Infrastructure
+- anchor 断开或严重 stale
+- strike coverage 不足
+- hedge venue 不可用
+- 严重残腿事件过多
 
-This runtime may reuse:
+没有 routing 明确允许的情况下，runtime 不允许 silent fallback 到弱锚或替代 provider。
 
-- normalized data feeds
-- shared market metadata and market-rule parsing
-- shared order adapter primitives
-- shared audit/artifact storage framework
-- shared monitor socket infrastructure
+## 与现有基础设施的复用边界
 
-This runtime must not inherit the old basis strategy's:
+这条 runtime 可以复用：
 
-- signal semantics
-- exit-band semantics
+- 行情归一化 feeds
+- 共享 market metadata 和 market-rule parsing
+- 底层 order adapter
+- 共享 audit / artifact 框架
+- 共享 monitor socket 基础设施
+
+这条 runtime 不应继承现有 basis 的：
+
+- signal 语义
+- exit-band 语义
 - planner truth model
-- monitor vocabulary
+- monitor 词汇体系
 
-## MVP Success Criteria
+## MVP 完成标准
 
-The MVP should be considered complete when all of the following are true:
+满足下面这些条件时，MVP 才算完成：
 
-- `BTC` and `ETH` can run in `paper` and `live-mock`
-- the runtime uses `Deribit` as the options anchor for both assets
-- the runtime hedges on `Binance USD-M perp`
-- every trade is represented as a full `PulseSession`
-- maker exit, pegging, rehedge, timeout, and emergency flatten are all observable in audit
-- the monitor can show active sessions and asset health
-- the audit schema already preserves enough raw tape for future queue reconstruction
-- the config schema already supports future provider and routing expansion
+- `BTC` 和 `ETH` 能在 `paper` 和 `live-mock` 中稳定跑起来
+- runtime 对这两个资产统一使用 `Deribit` 作为 options anchor
+- runtime 统一使用 `Binance USD-M perp` 做 hedge
+- 每一笔交易都以完整 `PulseSession` 表达
+- maker exit、pegging、rehedge、timeout、emergency flatten 都能在 audit 中回放
+- monitor 能展示 active sessions 和 asset health
+- audit schema 已经保留足够原始 tape，未来可升级到 queue reconstruction
+- config schema 已经具备 future provider / routing 扩展位
 
-## Future Expansion Path
+## 未来扩展路径
 
-The intended next expansion path after the MVP is:
+MVP 后推荐按下面顺序扩：
 
-1. add `BinanceOptionsAnchorProvider`
-2. add routing entries for future assets such as `SOL` and `XRP`
-3. add asset-specific quality and economics overrides
-4. optionally add emergency secondary hedge venues
-5. optionally upgrade from proxy maker metrics to queue-reconstruction analytics
+1. 新增 `BinanceOptionsAnchorProvider`
+2. 为未来资产如 `SOL`、`XRP` 增加 routing
+3. 增加资产级质量和经济学 override
+4. 视需要增加 secondary emergency hedge venue
+5. 视需要从 maker 代理指标升级到 queue reconstruction analytics
 
-The expansion path must not change:
+扩展时不应改变：
 
 - `PulseSession`
 - `SessionFSM`
-- `EventPricer` interface
-- `AnchorProvider` interface
-- audit schema shape
+- `EventPricer` 接口
+- `AnchorProvider` 接口
+- audit schema 总体形状
 
-## Affected Areas
+## 涉及区域
 
-- new crate: `crates/polyalpha-pulse`
-  Own pulse runtime, pricing, session FSM, execution logic, audit model.
+- 新 crate：`crates/polyalpha-pulse`
+  负责 pulse runtime、定价、状态机、执行和 audit 模型。
 - `crates/polyalpha-data`
-  Add any missing normalized feed support required by Deribit options and Binance perp.
+  补齐 Deribit options 和 Binance perp 所需的行情归一化支持。
 - `crates/polyalpha-core`
-  Add shared config and any cross-runtime types that truly belong in core.
+  只放真正跨 runtime 共享的配置和类型。
 - `crates/polyalpha-cli`
-  Add strategy-specific runtime entrypoints, monitor integration, and config loading.
-- storage / monitor plumbing
-  Reuse shared frameworks but add pulse-specific schemas and views.
+  增加策略 runtime 入口、monitor 集成和配置加载。
+- 存储 / monitor plumbing
+  复用共享框架，但新增 pulse 专属 schema 和视图。
