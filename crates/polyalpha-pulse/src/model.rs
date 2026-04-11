@@ -131,3 +131,44 @@ impl PulseFailureCode {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PulseSessionState {
+    PreTradeAudit,
+    PolyOpening,
+    HedgeOpening,
+    MakerExitWorking,
+    Pegging,
+    Rehedging,
+    EmergencyHedge,
+    EmergencyFlatten,
+    ChasingExit,
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GammaCapMode {
+    DeltaClamp,
+    ProtectiveOnly,
+    Freeze,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SessionCommand {
+    SubmitPolyOpen { max_price: Decimal, qty: Decimal },
+    SubmitMakerExit { price: Decimal, qty: Decimal },
+    ReplaceMakerExit { price: Decimal, qty: Decimal },
+    RequestHedgeReconcile { hedge_reference_qty: Decimal },
+    EmergencyFlatten { reason: PulseFailureCode },
+}
+
+impl SessionCommand {
+    pub fn hedge_reference_qty(&self) -> Decimal {
+        match self {
+            Self::RequestHedgeReconcile {
+                hedge_reference_qty,
+            } => *hedge_reference_qty,
+            _ => Decimal::ZERO,
+        }
+    }
+}
