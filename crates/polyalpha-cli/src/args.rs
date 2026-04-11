@@ -453,6 +453,8 @@ pub enum PulseCommand {
         env: String,
         #[arg(long)]
         assets: String,
+        #[arg(long, value_enum, default_value_t = LiveExecutorMode::Mock)]
+        executor_mode: LiveExecutorMode,
     },
 }
 
@@ -990,7 +992,7 @@ pub enum MarketAsset {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, PaperCommand};
+    use super::{Cli, Command, LiveCommand, PaperCommand};
     use clap::{error::ErrorKind, Parser};
 
     #[test]
@@ -1163,6 +1165,29 @@ mod tests {
             cli.command,
             Command::Paper {
                 command: PaperCommand::Pulse { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_live_pulse_run_command() {
+        let cli = Cli::parse_from([
+            "polyalpha-cli",
+            "live",
+            "pulse",
+            "run",
+            "--env",
+            "default",
+            "--assets",
+            "btc,eth",
+            "--executor-mode",
+            "mock",
+        ]);
+
+        assert!(matches!(
+            cli.command,
+            Command::Live {
+                command: LiveCommand::Pulse { .. }
             }
         ));
     }
