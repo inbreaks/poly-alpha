@@ -171,6 +171,7 @@ pub fn render_performance(state: &TuiState) -> Paragraph<'static> {
     ];
 
     lines.extend(strategy_health_summary_lines(state));
+    lines.extend(pulse_summary_lines(state));
     lines.extend([
         Line::from(vec![
             Span::styled("参数 ", Style::default().fg(Color::DarkGray)),
@@ -362,6 +363,82 @@ fn strategy_health_summary_lines(state: &TuiState) -> Vec<Line<'static>> {
             Span::raw(format!("{}", health.min_warmup_samples)),
         ]),
     ]
+}
+
+fn pulse_summary_lines(state: &TuiState) -> Vec<Line<'static>> {
+    let Some(pulse) = state.monitor.pulse.as_ref() else {
+        return Vec::new();
+    };
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled("Pulse ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!("会话 {}", pulse.active_sessions.len())),
+        Span::raw("  "),
+        Span::styled("活跃 ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!("{}", pulse.active_sessions.len())),
+        Span::raw("  "),
+        Span::raw(
+            pulse
+                .active_sessions
+                .iter()
+                .map(|row| {
+                    format!(
+                        "{} {} {:.1}bps {}s",
+                        row.asset, row.state, row.net_edge_bps, row.remaining_secs
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | "),
+        ),
+    ])];
+
+    if !pulse.asset_health.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Pulse 健康 ", Style::default().fg(Color::DarkGray)),
+            Span::raw(
+                pulse
+                    .asset_health
+                    .iter()
+                    .map(|row| {
+                        format!(
+                            "{} anchor{} lag{} poly{} cex{} open{} netΔ{} pos{}{}{}",
+                            row.asset,
+                            row.anchor_age_ms
+                                .map(|value| format!("{value}ms"))
+                                .unwrap_or_else(|| "-".to_owned()),
+                            row.anchor_latency_delta_ms
+                                .map(|value| format!("{value}ms"))
+                                .unwrap_or_else(|| "-".to_owned()),
+                            row.poly_quote_age_ms
+                                .map(|value| format!("{value}ms"))
+                                .unwrap_or_else(|| "-".to_owned()),
+                            row.cex_quote_age_ms
+                                .map(|value| format!("{value}ms"))
+                                .unwrap_or_else(|| "-".to_owned()),
+                            row.open_sessions,
+                            row.net_target_delta
+                                .map(|value| format!("{value:.2}"))
+                                .unwrap_or_else(|| "-".to_owned()),
+                            row.actual_exchange_position
+                                .map(|value| format!("{value:.2}"))
+                                .unwrap_or_else(|| "-".to_owned()),
+                            row.status
+                                .as_deref()
+                                .map(|status| format!(" {status}"))
+                                .unwrap_or_default(),
+                            row.disable_reason
+                                .as_deref()
+                                .map(|reason| format!(" {reason}"))
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+            ),
+        ]));
+    }
+
+    lines
 }
 
 fn strategy_root_cause_line(state: &TuiState) -> Option<Line<'static>> {
@@ -2779,7 +2856,10 @@ fn clamp_rect_to_area(rect: Rect, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use polyalpha_core::{CommandView, EventKind, MonitorEvent, PositionView};
+    use polyalpha_core::{
+        CommandView, EventKind, MonitorEvent, PositionView, PulseAssetHealthRow,
+        PulseMonitorView, PulseSessionMonitorRow,
+    };
     use ratatui::{buffer::Buffer, widgets::Widget};
 
     #[test]
@@ -3088,6 +3168,43 @@ mod tests {
         assert!(compact.contains("NoPoly62"));
         assert!(compact.contains("历史失败CEX3/Poly7"));
         assert!(compact.contains("门槛600"));
+    }
+
+    #[test]
+    fn render_performance_shows_pulse_summary_when_present() {
+        let mut state = TuiState::default();
+        state.monitor.pulse = Some(PulseMonitorView {
+            active_sessions: vec![PulseSessionMonitorRow {
+                session_id: "pulse-session-1".to_owned(),
+                asset: "btc".to_owned(),
+                state: "maker_exit_working".to_owned(),
+                remaining_secs: 540,
+                net_edge_bps: 31.4,
+            }],
+            asset_health: vec![PulseAssetHealthRow {
+                asset: "btc".to_owned(),
+                provider_id: Some("deribit_primary".to_owned()),
+                anchor_age_ms: Some(42),
+                anchor_latency_delta_ms: Some(18),
+                poly_quote_age_ms: Some(15),
+                cex_quote_age_ms: Some(8),
+                open_sessions: 1,
+                net_target_delta: Some(0.41),
+                actual_exchange_position: Some(0.39),
+                status: Some("healthy".to_owned()),
+                disable_reason: None,
+            }],
+            selected_session: None,
+        });
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 200, 14));
+        render_performance(&state).render(buffer.area, &mut buffer);
+
+        let compact = compact_text(&buffer_text(&buffer));
+        assert!(compact.contains("Pulse会话1"));
+        assert!(compact.contains("活跃1"));
+        assert!(compact.contains("btc"));
+        assert!(compact.contains("anchor42ms"));
     }
 
     #[test]

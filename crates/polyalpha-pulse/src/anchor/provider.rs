@@ -6,7 +6,15 @@ pub type Result<T> = std::result::Result<T, AnchorError>;
 
 pub trait AnchorProvider: Send + Sync {
     fn provider_id(&self) -> &str;
-    fn snapshot_for(&self, asset: PulseAsset) -> Result<Option<AnchorSnapshot>>;
+    fn snapshot_for(&self, asset: PulseAsset) -> Result<Option<AnchorSnapshot>> {
+        self.snapshot_for_target(asset, None)
+    }
+
+    fn snapshot_for_target(
+        &self,
+        asset: PulseAsset,
+        target_event_expiry_ts_ms: Option<u64>,
+    ) -> Result<Option<AnchorSnapshot>>;
 }
 
 #[derive(Debug, Error)]

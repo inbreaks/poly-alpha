@@ -3,7 +3,7 @@ use chrono::{Local, TimeZone};
 use libm::erf;
 use polyalpha_audit::{
     AuditEvent, AuditEventPayload, AuditReader, AuditSessionSummary, AuditWarehouse,
-    MarketMarkEvent, PositionMarkEvent, SignalEmittedEvent,
+    MarketMarkEvent, PositionMarkEvent, PulseSessionSummaryRow, SignalEmittedEvent,
 };
 use polyalpha_core::{
     Exchange, ExecutionEvent, MarketConfig, MarketRule, MarketRuleKind, OrderSide,
@@ -57,6 +57,70 @@ struct AuditEventQueryReport {
     summary: AuditSessionSummary,
     filters: AuditEventQueryFiltersView,
     events: Vec<AuditEventView>,
+}
+
+#[derive(Serialize)]
+struct PulseSessionsReport {
+    summary: AuditSessionSummary,
+    asset_filter: Option<String>,
+    raw_opening_kpi: PulseRawOpeningKpi,
+    sessions: Vec<PulseSessionSummaryRow>,
+}
+
+#[derive(Serialize)]
+struct PulseRawOpeningKpi {
+    opening_attempts: usize,
+    positive_fill_count: usize,
+    effective_open_count: usize,
+    effective_open_rate: f64,
+    still_active_effective_open_count: usize,
+    closed_rejection_reason_counts: HashMap<String, u64>,
+    max_actual_fill_notional_usd: Option<String>,
+    max_expected_open_net_pnl_usd: Option<String>,
+    effective_open_examples: Vec<PulseRawOpeningExample>,
+}
+
+#[derive(Clone, Serialize)]
+struct PulseRawOpeningExample {
+    session_id: String,
+    asset: String,
+    state: String,
+    actual_fill_notional_usd: String,
+    expected_open_net_pnl_usd: String,
+    opening_allocated_hedge_qty: String,
+    anchor_latency_delta_ms: Option<u64>,
+}
+
+#[derive(Clone, Default)]
+struct PulseRawOpeningSessionAggregate {
+    asset: String,
+    latest_seq: u64,
+    latest_state: String,
+    latest_actual_fill_notional_usd: Decimal,
+    latest_expected_open_net_pnl_usd: Decimal,
+    latest_opening_allocated_hedge_qty: String,
+    latest_anchor_latency_delta_ms: Option<u64>,
+    latest_opening_rejection_reason: Option<String>,
+    positive_fill: bool,
+    effective_open: bool,
+}
+
+#[derive(Serialize)]
+struct PulseSessionDetailAuditReport {
+    summary: AuditSessionSummary,
+    session: PulseSessionSummaryRow,
+    timeline: Vec<PulseSessionTimelineItem>,
+}
+
+#[derive(Clone, Serialize)]
+struct PulseSessionTimelineItem {
+    seq: u64,
+    timestamp_ms: u64,
+    time: String,
+    kind: String,
+    state: String,
+    summary: String,
+    instrument: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -298,6 +362,23 @@ pub fn run_audit_command(command: AuditCommand) -> Result<()> {
             session_id,
             format,
         } => run_session_summary(&env, session_id.as_deref(), format),
+        AuditCommand::PulseSessions {
+            env,
+            session_id,
+            asset,
+            format,
+        } => run_pulse_sessions_report(&env, session_id.as_deref(), asset.as_deref(), format),
+        AuditCommand::PulseSessionDetail {
+            env,
+            session_id,
+            pulse_session_id,
+            format,
+        } => run_pulse_session_detail_report(
+            &env,
+            session_id.as_deref(),
+            &pulse_session_id,
+            format,
+        ),
         AuditCommand::Market {
             env,
             session_id,
@@ -660,6 +741,7 @@ fn build_trade_timeline_detail(
             skip_reasons: HashMap::new(),
             evaluable_status_counts: HashMap::new(),
             async_classification_counts: HashMap::new(),
+            pulse_session_summaries: Vec::new(),
         },
         trade: selected_trade.clone(),
         skew_detected,
@@ -1003,6 +1085,7 @@ fn empty_summary_stub() -> AuditSessionSummary {
         skip_reasons: HashMap::new(),
         evaluable_status_counts: HashMap::new(),
         async_classification_counts: HashMap::new(),
+        pulse_session_summaries: Vec::new(),
     }
 }
 
@@ -1478,6 +1561,18 @@ fn format_decimal(value: Decimal) -> String {
     value.normalize().to_string()
 }
 
+fn parse_decimal_or_zero(value: &str) -> Decimal {
+    value.parse::<Decimal>().unwrap_or(Decimal::ZERO)
+}
+
+fn format_signed_usd(value: f64) -> String {
+    if value >= 0.0 {
+        format!("+${value:.2}")
+    } else {
+        format!("-${:.2}", value.abs())
+    }
+}
+
 fn format_f64_compact(value: f64) -> String {
     let value = if value.abs() < 1e-12 { 0.0 } else { value };
     let precision = if value.abs() >= 1.0 { 12 } else { 15 };
@@ -1922,6 +2017,427 @@ fn run_session_summary(
     }
 
     Ok(())
+}
+
+fn run_pulse_sessions_report(
+    env: &str,
+    session_id: Option<&str>,
+    asset: Option<&str>,
+    format: AuditOutputFormat,
+) -> Result<()> {
+    let (settings, summary) = resolve_session(env, session_id)?;
+    let _warehouse_path =
+        sync_warehouse_best_effort(&settings.general.data_dir, &summary.session_id);
+    let events = AuditReader::load_events(&settings.general.data_dir, &summary.session_id)?;
+    let raw_opening_kpi = collect_pulse_raw_opening_kpi(&events, asset);
+
+    let sessions = summary
+        .pulse_session_summaries
+        .iter()
+        .filter(|row| asset.is_none_or(|filter| row.asset.eq_ignore_ascii_case(filter)))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let report = PulseSessionsReport {
+        summary,
+        asset_filter: asset.map(str::to_owned),
+        raw_opening_kpi,
+        sessions,
+    };
+
+    match format {
+        AuditOutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+        AuditOutputFormat::Table => {
+            println!("Pulse 会话列表: {}", report.summary.session_id);
+            println!("环境: {}", report.summary.env);
+            println!("资产过滤: {}", format_option_text(report.asset_filter.as_deref()));
+            println!(
+                "Raw Opening KPI: attempts={} positive_fill={} effective_open={} ({:.2}%) active_effective_open={}",
+                report.raw_opening_kpi.opening_attempts,
+                report.raw_opening_kpi.positive_fill_count,
+                report.raw_opening_kpi.effective_open_count,
+                report.raw_opening_kpi.effective_open_rate * 100.0,
+                report.raw_opening_kpi.still_active_effective_open_count
+            );
+            println!(
+                "Raw Opening 峰值: max_fill_notional={} max_expected_open_pnl={}",
+                format_option_text(report.raw_opening_kpi.max_actual_fill_notional_usd.as_deref()),
+                format_option_text(
+                    report
+                        .raw_opening_kpi
+                        .max_expected_open_net_pnl_usd
+                        .as_deref()
+                )
+            );
+            if !report
+                .raw_opening_kpi
+                .closed_rejection_reason_counts
+                .is_empty()
+            {
+                println!(
+                    "Raw Opening 拒绝原因: {}",
+                    format_counter_map(&report.raw_opening_kpi.closed_rejection_reason_counts)
+                );
+            }
+            if !report.raw_opening_kpi.effective_open_examples.is_empty() {
+                println!("Raw Opening 样本:");
+                for example in &report.raw_opening_kpi.effective_open_examples {
+                    println!(
+                        "  {} 资产={} 状态={} fill_notional={} expected_open_pnl={} hedge_qty={} anchor_lag={}",
+                        example.session_id,
+                        example.asset,
+                        example.state,
+                        example.actual_fill_notional_usd,
+                        example.expected_open_net_pnl_usd,
+                        example.opening_allocated_hedge_qty,
+                        example
+                            .anchor_latency_delta_ms
+                            .map(|value| format!("{value}ms"))
+                            .unwrap_or_else(|| "-".to_owned())
+                    );
+                }
+            }
+            println!("已归档会话: {}", report.sessions.len());
+            if report.sessions.is_empty() {
+                println!("  （无）");
+            } else {
+                for row in &report.sessions {
+                    println!(
+                        "  {} 资产={} 状态={} fill={}/{} ({:.1}%) edge={} pnl={}",
+                        row.pulse_session_id,
+                        row.asset,
+                        row.state,
+                        row.actual_poly_filled_qty,
+                        row.planned_poly_qty,
+                        row.actual_poly_fill_ratio * 100.0,
+                        row.net_edge_bps
+                            .map(|value| format!("{value:.1}bps"))
+                            .unwrap_or_else(|| "-".to_owned()),
+                        row.realized_pnl_usd
+                            .map(format_signed_usd)
+                            .unwrap_or_else(|| "-".to_owned())
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_pulse_raw_opening_kpi(
+    events: &[AuditEvent],
+    asset_filter: Option<&str>,
+) -> PulseRawOpeningKpi {
+    let mut sessions = HashMap::<String, PulseRawOpeningSessionAggregate>::new();
+
+    for event in events {
+        let AuditEventPayload::PulseLifecycle(payload) = &event.payload else {
+            continue;
+        };
+        if asset_filter.is_some_and(|filter| !payload.asset.eq_ignore_ascii_case(filter)) {
+            continue;
+        }
+
+        let aggregate = sessions
+            .entry(payload.session_id.clone())
+            .or_insert_with(|| PulseRawOpeningSessionAggregate {
+                asset: payload.asset.clone(),
+                ..PulseRawOpeningSessionAggregate::default()
+            });
+
+        let actual_fill_notional_usd = parse_decimal_or_zero(&payload.actual_fill_notional_usd);
+        let actual_poly_filled_qty = parse_decimal_or_zero(&payload.actual_poly_filled_qty);
+        if actual_fill_notional_usd > Decimal::ZERO || actual_poly_filled_qty > Decimal::ZERO {
+            aggregate.positive_fill = true;
+        }
+        if payload.effective_open || payload.opening_outcome == "effective_open" {
+            aggregate.effective_open = true;
+        }
+        if event.seq >= aggregate.latest_seq {
+            aggregate.asset = payload.asset.clone();
+            aggregate.latest_seq = event.seq;
+            aggregate.latest_state = payload.state.clone();
+            aggregate.latest_actual_fill_notional_usd = actual_fill_notional_usd;
+            aggregate.latest_expected_open_net_pnl_usd =
+                parse_decimal_or_zero(&payload.expected_open_net_pnl_usd);
+            aggregate.latest_opening_allocated_hedge_qty =
+                payload.opening_allocated_hedge_qty.clone();
+            aggregate.latest_anchor_latency_delta_ms = payload.anchor_latency_delta_ms;
+            aggregate.latest_opening_rejection_reason = payload.opening_rejection_reason.clone();
+        }
+    }
+
+    let opening_attempts = sessions.len();
+    let positive_fill_count = sessions.values().filter(|session| session.positive_fill).count();
+    let effective_open_count = sessions
+        .values()
+        .filter(|session| session.effective_open)
+        .count();
+    let still_active_effective_open_count = sessions
+        .values()
+        .filter(|session| session.effective_open && !session.latest_state.eq("closed"))
+        .count();
+
+    let mut closed_rejection_reason_counts = HashMap::new();
+    for session in sessions
+        .values()
+        .filter(|session| !session.effective_open && session.latest_state == "closed")
+    {
+        if let Some(reason) = &session.latest_opening_rejection_reason {
+            *closed_rejection_reason_counts
+                .entry(reason.clone())
+                .or_insert(0) += 1;
+        }
+    }
+
+    let max_actual_fill_notional_usd = sessions
+        .values()
+        .map(|session| session.latest_actual_fill_notional_usd)
+        .max()
+        .map(format_decimal);
+    let max_expected_open_net_pnl_usd = sessions
+        .values()
+        .map(|session| session.latest_expected_open_net_pnl_usd)
+        .max()
+        .map(format_decimal);
+
+    let mut effective_open_examples = sessions
+        .into_iter()
+        .filter_map(|(session_id, session)| {
+            session.effective_open.then_some(PulseRawOpeningExample {
+                session_id,
+                asset: session.asset,
+                state: session.latest_state,
+                actual_fill_notional_usd: format_decimal(session.latest_actual_fill_notional_usd),
+                expected_open_net_pnl_usd: format_decimal(
+                    session.latest_expected_open_net_pnl_usd,
+                ),
+                opening_allocated_hedge_qty: session.latest_opening_allocated_hedge_qty,
+                anchor_latency_delta_ms: session.latest_anchor_latency_delta_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    effective_open_examples.sort_by(|left, right| {
+        parse_decimal_or_zero(&right.expected_open_net_pnl_usd)
+            .cmp(&parse_decimal_or_zero(&left.expected_open_net_pnl_usd))
+            .then_with(|| {
+                parse_decimal_or_zero(&right.actual_fill_notional_usd)
+                    .cmp(&parse_decimal_or_zero(&left.actual_fill_notional_usd))
+            })
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
+    effective_open_examples.truncate(5);
+
+    PulseRawOpeningKpi {
+        opening_attempts,
+        positive_fill_count,
+        effective_open_count,
+        effective_open_rate: if opening_attempts == 0 {
+            0.0
+        } else {
+            effective_open_count as f64 / opening_attempts as f64
+        },
+        still_active_effective_open_count,
+        closed_rejection_reason_counts,
+        max_actual_fill_notional_usd,
+        max_expected_open_net_pnl_usd,
+        effective_open_examples,
+    }
+}
+
+fn run_pulse_session_detail_report(
+    env: &str,
+    session_id: Option<&str>,
+    pulse_session_id: &str,
+    format: AuditOutputFormat,
+) -> Result<()> {
+    let (settings, summary) = resolve_session(env, session_id)?;
+    let _warehouse_path =
+        sync_warehouse_best_effort(&settings.general.data_dir, &summary.session_id);
+    let events = AuditReader::load_events(&settings.general.data_dir, &summary.session_id)?;
+
+    let session = summary
+        .pulse_session_summaries
+        .iter()
+        .find(|row| row.pulse_session_id == pulse_session_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("未找到 pulse session `{pulse_session_id}`"))?;
+
+    let timeline = build_pulse_session_timeline(&events, pulse_session_id);
+    let report = PulseSessionDetailAuditReport {
+        summary,
+        session,
+        timeline,
+    };
+
+    match format {
+        AuditOutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+        AuditOutputFormat::Table => {
+            println!("Pulse 会话详情: {}", report.session.pulse_session_id);
+            println!("审计会话: {}", report.summary.session_id);
+            println!("资产: {}", report.session.asset);
+            println!("状态: {}", report.session.state);
+            println!(
+                "开/平时间: {} / {}",
+                format_timestamp_ms(report.session.opened_at_ms),
+                report
+                    .session
+                    .closed_at_ms
+                    .map(format_timestamp_ms)
+                    .unwrap_or_else(|| "仍在运行".to_owned())
+            );
+            println!(
+                "Poly 成交: {}/{} ({:.1}%)",
+                report.session.actual_poly_filled_qty,
+                report.session.planned_poly_qty,
+                report.session.actual_poly_fill_ratio * 100.0
+            );
+            println!(
+                "对冲归因: session_delta={} allocated_hedge={}",
+                report.session.session_target_delta_exposure,
+                report.session.session_allocated_hedge_qty
+            );
+            println!(
+                "审计指标: anchor_latency={} queue_distance={} order_age={}",
+                report
+                    .session
+                    .anchor_latency_delta_ms
+                    .map(|value| format!("{value}ms"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                report
+                    .session
+                    .distance_to_mid_bps
+                    .map(|value| format!("{value:.1}bps"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                report
+                    .session
+                    .relative_order_age_ms
+                    .map(|value| format!("{value}ms"))
+                    .unwrap_or_else(|| "-".to_owned())
+            );
+            println!(
+                "结果: edge={} pnl={}",
+                report
+                    .session
+                    .net_edge_bps
+                    .map(|value| format!("{value:.1}bps"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                report
+                    .session
+                    .realized_pnl_usd
+                    .map(format_signed_usd)
+                    .unwrap_or_else(|| "-".to_owned())
+            );
+            let exit_slippage = match (
+                report.session.target_exit_price.as_deref(),
+                report.session.final_exit_price.as_deref(),
+            ) {
+                (Some(target), Some(final_price)) => Some(
+                    parse_decimal_or_zero(final_price) - parse_decimal_or_zero(target),
+                ),
+                _ => None,
+            };
+            println!(
+                "离场: path={} target={} final={} slippage={}",
+                report
+                    .session
+                    .exit_path
+                    .clone()
+                    .unwrap_or_else(|| "-".to_owned()),
+                report
+                    .session
+                    .target_exit_price
+                    .clone()
+                    .unwrap_or_else(|| "-".to_owned()),
+                report
+                    .session
+                    .final_exit_price
+                    .clone()
+                    .unwrap_or_else(|| "-".to_owned()),
+                exit_slippage
+                    .map(format_decimal)
+                    .unwrap_or_else(|| "-".to_owned())
+            );
+            println!("时间线事件: {}", report.timeline.len());
+            if report.timeline.is_empty() {
+                println!("  （无）");
+            } else {
+                for item in &report.timeline {
+                    println!(
+                        "  #{} {} {} state={} {}{}",
+                        item.seq,
+                        item.time,
+                        item.kind,
+                        item.state,
+                        item.summary,
+                        item.instrument
+                            .as_ref()
+                            .map(|value| format!(" instrument={value}"))
+                            .unwrap_or_default()
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn build_pulse_session_timeline(
+    events: &[AuditEvent],
+    pulse_session_id: &str,
+) -> Vec<PulseSessionTimelineItem> {
+    let mut timeline = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            AuditEventPayload::PulseLifecycle(payload)
+                if payload.session_id == pulse_session_id =>
+            {
+                Some(PulseSessionTimelineItem {
+                    seq: event.seq,
+                    timestamp_ms: event.timestamp_ms,
+                    time: format_timestamp_ms(event.timestamp_ms),
+                    kind: event.kind.label_zh().to_owned(),
+                    state: payload.state.clone(),
+                    summary: event.summary.clone(),
+                    instrument: None,
+                })
+            }
+            AuditEventPayload::PulseBookTape(payload)
+                if payload.session_id == pulse_session_id =>
+            {
+                Some(PulseSessionTimelineItem {
+                    seq: event.seq,
+                    timestamp_ms: event.timestamp_ms,
+                    time: format_timestamp_ms(event.timestamp_ms),
+                    kind: event.kind.label_zh().to_owned(),
+                    state: payload.state.clone(),
+                    summary: format!(
+                        "{} {} seq={}",
+                        payload.symbol, payload.book.instrument, payload.book.sequence
+                    ),
+                    instrument: Some(payload.book.instrument.clone()),
+                })
+            }
+            AuditEventPayload::PulseSessionSummary(payload)
+                if payload.pulse_session_id == pulse_session_id =>
+            {
+                Some(PulseSessionTimelineItem {
+                    seq: event.seq,
+                    timestamp_ms: event.timestamp_ms,
+                    time: format_timestamp_ms(event.timestamp_ms),
+                    kind: event.kind.label_zh().to_owned(),
+                    state: payload.state.clone(),
+                    summary: event.summary.clone(),
+                    instrument: None,
+                })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    timeline.sort_by_key(|item| (item.timestamp_ms, item.seq));
+    timeline
 }
 
 fn run_market_report(
@@ -2496,7 +3012,8 @@ mod tests {
     use polyalpha_audit::{
         AuditEventKind, AuditEventPayload, AuditGateResult, AuditObservedMarket,
         ExecutionAuditEvent, GateDecisionEvent, MarketMarkEvent, PositionMarkEvent,
-        SignalEmittedEvent,
+        PulseBookLevelAuditRow, PulseBookSnapshotAudit, PulseBookTapeAuditEvent,
+        PulseLifecycleAuditEvent, SignalEmittedEvent,
     };
     use polyalpha_core::{
         AsyncClassification, CexBaseQty, EvaluableStatus, Exchange, ExecutionEvent,
@@ -2608,6 +3125,203 @@ mod tests {
             .expect("latest mark")
             .effective_sigma_annualized
             .is_some());
+    }
+
+    #[test]
+    fn pulse_session_timeline_collects_lifecycle_and_tape_events() {
+        let events = vec![
+            AuditEvent {
+                session_id: "audit-session-1".to_owned(),
+                env: "test".to_owned(),
+                seq: 1,
+                timestamp_ms: 1_000,
+                kind: AuditEventKind::PulseLifecycle,
+                symbol: None,
+                signal_id: None,
+                correlation_id: None,
+                gate: None,
+                result: None,
+                reason: None,
+                summary: "pulse btc maker_exit_working".to_owned(),
+                payload: AuditEventPayload::PulseLifecycle(PulseLifecycleAuditEvent {
+                    session_id: "pulse-session-1".to_owned(),
+                    asset: "btc".to_owned(),
+                    state: "maker_exit_working".to_owned(),
+                    planned_poly_qty: "10000".to_owned(),
+                    actual_poly_filled_qty: "3500".to_owned(),
+                    actual_poly_fill_ratio: 0.35,
+                    actual_fill_notional_usd: "1225".to_owned(),
+                    expected_open_net_pnl_usd: "3.85".to_owned(),
+                    effective_open: true,
+                    opening_outcome: "effective_open".to_owned(),
+                    opening_rejection_reason: None,
+                    opening_allocated_hedge_qty: "0.39".to_owned(),
+                    session_target_delta_exposure: "0.41".to_owned(),
+                    session_allocated_hedge_qty: "0.39".to_owned(),
+                    account_net_target_delta_before_order: "0.52".to_owned(),
+                    account_net_target_delta_after_order: "0.13".to_owned(),
+                    delta_bump_used: "10".to_owned(),
+                    anchor_latency_delta_ms: Some(18),
+                    distance_to_mid_bps: Some(7.5),
+                    relative_order_age_ms: Some(900),
+                    poly_yes_book: None,
+                    poly_no_book: None,
+                    cex_book: None,
+                }),
+            },
+            AuditEvent {
+                session_id: "audit-session-1".to_owned(),
+                env: "test".to_owned(),
+                seq: 2,
+                timestamp_ms: 1_005,
+                kind: AuditEventKind::PulseBookTape,
+                symbol: None,
+                signal_id: None,
+                correlation_id: None,
+                gate: None,
+                result: None,
+                reason: None,
+                summary: "pulse tape btc cex_perp".to_owned(),
+                payload: AuditEventPayload::PulseBookTape(PulseBookTapeAuditEvent {
+                    session_id: "pulse-session-1".to_owned(),
+                    asset: "btc".to_owned(),
+                    state: "maker_exit_working".to_owned(),
+                    symbol: "btc-above-100k".to_owned(),
+                    book: PulseBookSnapshotAudit {
+                        exchange: "Binance".to_owned(),
+                        instrument: "cex_perp".to_owned(),
+                        received_at_ms: 1_005,
+                        sequence: 42,
+                        bids: vec![PulseBookLevelAuditRow {
+                            price: "100000".to_owned(),
+                            quantity: "1.5".to_owned(),
+                        }],
+                        asks: vec![PulseBookLevelAuditRow {
+                            price: "100010".to_owned(),
+                            quantity: "1.2".to_owned(),
+                        }],
+                    },
+                }),
+            },
+        ];
+
+        let timeline = build_pulse_session_timeline(&events, "pulse-session-1");
+
+        assert_eq!(timeline.len(), 2);
+        assert_eq!(timeline[0].kind, "Pulse 生命周期");
+        assert_eq!(timeline[0].state, "maker_exit_working");
+        assert_eq!(timeline[1].kind, "Pulse 盘口 Tape");
+        assert_eq!(timeline[1].instrument.as_deref(), Some("cex_perp"));
+    }
+
+    #[test]
+    fn pulse_raw_opening_kpi_aggregates_effective_open_and_rejections() {
+        let events = vec![
+            pulse_lifecycle_event(
+                1,
+                1_000,
+                "pulse-session-1",
+                "btc",
+                "poly_opening",
+                "1000",
+                "250",
+                "62.5",
+                "1.2",
+                false,
+                "partial_fill",
+                None,
+            ),
+            pulse_lifecycle_event(
+                2,
+                1_100,
+                "pulse-session-1",
+                "btc",
+                "maker_exit_working",
+                "1000",
+                "250",
+                "62.5",
+                "1.2",
+                true,
+                "effective_open",
+                None,
+            ),
+            pulse_lifecycle_event(
+                3,
+                1_200,
+                "pulse-session-2",
+                "btc",
+                "closed",
+                "1200",
+                "600",
+                "45.225",
+                "1.2670888380606710646447687897",
+                false,
+                "rejected",
+                Some("min_open_notional"),
+            ),
+        ];
+
+        let kpi = collect_pulse_raw_opening_kpi(&events, None);
+
+        assert_eq!(kpi.opening_attempts, 2);
+        assert_eq!(kpi.positive_fill_count, 2);
+        assert_eq!(kpi.effective_open_count, 1);
+        assert_eq!(kpi.still_active_effective_open_count, 1);
+        assert_eq!(
+            kpi.closed_rejection_reason_counts
+                .get("min_open_notional")
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(kpi.max_actual_fill_notional_usd.as_deref(), Some("62.5"));
+        assert_eq!(
+            kpi.max_expected_open_net_pnl_usd.as_deref(),
+            Some("1.2670888380606710646447687897")
+        );
+        assert_eq!(kpi.effective_open_examples.len(), 1);
+        assert_eq!(kpi.effective_open_examples[0].session_id, "pulse-session-1");
+    }
+
+    #[test]
+    fn pulse_raw_opening_kpi_respects_asset_filter() {
+        let events = vec![
+            pulse_lifecycle_event(
+                1,
+                1_000,
+                "pulse-btc-1",
+                "btc",
+                "maker_exit_working",
+                "1000",
+                "250",
+                "62.5",
+                "1.2",
+                true,
+                "effective_open",
+                None,
+            ),
+            pulse_lifecycle_event(
+                2,
+                1_100,
+                "pulse-eth-1",
+                "eth",
+                "maker_exit_working",
+                "800",
+                "400",
+                "80",
+                "2.5",
+                true,
+                "effective_open",
+                None,
+            ),
+        ];
+
+        let kpi = collect_pulse_raw_opening_kpi(&events, Some("eth"));
+
+        assert_eq!(kpi.opening_attempts, 1);
+        assert_eq!(kpi.effective_open_count, 1);
+        assert_eq!(kpi.effective_open_examples.len(), 1);
+        assert_eq!(kpi.effective_open_examples[0].asset, "eth");
+        assert_eq!(kpi.effective_open_examples[0].session_id, "pulse-eth-1");
     }
 
     #[test]
@@ -2936,6 +3650,61 @@ mod tests {
             cex_qty_step: dec("0.01"),
             cex_contract_multiplier: dec("1"),
         }]
+    }
+
+    fn pulse_lifecycle_event(
+        seq: u64,
+        timestamp_ms: u64,
+        pulse_session_id: &str,
+        asset: &str,
+        state: &str,
+        planned_poly_qty: &str,
+        actual_poly_filled_qty: &str,
+        actual_fill_notional_usd: &str,
+        expected_open_net_pnl_usd: &str,
+        effective_open: bool,
+        opening_outcome: &str,
+        opening_rejection_reason: Option<&str>,
+    ) -> AuditEvent {
+        AuditEvent {
+            session_id: "audit-session-1".to_owned(),
+            env: "test".to_owned(),
+            seq,
+            timestamp_ms,
+            kind: AuditEventKind::PulseLifecycle,
+            symbol: None,
+            signal_id: None,
+            correlation_id: None,
+            gate: None,
+            result: None,
+            reason: None,
+            summary: format!("pulse {asset} {state}"),
+            payload: AuditEventPayload::PulseLifecycle(PulseLifecycleAuditEvent {
+                session_id: pulse_session_id.to_owned(),
+                asset: asset.to_owned(),
+                state: state.to_owned(),
+                planned_poly_qty: planned_poly_qty.to_owned(),
+                actual_poly_filled_qty: actual_poly_filled_qty.to_owned(),
+                actual_poly_fill_ratio: 0.25,
+                actual_fill_notional_usd: actual_fill_notional_usd.to_owned(),
+                expected_open_net_pnl_usd: expected_open_net_pnl_usd.to_owned(),
+                effective_open,
+                opening_outcome: opening_outcome.to_owned(),
+                opening_rejection_reason: opening_rejection_reason.map(str::to_owned),
+                opening_allocated_hedge_qty: "0.10".to_owned(),
+                session_target_delta_exposure: "0.12".to_owned(),
+                session_allocated_hedge_qty: "0.10".to_owned(),
+                account_net_target_delta_before_order: "0.22".to_owned(),
+                account_net_target_delta_after_order: "0.12".to_owned(),
+                delta_bump_used: "10".to_owned(),
+                anchor_latency_delta_ms: Some(25),
+                distance_to_mid_bps: Some(5.0),
+                relative_order_age_ms: Some(800),
+                poly_yes_book: None,
+                poly_no_book: None,
+                cex_book: None,
+            }),
+        }
     }
 
     fn position_mark_event(seq: u64, timestamp_ms: u64, symbol: &str) -> AuditEvent {

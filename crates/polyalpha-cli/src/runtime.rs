@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 
 use polyalpha_core::{
@@ -47,6 +48,15 @@ impl RuntimeExecutor {
                 .open_order_snapshots()
                 .map_err(|err| anyhow!("failed to list dry-run open orders: {err}")),
             Self::Live(inner) => inner.open_order_snapshots(),
+        }
+    }
+
+    pub fn cex_net_position(&self, exchange: Exchange, venue_symbol: &str) -> Result<Decimal> {
+        match self {
+            Self::DryRun(inner) => inner
+                .cex_net_position(exchange, venue_symbol)
+                .map_err(|err| anyhow!("failed to read dry-run cex net position: {err}")),
+            Self::Live(inner) => inner.cex_net_position(exchange, venue_symbol),
         }
     }
 }
@@ -348,6 +358,12 @@ impl LiveRuntimeExecutor {
     pub fn open_order_snapshots(&self) -> Result<Vec<DryRunOrderSnapshot>> {
         self.inner.open_order_snapshots()
     }
+
+    pub fn cex_net_position(&self, exchange: Exchange, venue_symbol: &str) -> Result<Decimal> {
+        Err(anyhow!(
+            "live runtime executor does not expose actual cex position sync yet (exchange={exchange:?}, venue_symbol={venue_symbol})"
+        ))
+    }
 }
 
 #[async_trait]
@@ -616,6 +632,50 @@ pub fn apply_orderbook_snapshot(
     }
 }
 
+pub fn apply_orderbook_event(
+    provider: &InMemoryOrderbookProvider,
+    registry: &SymbolRegistry,
+    event: &MarketDataEvent,
+) {
+    match event {
+        MarketDataEvent::OrderBookUpdate { snapshot } => {
+            apply_orderbook_snapshot(provider, registry, snapshot);
+        }
+        MarketDataEvent::CexVenueOrderBookUpdate {
+            exchange,
+            venue_symbol,
+            bids,
+            asks,
+            exchange_timestamp_ms,
+            received_at_ms,
+            sequence,
+        } => {
+            let Some(symbols) = registry.lookup_cex_symbols(*exchange, venue_symbol) else {
+                return;
+            };
+            let Some(first_symbol) = symbols.first() else {
+                return;
+            };
+            provider.update_cex_shared(
+                OrderBookSnapshot {
+                    exchange: *exchange,
+                    symbol: first_symbol.clone(),
+                    instrument: polyalpha_core::InstrumentKind::CexPerp,
+                    bids: bids.clone(),
+                    asks: asks.clone(),
+                    exchange_timestamp_ms: *exchange_timestamp_ms,
+                    received_at_ms: *received_at_ms,
+                    sequence: *sequence,
+                    last_trade_price: None,
+                },
+                venue_symbol.clone(),
+                symbols,
+            );
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -628,11 +688,12 @@ mod tests {
         create_channels, BandPolicyMode, BasisStrategyConfig, CexBaseQty, CexOrderRequest,
         ClientOrderId, CoreError, DmmStrategyConfig, Fill, MarketConfig, NegRiskStrategyConfig,
         OpenCandidate, OrderExecutor, OrderId, OrderRequest, OrderResponse, OrderSide, OrderStatus,
-        OrderType, PolyShares, PolymarketConfig, PolymarketIds, Price, RiskConfig, RiskManager,
-        RiskRejection, Settings, SettlementRules, StrategyConfig, StrategyMarketScopeConfig,
-        TimeInForce, TokenSide, UsdNotional, VenueQuantity,
+        OrderType, PolyShares, PolymarketConfig, PolymarketIds, Price, PriceLevel, RiskConfig,
+        RiskManager, RiskRejection, Settings, SettlementRules, StrategyConfig,
+        StrategyMarketScopeConfig, TimeInForce, TokenSide, UsdNotional, VenueQuantity,
     };
     use polyalpha_data::{CexBookLevel, CexBookUpdate, PolyBookLevel, PolyBookUpdate};
+    use polyalpha_executor::OrderbookProvider;
     use polyalpha_risk::{InMemoryRiskManager, RiskLimits};
 
     use super::*;
@@ -730,11 +791,22 @@ mod tests {
                     },
                     session: polyalpha_core::PulseSessionConfig {
                         max_holding_secs: 900,
+                        opening_request_notional_usd: None,
                         min_opening_notional_usd: UsdNotional(Decimal::new(250, 0)),
+                        require_nonzero_hedge: false,
+                        min_expected_net_pnl_usd: None,
+                        min_open_fill_ratio: None,
+                        min_open_notional_reject_cooldown_secs: 0,
                     },
                     entry: polyalpha_core::PulseEntryConfig {
                         min_net_session_edge_bps: Decimal::new(25, 0),
+                        pulse_window_ms: 5_000,
+                        min_claim_price_move_bps: Decimal::new(80, 0),
+                        max_fair_claim_move_bps: Decimal::new(35, 0),
+                        max_cex_mid_move_bps: Decimal::new(30, 0),
+                        min_pulse_score_bps: Decimal::new(50, 0),
                     },
+                    exit: polyalpha_core::PulseExitConfig::default(),
                     rehedge: polyalpha_core::PulseRehedgeConfig {
                         delta_drift_threshold: Decimal::new(3, 2),
                         delta_bump_mode: "relative_with_clamp".to_owned(),
@@ -754,6 +826,7 @@ mod tests {
                             kind: "deribit".to_owned(),
                             enabled: true,
                             max_anchor_age_ms: 250,
+                            max_anchor_latency_delta_ms: 5_000,
                             soft_mismatch_window_minutes: 360,
                             hard_expiry_mismatch_minutes: 720,
                         },
@@ -788,6 +861,36 @@ mod tests {
             execution_costs: polyalpha_core::ExecutionCostConfig::default(),
             audit: polyalpha_core::AuditConfig::default(),
         }
+    }
+
+    #[test]
+    fn apply_orderbook_event_updates_shared_cex_orderbook_for_venue_updates() {
+        let market = sample_market();
+        let registry = SymbolRegistry::new(vec![market.clone()]);
+        let provider = InMemoryOrderbookProvider::new();
+        let event = MarketDataEvent::CexVenueOrderBookUpdate {
+            exchange: Exchange::Binance,
+            venue_symbol: market.cex_symbol.clone(),
+            bids: vec![PriceLevel {
+                price: Price(Decimal::new(99_995, 0)),
+                quantity: VenueQuantity::CexBaseQty(CexBaseQty(Decimal::new(1, 0))),
+            }],
+            asks: vec![PriceLevel {
+                price: Price(Decimal::new(100_005, 0)),
+                quantity: VenueQuantity::CexBaseQty(CexBaseQty(Decimal::new(1, 0))),
+            }],
+            exchange_timestamp_ms: 7,
+            received_at_ms: 8,
+            sequence: 9,
+        };
+
+        apply_orderbook_event(&provider, &registry, &event);
+
+        let snapshot = provider
+            .get_cex_orderbook(Exchange::Binance, &market.cex_symbol)
+            .expect("shared cex orderbook should be indexed by venue symbol");
+        assert_eq!(snapshot.sequence, 9);
+        assert_eq!(snapshot.symbol, market.symbol);
     }
 
     fn sample_okx_market() -> MarketConfig {
@@ -1218,6 +1321,87 @@ mod tests {
 
         assert!(matches!(executor, RuntimeExecutor::DryRun(_)));
         assert!(execution.orderbook_provider().is_some());
+    }
+
+    #[test]
+    fn runtime_executor_dry_run_reports_signed_cex_net_position_from_fills() {
+        let settings = sample_settings();
+        let registry = SymbolRegistry::new(settings.markets.clone());
+        let market = sample_market();
+        let (provider, executor, _execution) = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(build_execution_stack(
+                &settings,
+                &registry,
+                RuntimeExecutionMode::Paper,
+                1_700_000_000_000,
+                None,
+            ))
+            .expect("paper execution stack");
+
+        apply_orderbook_snapshot(
+            &provider,
+            &registry,
+            &OrderBookSnapshot {
+                exchange: Exchange::Binance,
+                symbol: market.symbol.clone(),
+                instrument: polyalpha_core::InstrumentKind::CexPerp,
+                bids: vec![PriceLevel {
+                    price: Price(Decimal::new(99_995, 0)),
+                    quantity: VenueQuantity::CexBaseQty(CexBaseQty(Decimal::new(10, 0))),
+                }],
+                asks: vec![PriceLevel {
+                    price: Price(Decimal::new(100_005, 0)),
+                    quantity: VenueQuantity::CexBaseQty(CexBaseQty(Decimal::new(10, 0))),
+                }],
+                exchange_timestamp_ms: 7,
+                received_at_ms: 8,
+                sequence: 9,
+                last_trade_price: None,
+            },
+        );
+
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                executor
+                    .submit_order(OrderRequest::Cex(CexOrderRequest {
+                        client_order_id: ClientOrderId("buy-1".to_owned()),
+                        exchange: Exchange::Binance,
+                        symbol: market.symbol.clone(),
+                        venue_symbol: market.cex_symbol.clone(),
+                        side: OrderSide::Buy,
+                        order_type: OrderType::Limit,
+                        price: Some(Price(Decimal::new(100_005, 0))),
+                        base_qty: CexBaseQty(Decimal::new(2, 0)),
+                        time_in_force: TimeInForce::Ioc,
+                        reduce_only: false,
+                    }))
+                    .await
+                    .expect("buy fill");
+                executor
+                    .submit_order(OrderRequest::Cex(CexOrderRequest {
+                        client_order_id: ClientOrderId("sell-1".to_owned()),
+                        exchange: Exchange::Binance,
+                        symbol: market.symbol.clone(),
+                        venue_symbol: market.cex_symbol.clone(),
+                        side: OrderSide::Sell,
+                        order_type: OrderType::Limit,
+                        price: Some(Price(Decimal::new(99_995, 0))),
+                        base_qty: CexBaseQty(Decimal::new(5, 1)),
+                        time_in_force: TimeInForce::Ioc,
+                        reduce_only: false,
+                    }))
+                    .await
+                    .expect("sell fill");
+            });
+
+        assert_eq!(
+            executor
+                .cex_net_position(Exchange::Binance, &market.cex_symbol)
+                .expect("net position"),
+            Decimal::new(15, 1)
+        );
     }
 
     #[test]

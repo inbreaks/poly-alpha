@@ -6483,7 +6483,7 @@ fn ws_housekeeping_interval(poll_interval_ms: u64) -> tokio::time::Interval {
     timer
 }
 
-type WsSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub(crate) type WsSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum WsProxyKind {
@@ -6513,13 +6513,13 @@ impl WsProxyEndpoint {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct WsProxyConfig {
+pub(crate) struct WsProxyConfig {
     kind: WsProxyKind,
     endpoint: WsProxyEndpoint,
 }
 
 impl WsProxyConfig {
-    fn describe(&self) -> String {
+    pub(crate) fn describe(&self) -> String {
         format!("{} {}", self.kind.label(), self.endpoint.address())
     }
 }
@@ -6538,7 +6538,7 @@ impl SystemProxyConfig {
 }
 
 #[derive(Clone, Debug, Default)]
-struct WsProxySettings {
+pub(crate) struct WsProxySettings {
     all_proxy: Option<String>,
     https_proxy: Option<String>,
     http_proxy: Option<String>,
@@ -6546,7 +6546,7 @@ struct WsProxySettings {
 }
 
 impl WsProxySettings {
-    fn detect() -> Self {
+    pub(crate) fn detect() -> Self {
         Self {
             all_proxy: read_proxy_env(&["ALL_PROXY", "all_proxy"]),
             https_proxy: read_proxy_env(&["HTTPS_PROXY", "https_proxy"]),
@@ -6555,7 +6555,7 @@ impl WsProxySettings {
         }
     }
 
-    fn resolve_for_url(&self, ws_url: &str) -> Result<Option<WsProxyConfig>> {
+    pub(crate) fn resolve_for_url(&self, ws_url: &str) -> Result<Option<WsProxyConfig>> {
         let target = parse_ws_target(ws_url)?;
         select_ws_proxy(
             &target.scheme,
@@ -6772,7 +6772,7 @@ fn negotiated_ws_extensions<B>(response: &tungstenite::http::Response<B>) -> Opt
         .map(str::to_owned)
 }
 
-async fn connect_websocket(
+pub(crate) async fn connect_websocket(
     ws_url: &str,
     proxy: Option<&WsProxyConfig>,
 ) -> std::result::Result<
@@ -14520,6 +14520,7 @@ fn build_multi_monitor_state_from_seed_cache(
         recent_events: request.recent_events.clone(),
         recent_trades: request.recent_trades.clone(),
         recent_commands: request.recent_commands.clone(),
+        pulse: None,
     };
 
     if request.apply_strategy_health {
@@ -14773,6 +14774,7 @@ fn build_monitor_state_common(
         recent_events: recent_events.to_vec(),
         recent_trades: trade_book.recent_trades(),
         recent_commands,
+        pulse: None,
     }
 }
 
@@ -16035,13 +16037,13 @@ fn format_ws_close_reason(
     }
 }
 
-fn log_ws_warning(message: impl AsRef<str>) {
+pub(crate) fn log_ws_warning(message: impl AsRef<str>) {
     let message = message.as_ref();
     eprintln!("{message}");
     tracing::warn!("{message}");
 }
 
-async fn run_ws_future_with_timeout<F, T>(
+pub(crate) async fn run_ws_future_with_timeout<F, T>(
     future: F,
     timeout_duration: Duration,
     label: String,
@@ -16566,11 +16568,22 @@ mod tests {
                     },
                     session: polyalpha_core::PulseSessionConfig {
                         max_holding_secs: 900,
+                        opening_request_notional_usd: None,
                         min_opening_notional_usd: UsdNotional(Decimal::new(250, 0)),
+                        require_nonzero_hedge: false,
+                        min_expected_net_pnl_usd: None,
+                        min_open_fill_ratio: None,
+                        min_open_notional_reject_cooldown_secs: 0,
                     },
                     entry: polyalpha_core::PulseEntryConfig {
                         min_net_session_edge_bps: Decimal::new(25, 0),
+                        pulse_window_ms: 5_000,
+                        min_claim_price_move_bps: Decimal::new(80, 0),
+                        max_fair_claim_move_bps: Decimal::new(35, 0),
+                        max_cex_mid_move_bps: Decimal::new(30, 0),
+                        min_pulse_score_bps: Decimal::new(50, 0),
                     },
+                    exit: polyalpha_core::PulseExitConfig::default(),
                     rehedge: polyalpha_core::PulseRehedgeConfig {
                         delta_drift_threshold: Decimal::new(3, 2),
                         delta_bump_mode: "relative_with_clamp".to_owned(),
@@ -16590,6 +16603,7 @@ mod tests {
                             kind: "deribit".to_owned(),
                             enabled: true,
                             max_anchor_age_ms: 250,
+                            max_anchor_latency_delta_ms: 5_000,
                             soft_mismatch_window_minutes: 360,
                             hard_expiry_mismatch_minutes: 720,
                         },

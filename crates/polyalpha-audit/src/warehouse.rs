@@ -29,13 +29,20 @@ impl AuditWarehouse {
         self.ensure_schema(&conn)?;
         let tx = conn.transaction().context("开启审计仓库同步事务失败")?;
 
-        let existing_max_seq = tx
-            .query_row(
-                "SELECT COALESCE(MAX(seq), 0) FROM audit_events WHERE session_id = ?",
-                params![session_id],
-                |row| row.get::<_, i64>(0),
+        let mut existing_seq_stmt = tx
+            .prepare(
+                "SELECT seq FROM audit_events WHERE session_id = ? ORDER BY seq DESC LIMIT 1",
             )
+            .with_context(|| format!("准备审计会话 `{session_id}` 已同步序号查询失败"))?;
+        let mut existing_seq_rows = existing_seq_stmt
+            .query_map(params![session_id], |row| row.get::<_, i64>(0))
             .with_context(|| format!("查询审计会话 `{session_id}` 已同步序号失败"))?;
+        let existing_max_seq = match existing_seq_rows.next() {
+            Some(row) => row.with_context(|| format!("读取审计会话 `{session_id}` 已同步序号失败"))?,
+            None => 0,
+        };
+        drop(existing_seq_rows);
+        drop(existing_seq_stmt);
 
         let mut appender = tx
             .appender("audit_events")
@@ -104,6 +111,79 @@ impl AuditWarehouse {
             ],
         )
         .with_context(|| format!("写入审计摘要 `{}` 失败", summary.session_id))?;
+
+        tx.execute(
+            "DELETE FROM pulse_session_summaries WHERE session_id = ?",
+            params![summary.session_id.clone()],
+        )
+        .with_context(|| format!("删除旧 pulse 会话摘要 `{}` 失败", summary.session_id))?;
+
+        for pulse_summary in &summary.pulse_session_summaries {
+            tx.execute(
+                "INSERT INTO pulse_session_summaries (
+                    session_id,
+                    pulse_session_id,
+                    asset,
+                    state,
+                    opened_at_ms,
+                    closed_at_ms,
+                    planned_poly_qty,
+                    actual_poly_filled_qty,
+                    actual_poly_fill_ratio,
+                    actual_fill_notional_usd,
+                    expected_open_net_pnl_usd,
+                    effective_open,
+                    opening_outcome,
+                    opening_rejection_reason,
+                    opening_allocated_hedge_qty,
+                    session_target_delta_exposure,
+                    session_allocated_hedge_qty,
+                    net_edge_bps,
+                    realized_pnl_usd,
+                    exit_path,
+                    target_exit_price,
+                    final_exit_price,
+                    anchor_latency_delta_ms,
+                    distance_to_mid_bps,
+                    relative_order_age_ms,
+                    row_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    summary.session_id.clone(),
+                    pulse_summary.pulse_session_id.clone(),
+                    pulse_summary.asset.clone(),
+                    pulse_summary.state.clone(),
+                    pulse_summary.opened_at_ms as i64,
+                    pulse_summary.closed_at_ms.map(|value| value as i64),
+                    pulse_summary.planned_poly_qty.clone(),
+                    pulse_summary.actual_poly_filled_qty.clone(),
+                    pulse_summary.actual_poly_fill_ratio,
+                    pulse_summary.actual_fill_notional_usd.clone(),
+                    pulse_summary.expected_open_net_pnl_usd.clone(),
+                    pulse_summary.effective_open,
+                    pulse_summary.opening_outcome.clone(),
+                    pulse_summary.opening_rejection_reason.clone(),
+                    pulse_summary.opening_allocated_hedge_qty.clone(),
+                    pulse_summary.session_target_delta_exposure.clone(),
+                    pulse_summary.session_allocated_hedge_qty.clone(),
+                    pulse_summary.net_edge_bps,
+                    pulse_summary.realized_pnl_usd,
+                    pulse_summary.exit_path.clone(),
+                    pulse_summary.target_exit_price.clone(),
+                    pulse_summary.final_exit_price.clone(),
+                    pulse_summary.anchor_latency_delta_ms.map(|value| value as i64),
+                    pulse_summary.distance_to_mid_bps,
+                    pulse_summary.relative_order_age_ms.map(|value| value as i64),
+                    serde_json::to_string(pulse_summary)
+                        .context("序列化 pulse 会话摘要失败")?,
+                ])
+                .with_context(|| {
+                    format!(
+                        "写入 pulse 会话摘要 `{}` / `{}` 失败",
+                        summary.session_id, pulse_summary.pulse_session_id
+                    )
+                })?;
+        }
         tx.commit()
             .with_context(|| format!("提交审计会话 `{session_id}` 仓库同步事务失败"))?;
 
@@ -155,9 +235,76 @@ impl AuditWarehouse {
                 skip_reasons_json VARCHAR NOT NULL,
                 summary_json VARCHAR NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS pulse_session_summaries (
+                session_id VARCHAR NOT NULL,
+                pulse_session_id VARCHAR NOT NULL,
+                asset VARCHAR NOT NULL,
+                state VARCHAR NOT NULL,
+                opened_at_ms BIGINT NOT NULL,
+                closed_at_ms BIGINT,
+                planned_poly_qty VARCHAR NOT NULL,
+                actual_poly_filled_qty VARCHAR NOT NULL,
+                actual_poly_fill_ratio DOUBLE NOT NULL,
+                actual_fill_notional_usd VARCHAR NOT NULL,
+                expected_open_net_pnl_usd VARCHAR NOT NULL,
+                effective_open BOOLEAN NOT NULL,
+                opening_outcome VARCHAR NOT NULL,
+                opening_rejection_reason VARCHAR,
+                opening_allocated_hedge_qty VARCHAR NOT NULL,
+                session_target_delta_exposure VARCHAR NOT NULL,
+                session_allocated_hedge_qty VARCHAR NOT NULL,
+                net_edge_bps DOUBLE,
+                realized_pnl_usd DOUBLE,
+                exit_path VARCHAR,
+                target_exit_price VARCHAR,
+                final_exit_price VARCHAR,
+                anchor_latency_delta_ms BIGINT,
+                distance_to_mid_bps DOUBLE,
+                relative_order_age_ms BIGINT,
+                row_json VARCHAR NOT NULL
+            );
             ",
         )
-        .context("初始化审计仓库 schema 失败")
+        .context("初始化审计仓库 schema 失败")?;
+
+        self.ensure_pulse_session_summary_columns(conn)
+    }
+
+    fn ensure_pulse_session_summary_columns(&self, conn: &Connection) -> Result<()> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info('pulse_session_summaries')")
+            .context("查询 pulse 会话摘要 schema 失败")?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .context("读取 pulse 会话摘要 schema 行失败")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("收集 pulse 会话摘要 schema 列失败")?;
+
+        for (name, definition) in [
+            ("actual_fill_notional_usd", "VARCHAR"),
+            ("expected_open_net_pnl_usd", "VARCHAR"),
+            ("effective_open", "BOOLEAN"),
+            ("opening_outcome", "VARCHAR"),
+            ("opening_rejection_reason", "VARCHAR"),
+            ("opening_allocated_hedge_qty", "VARCHAR"),
+            ("exit_path", "VARCHAR"),
+            ("target_exit_price", "VARCHAR"),
+            ("final_exit_price", "VARCHAR"),
+        ] {
+            if columns.iter().any(|column| column == name) {
+                continue;
+            }
+            conn.execute(
+                &format!(
+                    "ALTER TABLE pulse_session_summaries ADD COLUMN {name} {definition}"
+                ),
+                [],
+            )
+            .with_context(|| format!("为 pulse 会话摘要补列 `{name}` 失败"))?;
+        }
+
+        Ok(())
     }
 }
 
@@ -173,8 +320,8 @@ mod tests {
 
     use super::AuditWarehouse;
     use crate::{
-        AuditAnomalyEvent, AuditEventKind, AuditEventPayload, AuditSessionManifest, AuditSeverity,
-        AuditWriter, NewAuditEvent,
+        AuditAnomalyEvent, AuditEventKind, AuditEventPayload, AuditReader, AuditSessionManifest,
+        AuditSeverity, AuditWriter, NewAuditEvent, PulseSessionSummaryRow,
     };
 
     #[test]
@@ -208,6 +355,88 @@ mod tests {
             inserted_events, 0,
             "failed sync should not leave partially inserted events"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn warehouse_sync_persists_pulse_session_summary_rows() {
+        let root = temp_root("polyalpha-audit-pulse-session");
+        let session_id = "pulse-audit-session";
+
+        write_test_pulse_session(&root, session_id).expect("write pulse session");
+
+        let warehouse = AuditWarehouse::new(&root).expect("create warehouse");
+        warehouse
+            .sync_session(&root, session_id)
+            .expect("sync pulse session");
+
+        let conn = duckdb::Connection::open(warehouse.db_path()).expect("open warehouse");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pulse_session_summaries WHERE session_id = ?",
+                duckdb::params![session_id],
+                |row| row.get(0),
+            )
+            .expect("query pulse summary count");
+
+        assert_eq!(count, 1);
+        let outcome: String = conn
+            .query_row(
+                "SELECT json_extract_string(row_json, '$.opening_outcome') FROM pulse_session_summaries WHERE session_id = ?",
+                duckdb::params![session_id],
+                |row| row.get(0),
+            )
+            .expect("query opening outcome");
+        assert_eq!(outcome, "effective_open");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn warehouse_sync_migrates_legacy_pulse_session_summary_schema() {
+        let root = temp_root("polyalpha-audit-pulse-legacy-schema");
+        let session_id = "pulse-audit-legacy-session";
+
+        write_test_pulse_session(&root, session_id).expect("write pulse session");
+
+        let warehouse = AuditWarehouse::new(&root).expect("create warehouse");
+        create_legacy_pulse_summary_schema(warehouse.db_path())
+            .expect("create legacy pulse summary schema");
+
+        warehouse
+            .sync_session(&root, session_id)
+            .expect("sync pulse session into legacy warehouse");
+
+        let conn = duckdb::Connection::open(warehouse.db_path()).expect("open warehouse");
+        let row: (String, bool, String, String, String, String, String) = conn
+            .query_row(
+                "SELECT actual_fill_notional_usd, effective_open, opening_outcome, opening_allocated_hedge_qty,
+                        exit_path, target_exit_price, final_exit_price
+                 FROM pulse_session_summaries
+                 WHERE session_id = ?",
+                duckdb::params![session_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("query migrated pulse summary row");
+
+        assert_eq!(row.0, "1225");
+        assert!(row.1);
+        assert_eq!(row.2, "effective_open");
+        assert_eq!(row.3, "0.39");
+        assert_eq!(row.4, "maker_proxy_hit");
+        assert_eq!(row.5, "0.38");
+        assert_eq!(row.6, "0.38");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -249,6 +478,51 @@ mod tests {
         Ok(())
     }
 
+    fn write_test_pulse_session(root: &Path, session_id: &str) -> Result<()> {
+        write_test_session(root, session_id)?;
+
+        let mut summary = AuditReader::load_summary(root, session_id)?;
+        summary.pulse_session_summaries = vec![PulseSessionSummaryRow {
+            pulse_session_id: "pulse-session-1".to_owned(),
+            asset: "btc".to_owned(),
+            state: "maker_exit_working".to_owned(),
+            opened_at_ms: 1_717_171_717_010,
+            closed_at_ms: Some(1_717_171_717_999),
+            planned_poly_qty: "10000".to_owned(),
+            actual_poly_filled_qty: "3500".to_owned(),
+            actual_poly_fill_ratio: 0.35,
+            actual_fill_notional_usd: "1225".to_owned(),
+            expected_open_net_pnl_usd: "3.85".to_owned(),
+            effective_open: true,
+            opening_outcome: "effective_open".to_owned(),
+            opening_rejection_reason: None,
+            opening_allocated_hedge_qty: "0.39".to_owned(),
+            session_target_delta_exposure: "0.41".to_owned(),
+            session_allocated_hedge_qty: "0.39".to_owned(),
+            net_edge_bps: Some(31.4),
+            realized_pnl_usd: Some(75.7),
+            exit_path: Some("maker_proxy_hit".to_owned()),
+            target_exit_price: Some("0.38".to_owned()),
+            final_exit_price: Some("0.38".to_owned()),
+            anchor_latency_delta_ms: Some(42),
+            distance_to_mid_bps: Some(8.0),
+            relative_order_age_ms: Some(950),
+        }];
+
+        let manifest = AuditSessionManifest {
+            version: 1,
+            session_id: session_id.to_owned(),
+            env: "test".to_owned(),
+            mode: TradingMode::Paper,
+            started_at_ms: 1_717_171_717_000,
+            market_count: 1,
+            markets: vec!["test-market".to_owned()],
+        };
+        let mut writer = AuditWriter::create(root, manifest, 1_024 * 1_024)?;
+        writer.write_summary(&summary)?;
+        Ok(())
+    }
+
     fn create_incompatible_summary_schema(db_path: &Path) -> Result<()> {
         let conn = Connection::open(db_path)?;
         conn.execute_batch(
@@ -275,5 +549,33 @@ mod tests {
             ",
         )
         .context("prepare incompatible warehouse schema")
+    }
+
+    fn create_legacy_pulse_summary_schema(db_path: &Path) -> Result<()> {
+        let conn = Connection::open(db_path)?;
+        conn.execute_batch(
+            "
+            CREATE TABLE pulse_session_summaries (
+                session_id VARCHAR NOT NULL,
+                pulse_session_id VARCHAR NOT NULL,
+                asset VARCHAR NOT NULL,
+                state VARCHAR NOT NULL,
+                opened_at_ms BIGINT NOT NULL,
+                closed_at_ms BIGINT,
+                planned_poly_qty VARCHAR NOT NULL,
+                actual_poly_filled_qty VARCHAR NOT NULL,
+                actual_poly_fill_ratio DOUBLE NOT NULL,
+                session_target_delta_exposure VARCHAR NOT NULL,
+                session_allocated_hedge_qty VARCHAR NOT NULL,
+                net_edge_bps DOUBLE,
+                realized_pnl_usd DOUBLE,
+                anchor_latency_delta_ms BIGINT,
+                distance_to_mid_bps DOUBLE,
+                relative_order_age_ms BIGINT,
+                row_json VARCHAR NOT NULL
+            );
+            ",
+        )
+        .context("prepare legacy pulse summary schema")
     }
 }

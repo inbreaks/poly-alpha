@@ -612,7 +612,7 @@ pub async fn run_refresh_active(
         templates.push((asset, template));
     }
 
-    let synced_cex_qty_steps = fetch_binance_cex_qty_steps(
+    let synced_cex_qty_steps = fetch_binance_cex_qty_steps_or_warn(
         &client,
         &base_settings.binance.rest_url,
         &templates
@@ -620,8 +620,9 @@ pub async fn run_refresh_active(
             .filter(|(_, template)| template.hedge_exchange == Exchange::Binance)
             .map(|(_, template)| template.cex_symbol.clone())
             .collect::<Vec<_>>(),
+        &mut warnings,
     )
-    .await?;
+    .await;
 
     for (asset, template) in templates {
         let artifact = refresh_asset_markets(
@@ -1380,6 +1381,23 @@ async fn fetch_binance_cex_qty_steps(
     }
 
     Ok(synced_steps)
+}
+
+async fn fetch_binance_cex_qty_steps_or_warn(
+    client: &Client,
+    rest_url: &str,
+    symbols: &[String],
+    warnings: &mut Vec<String>,
+) -> CexQtyStepSyncMap {
+    match fetch_binance_cex_qty_steps(client, rest_url, symbols).await {
+        Ok(steps) => steps,
+        Err(err) => {
+            warnings.push(format!(
+                "Binance exchangeInfo sync failed; falling back to template cex_qty_step: {err:#}"
+            ));
+            HashMap::new()
+        }
+    }
 }
 
 fn parse_binance_exchange_info_step_size(payload: &Value, symbol: &str) -> Result<Decimal> {
@@ -3043,6 +3061,28 @@ mod tests {
         assert!(err.to_string().contains("exchangeInfo"));
     }
 
+    #[tokio::test]
+    async fn fetch_binance_cex_qty_steps_or_warn_falls_back_to_empty_map_when_exchange_info_fails() {
+        let base_url = spawn_static_http_server(
+            "500 Internal Server Error",
+            r#"{"code":"boom"}"#,
+            HTTP_GET_RETRY_ATTEMPTS,
+        );
+        let client = Client::builder().build().expect("reqwest client");
+        let mut warnings = Vec::new();
+
+        let steps = fetch_binance_cex_qty_steps_or_warn(
+            &client,
+            &base_url,
+            &[String::from("ETHUSDT")],
+            &mut warnings,
+        )
+        .await;
+
+        assert!(steps.is_empty());
+        assert!(warnings.iter().any(|warning| warning.contains("exchangeInfo")));
+    }
+
     #[test]
     fn refresh_catalog_market_config_replaces_legacy_symbol_with_discovered_slug() {
         let existing = MarketConfig {
@@ -3519,11 +3559,22 @@ mod tests {
                     },
                     session: polyalpha_core::PulseSessionConfig {
                         max_holding_secs: 900,
+                        opening_request_notional_usd: None,
                         min_opening_notional_usd: UsdNotional(Decimal::new(250, 0)),
+                        require_nonzero_hedge: false,
+                        min_expected_net_pnl_usd: None,
+                        min_open_fill_ratio: None,
+                        min_open_notional_reject_cooldown_secs: 0,
                     },
                     entry: polyalpha_core::PulseEntryConfig {
                         min_net_session_edge_bps: Decimal::new(25, 0),
+                        pulse_window_ms: 5_000,
+                        min_claim_price_move_bps: Decimal::new(80, 0),
+                        max_fair_claim_move_bps: Decimal::new(35, 0),
+                        max_cex_mid_move_bps: Decimal::new(30, 0),
+                        min_pulse_score_bps: Decimal::new(50, 0),
                     },
+                    exit: polyalpha_core::PulseExitConfig::default(),
                     rehedge: polyalpha_core::PulseRehedgeConfig {
                         delta_drift_threshold: Decimal::new(3, 2),
                         delta_bump_mode: "relative_with_clamp".to_owned(),
@@ -3543,6 +3594,7 @@ mod tests {
                             kind: "deribit".to_owned(),
                             enabled: true,
                             max_anchor_age_ms: 250,
+                            max_anchor_latency_delta_ms: 5_000,
                             soft_mismatch_window_minutes: 360,
                             hard_expiry_mismatch_minutes: 720,
                         },

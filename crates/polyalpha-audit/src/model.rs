@@ -98,6 +98,8 @@ pub struct AuditSessionSummary {
     pub evaluable_status_counts: HashMap<String, u64>,
     #[serde(default)]
     pub async_classification_counts: HashMap<String, u64>,
+    #[serde(default)]
+    pub pulse_session_summaries: Vec<PulseSessionSummaryRow>,
 }
 
 impl AuditSessionSummary {
@@ -123,6 +125,7 @@ impl AuditSessionSummary {
             skip_reasons: HashMap::new(),
             evaluable_status_counts: HashMap::new(),
             async_classification_counts: HashMap::new(),
+            pulse_session_summaries: Vec::new(),
         }
     }
 }
@@ -212,6 +215,10 @@ pub enum AuditEventKind {
     PositionMark,
     EquityMark,
     Anomaly,
+    PulseLifecycle,
+    PulseBookTape,
+    PulseSessionSummary,
+    PulseAssetHealth,
 }
 
 impl AuditEventKind {
@@ -225,6 +232,10 @@ impl AuditEventKind {
             Self::PositionMark => "position_mark",
             Self::EquityMark => "equity_mark",
             Self::Anomaly => "anomaly",
+            Self::PulseLifecycle => "pulse_lifecycle",
+            Self::PulseBookTape => "pulse_book_tape",
+            Self::PulseSessionSummary => "pulse_session_summary",
+            Self::PulseAssetHealth => "pulse_asset_health",
         }
     }
 
@@ -238,6 +249,10 @@ impl AuditEventKind {
             Self::PositionMark => "持仓快照",
             Self::EquityMark => "净值快照",
             Self::Anomaly => "异常",
+            Self::PulseLifecycle => "Pulse 生命周期",
+            Self::PulseBookTape => "Pulse 盘口 Tape",
+            Self::PulseSessionSummary => "Pulse 会话摘要",
+            Self::PulseAssetHealth => "Pulse 资产健康",
         }
     }
 }
@@ -309,6 +324,132 @@ pub struct AuditAnomalyEvent {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PulseBookLevelAuditRow {
+    pub price: String,
+    pub quantity: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PulseBookSnapshotAudit {
+    pub exchange: String,
+    pub instrument: String,
+    pub received_at_ms: u64,
+    pub sequence: u64,
+    #[serde(default)]
+    pub bids: Vec<PulseBookLevelAuditRow>,
+    #[serde(default)]
+    pub asks: Vec<PulseBookLevelAuditRow>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PulseLifecycleAuditEvent {
+    pub session_id: String,
+    pub asset: String,
+    pub state: String,
+    pub planned_poly_qty: String,
+    pub actual_poly_filled_qty: String,
+    pub actual_poly_fill_ratio: f64,
+    pub actual_fill_notional_usd: String,
+    pub expected_open_net_pnl_usd: String,
+    pub effective_open: bool,
+    pub opening_outcome: String,
+    #[serde(default)]
+    pub opening_rejection_reason: Option<String>,
+    pub opening_allocated_hedge_qty: String,
+    pub session_target_delta_exposure: String,
+    pub session_allocated_hedge_qty: String,
+    pub account_net_target_delta_before_order: String,
+    pub account_net_target_delta_after_order: String,
+    pub delta_bump_used: String,
+    #[serde(default)]
+    pub anchor_latency_delta_ms: Option<u64>,
+    #[serde(default)]
+    pub distance_to_mid_bps: Option<f64>,
+    #[serde(default)]
+    pub relative_order_age_ms: Option<u64>,
+    #[serde(default)]
+    pub poly_yes_book: Option<PulseBookSnapshotAudit>,
+    #[serde(default)]
+    pub poly_no_book: Option<PulseBookSnapshotAudit>,
+    #[serde(default)]
+    pub cex_book: Option<PulseBookSnapshotAudit>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PulseBookTapeAuditEvent {
+    pub session_id: String,
+    pub asset: String,
+    pub state: String,
+    pub symbol: String,
+    pub book: PulseBookSnapshotAudit,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PulseSessionSummaryRow {
+    pub pulse_session_id: String,
+    pub asset: String,
+    pub state: String,
+    pub opened_at_ms: u64,
+    #[serde(default)]
+    pub closed_at_ms: Option<u64>,
+    pub planned_poly_qty: String,
+    pub actual_poly_filled_qty: String,
+    pub actual_poly_fill_ratio: f64,
+    pub actual_fill_notional_usd: String,
+    pub expected_open_net_pnl_usd: String,
+    pub effective_open: bool,
+    pub opening_outcome: String,
+    #[serde(default)]
+    pub opening_rejection_reason: Option<String>,
+    pub opening_allocated_hedge_qty: String,
+    pub session_target_delta_exposure: String,
+    pub session_allocated_hedge_qty: String,
+    #[serde(default)]
+    pub net_edge_bps: Option<f64>,
+    #[serde(default)]
+    pub realized_pnl_usd: Option<f64>,
+    #[serde(default)]
+    pub exit_path: Option<String>,
+    #[serde(default)]
+    pub target_exit_price: Option<String>,
+    #[serde(default)]
+    pub final_exit_price: Option<String>,
+    #[serde(default)]
+    pub anchor_latency_delta_ms: Option<u64>,
+    #[serde(default)]
+    pub distance_to_mid_bps: Option<f64>,
+    #[serde(default)]
+    pub relative_order_age_ms: Option<u64>,
+}
+
+pub type PulseSessionSummaryEvent = PulseSessionSummaryRow;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PulseAssetHealthAuditEvent {
+    pub asset: String,
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub anchor_age_ms: Option<u64>,
+    #[serde(default)]
+    pub anchor_latency_delta_ms: Option<u64>,
+    #[serde(default)]
+    pub poly_quote_age_ms: Option<u64>,
+    #[serde(default)]
+    pub cex_quote_age_ms: Option<u64>,
+    #[serde(default)]
+    pub open_sessions: usize,
+    #[serde(default)]
+    pub net_target_delta: Option<String>,
+    #[serde(default)]
+    pub actual_exchange_position: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub disable_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuditEventPayload {
     EvaluationSkip(EvaluationSkipEvent),
@@ -319,6 +460,10 @@ pub enum AuditEventPayload {
     PositionMark(PositionMarkEvent),
     EquityMark(EquityMarkEvent),
     Anomaly(AuditAnomalyEvent),
+    PulseLifecycle(PulseLifecycleAuditEvent),
+    PulseBookTape(PulseBookTapeAuditEvent),
+    PulseSessionSummary(PulseSessionSummaryEvent),
+    PulseAssetHealth(PulseAssetHealthAuditEvent),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -366,7 +511,10 @@ pub struct AuditEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::AuditSessionSummary;
+    use super::{
+        AuditEventPayload, AuditSessionSummary, PulseBookLevelAuditRow,
+        PulseBookSnapshotAudit, PulseBookTapeAuditEvent, PulseLifecycleAuditEvent,
+    };
 
     #[test]
     fn session_summary_deserializes_with_legacy_counter_fields_missing() {
@@ -420,5 +568,68 @@ mod tests {
         assert_eq!(summary.counters.evaluable_passes, 0);
         assert_eq!(summary.counters.execution_rejected, 0);
         assert_eq!(summary.counters.trades_closed, 0);
+    }
+
+    #[test]
+    fn pulse_session_record_serializes_partial_fill_and_hedge_attribution() {
+        let payload = AuditEventPayload::PulseLifecycle(PulseLifecycleAuditEvent {
+            session_id: "pulse-session-1".to_owned(),
+            asset: "btc".to_owned(),
+            state: "maker_exit_working".to_owned(),
+            planned_poly_qty: "10000".to_owned(),
+            actual_poly_filled_qty: "3500".to_owned(),
+            actual_poly_fill_ratio: 0.35,
+            actual_fill_notional_usd: "1225".to_owned(),
+            expected_open_net_pnl_usd: "3.85".to_owned(),
+            effective_open: true,
+            opening_outcome: "effective_open".to_owned(),
+            opening_rejection_reason: None,
+            opening_allocated_hedge_qty: "0.39".to_owned(),
+            session_target_delta_exposure: "0.41".to_owned(),
+            session_allocated_hedge_qty: "0.39".to_owned(),
+            account_net_target_delta_before_order: "0.52".to_owned(),
+            account_net_target_delta_after_order: "0.13".to_owned(),
+            delta_bump_used: "10".to_owned(),
+            anchor_latency_delta_ms: None,
+            distance_to_mid_bps: None,
+            relative_order_age_ms: None,
+            poly_yes_book: None,
+            poly_no_book: None,
+            cex_book: None,
+        });
+
+        let encoded = serde_json::to_string(&payload).expect("serialize payload");
+        assert!(encoded.contains("\"pulse_lifecycle\""));
+        assert!(encoded.contains("\"actual_poly_filled_qty\":\"3500\""));
+        assert!(encoded.contains("\"opening_outcome\":\"effective_open\""));
+    }
+
+    #[test]
+    fn pulse_book_tape_record_serializes_raw_book_snapshot() {
+        let payload = AuditEventPayload::PulseBookTape(PulseBookTapeAuditEvent {
+            session_id: "pulse-session-1".to_owned(),
+            asset: "btc".to_owned(),
+            state: "maker_exit_working".to_owned(),
+            symbol: "btc-above-100k".to_owned(),
+            book: PulseBookSnapshotAudit {
+                exchange: "Binance".to_owned(),
+                instrument: "cex_perp".to_owned(),
+                received_at_ms: 1_717_171_717_123,
+                sequence: 42,
+                bids: vec![PulseBookLevelAuditRow {
+                    price: "100000".to_owned(),
+                    quantity: "1.5".to_owned(),
+                }],
+                asks: vec![PulseBookLevelAuditRow {
+                    price: "100010".to_owned(),
+                    quantity: "1.2".to_owned(),
+                }],
+            },
+        });
+
+        let encoded = serde_json::to_string(&payload).expect("serialize tape payload");
+        assert!(encoded.contains("\"pulse_book_tape\""));
+        assert!(encoded.contains("\"instrument\":\"cex_perp\""));
+        assert!(encoded.contains("\"sequence\":42"));
     }
 }

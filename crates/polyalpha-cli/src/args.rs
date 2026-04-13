@@ -153,6 +153,26 @@ pub enum AuditCommand {
         #[arg(long, value_enum, default_value_t = AuditOutputFormat::Table)]
         format: AuditOutputFormat,
     },
+    PulseSessions {
+        #[arg(long, default_value = "default")]
+        env: String,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        asset: Option<String>,
+        #[arg(long, value_enum, default_value_t = AuditOutputFormat::Table)]
+        format: AuditOutputFormat,
+    },
+    PulseSessionDetail {
+        #[arg(long, default_value = "default")]
+        env: String,
+        #[arg(long)]
+        session_id: Option<String>,
+        #[arg(long)]
+        pulse_session_id: String,
+        #[arg(long, value_enum, default_value_t = AuditOutputFormat::Table)]
+        format: AuditOutputFormat,
+    },
     SessionSummary {
         #[arg(long, default_value = "default")]
         env: String,
@@ -455,6 +475,10 @@ pub enum PulseCommand {
         assets: String,
         #[arg(long, value_enum, default_value_t = LiveExecutorMode::Mock)]
         executor_mode: LiveExecutorMode,
+    },
+    Inspect {
+        #[arg(long, default_value = "default")]
+        env: String,
     },
 }
 
@@ -992,7 +1016,7 @@ pub enum MarketAsset {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, LiveCommand, PaperCommand};
+    use super::{AuditCommand, Cli, Command, LiveCommand, PaperCommand};
     use clap::{error::ErrorKind, Parser};
 
     #[test]
@@ -1149,6 +1173,52 @@ mod tests {
     }
 
     #[test]
+    fn parses_audit_pulse_sessions_subcommand() {
+        let cli = Cli::try_parse_from([
+            "polyalpha-cli",
+            "audit",
+            "pulse-sessions",
+            "--env",
+            "prod",
+            "--session-id",
+            "session-1",
+            "--asset",
+            "btc",
+        ])
+        .expect("audit pulse-sessions command should parse");
+
+        match cli.command {
+            Command::Audit {
+                command: AuditCommand::PulseSessions { .. },
+            } => {}
+            other => panic!("expected audit pulse-sessions command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_audit_pulse_session_detail_subcommand() {
+        let cli = Cli::try_parse_from([
+            "polyalpha-cli",
+            "audit",
+            "pulse-session-detail",
+            "--env",
+            "prod",
+            "--session-id",
+            "session-1",
+            "--pulse-session-id",
+            "pulse-session-1",
+        ])
+        .expect("audit pulse-session-detail command should parse");
+
+        match cli.command {
+            Command::Audit {
+                command: AuditCommand::PulseSessionDetail { .. },
+            } => {}
+            other => panic!("expected audit pulse-session-detail command, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_paper_pulse_run_command() {
         let cli = Cli::parse_from([
             "polyalpha-cli",
@@ -1159,6 +1229,25 @@ mod tests {
             "default",
             "--assets",
             "btc,eth",
+        ]);
+
+        assert!(matches!(
+            cli.command,
+            Command::Paper {
+                command: PaperCommand::Pulse { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_paper_pulse_inspect_command() {
+        let cli = Cli::parse_from([
+            "polyalpha-cli",
+            "paper",
+            "pulse",
+            "inspect",
+            "--env",
+            "default",
         ]);
 
         assert!(matches!(

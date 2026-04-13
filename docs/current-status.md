@@ -1,6 +1,6 @@
 # PolyAlpha Current Status
 
-更新日期：`2026-04-02`
+更新日期：`2026-04-12`
 
 ## 一句话现状
 
@@ -11,6 +11,28 @@
 - `engine -> planner -> execution -> artifact/audit`
 - `sim / paper / live mock` 共享执行栈
 - `backtest rust-replay` 作为默认历史事实源
+
+## Pulse Arb Runtime 状态
+
+`pulse_arb` 独立 runtime 的 MVP 主线已经接通，并且有基础验收覆盖。
+
+当前范围：
+
+- 资产：`BTC / ETH`
+- anchor：`Deribit options`
+- hedge：`Binance USD-M perp`
+- 模式：`paper / live-mock`
+- 观测：pulse audit summary、warehouse summary row、monitor pulse snapshot
+- operator surface：`paper pulse run`、`live pulse run --executor-mode mock`、`paper pulse inspect`、`audit pulse-sessions`、`audit pulse-session-detail`
+- 运行形态：已接真实 `Deribit / Polymarket / Binance` feed-driven pulse runtime
+- 审计回放：`pulse-session-detail` 可回放 lifecycle timeline；active session 期间的 raw book tape 已保留在 audit events，可继续升级到 queue reconstruction
+
+当前明确非目标：
+
+- 不做真钱 live trading
+- 不做 `SOL / XRP` 实盘接入
+- 不做完整 queue reconstruction
+- 不做全局 volatility surface calibration
 
 ## 已完成并验证
 
@@ -165,6 +187,37 @@ cargo test -p polyalpha-cli -- --nocapture
 
 - `polyalpha-cli`: `148 passed, 0 failed, 4 ignored`
 
+针对 `pulse_arb` MVP，最新补跑：
+
+```bash
+cargo test -p polyalpha-audit -- --nocapture
+cargo test -p polyalpha-pulse -- --nocapture
+cargo test -p polyalpha-cli pulse_session_timeline_collects_lifecycle_and_tape_events -- --nocapture
+cargo build -p polyalpha-cli
+./target/debug/polyalpha-cli paper pulse inspect --env multi-market-active.fresh
+./target/debug/polyalpha-cli audit pulse-sessions --env multi-market-active.fresh --session-id 270da19c-3aba-41b5-9cfa-51a6882b2694 --format json
+./target/debug/polyalpha-cli audit pulse-session-detail --env multi-market-active.fresh --session-id 270da19c-3aba-41b5-9cfa-51a6882b2694 --pulse-session-id pulse-btc-4 --format json
+```
+
+最新结果：
+
+- `polyalpha-audit`: `6 passed, 0 failed`
+- `polyalpha-pulse`: `37 passed, 0 failed`
+- `polyalpha-cli`: pulse timeline targeted regression pass
+- `cargo build -p polyalpha-cli`: success
+- `paper pulse inspect`: `BTC / ETH` 都确认 routing 到 `Deribit` anchor + `Binance USD-M perp`
+- `audit pulse-sessions`: 已确认真实会话 `270da19c-3aba-41b5-9cfa-51a6882b2694` 下 `pulse_session_summaries` 非空
+- `audit pulse-session-detail`: 已确认 `pulse-btc-4` timeline 可回放 `poly_opening -> closed`，并保留 session 级审计字段
+
+这轮 `polyalpha-pulse` 测试里，已经直接覆盖：
+
+- partial fill / zero fill 按 `actual_filled_qty` 缩放
+- pin risk `delta_clamp / protective_only / freeze`
+- `GlobalHedgeAggregator` 多 session 净额仲裁
+- external actual position sync
+- `maker exit`、`pegging`、`rehedging`、`timeout`、`emergency flatten`
+- audit / monitor snapshot 保持
+
 ### live-mock 运行证据
 
 历史长跑样本：
@@ -224,25 +277,53 @@ cargo run -p polyalpha-cli -- live run-multi \
   --executor-mode mock
 ```
 
-对应产物：
+针对 `pulse_arb` 的最新真实验收（`2026-04-12`）：
 
-- artifact: `data/live/multi-market-active.fresh-last-run.json`
-- audit summary: `data/audit/sessions/83015550-f319-4c9d-a8ce-c42f2d28cf19/summary.json`
+```bash
+./target/debug/polyalpha-cli paper pulse run --env multi-market-active.fresh --assets btc,eth
+./target/debug/polyalpha-cli live pulse run --env multi-market-active.fresh --assets btc,eth --executor-mode mock
+```
 
-最新一轮结果：
+最新结果：
 
-- 最终 monitor 连接状态：`Binance=已连接, Polymarket=已连接`
-- `signals_seen = 95`
-- `signals_rejected = 139`
-- `signal_emitted = 95`
-- `gate_decision = 150`
-- `order_submitted / fills = 0 / 0`
+- `paper` 会话 `9c066758-b37e-429c-ab8a-c575740ef073`
+  - `status = completed`
+  - `ticks_processed = 133`
+  - `market_events = 13168`
+  - `signals_seen = 2362`
+  - `evaluation_attempts = 13076`
+  - `trades_closed = 226`
+  - `pulse_session_summaries` 非空
+- `live-mock` 会话 `38ff2765-5075-4883-a9b6-d025227d8896`
+  - `status = completed`
+  - `ticks_processed = 144`
+  - `market_events = 15614`
+  - `signals_seen = 2449`
+  - `evaluation_attempts = 13936`
+  - `trades_closed = 244`
+  - `pulse_session_summaries` 非空
+- `paper` smoke 会话 `270da19c-3aba-41b5-9cfa-51a6882b2694`
+  - `status = completed`
+  - `ticks_processed = 174`
+  - `evaluation_attempts = 17556`
+  - `signals_seen = 2389`
+  - `order_submitted = 0`
+  - `fills = 0`
+  - `pulse_session_summaries` 非空
+  - `audit pulse-session-detail` 已确认示例会话 `pulse-btc-4` 为 `poly_opening -> closed`
 
-补充判断：
+这说明：
 
-- 这轮没有成交，不是因为连接状态仍然坏掉
-- 主要拒绝已经变成 `zero_cex_hedge_qty`、`residual_delta_too_large`、`poly_stale`、`bootstrap_in_progress`
-- `cex_stale` 已压到 `2` 次，且价格带误入场已经能进入 `cooldown_above_or_equal_max_poly_price`
+- `paper / live-mock` 对 `BTC / ETH` 的 pulse runtime 已能稳定起真实行情链路
+- `Deribit` 作为 options anchor、`Binance USD-M perp` 作为 hedge venue 的主装配已经接通
+- session 级审计已经能回放 timeline，并保留 raw tape、`anchor_latency_delta_ms`、`distance_to_mid_bps`、`relative_order_age_ms`
+- 真实短跑里已经能观测到 `PulseSession` 创建并落盘，不再是“只起 runtime 但完全没有 session”
+
+同时也必须明确：
+
+- 这轮真实样本里，大部分 session 仍然是 `zero-fill`，表现为 `poly_opening -> closed`
+- 所以真实短跑当前证明的是“行情链、session 链、audit 链打通”，不是“已经在 live window 里稳定观察到 maker/rehedge/flatten 全生命周期”
+- `maker exit`、`pegging`、`rehedging`、`timeout`、`emergency flatten` 的完整链路，目前主要由 deterministic runtime tests 保证
 - 启动早期仍有少量 `connection_lost`，但最后一次出现在启动后约 4 秒内，已经不再是持续性 blocker
 
 ## 当前 live-ready 阻塞

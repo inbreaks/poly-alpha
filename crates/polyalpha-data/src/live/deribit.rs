@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use reqwest::Client;
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::error::{DataError, Result};
 
@@ -50,6 +51,16 @@ impl DeribitOptionType {
             ))),
         }
     }
+
+    fn from_api(value: &str) -> Result<Self> {
+        match value {
+            "call" => Ok(Self::Call),
+            "put" => Ok(Self::Put),
+            other => Err(DataError::InvalidResponse(format!(
+                "unsupported Deribit option type `{other}`"
+            ))),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -69,6 +80,7 @@ pub struct DeribitTickerMessage {
     pub strike: f64,
     pub option_type: DeribitOptionType,
     pub timestamp_ms: u64,
+    pub received_at_ms: u64,
     pub mark_price: f64,
     pub mark_iv: f64,
     pub best_bid_price: Option<f64>,
@@ -96,6 +108,7 @@ impl DeribitTickerMessage {
             strike: parsed.strike,
             option_type: parsed.option_type,
             timestamp_ms: data.timestamp,
+            received_at_ms: current_time_ms().unwrap_or(data.timestamp),
             mark_price: data.mark_price,
             mark_iv: data.mark_iv,
             best_bid_price: data.best_bid_price,
@@ -234,7 +247,55 @@ impl DeribitOptionsClient {
             .expect("deribit tickers lock poisoned")
             .entry(asset)
             .or_default();
+        if self
+            .instruments
+            .lock()
+            .expect("deribit instruments lock poisoned")
+            .get(&asset)
+            .is_none_or(Vec::is_empty)
+        {
+            let instruments = self.fetch_instruments(asset).await?;
+            self.replace_instruments(asset, instruments);
+        }
         Ok(())
+    }
+
+    pub async fn fetch_instruments(&self, asset: DeribitAsset) -> Result<Vec<DeribitInstrument>> {
+        let endpoint = format!(
+            "{}/public/get_instruments",
+            self.rest_url.trim_end_matches('/')
+        );
+        let payload = self
+            .client
+            .get(endpoint)
+            .query(&[
+                ("currency", asset.as_str()),
+                ("kind", "option"),
+                ("expired", "false"),
+            ])
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        Self::parse_instruments_payload(&payload, asset)
+    }
+
+    pub async fn fetch_index_price(&self, asset: DeribitAsset) -> Result<f64> {
+        let endpoint = format!(
+            "{}/public/get_index_price",
+            self.rest_url.trim_end_matches('/')
+        );
+        let payload = self
+            .client
+            .get(endpoint)
+            .query(&[("index_name", deribit_index_name(asset))])
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        Self::parse_index_price_payload(&payload)
     }
 
     pub fn latest_tickers(&self, asset: DeribitAsset) -> Vec<DeribitTickerMessage> {
@@ -329,6 +390,54 @@ impl DeribitOptionsClient {
         self.discovery_filter
     }
 
+    pub fn ticker_channel(instrument_name: &str) -> String {
+        format!("ticker.{instrument_name}.100ms")
+    }
+
+    pub fn build_subscribe_message(channels: &[String], id: u64) -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "public/subscribe",
+            "params": {
+                "channels": channels
+            }
+        })
+    }
+
+    pub fn parse_instruments_payload(
+        payload: &str,
+        asset: DeribitAsset,
+    ) -> Result<Vec<DeribitInstrument>> {
+        let response: DeribitInstrumentsResponse = serde_json::from_str(payload)?;
+        let mut instruments = response
+            .result
+            .into_iter()
+            .map(|instrument| {
+                Ok(DeribitInstrument {
+                    instrument_name: instrument.instrument_name,
+                    asset,
+                    strike: instrument.strike,
+                    expiry_ts_ms: instrument.expiration_timestamp,
+                    option_type: DeribitOptionType::from_api(&instrument.option_type)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        instruments.sort_by(|left, right| left.instrument_name.cmp(&right.instrument_name));
+        Ok(instruments)
+    }
+
+    pub fn parse_index_price_payload(payload: &str) -> Result<f64> {
+        let response: DeribitIndexPriceResponse = serde_json::from_str(payload)?;
+        if response.result.index_price.is_finite() && response.result.index_price > 0.0 {
+            Ok(response.result.index_price)
+        } else {
+            Err(DataError::InvalidResponse(
+                "invalid Deribit index price".to_owned(),
+            ))
+        }
+    }
+
     pub fn should_refresh_subscriptions(
         &self,
         asset: DeribitAsset,
@@ -415,6 +524,29 @@ struct DeribitGreeksPayload {
     delta: Option<f64>,
     #[serde(default)]
     gamma: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeribitInstrumentsResponse {
+    result: Vec<DeribitInstrumentPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeribitInstrumentPayload {
+    instrument_name: String,
+    expiration_timestamp: u64,
+    strike: f64,
+    option_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeribitIndexPriceResponse {
+    result: DeribitIndexPricePayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeribitIndexPricePayload {
+    index_price: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -520,6 +652,13 @@ fn current_time_ms() -> Result<u64> {
     Ok(now.as_millis() as u64)
 }
 
+fn deribit_index_name(asset: DeribitAsset) -> &'static str {
+    match asset {
+        DeribitAsset::Btc => "btc_usd",
+        DeribitAsset::Eth => "eth_usd",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,5 +723,53 @@ mod tests {
         assert!(filter.allows(&near, 100_000.0, now_ts_ms));
         assert!(!filter.allows(&far_strike, 100_000.0, now_ts_ms));
         assert!(!filter.allows(&far_expiry, 100_000.0, now_ts_ms));
+    }
+
+    #[test]
+    fn parse_deribit_instruments_payload_extracts_option_chain_metadata() {
+        let payload = r#"{
+            "jsonrpc":"2.0",
+            "result":[
+                {
+                    "instrument_name":"BTC-27SEP24-100000-C",
+                    "expiration_timestamp":1727424000000,
+                    "strike":100000,
+                    "option_type":"call"
+                },
+                {
+                    "instrument_name":"BTC-27SEP24-95000-P",
+                    "expiration_timestamp":1727424000000,
+                    "strike":95000,
+                    "option_type":"put"
+                }
+            ]
+        }"#;
+
+        let instruments =
+            DeribitOptionsClient::parse_instruments_payload(payload, DeribitAsset::Btc)
+                .expect("parse Deribit instruments payload");
+
+        assert_eq!(instruments.len(), 2);
+        assert_eq!(instruments[0].instrument_name, "BTC-27SEP24-100000-C");
+        assert_eq!(instruments[0].option_type, DeribitOptionType::Call);
+        assert_eq!(instruments[1].option_type, DeribitOptionType::Put);
+    }
+
+    #[test]
+    fn build_deribit_subscribe_message_uses_ticker_channels() {
+        let payload = DeribitOptionsClient::build_subscribe_message(
+            &[
+                "ticker.BTC-27SEP24-100000-C.100ms".to_owned(),
+                "ticker.BTC-27SEP24-95000-P.100ms".to_owned(),
+            ],
+            7,
+        );
+
+        assert_eq!(payload["method"], "public/subscribe");
+        assert_eq!(payload["id"], 7);
+        assert_eq!(
+            payload["params"]["channels"][0],
+            "ticker.BTC-27SEP24-100000-C.100ms"
+        );
     }
 }

@@ -38,6 +38,26 @@ MVP 只交易：
 - 以 options anchor 为中心，而不是以 realized vol 近似为中心
 - 以完整执行生命周期为中心，而不是只做“入场-回归-离场”的轻量逻辑
 
+## 2026-04-13 信号修正
+
+在第一轮真实 `15m` 审计之后，MVP 的 entry 语义做了一个明确收敛：
+
+- `Deribit fair probability gap` 继续保留，但它只作为定价锚和 sanity check
+- 真正触发开仓的，不再是“谁的 `net_session_edge` 最大”，而是“谁更像一个短时情绪脉冲”
+- `PulseDetector` 必须验证：
+  - Poly 侧 claim 价格在短窗内发生了足够大的有利位移
+  - 同窗 `fair claim` 漂移不能明显跟随
+  - 同窗 `CEX mid` 不能明显跟随
+  - 扣掉摩擦后依然有正的 `net_session_edge`
+- `best_entry_candidate` 的排序主键改成 `pulse_score`，`net_session_edge` 只作为次级排序和经济准入
+- `target_exit_price` 不再按理论 edge 线性外推，而是改成 reachability-first 的 tick ladder：
+  - 弱 setup 默认只要 `+1 tick`
+  - 中等 setup 允许 `+2 tick`
+  - 强 setup 允许 `+3 tick`
+  - 并受最近一次 Poly 脉冲幅度限制
+
+这次修正的目的不是“调参数”，而是把信号从 `value gap` 拉回 `15m pulse reversion` 主线。
+
 ## 已确认范围
 
 ### MVP 范围
@@ -109,7 +129,7 @@ MVP 虽然只做 `BTC/ETH`，但设计上必须明确支持以后扩到：
 - `EventPricer`
   把归一化后的 anchor 数据和 market rule 映射成公允概率与事件 Greeks。
 - `PulseDetector`
-  判断一次 Polymarket 偏离在扣掉完整会话摩擦后是否还值得做。
+  先做 pulse confirmation，再判断一次 Polymarket 偏离在扣掉完整会话摩擦后是否还值得做。
 - `SessionFSM`
   管理一笔交易从创建到收尾的完整生命周期。
 - `GlobalHedgeAggregator`

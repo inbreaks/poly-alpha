@@ -34,6 +34,18 @@ impl DeribitAnchorProvider {
             client: Arc::new(client),
         }
     }
+
+    pub fn with_client(
+        provider_id: impl Into<String>,
+        config: PulseProviderConfig,
+        client: Arc<DeribitOptionsClient>,
+    ) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            config,
+            client,
+        }
+    }
 }
 
 impl AnchorProvider for DeribitAnchorProvider {
@@ -41,7 +53,11 @@ impl AnchorProvider for DeribitAnchorProvider {
         &self.provider_id
     }
 
-    fn snapshot_for(&self, asset: PulseAsset) -> Result<Option<AnchorSnapshot>> {
+    fn snapshot_for_target(
+        &self,
+        asset: PulseAsset,
+        target_event_expiry_ts_ms: Option<u64>,
+    ) -> Result<Option<AnchorSnapshot>> {
         let deribit_asset =
             asset
                 .as_deribit_asset()
@@ -56,7 +72,10 @@ impl AnchorProvider for DeribitAnchorProvider {
         let selected_expiry_ts_ms = tickers
             .iter()
             .map(|ticker| ticker.expiry_ts_ms)
-            .min()
+            .min_by_key(|expiry_ts_ms| match target_event_expiry_ts_ms {
+                Some(target) => expiry_ts_ms.abs_diff(target),
+                None => *expiry_ts_ms,
+            })
             .ok_or_else(|| AnchorError::InvalidSnapshot("missing Deribit expiry".to_owned()))?;
         let surface = tickers
             .into_iter()
@@ -67,6 +86,13 @@ impl AnchorProvider for DeribitAnchorProvider {
             .map(|ticker| ticker.timestamp_ms)
             .max()
             .ok_or_else(|| AnchorError::InvalidSnapshot("missing Deribit timestamp".to_owned()))?;
+        let latest_received_at_ms = surface
+            .iter()
+            .map(|ticker| ticker.received_at_ms)
+            .max()
+            .ok_or_else(|| {
+                AnchorError::InvalidSnapshot("missing Deribit receive timestamp".to_owned())
+            })?;
         let index_price = surface
             .iter()
             .find_map(|ticker| ticker.index_price)
@@ -99,13 +125,15 @@ impl AnchorProvider for DeribitAnchorProvider {
             atm_iv: atm_point.mark_iv,
             local_surface_points: local_surface_points.clone(),
             quality: AnchorQualityMetrics {
-                anchor_age_ms: current_time_ms().saturating_sub(latest_ts_ms),
+                anchor_age_ms: current_time_ms().saturating_sub(latest_received_at_ms),
                 max_quote_spread_bps: max_quote_spread_bps(&surface),
                 has_strike_coverage: !local_surface_points.is_empty(),
                 has_liquidity: local_surface_points
                     .iter()
                     .any(|point| point.best_bid.is_some() && point.best_ask.is_some()),
-                expiry_mismatch_minutes: 0,
+                expiry_mismatch_minutes: target_event_expiry_ts_ms
+                    .map(|target| signed_expiry_mismatch_minutes(selected_expiry_ts_ms, target))
+                    .unwrap_or(0),
                 greeks_complete: local_surface_points
                     .iter()
                     .all(|point| point.delta.is_some() && point.gamma.is_some()),
@@ -165,4 +193,70 @@ fn current_time_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
+}
+
+fn signed_expiry_mismatch_minutes(selected_expiry_ts_ms: u64, target_event_expiry_ts_ms: u64) -> i64 {
+    let diff_ms = selected_expiry_ts_ms as i128 - target_event_expiry_ts_ms as i128;
+    (diff_ms / 60_000) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use polyalpha_core::PulseProviderConfig;
+    use polyalpha_data::{DeribitAsset, DeribitOptionType, DeribitOptionsClient, DeribitTickerMessage, DiscoveryFilter};
+
+    use super::*;
+
+    #[test]
+    fn snapshot_quality_uses_local_receive_time_for_anchor_age() {
+        let now_ms = current_time_ms();
+        let expiry_ts_ms = now_ms + 24 * 60 * 60 * 1_000;
+        let client = Arc::new(DeribitOptionsClient::new(
+            "https://www.deribit.com/api/v2",
+            "wss://www.deribit.com/ws/api/v2",
+            DiscoveryFilter::default(),
+        ));
+        for strike in [100_000_i64, 102_000_i64] {
+            client.ingest_ticker(DeribitTickerMessage {
+                instrument_name: format!("BTC-TEST-{strike}-C"),
+                asset: DeribitAsset::Btc,
+                expiry_ts_ms,
+                strike: strike as f64,
+                option_type: DeribitOptionType::Call,
+                timestamp_ms: now_ms.saturating_sub(1_000),
+                received_at_ms: now_ms,
+                mark_price: 0.12,
+                mark_iv: 55.0,
+                best_bid_price: Some(0.11),
+                best_ask_price: Some(0.13),
+                bid_iv: Some(54.5),
+                ask_iv: Some(55.5),
+                delta: Some(0.5),
+                gamma: Some(0.0002),
+                index_price: Some(100_000.0),
+            });
+        }
+
+        let provider = DeribitAnchorProvider::with_client(
+            "deribit_primary",
+            PulseProviderConfig {
+                kind: "deribit".to_owned(),
+                enabled: true,
+                max_anchor_age_ms: 250,
+                max_anchor_latency_delta_ms: 5_000,
+                soft_mismatch_window_minutes: 360,
+                hard_expiry_mismatch_minutes: 720,
+            },
+            client,
+        );
+
+        let snapshot = provider
+            .snapshot_for_target(PulseAsset::Btc, Some(expiry_ts_ms))
+            .expect("provider snapshot")
+            .expect("anchor snapshot");
+
+        assert!(snapshot.quality.anchor_age_ms < 200);
+    }
 }

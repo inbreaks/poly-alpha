@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+polyalpha-audit = { path = "../polyalpha-audit" }
 polyalpha-core = { path = "../polyalpha-core" }
 polyalpha-data = { path = "../polyalpha-data" }
 rust_decimal.workspace = true
@@ -13,3 +14,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+polyalpha-executor = { path = "../polyalpha-executor" }

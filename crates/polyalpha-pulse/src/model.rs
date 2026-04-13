@@ -104,12 +104,17 @@ pub struct PulseOpportunityInput {
     pub timeout_exit_reserve_bps: f64,
     pub anchor_quality_ok: bool,
     pub data_fresh: bool,
+    pub has_pulse_history: bool,
+    pub claim_price_move_bps: f64,
+    pub fair_claim_move_bps: f64,
+    pub cex_mid_move_bps: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DetectorDecision {
     pub should_trade: bool,
     pub net_session_edge_bps: f64,
+    pub pulse_score_bps: f64,
     pub rejection_code: Option<PulseFailureCode>,
 }
 
@@ -117,7 +122,10 @@ pub struct DetectorDecision {
 pub enum PulseFailureCode {
     NetSessionEdgeBelowThreshold,
     AnchorQualityRejected,
+    AnchorLatencyDeltaRejected,
     DataFreshnessRejected,
+    OpeningRejectCooldownActive,
+    PulseConfirmationRejected,
     HardExpiryGapExceeded,
 }
 
@@ -126,7 +134,10 @@ impl PulseFailureCode {
         match self {
             Self::NetSessionEdgeBelowThreshold => "net_session_edge_below_threshold",
             Self::AnchorQualityRejected => "anchor_quality_rejected",
+            Self::AnchorLatencyDeltaRejected => "anchor_latency_delta_rejected",
             Self::DataFreshnessRejected => "data_freshness_rejected",
+            Self::OpeningRejectCooldownActive => "opening_reject_cooldown_active",
+            Self::PulseConfirmationRejected => "pulse_confirmation_rejected",
             Self::HardExpiryGapExceeded => "hard_expiry_gap_exceeded",
         }
     }

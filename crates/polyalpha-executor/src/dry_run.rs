@@ -99,6 +99,7 @@ struct StoredOrder {
     exchange: Exchange,
     symbol: Symbol,
     venue_symbol: Option<String>,
+    side: OrderSide,
     response: OrderResponse,
 }
 
@@ -746,6 +747,13 @@ impl DryRunExecutor {
         }
     }
 
+    fn order_side(request: &OrderRequest) -> OrderSide {
+        match request {
+            OrderRequest::Poly(req) => req.side,
+            OrderRequest::Cex(req) => req.side,
+        }
+    }
+
     fn initial_price(request: &OrderRequest) -> Option<Price> {
         match request {
             OrderRequest::Poly(req) => req.sizing.boundary_price(),
@@ -806,6 +814,31 @@ impl DryRunExecutor {
     pub fn open_order_count(&self) -> Result<usize> {
         Ok(self.open_order_snapshots()?.len())
     }
+
+    pub fn cex_net_position(&self, exchange: Exchange, venue_symbol: &str) -> Result<Decimal> {
+        let orders = self
+            .orders
+            .lock()
+            .map_err(|_| CoreError::Channel("dry-run order store poisoned".to_owned()))?;
+        let net_position = orders
+            .values()
+            .filter(|stored| {
+                stored.exchange == exchange
+                    && stored.venue_symbol.as_deref() == Some(venue_symbol)
+            })
+            .fold(Decimal::ZERO, |acc, stored| {
+                let filled_qty = match stored.response.filled_quantity {
+                    VenueQuantity::CexBaseQty(qty) => qty.0,
+                    VenueQuantity::PolyShares(_) => Decimal::ZERO,
+                };
+                let signed_qty = match stored.side {
+                    OrderSide::Buy => filled_qty,
+                    OrderSide::Sell => -filled_qty,
+                };
+                acc + signed_qty
+            });
+        Ok(net_position)
+    }
 }
 
 #[async_trait]
@@ -841,6 +874,7 @@ impl OrderExecutor for DryRunExecutor {
                 exchange,
                 symbol,
                 venue_symbol,
+                side: Self::order_side(&request),
                 response: response.clone(),
             },
         );

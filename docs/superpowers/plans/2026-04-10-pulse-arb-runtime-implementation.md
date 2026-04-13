@@ -10,6 +10,57 @@
 
 ---
 
+## Execution Status
+
+更新日期：`2026-04-12`
+
+当前这份实现计划对应的 MVP 代码主线已经落地，剩余未执行项主要是计划里的 `Commit` 步骤，本轮故意保持未提交状态，方便继续走读和补小口径。
+
+`2026-04-13` 的一个重要修正是：entry 主线已经从“静态 value gap 触发”收敛成“pulse-first 触发”。
+
+当前代码语义是：
+
+- `net_session_edge` 仍然存在，但只负责经济准入
+- 新 entry gating 增加了短窗 `claim_price_move / fair_claim_move / cex_mid_move`
+- `PulseDetector` 先验证 pulse confirmation，再看摩擦后的净 edge
+- runtime 不再按 `max net_edge_bps` 选市场，而是按 `max pulse_score`
+- `target_exit_price` 改成了 reachability-first 的 tick ladder，而不是按理论 edge 线性推目标价
+
+所以如果后续继续做 live-ready 或参数实验，应当围绕 `pulse_window / pulse_score / tick ladder` 去调，而不是回到单纯的 `anchor latency / notional / edge threshold` 微调。
+
+已完成的 MVP 范围：
+
+- `Task 1` 到 `Task 6` 的功能目标已经接通：独立 `pulse_arb` crate、`Deribit` anchor、`EventPricer` / `PulseDetector`、`PulseSession`、`GlobalHedgeAggregator`、`paper/live-mock` runtime、audit、monitor、CLI 入口都已存在
+- `Task 7` 的关键验收测试和 operator 文档也已补上：README、`docs/current-status.md`、timeout / hedge netting 等 end-to-end runtime tests 已落地
+- `paper` / `live-mock` 对 `BTC / ETH` 的真实 feed-driven 短跑已经验证能稳定起 runtime，并落出非空 `pulse_session_summaries`
+- `pulse` 的真实 Polymarket WS 现在已经复用本地 book cache、`price_change` 增量更新和单调 sequence 语义，不再停留在 `waiting_anchor / waiting_poly_quote`
+- `actual position sync` 已经接进 runtime reconcile 路径，Aggregator 不再只依赖名义仓位推断
+
+本轮 fresh verification：
+
+```bash
+cargo test -p polyalpha-pulse -- --nocapture
+cargo test -p polyalpha-cli pulse_session_timeline_collects_lifecycle_and_tape_events -- --nocapture
+cargo build -p polyalpha-cli
+./target/debug/polyalpha-cli paper pulse inspect --env multi-market-active.fresh
+./target/debug/polyalpha-cli audit pulse-sessions --env multi-market-active.fresh --session-id 270da19c-3aba-41b5-9cfa-51a6882b2694 --format json
+./target/debug/polyalpha-cli audit pulse-session-detail --env multi-market-active.fresh --session-id 270da19c-3aba-41b5-9cfa-51a6882b2694 --pulse-session-id pulse-btc-4 --format json
+```
+
+本轮确认到的事实：
+
+- `polyalpha-pulse`：`37 passed, 0 failed`
+- runtime tests 已覆盖 `actual_filled_qty` 缩放、pin risk 抑制、timeout exit、maker exit、pegging、rehedging、emergency flatten、多 session netting、actual position sync、executor feedback
+- `paper pulse inspect` 已确认 `BTC / ETH` 都统一走 `Deribit -> Binance USD-M perp`
+- 真实 `audit pulse-sessions` 已确认 `pulse_session_summaries` 非空
+- 真实 `audit pulse-session-detail` 已确认 session timeline 能回放 `poly_opening -> closed`，并保留足够原始字段供后续 queue reconstruction 升级
+
+当前仍需如实注明的边界：
+
+- 真实短跑样本里，已经观察到 `PulseSession` 创建和审计落盘，但这轮窗口里的多数样本仍是 `zero-fill`，会话表现为 `poly_opening -> closed`
+- 所以，“真实 feed runtime 已接通” 和 “完整 maker/rehedge/flatten 生命周期在 deterministic runtime tests 中已覆盖” 这两件事要分开理解，不能混写成已经在 live window 里频繁观察到非零 fill
+- `SOL / XRP`、多 anchor provider、次级 hedge venue 仍然只是结构扩展位，不属于当前 MVP 已交付范围
+
 ## File Structure
 
 - Modify: `Cargo.toml`
@@ -39,13 +90,13 @@
 - Create: `crates/polyalpha-pulse/src/pricing.rs`
   Responsibility: `EventPricer`，实现 fair probability、event delta、`dS` 相对 bump、expiry gap adjustment。
 - Create: `crates/polyalpha-pulse/src/detector.rs`
-  Responsibility: `PulseDetector`，计算 `net_session_edge` 与准入闸门。
+  Responsibility: `PulseDetector`，做 pulse confirmation，并计算 `net_session_edge` 与准入闸门。
 - Create: `crates/polyalpha-pulse/src/session.rs`
   Responsibility: `PulseSession` 聚合对象与生命周期命令。
 - Create: `crates/polyalpha-pulse/src/hedge.rs`
   Responsibility: `GlobalHedgeAggregator` 与 session-level hedge attribution。
 - Create: `crates/polyalpha-pulse/src/runtime.rs`
-  Responsibility: pulse runtime 主循环，串联 Poly/Binance feeds、anchor、detector、FSM、hedge executor。
+  Responsibility: pulse runtime 主循环，串联 Poly/Binance feeds、anchor、signal tape、detector、FSM、hedge executor。
 - Create: `crates/polyalpha-pulse/src/audit.rs`
   Responsibility: `PulseAuditSink`，把 session 级事件映射到共享 audit writer。
 - Create: `crates/polyalpha-pulse/src/monitor.rs`

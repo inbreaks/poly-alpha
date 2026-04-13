@@ -1,3 +1,5 @@
+markets = []
+
 [general]
 log_level = "info"
 data_dir = "./data"
@@ -111,10 +113,27 @@ max_concurrent_sessions_per_asset = 2
 
 [strategy.pulse_arb.session]
 max_holding_secs = 900
-min_opening_notional_usd = 250
+opening_request_notional_usd = 250
+min_opening_notional_usd = 50
+require_nonzero_hedge = true
+min_expected_net_pnl_usd = 0.5
+min_open_fill_ratio = 0.05
+min_open_notional_reject_cooldown_secs = 30
 
 [strategy.pulse_arb.entry]
 min_net_session_edge_bps = 25
+pulse_window_ms = 5000
+min_claim_price_move_bps = 80
+max_fair_claim_move_bps = 35
+max_cex_mid_move_bps = 30
+min_pulse_score_bps = 50
+
+[strategy.pulse_arb.exit]
+base_target_ticks = 1
+medium_target_ticks = 2
+strong_target_ticks = 3
+medium_pulse_score_bps = 150
+strong_pulse_score_bps = 250
 
 [strategy.pulse_arb.rehedge]
 delta_drift_threshold = 0.03
@@ -132,14 +151,16 @@ pin_risk_time_window_secs = 1800
 [strategy.pulse_arb.providers.deribit_primary]
 kind = "deribit"
 enabled = true
-max_anchor_age_ms = 250
+max_anchor_age_ms = 500
+max_anchor_latency_delta_ms = 5000
 soft_mismatch_window_minutes = 360
 hard_expiry_mismatch_minutes = 720
 
 [strategy.pulse_arb.providers.binance_options_primary]
 kind = "binance_options"
 enabled = false
-max_anchor_age_ms = 250
+max_anchor_age_ms = 500
+max_anchor_latency_delta_ms = 5000
 soft_mismatch_window_minutes = 360
 hard_expiry_mismatch_minutes = 720
 

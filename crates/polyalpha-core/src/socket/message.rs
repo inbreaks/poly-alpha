@@ -89,6 +89,8 @@ pub struct MonitorState {
     pub recent_trades: Vec<TradeView>,
     #[serde(default)]
     pub recent_commands: Vec<CommandView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pulse: Option<PulseMonitorView>,
 }
 
 impl Default for MonitorState {
@@ -111,8 +113,78 @@ impl Default for MonitorState {
             recent_events: Vec::new(),
             recent_trades: Vec::new(),
             recent_commands: Vec::new(),
+            pulse: None,
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PulseMonitorView {
+    #[serde(default)]
+    pub active_sessions: Vec<PulseSessionMonitorRow>,
+    #[serde(default)]
+    pub asset_health: Vec<PulseAssetHealthRow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_session: Option<PulseSessionDetailView>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PulseSessionMonitorRow {
+    pub session_id: String,
+    pub asset: String,
+    pub state: String,
+    pub remaining_secs: u64,
+    pub net_edge_bps: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PulseAssetHealthRow {
+    pub asset: String,
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub anchor_age_ms: Option<u64>,
+    #[serde(default)]
+    pub anchor_latency_delta_ms: Option<u64>,
+    #[serde(default)]
+    pub poly_quote_age_ms: Option<u64>,
+    #[serde(default)]
+    pub cex_quote_age_ms: Option<u64>,
+    #[serde(default)]
+    pub open_sessions: usize,
+    #[serde(default)]
+    pub net_target_delta: Option<f64>,
+    #[serde(default)]
+    pub actual_exchange_position: Option<f64>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub disable_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PulseSessionDetailView {
+    pub session_id: String,
+    pub asset: String,
+    pub state: String,
+    pub remaining_secs: u64,
+    pub net_edge_bps: f64,
+    #[serde(default)]
+    pub planned_poly_qty: Option<String>,
+    #[serde(default)]
+    pub actual_poly_filled_qty: Option<String>,
+    #[serde(default)]
+    pub actual_poly_fill_ratio: Option<f64>,
+    #[serde(default)]
+    pub session_target_delta_exposure: Option<String>,
+    #[serde(default)]
+    pub session_allocated_hedge_qty: Option<String>,
+    #[serde(default)]
+    pub anchor_latency_delta_ms: Option<u64>,
+    #[serde(default)]
+    pub distance_to_mid_bps: Option<f64>,
+    #[serde(default)]
+    pub relative_order_age_ms: Option<u64>,
 }
 
 /// 交易模式
@@ -1499,5 +1571,25 @@ mod tests {
             MarketRetentionReason::HasPosition
         );
         assert_eq!(state.markets[0].last_focus_at_ms, Some(100));
+    }
+
+    #[test]
+    fn monitor_state_serializes_optional_pulse_snapshot() {
+        let mut state = MonitorState::default();
+        state.pulse = Some(PulseMonitorView {
+            active_sessions: vec![PulseSessionMonitorRow {
+                session_id: "pulse-session-1".to_owned(),
+                asset: "btc".to_owned(),
+                state: "maker_exit_working".to_owned(),
+                remaining_secs: 540,
+                net_edge_bps: 31.4,
+            }],
+            asset_health: vec![],
+            selected_session: None,
+        });
+
+        let encoded = serde_json::to_string(&state).expect("serialize monitor state");
+        assert!(encoded.contains("\"pulse\""));
+        assert!(encoded.contains("\"active_sessions\""));
     }
 }

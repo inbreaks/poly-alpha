@@ -130,6 +130,7 @@ async fn main() -> Result<()> {
                     let parsed_assets = pulse::parse_pulse_assets(&assets)?;
                     pulse::run_pulse_live_mock(&env, &parsed_assets, executor_mode).await?
                 }
+                PulseCommand::Inspect { env } => pulse::inspect_pulse(&env)?,
             },
         },
         Command::LiveDataCheck {
@@ -343,6 +344,7 @@ async fn main() -> Result<()> {
                     let parsed_assets = pulse::parse_pulse_assets(&assets)?;
                     pulse::run_pulse_paper(&env, &parsed_assets).await?
                 }
+                PulseCommand::Inspect { env } => pulse::inspect_pulse(&env)?,
             },
         },
         Command::Backtest { command } => backtest::run_backtest_command(command).await?,

@@ -1,33 +1,344 @@
-use anyhow::{anyhow, Context, Result};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use polyalpha_core::Settings;
+use anyhow::{anyhow, Context, Result};
+use futures_util::{SinkExt, StreamExt};
+use rust_decimal::Decimal;
+use serde::Serialize;
+use serde_json::Value;
+use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
+use tokio::time::{interval, Instant, MissedTickBehavior};
+use tokio_tungstenite::tungstenite::Message;
+use uuid::Uuid;
+
+use polyalpha_audit::{
+    AuditAnomalyEvent, AuditCheckpoint, AuditCounterSnapshot, AuditEventKind,
+    AuditEventPayload, AuditSessionManifest, AuditSessionSummary, AuditSessionStatus,
+    AuditSeverity, AuditWarehouse, AuditWriter, NewAuditEvent,
+};
+use polyalpha_core::{
+    asset_key_from_cex_symbol, Message as MonitorMessage, MonitorSocketServer, MonitorState,
+    PolyShares, Price, Settings, SymbolRegistry, TradingMode,
+};
+use polyalpha_data::{
+    BinanceFuturesDataSource, DataManager, DeribitOptionsClient, DeribitTickerMessage,
+    PolyBookLevel, PolyBookUpdate, PolymarketLiveDataSource,
+};
+use polyalpha_pulse::anchor::deribit::DeribitAnchorProvider;
+use polyalpha_pulse::audit::PulseAuditRecord;
 use polyalpha_pulse::model::PulseAsset;
-use polyalpha_pulse::runtime::{PulseBookFeedStub, PulseExecutionMode, PulseRuntimeBuilder};
+use polyalpha_pulse::runtime::{
+    ActualPositionSync, PulseBookFeedStub, PulseExecutionMode, PulseRuntimeBuilder,
+};
 
 use crate::args::LiveExecutorMode;
+use crate::paper::{
+    connect_websocket, log_ws_warning, run_ws_future_with_timeout, WsProxySettings,
+};
+use crate::runtime::{
+    apply_orderbook_event, build_data_manager, build_execution_stack, RuntimeExecutionMode,
+};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct PulseInspectRouteView {
+    asset: String,
+    anchor_provider: String,
+    provider_kind: String,
+    hedge_venue: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct PulseInspectView {
+    env: String,
+    runtime_enabled: bool,
+    max_concurrent_sessions_per_asset: usize,
+    max_holding_secs: u64,
+    min_opening_notional_usd: String,
+    supported_modes: Vec<String>,
+    enabled_assets: Vec<String>,
+    routes: Vec<PulseInspectRouteView>,
+}
+
+struct PulseAuditRuntime {
+    data_dir: String,
+    writer: AuditWriter,
+    warehouse: AuditWarehouse,
+    summary: AuditSessionSummary,
+    last_record_index: usize,
+    tick_index: u64,
+    market_events: u64,
+    snapshot_interval_ms: u64,
+    checkpoint_interval_ms: u64,
+    warehouse_sync_interval_ms: u64,
+    last_summary_write_ms: u64,
+    last_checkpoint_ms: u64,
+    last_warehouse_sync_ms: u64,
+    warehouse_sync_degraded: bool,
+}
+
+impl PulseAuditRuntime {
+    fn start(
+        settings: &Settings,
+        env: &str,
+        mode: PulseExecutionMode,
+        now_ms: u64,
+    ) -> Result<Option<Self>> {
+        if !settings.audit.enabled {
+            return Ok(None);
+        }
+
+        let manifest = AuditSessionManifest {
+            version: 1,
+            session_id: Uuid::new_v4().to_string(),
+            env: env.to_owned(),
+            mode: match mode {
+                PulseExecutionMode::Paper => TradingMode::Paper,
+                PulseExecutionMode::LiveMock => TradingMode::Live,
+            },
+            started_at_ms: now_ms,
+            market_count: settings.markets.len(),
+            markets: settings
+                .markets
+                .iter()
+                .map(|market| market.symbol.0.clone())
+                .collect(),
+        };
+        let warehouse = AuditWarehouse::new(&settings.general.data_dir)?;
+        let writer = AuditWriter::create(
+            &settings.general.data_dir,
+            manifest.clone(),
+            settings.audit.raw_segment_max_bytes,
+        )?;
+        let summary = AuditSessionSummary::new_running(&manifest);
+
+        Ok(Some(Self {
+            data_dir: settings.general.data_dir.clone(),
+            writer,
+            warehouse,
+            summary,
+            last_record_index: 0,
+            tick_index: 0,
+            market_events: 0,
+            snapshot_interval_ms: settings.audit.snapshot_interval_secs.max(1) * 1_000,
+            checkpoint_interval_ms: settings.audit.checkpoint_interval_secs.max(1) * 1_000,
+            warehouse_sync_interval_ms: settings.audit.warehouse_sync_interval_secs.max(1) * 1_000,
+            last_summary_write_ms: now_ms,
+            last_checkpoint_ms: now_ms,
+            last_warehouse_sync_ms: now_ms,
+            warehouse_sync_degraded: false,
+        }))
+    }
+
+    fn note_market_event(&mut self) {
+        self.market_events = self.market_events.saturating_add(1);
+    }
+
+    fn sync_runtime_state(
+        &mut self,
+        runtime: &polyalpha_pulse::runtime::PulseRuntime,
+        monitor_state: &MonitorState,
+        now_ms: u64,
+    ) -> Result<()> {
+        self.tick_index = self.tick_index.saturating_add(1);
+        self.append_new_pulse_records(runtime)?;
+        self.refresh_summary(runtime, monitor_state, now_ms);
+
+        let checkpoint_due =
+            now_ms.saturating_sub(self.last_checkpoint_ms) >= self.checkpoint_interval_ms;
+        let summary_due =
+            now_ms.saturating_sub(self.last_summary_write_ms) >= self.snapshot_interval_ms;
+        if checkpoint_due {
+            self.summary.latest_checkpoint_ms = Some(now_ms);
+            self.writer.write_checkpoint(&AuditCheckpoint {
+                session_id: self.summary.session_id.clone(),
+                updated_at_ms: now_ms,
+                tick_index: self.tick_index,
+                counters: self.summary.counters.clone(),
+                monitor_state: monitor_state.clone(),
+            })?;
+            self.writer.write_summary(&self.summary)?;
+            self.last_checkpoint_ms = now_ms;
+            self.last_summary_write_ms = now_ms;
+        } else if summary_due {
+            self.writer.write_summary(&self.summary)?;
+            self.last_summary_write_ms = now_ms;
+        }
+
+        if now_ms.saturating_sub(self.last_warehouse_sync_ms) >= self.warehouse_sync_interval_ms {
+            self.sync_warehouse_best_effort(now_ms)?;
+            self.last_warehouse_sync_ms = now_ms;
+        }
+
+        Ok(())
+    }
+
+    fn finalize(
+        &mut self,
+        runtime: &polyalpha_pulse::runtime::PulseRuntime,
+        monitor_state: &MonitorState,
+        now_ms: u64,
+        status: AuditSessionStatus,
+    ) -> Result<()> {
+        self.append_new_pulse_records(runtime)?;
+        self.refresh_summary(runtime, monitor_state, now_ms);
+        self.summary.status = status;
+        self.summary.updated_at_ms = now_ms;
+        self.summary.ended_at_ms = Some(now_ms);
+        self.summary.latest_checkpoint_ms = Some(now_ms);
+
+        self.writer.write_checkpoint(&AuditCheckpoint {
+            session_id: self.summary.session_id.clone(),
+            updated_at_ms: now_ms,
+            tick_index: self.tick_index,
+            counters: self.summary.counters.clone(),
+            monitor_state: monitor_state.clone(),
+        })?;
+        self.writer.write_summary(&self.summary)?;
+        self.sync_warehouse_best_effort(now_ms)?;
+        self.last_checkpoint_ms = now_ms;
+        self.last_summary_write_ms = now_ms;
+        self.last_warehouse_sync_ms = now_ms;
+        Ok(())
+    }
+
+    fn append_new_pulse_records(
+        &mut self,
+        runtime: &polyalpha_pulse::runtime::PulseRuntime,
+    ) -> Result<()> {
+        for record in runtime.audit_records().iter().skip(self.last_record_index) {
+            self.writer.append_event(pulse_audit_event(record))?;
+        }
+        self.last_record_index = runtime.audit_records().len();
+        Ok(())
+    }
+
+    fn refresh_summary(
+        &mut self,
+        runtime: &polyalpha_pulse::runtime::PulseRuntime,
+        monitor_state: &MonitorState,
+        now_ms: u64,
+    ) {
+        let closed_session_count = runtime
+            .pulse_session_rows()
+            .iter()
+            .filter(|row| row.closed_at_ms.is_some())
+            .count() as u64;
+
+        self.summary.status = AuditSessionStatus::Running;
+        self.summary.updated_at_ms = now_ms;
+        self.summary.latest_tick_index = self.tick_index;
+        self.summary.latest_equity = Some(monitor_state.performance.equity);
+        self.summary.latest_total_pnl_usd = Some(monitor_state.performance.total_pnl_usd);
+        self.summary.latest_today_pnl_usd = Some(monitor_state.performance.today_pnl_usd);
+        self.summary.latest_total_exposure_usd = Some(
+            monitor_state
+                .positions
+                .iter()
+                .map(|position| {
+                    (position.poly_current_price * position.poly_quantity.abs())
+                        + (position.cex_current_price * position.cex_quantity.abs())
+                })
+                .sum(),
+        );
+        let signal_stats = runtime.signal_stats();
+        let evaluation_stats = runtime.evaluation_stats();
+        self.summary.counters = AuditCounterSnapshot {
+            ticks_processed: self.tick_index,
+            market_events: self.market_events,
+            signals_seen: signal_stats.seen,
+            signals_rejected: signal_stats.rejected,
+            evaluation_attempts: evaluation_stats.attempts,
+            state_changes: runtime.audit_records().len() as u64,
+            trades_closed: closed_session_count,
+            ..AuditCounterSnapshot::default()
+        };
+        self.summary.rejection_reasons = signal_stats.rejection_reasons.clone();
+        self.summary.pulse_session_summaries = runtime.pulse_session_rows();
+    }
+
+    fn sync_warehouse(&self) -> Result<()> {
+        self.warehouse
+            .sync_session(&self.data_dir, &self.summary.session_id)
+            .with_context(|| format!("同步审计会话 `{}` 到仓库失败", self.summary.session_id))
+    }
+
+    fn sync_warehouse_best_effort(&mut self, now_ms: u64) -> Result<()> {
+        match self.sync_warehouse() {
+            Ok(()) => {
+                self.warehouse_sync_degraded = false;
+                Ok(())
+            }
+            Err(err) => {
+                let message = format!("审计仓库同步失败，已保留原始审计文件：{err}");
+                if !self.warehouse_sync_degraded {
+                    self.writer.append_event(NewAuditEvent {
+                        timestamp_ms: now_ms,
+                        kind: AuditEventKind::Anomaly,
+                        symbol: None,
+                        signal_id: None,
+                        correlation_id: None,
+                        gate: None,
+                        result: None,
+                        reason: Some("warehouse_sync_degraded".to_owned()),
+                        summary: message.clone(),
+                        payload: AuditEventPayload::Anomaly(AuditAnomalyEvent {
+                            severity: AuditSeverity::Warning,
+                            code: "warehouse_sync_degraded".to_owned(),
+                            message: message.clone(),
+                            symbol: None,
+                            signal_id: None,
+                            correlation_id: None,
+                        }),
+                    })?;
+                }
+                eprintln!("{message}");
+                self.warehouse_sync_degraded = true;
+                Ok(())
+            }
+        }
+    }
+}
+
+fn pulse_audit_event(record: &PulseAuditRecord) -> NewAuditEvent {
+    let summary = match &record.payload {
+        polyalpha_audit::AuditEventPayload::PulseLifecycle(event) => {
+            format!("pulse {} {}", event.asset, event.state)
+        }
+        polyalpha_audit::AuditEventPayload::PulseBookTape(event) => format!(
+            "pulse tape {} {}",
+            event.asset, event.book.instrument
+        ),
+        polyalpha_audit::AuditEventPayload::PulseSessionSummary(event) => format!(
+            "pulse summary {} {}",
+            event.asset, event.state
+        ),
+        polyalpha_audit::AuditEventPayload::PulseAssetHealth(event) => format!(
+            "pulse health {} {}",
+            event.asset,
+            event.status.as_deref().unwrap_or("unknown")
+        ),
+        _ => "pulse".to_owned(),
+    };
+
+    NewAuditEvent {
+        timestamp_ms: record.timestamp_ms,
+        kind: record.kind,
+        symbol: None,
+        signal_id: None,
+        correlation_id: None,
+        gate: None,
+        result: None,
+        reason: None,
+        summary,
+        payload: record.payload.clone(),
+    }
+}
 
 pub async fn run_pulse_paper(env: &str, assets: &[PulseAsset]) -> Result<()> {
-    let settings = filtered_pulse_settings(env, assets)?;
-    let asset_feeds = assets
-        .iter()
-        .copied()
-        .map(|asset| PulseBookFeedStub { asset, depth: 20 })
-        .collect::<Vec<_>>();
-
-    let runtime = PulseRuntimeBuilder::new(settings)
-        .with_poly_books(asset_feeds.clone())
-        .with_binance_books(asset_feeds)
-        .with_execution_mode(PulseExecutionMode::Paper)
-        .build()
-        .await
-        .context("build pulse paper runtime")?;
-
-    println!(
-        "pulse paper runtime bootstrap complete: assets={:?}, aggregator={}",
-        runtime.enabled_assets(),
-        runtime.uses_global_hedge_aggregator()
-    );
-    Ok(())
+    run_pulse(env, assets, PulseExecutionMode::Paper, None).await
 }
 
 pub async fn run_pulse_live_mock(
@@ -41,26 +352,37 @@ pub async fn run_pulse_live_mock(
         ));
     }
 
-    let settings = filtered_pulse_settings(env, assets)?;
-    let asset_feeds = assets
-        .iter()
-        .copied()
-        .map(|asset| PulseBookFeedStub { asset, depth: 20 })
-        .collect::<Vec<_>>();
+    run_pulse(env, assets, PulseExecutionMode::LiveMock, Some(executor_mode)).await
+}
 
-    let runtime = PulseRuntimeBuilder::new(settings)
-        .with_poly_books(asset_feeds.clone())
-        .with_binance_books(asset_feeds)
-        .with_execution_mode(PulseExecutionMode::LiveMock)
-        .build()
-        .await
-        .context("build pulse live-mock runtime")?;
+pub fn inspect_pulse(env: &str) -> Result<()> {
+    let settings =
+        Settings::load(env).with_context(|| format!("failed to load config env `{env}`"))?;
+    let inspect = build_pulse_inspect_view(env, &settings);
 
+    println!("pulse runtime inspect");
+    println!("env: {}", inspect.env);
+    println!("runtime_enabled: {}", inspect.runtime_enabled);
     println!(
-        "pulse live-mock runtime bootstrap complete: assets={:?}, aggregator={}",
-        runtime.enabled_assets(),
-        runtime.uses_global_hedge_aggregator()
+        "session_limits: max_concurrent_per_asset={}, max_holding_secs={}, min_opening_notional_usd={}",
+        inspect.max_concurrent_sessions_per_asset,
+        inspect.max_holding_secs,
+        inspect.min_opening_notional_usd
     );
+    println!("supported_modes: {}", inspect.supported_modes.join(","));
+    println!("enabled_assets: {}", inspect.enabled_assets.join(","));
+
+    if inspect.routes.is_empty() {
+        println!("routes: none");
+    } else {
+        for route in inspect.routes {
+            println!(
+                "route: asset={} anchor_provider={} provider_kind={} hedge_venue={}",
+                route.asset, route.anchor_provider, route.provider_kind, route.hedge_venue
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -82,10 +404,241 @@ pub fn parse_pulse_assets(raw: &str) -> Result<Vec<PulseAsset>> {
     Ok(assets)
 }
 
-fn filtered_pulse_settings(env: &str, assets: &[PulseAsset]) -> Result<Settings> {
-    let mut settings =
-        Settings::load(env).with_context(|| format!("failed to load config env `{env}`"))?;
+async fn run_pulse(
+    env: &str,
+    assets: &[PulseAsset],
+    mode: PulseExecutionMode,
+    _executor_mode: Option<LiveExecutorMode>,
+) -> Result<()> {
+    let settings = filtered_pulse_settings(env, assets)?;
+    if settings.markets.is_empty() {
+        return Err(anyhow!(
+            "pulse runtime env `{env}` has no eligible BTC/ETH markets after filtering"
+        ));
+    }
 
+    let registry = SymbolRegistry::new(settings.markets.clone());
+    let (market_data_tx, _) = broadcast::channel(4_096);
+    let mut market_data_rx = market_data_tx.subscribe();
+    let manager = build_data_manager(&registry, market_data_tx);
+    let executor_start_ms = current_time_ms();
+    let runtime_mode = match mode {
+        PulseExecutionMode::Paper => RuntimeExecutionMode::Paper,
+        PulseExecutionMode::LiveMock => RuntimeExecutionMode::LiveMock,
+    };
+    let asset_feeds = assets
+        .iter()
+        .copied()
+        .map(|asset| PulseBookFeedStub { asset, depth: 20 })
+        .collect::<Vec<_>>();
+    let (orderbook_provider, executor, _execution_manager) = build_execution_stack(
+        &settings,
+        &registry,
+        runtime_mode,
+        executor_start_ms,
+        None,
+    )
+    .await
+    .context("build pulse execution stack")?;
+
+    let deribit_provider = build_deribit_anchor_provider(&settings, assets)
+        .await
+        .context("build Deribit anchor provider")?;
+    let position_sync = build_pulse_position_sync(executor.clone());
+    let runtime_executor: Arc<dyn polyalpha_core::OrderExecutor> = Arc::new(executor.clone());
+    let mut runtime = PulseRuntimeBuilder::new(settings.clone())
+        .with_anchor_provider(deribit_provider.provider.clone())
+        .with_markets(settings.markets.clone())
+        .with_executor(runtime_executor)
+        .with_position_sync(position_sync)
+        .with_poly_books(asset_feeds.clone())
+        .with_binance_books(asset_feeds)
+        .with_execution_mode(mode)
+        .build()
+        .await
+        .context("build pulse runtime")?;
+
+    let (state_broadcaster, _socket_handle) = spawn_pulse_monitor_server(&settings);
+    let _data_tasks =
+        spawn_pulse_market_data_tasks(manager, &settings, &settings.markets, 20, deribit_provider)
+            .await
+            .context("spawn pulse market data tasks")?;
+    let mut audit_runtime = PulseAuditRuntime::start(&settings, env, mode, executor_start_ms)
+        .context("start pulse audit runtime")?;
+
+    println!(
+        "pulse {:?} runtime running: assets={:?}, markets={}, socket={}",
+        mode,
+        assets,
+        settings.markets.len(),
+        settings.general.monitor_socket_path
+    );
+
+    let started_at = Instant::now();
+    let mut tick = interval(Duration::from_millis(250));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut last_monitor_state = MonitorState::default();
+    last_monitor_state.timestamp_ms = executor_start_ms;
+    last_monitor_state.mode = match mode {
+        PulseExecutionMode::Paper => TradingMode::Paper,
+        PulseExecutionMode::LiveMock => TradingMode::Live,
+    };
+
+    let runtime_result: Result<()> = loop {
+        tokio::select! {
+            recv = market_data_rx.recv() => {
+                match recv {
+                    Ok(event) => {
+                        if let Some(audit) = audit_runtime.as_mut() {
+                            audit.note_market_event();
+                        }
+                        apply_orderbook_event(&orderbook_provider, &registry, &event);
+                        runtime.observe_market_event(event);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => {
+                        break Err(anyhow!("pulse market data channel closed"));
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                break Ok(());
+            }
+            _ = tick.tick() => {
+                let now_ms = current_time_ms();
+                if let Err(err) = runtime.run_tick(now_ms).await {
+                    break Err(anyhow!("pulse runtime tick failed: {err}"));
+                }
+                if let Some(view) = runtime.last_monitor_view().cloned() {
+                    let mut state = MonitorState::default();
+                    state.timestamp_ms = now_ms;
+                    state.uptime_secs = started_at.elapsed().as_secs();
+                    state.mode = match mode {
+                        PulseExecutionMode::Paper => TradingMode::Paper,
+                        PulseExecutionMode::LiveMock => TradingMode::Live,
+                    };
+                    state.signals = runtime.signal_stats();
+                    state.evaluation = runtime.evaluation_stats();
+                    state.pulse = Some(view);
+                    if let Some(audit) = audit_runtime.as_mut() {
+                        if let Err(err) = audit.sync_runtime_state(&runtime, &state, now_ms) {
+                            break Err(err.context("sync pulse audit runtime"));
+                        }
+                    }
+                    last_monitor_state = state.clone();
+                    let _ = state_broadcaster.send(state);
+                }
+            }
+        }
+    };
+
+    last_monitor_state.timestamp_ms = current_time_ms();
+    last_monitor_state.uptime_secs = started_at.elapsed().as_secs();
+    last_monitor_state.mode = match mode {
+        PulseExecutionMode::Paper => TradingMode::Paper,
+        PulseExecutionMode::LiveMock => TradingMode::Live,
+    };
+    last_monitor_state.signals = runtime.signal_stats();
+    last_monitor_state.evaluation = runtime.evaluation_stats();
+    if let Some(view) = runtime.last_monitor_view().cloned() {
+        last_monitor_state.pulse = Some(view);
+    }
+    if let Some(audit) = audit_runtime.as_mut() {
+        audit
+            .finalize(
+                &runtime,
+                &last_monitor_state,
+                last_monitor_state.timestamp_ms,
+                if runtime_result.is_ok() {
+                    AuditSessionStatus::Completed
+                } else {
+                    AuditSessionStatus::Failed
+                },
+            )
+            .context("finalize pulse audit runtime")?;
+    }
+
+    runtime_result
+}
+
+fn build_pulse_position_sync(
+    executor: crate::runtime::RuntimeExecutor,
+) -> Arc<ActualPositionSync> {
+    Arc::new(move |asset, market| {
+        executor
+            .cex_net_position(market.hedge_exchange, &market.cex_symbol)
+            .map(Some)
+            .map_err(|err| {
+                format!(
+                    "sync pulse actual hedge position failed for asset={} symbol={} venue={:?}: {err}",
+                    asset.as_str(),
+                    market.cex_symbol,
+                    market.hedge_exchange
+                )
+            })
+    })
+}
+
+fn filtered_pulse_settings(env: &str, assets: &[PulseAsset]) -> Result<Settings> {
+    let settings =
+        Settings::load(env).with_context(|| format!("failed to load config env `{env}`"))?;
+    Ok(apply_pulse_asset_filter(settings, assets))
+}
+
+fn build_pulse_inspect_view(env: &str, settings: &Settings) -> PulseInspectView {
+    let mut routes = settings
+        .strategy
+        .pulse_arb
+        .routing
+        .iter()
+        .filter(|(_, route)| route.enabled)
+        .map(|(asset, route)| {
+            let provider_kind = settings
+                .strategy
+                .pulse_arb
+                .providers
+                .get(&route.anchor_provider)
+                .map(|provider| provider.kind.clone())
+                .unwrap_or_else(|| "unknown".to_owned());
+            PulseInspectRouteView {
+                asset: asset.to_owned(),
+                anchor_provider: route.anchor_provider.clone(),
+                provider_kind,
+                hedge_venue: route.hedge_venue.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    routes.sort_by(|left, right| left.asset.cmp(&right.asset));
+
+    let enabled_assets = routes
+        .iter()
+        .map(|route| route.asset.clone())
+        .collect::<Vec<_>>();
+
+    PulseInspectView {
+        env: env.to_owned(),
+        runtime_enabled: settings.strategy.pulse_arb.runtime.enabled,
+        max_concurrent_sessions_per_asset: settings
+            .strategy
+            .pulse_arb
+            .runtime
+            .max_concurrent_sessions_per_asset,
+        max_holding_secs: settings.strategy.pulse_arb.session.max_holding_secs,
+        min_opening_notional_usd: settings
+            .strategy
+            .pulse_arb
+            .session
+            .min_opening_notional_usd
+            .0
+            .normalize()
+            .to_string(),
+        supported_modes: vec!["paper".to_owned(), "live-mock".to_owned()],
+        enabled_assets,
+        routes,
+    }
+}
+
+fn apply_pulse_asset_filter(mut settings: Settings, assets: &[PulseAsset]) -> Settings {
     for (asset_key, route) in settings.strategy.pulse_arb.routing.iter_mut() {
         let enabled_for_selection = PulseAsset::from_routing_key(asset_key)
             .map(|asset| assets.contains(&asset))
@@ -93,5 +646,988 @@ fn filtered_pulse_settings(env: &str, assets: &[PulseAsset]) -> Result<Settings>
         route.enabled = route.enabled && enabled_for_selection;
     }
 
-    Ok(settings)
+    settings.markets.retain(|market| {
+        PulseAsset::from_routing_key(&asset_key_from_cex_symbol(&market.cex_symbol))
+            .is_some_and(|asset| assets.contains(&asset))
+    });
+    settings
+}
+
+struct DeribitRuntimeProvider {
+    provider: Arc<DeribitAnchorProvider>,
+    client: Arc<DeribitOptionsClient>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LocalPulsePolyBook {
+    bids: BTreeMap<Decimal, Decimal>,
+    asks: BTreeMap<Decimal, Decimal>,
+    last_trade_price: Option<Price>,
+    sequence: u64,
+}
+
+impl LocalPulsePolyBook {
+    fn from_update_with_previous(update: &PolyBookUpdate, previous_sequence: u64) -> Self {
+        let mut book = Self::default();
+        for level in &update.bids {
+            book.bids.insert(level.price.0, level.shares.0);
+        }
+        for level in &update.asks {
+            book.asks.insert(level.price.0, level.shares.0);
+        }
+        book.last_trade_price = update.last_trade_price;
+        book.sequence = normalized_pulse_ws_poly_sequence(previous_sequence, update.sequence);
+        book
+    }
+
+    fn apply_level(&mut self, side: PulsePolymarketBookSide, price: Decimal, size: Decimal) {
+        let levels = match side {
+            PulsePolymarketBookSide::Bid => &mut self.bids,
+            PulsePolymarketBookSide::Ask => &mut self.asks,
+        };
+        if size <= Decimal::ZERO {
+            levels.remove(&price);
+        } else {
+            levels.insert(price, size);
+        }
+    }
+
+    fn next_sequence(&self) -> u64 {
+        normalized_pulse_ws_poly_sequence(self.sequence, 0)
+    }
+
+    fn to_update(
+        &self,
+        asset_id: &str,
+        exchange_timestamp_ms: u64,
+        sequence: u64,
+    ) -> PolyBookUpdate {
+        PolyBookUpdate {
+            asset_id: asset_id.to_owned(),
+            bids: self
+                .bids
+                .iter()
+                .rev()
+                .map(|(price, size)| PolyBookLevel {
+                    price: Price(*price),
+                    shares: PolyShares(*size),
+                })
+                .collect(),
+            asks: self
+                .asks
+                .iter()
+                .map(|(price, size)| PolyBookLevel {
+                    price: Price(*price),
+                    shares: PolyShares(*size),
+                })
+                .collect(),
+            exchange_timestamp_ms,
+            received_at_ms: current_time_ms(),
+            sequence,
+            last_trade_price: self.last_trade_price,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PulsePolymarketBookSide {
+    Bid,
+    Ask,
+}
+
+#[derive(Clone, Debug)]
+struct PulsePolymarketPriceChange {
+    asset_id: String,
+    price: Decimal,
+    size: Decimal,
+    side: PulsePolymarketBookSide,
+    timestamp_ms: u64,
+}
+
+fn normalized_pulse_ws_poly_sequence(previous_sequence: u64, incoming_sequence: u64) -> u64 {
+    incoming_sequence
+        .max(previous_sequence.saturating_add(1))
+        .max(1)
+}
+
+async fn handle_pulse_polymarket_ws_text(
+    manager: &DataManager,
+    books: &Arc<Mutex<HashMap<String, LocalPulsePolyBook>>>,
+    payload: &str,
+) -> Result<()> {
+    let value: Value = serde_json::from_str(payload)?;
+    let messages = match value {
+        Value::Array(items) => items,
+        other => vec![other],
+    };
+
+    for message in messages {
+        if message
+            .get("event_type")
+            .or_else(|| message.get("type"))
+            .and_then(Value::as_str)
+            .map(|kind| kind.eq_ignore_ascii_case("price_change"))
+            .unwrap_or(false)
+        {
+            let changes = parse_pulse_polymarket_price_changes(&message)?;
+            if !changes.is_empty() {
+                let _ = apply_pulse_polymarket_price_changes(manager, books, &changes)?;
+            }
+            continue;
+        }
+
+        if let Some(last_trade_price) = pulse_parse_decimal_value(
+            message
+                .get("last_trade_price")
+                .or_else(|| message.get("price")),
+        ) {
+            if let Some(asset_id) = message
+                .get("asset_id")
+                .or_else(|| message.get("market"))
+                .and_then(Value::as_str)
+            {
+                if let Ok(mut guard) = books.lock() {
+                    let book = guard.entry(asset_id.to_owned()).or_default();
+                    book.last_trade_price = Some(Price(last_trade_price));
+                }
+            }
+        }
+
+        if message.get("book").is_some()
+            || message.get("bids").is_some()
+            || message.get("asks").is_some()
+        {
+            let mut update =
+                PolymarketLiveDataSource::parse_ws_orderbook_payload(&message.to_string(), "")?;
+            if let Ok(mut guard) = books.lock() {
+                let previous_sequence = guard
+                    .get(&update.asset_id)
+                    .map(|book| book.sequence)
+                    .unwrap_or(0);
+                let book = LocalPulsePolyBook::from_update_with_previous(&update, previous_sequence);
+                update.sequence = book.sequence;
+                guard.insert(update.asset_id.clone(), book);
+            }
+            let _ = manager.normalize_and_publish_poly_orderbook(update)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_pulse_polymarket_price_changes(
+    manager: &DataManager,
+    books: &Arc<Mutex<HashMap<String, LocalPulsePolyBook>>>,
+    changes: &[PulsePolymarketPriceChange],
+) -> Result<usize> {
+    let mut grouped: HashMap<String, (u64, LocalPulsePolyBook)> = HashMap::new();
+    let mut guard = books
+        .lock()
+        .map_err(|_| anyhow!("pulse Polymarket 订单簿缓存锁异常"))?;
+
+    for change in changes {
+        let entry = grouped.entry(change.asset_id.clone()).or_insert_with(|| {
+            let book = guard.get(&change.asset_id).cloned().unwrap_or_default();
+            (change.timestamp_ms, book)
+        });
+        entry.0 = entry.0.max(change.timestamp_ms);
+        entry.1.apply_level(change.side, change.price, change.size);
+    }
+
+    let emitted_updates = grouped.len();
+    for (asset_id, (timestamp_ms, mut book)) in grouped {
+        let sequence = book.next_sequence();
+        book.sequence = sequence;
+        guard.insert(asset_id.clone(), book.clone());
+        let update = book.to_update(&asset_id, timestamp_ms, sequence);
+        let _ = manager.normalize_and_publish_poly_orderbook(update)?;
+    }
+
+    Ok(emitted_updates)
+}
+
+fn parse_pulse_polymarket_price_changes(message: &Value) -> Result<Vec<PulsePolymarketPriceChange>> {
+    let changes = message
+        .get("changes")
+        .or_else(|| message.get("price_changes"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let default_asset_id = message
+        .get("asset_id")
+        .or_else(|| message.get("market"))
+        .and_then(Value::as_str)
+        .map(|value| value.to_owned());
+    let default_timestamp_ms = pulse_parse_timestamp_value(
+        message
+            .get("timestamp")
+            .or_else(|| message.get("ts"))
+            .or_else(|| message.get("created_at")),
+    )
+    .unwrap_or_else(current_time_ms);
+
+    changes
+        .into_iter()
+        .map(|change| {
+            let asset_id = change
+                .get("asset_id")
+                .or_else(|| change.get("market"))
+                .and_then(Value::as_str)
+                .map(|value| value.to_owned())
+                .or_else(|| default_asset_id.clone())
+                .ok_or_else(|| anyhow!("pulse Polymarket price_change 缺少 asset_id"))?;
+            let price = pulse_parse_decimal_value(
+                change
+                    .get("price")
+                    .or_else(|| change.get("px"))
+                    .or_else(|| change.get("p")),
+            )
+            .ok_or_else(|| anyhow!("pulse Polymarket price_change 缺少 price"))?;
+            let size = pulse_parse_decimal_value(
+                change
+                    .get("size")
+                    .or_else(|| change.get("qty"))
+                    .or_else(|| change.get("quantity"))
+                    .or_else(|| change.get("s")),
+            )
+            .ok_or_else(|| anyhow!("pulse Polymarket price_change 缺少 size"))?;
+            let side = parse_pulse_polymarket_side(
+                change
+                    .get("side")
+                    .or_else(|| change.get("book_side"))
+                    .and_then(Value::as_str),
+            )
+            .ok_or_else(|| anyhow!("pulse Polymarket price_change 缺少 side"))?;
+            let timestamp_ms = pulse_parse_timestamp_value(
+                change
+                    .get("timestamp")
+                    .or_else(|| change.get("ts"))
+                    .or_else(|| change.get("created_at")),
+            )
+            .unwrap_or(default_timestamp_ms);
+
+            Ok(PulsePolymarketPriceChange {
+                asset_id,
+                price,
+                size,
+                side,
+                timestamp_ms,
+            })
+        })
+        .collect()
+}
+
+fn parse_pulse_polymarket_side(value: Option<&str>) -> Option<PulsePolymarketBookSide> {
+    match value?.to_ascii_uppercase().as_str() {
+        "BUY" | "BID" => Some(PulsePolymarketBookSide::Bid),
+        "SELL" | "ASK" => Some(PulsePolymarketBookSide::Ask),
+        _ => None,
+    }
+}
+
+fn pulse_parse_decimal_value(value: Option<&Value>) -> Option<Decimal> {
+    match value? {
+        Value::String(raw) => Decimal::from_str(raw).ok(),
+        Value::Number(number) => Decimal::from_str(&number.to_string()).ok(),
+        _ => None,
+    }
+}
+
+fn pulse_parse_timestamp_value(value: Option<&Value>) -> Option<u64> {
+    match value {
+        Some(Value::Number(number)) => number.as_u64(),
+        Some(Value::String(raw)) => raw.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+async fn build_deribit_anchor_provider(
+    settings: &Settings,
+    assets: &[PulseAsset],
+) -> Result<DeribitRuntimeProvider> {
+    let mut client = DeribitOptionsClient::new(
+        settings.deribit.rest_url.clone(),
+        settings.deribit.ws_url.clone(),
+        Default::default(),
+    );
+    client.connect().await.context("connect Deribit client")?;
+    for asset in assets {
+        let Some(deribit_asset) = asset.as_deribit_asset() else {
+            continue;
+        };
+        client
+            .prime_asset(deribit_asset)
+            .await
+            .with_context(|| format!("prime Deribit asset `{}`", asset.as_str()))?;
+    }
+    let client = Arc::new(client);
+    let provider_config = settings
+        .strategy
+        .pulse_arb
+        .providers
+        .get("deribit_primary")
+        .cloned()
+        .ok_or_else(|| anyhow!("missing pulse provider `deribit_primary`"))?;
+    let provider = Arc::new(DeribitAnchorProvider::with_client(
+        "deribit_primary",
+        provider_config,
+        client.clone(),
+    ));
+    Ok(DeribitRuntimeProvider { provider, client })
+}
+
+fn spawn_pulse_monitor_server(settings: &Settings) -> (broadcast::Sender<MonitorState>, JoinHandle<()>) {
+    let current_state = Arc::new(std::sync::RwLock::new(None));
+    let socket_server = MonitorSocketServer::new_with_current_state(
+        settings.general.monitor_socket_path.clone(),
+        current_state,
+    );
+    let state_broadcaster = socket_server.state_broadcaster();
+    let handle = tokio::spawn(async move {
+        let handler = Box::new(|_command_id, _kind| {
+            Err::<MonitorMessage, String>("pulse runtime does not accept monitor commands".to_owned())
+        });
+        let _ = socket_server.run(handler).await;
+    });
+    (state_broadcaster, handle)
+}
+
+async fn spawn_pulse_market_data_tasks(
+    manager: DataManager,
+    settings: &Settings,
+    markets: &[polyalpha_core::MarketConfig],
+    depth: u16,
+    deribit: DeribitRuntimeProvider,
+) -> Result<Vec<JoinHandle<()>>> {
+    let mut tasks = Vec::new();
+    let proxy_settings = WsProxySettings::detect();
+    tasks.push(spawn_polymarket_ws_task(
+        manager.clone(),
+        settings.polymarket.ws_url.clone(),
+        markets,
+        proxy_settings.clone(),
+    ));
+    tasks.push(spawn_binance_ws_task(
+        manager.clone(),
+        settings.binance.ws_url.clone(),
+        markets,
+        depth,
+        proxy_settings.clone(),
+    ));
+    tasks.push(spawn_deribit_ws_task(
+        deribit.client,
+        settings.deribit.ws_url.clone(),
+        markets,
+        proxy_settings,
+    ));
+    Ok(tasks)
+}
+
+fn spawn_polymarket_ws_task(
+    manager: DataManager,
+    ws_url: String,
+    markets: &[polyalpha_core::MarketConfig],
+    proxy_settings: WsProxySettings,
+) -> JoinHandle<()> {
+    let asset_ids = markets
+        .iter()
+        .flat_map(|market| {
+            [
+                market.poly_ids.yes_token_id.clone(),
+                market.poly_ids.no_token_id.clone(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    tokio::spawn(async move {
+        if asset_ids.is_empty() {
+            return;
+        }
+        let books: Arc<Mutex<HashMap<String, LocalPulsePolyBook>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let proxy = match proxy_settings.resolve_for_url(&ws_url) {
+            Ok(proxy) => proxy,
+            Err(err) => {
+                log_ws_warning(format!("pulse polymarket ws proxy resolution failed: {err}"));
+                return;
+            }
+        };
+        loop {
+            match run_ws_future_with_timeout(
+                connect_websocket(&ws_url, proxy.as_ref()),
+                Duration::from_secs(10),
+                "pulse polymarket ws connect".to_owned(),
+            )
+            .await
+            {
+                Ok((stream, _)) => {
+                    let (mut writer, mut reader) = stream.split();
+                    let subscribe =
+                        PolymarketLiveDataSource::build_orderbook_subscribe_message(&asset_ids);
+                    if writer
+                        .send(Message::Text(subscribe.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    let mut heartbeat = interval(Duration::from_secs(10));
+                    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+                    loop {
+                        tokio::select! {
+                            _ = heartbeat.tick() => {
+                                if writer.send(Message::Text("PING".to_owned().into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            message = reader.next() => {
+                                match message {
+                                    Some(Ok(Message::Text(text))) => {
+                                        if text == "PONG" {
+                                            continue;
+                                        }
+                                        if let Err(err) =
+                                            handle_pulse_polymarket_ws_text(&manager, &books, &text).await
+                                        {
+                                            log_ws_warning(format!(
+                                                "pulse polymarket ws payload ignored: {err}"
+                                            ));
+                                        }
+                                    }
+                                    Some(Ok(Message::Ping(payload))) => {
+                                        if writer.send(Message::Pong(payload)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Some(Ok(Message::Close(frame))) => {
+                                        log_ws_warning(format!("pulse polymarket ws closed: {:?}", frame));
+                                        break;
+                                    }
+                                    None => break,
+                                    Some(Err(err)) => {
+                                        log_ws_warning(format!("pulse polymarket ws read error: {err}"));
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    log_ws_warning(format!("pulse polymarket ws connect failed: {err}"));
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    })
+}
+
+fn spawn_binance_ws_task(
+    manager: DataManager,
+    ws_url: String,
+    markets: &[polyalpha_core::MarketConfig],
+    depth: u16,
+    proxy_settings: WsProxySettings,
+) -> JoinHandle<()> {
+    let mut seen = HashSet::new();
+    let venue_symbols = markets
+        .iter()
+        .map(|market| market.cex_symbol.clone())
+        .filter(|symbol| seen.insert(symbol.clone()))
+        .collect::<Vec<_>>();
+    tokio::spawn(async move {
+        if venue_symbols.is_empty() {
+            return;
+        }
+        let stream_path =
+            BinanceFuturesDataSource::build_combined_partial_depth_stream_path(&venue_symbols, depth);
+        let endpoint = format!("{}{}", ws_url.trim_end_matches('/'), stream_path);
+        let proxy = match proxy_settings.resolve_for_url(&endpoint) {
+            Ok(proxy) => proxy,
+            Err(err) => {
+                log_ws_warning(format!("pulse binance ws proxy resolution failed: {err}"));
+                return;
+            }
+        };
+        loop {
+            match run_ws_future_with_timeout(
+                connect_websocket(&endpoint, proxy.as_ref()),
+                Duration::from_secs(10),
+                "pulse binance ws connect".to_owned(),
+            )
+            .await
+            {
+                Ok((stream, _)) => {
+                    let (_writer, mut reader) = stream.split();
+                    while let Some(message) = reader.next().await {
+                        match message {
+                            Ok(Message::Text(text)) => {
+                                if let Ok(Some(update)) =
+                                    BinanceFuturesDataSource::parse_partial_depth_ws_payload(&text, "")
+                                {
+                                    let _ = manager.normalize_and_publish_cex_orderbook(update);
+                                }
+                            }
+                            Ok(Message::Close(frame)) => {
+                                log_ws_warning(format!("pulse binance ws closed: {:?}", frame));
+                                break;
+                            }
+                            Err(err) => {
+                                log_ws_warning(format!("pulse binance ws read error: {err}"));
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(err) => {
+                    log_ws_warning(format!("pulse binance ws connect failed: {err}"));
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    })
+}
+
+fn spawn_deribit_ws_task(
+    client: Arc<DeribitOptionsClient>,
+    ws_url: String,
+    markets: &[polyalpha_core::MarketConfig],
+    proxy_settings: WsProxySettings,
+) -> JoinHandle<()> {
+    let assets = markets
+        .iter()
+        .filter_map(|market| PulseAsset::from_routing_key(&asset_key_from_cex_symbol(&market.cex_symbol)))
+        .filter_map(|asset| asset.as_deribit_asset())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    tokio::spawn(async move {
+        if assets.is_empty() {
+            return;
+        }
+        let proxy = match proxy_settings.resolve_for_url(&ws_url) {
+            Ok(proxy) => proxy,
+            Err(err) => {
+                log_ws_warning(format!("pulse deribit ws proxy resolution failed: {err}"));
+                return;
+            }
+        };
+
+        loop {
+            let now_ms = current_time_ms();
+            let mut channels = Vec::new();
+            for asset in &assets {
+                let _ = client.prime_asset(*asset).await;
+                let Ok(index_price) = client.fetch_index_price(*asset).await else {
+                    continue;
+                };
+                channels.extend(
+                    client
+                        .selected_instruments(*asset, index_price, now_ms)
+                        .into_iter()
+                        .map(|instrument| {
+                            DeribitOptionsClient::ticker_channel(&instrument.instrument_name)
+                        }),
+                );
+            }
+            if channels.is_empty() {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+
+            match run_ws_future_with_timeout(
+                connect_websocket(&ws_url, proxy.as_ref()),
+                Duration::from_secs(10),
+                "pulse deribit ws connect".to_owned(),
+            )
+            .await
+            {
+                Ok((stream, _)) => {
+                    let (mut writer, mut reader) = stream.split();
+                    let subscribe =
+                        DeribitOptionsClient::build_subscribe_message(&channels, 1).to_string();
+                    if writer
+                        .send(Message::Text(subscribe.into()))
+                        .await
+                        .is_err()
+                    {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    let reprune_after =
+                        Duration::from_secs(client.discovery_filter().reprune_interval_secs.max(60));
+                    let reprune_deadline = Instant::now() + reprune_after;
+
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(reprune_deadline) => break,
+                            message = reader.next() => {
+                                match message {
+                                    Some(Ok(Message::Text(text))) => {
+                                        if let Ok(ticker) = DeribitTickerMessage::from_text(&text) {
+                                            client.ingest_ticker(ticker);
+                                        }
+                                    }
+                                    Some(Ok(Message::Close(frame))) => {
+                                        log_ws_warning(format!("pulse deribit ws closed: {:?}", frame));
+                                        break;
+                                    }
+                                    None => break,
+                                    Some(Err(err)) => {
+                                        log_ws_warning(format!("pulse deribit ws read error: {err}"));
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    log_ws_warning(format!("pulse deribit ws connect failed: {err}"));
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    })
+}
+
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, fs, path::PathBuf, sync::Mutex};
+
+    use polyalpha_audit::{AuditReader, AuditSessionStatus};
+    use polyalpha_core::{
+        create_channels, Exchange, InstrumentKind, MarketConfig, MarketDataEvent, PolymarketIds,
+        Price, Symbol,
+    };
+    use serde_json::json;
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    use super::*;
+
+    fn pulse_settings_json() -> serde_json::Value {
+        json!({
+            "general": {
+                "log_level": "info",
+                "data_dir": "./data",
+                "monitor_socket_path": "/tmp/polyalpha.sock"
+            },
+            "polymarket": {
+                "clob_api_url": "https://clob.polymarket.com",
+                "ws_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+                "chain_id": 137
+            },
+            "binance": {
+                "rest_url": "https://fapi.binance.com",
+                "ws_url": "wss://fstream.binance.com"
+            },
+            "deribit": {
+                "rest_url": "https://www.deribit.com/api/v2",
+                "ws_url": "wss://www.deribit.com/ws/api/v2"
+            },
+            "okx": {
+                "rest_url": "https://www.okx.com",
+                "ws_public_url": "wss://ws.okx.com:8443/ws/v5/public",
+                "ws_private_url": "wss://ws.okx.com:8443/ws/v5/private"
+            },
+            "markets": [],
+            "strategy": {
+                "basis": {
+                    "entry_z_score_threshold": "4.0",
+                    "exit_z_score_threshold": "0.5",
+                    "rolling_window_secs": 36000,
+                    "min_warmup_samples": 600,
+                    "min_basis_bps": "50.0",
+                    "max_position_usd": "200",
+                    "delta_rebalance_threshold": "0.05",
+                    "delta_rebalance_interval_secs": 60
+                },
+                "dmm": {
+                    "gamma": "0.1",
+                    "sigma_window_secs": 300,
+                    "max_inventory": "5000",
+                    "order_refresh_secs": 10,
+                    "num_levels": 3,
+                    "level_spacing_bps": "10.0",
+                    "min_spread_bps": "20.0"
+                },
+                "negrisk": {
+                    "min_arb_bps": "30.0",
+                    "max_legs": 8,
+                    "enable_inventory_backed_short": false
+                },
+                "pulse_arb": {
+                    "runtime": { "enabled": true, "max_concurrent_sessions_per_asset": 2 },
+                    "session": { "max_holding_secs": 900, "min_opening_notional_usd": "250" },
+                    "entry": { "min_net_session_edge_bps": "25" },
+                    "rehedge": {
+                        "delta_drift_threshold": "0.03",
+                        "delta_bump_mode": "relative_with_clamp",
+                        "delta_bump_ratio_bps": 1,
+                        "min_abs_bump": "5",
+                        "max_abs_bump": "25"
+                    },
+                    "pin_risk": {
+                        "gamma_cap_mode": "delta_clamp",
+                        "max_abs_event_delta": "0.75",
+                        "pin_risk_zone_bps": 15,
+                        "pin_risk_time_window_secs": 1800
+                    },
+                    "providers": {
+                        "deribit_primary": {
+                            "kind": "deribit",
+                            "enabled": true,
+                            "max_anchor_age_ms": 250,
+                            "soft_mismatch_window_minutes": 360,
+                            "hard_expiry_mismatch_minutes": 720
+                        }
+                    },
+                    "routing": {
+                        "btc": { "enabled": true, "anchor_provider": "deribit_primary", "hedge_venue": "binance_perp" },
+                        "eth": { "enabled": true, "anchor_provider": "deribit_primary", "hedge_venue": "binance_perp" },
+                        "sol": { "enabled": false, "anchor_provider": "deribit_primary", "hedge_venue": "binance_perp" }
+                    }
+                },
+                "settlement": {
+                    "stop_new_position_hours": 24,
+                    "force_reduce_hours": 12,
+                    "force_reduce_target_ratio": "0.5",
+                    "close_only_hours": 6,
+                    "emergency_close_hours": 1,
+                    "dispute_close_only": true
+                }
+            },
+            "risk": {
+                "max_total_exposure_usd": "10000",
+                "max_single_position_usd": "200",
+                "max_daily_loss_usd": "500",
+                "max_drawdown_pct": "10.0",
+                "max_open_orders": 50,
+                "circuit_breaker_cooldown_secs": 300,
+                "rate_limit_orders_per_sec": 5,
+                "max_persistence_lag_secs": 10
+            }
+        })
+    }
+
+    fn sample_pulse_market() -> MarketConfig {
+        MarketConfig {
+            symbol: Symbol::new("btc-pulse-test"),
+            poly_ids: PolymarketIds {
+                condition_id: "cond-1".to_owned(),
+                yes_token_id: "yes".to_owned(),
+                no_token_id: "no".to_owned(),
+            },
+            market_question: Some("Will BTC be above 100k?".to_owned()),
+            market_rule: None,
+            cex_symbol: "BTCUSDT".to_owned(),
+            hedge_exchange: Exchange::Binance,
+            strike_price: Some(Price(Decimal::new(100_000, 0))),
+            settlement_timestamp: 1_800_000_000,
+            min_tick_size: Price(Decimal::new(1, 2)),
+            neg_risk: false,
+            cex_price_tick: Decimal::ONE,
+            cex_qty_step: Decimal::new(1, 3),
+            cex_contract_multiplier: Decimal::ONE,
+        }
+    }
+
+    #[test]
+    fn parse_pulse_assets_rejects_unknown_asset() {
+        let err = parse_pulse_assets("btc,doge").expect_err("unknown asset should fail");
+        assert!(err.to_string().contains("unsupported pulse asset `doge`"));
+    }
+
+    #[test]
+    fn apply_pulse_asset_filter_only_keeps_selected_assets_enabled() {
+        let settings: Settings =
+            serde_json::from_value(pulse_settings_json()).expect("deserialize pulse settings");
+
+        let settings = apply_pulse_asset_filter(settings, &[PulseAsset::Btc]);
+
+        assert!(
+            settings
+                .strategy
+                .pulse_arb
+                .routing
+                .get("btc")
+                .expect("btc route")
+                .enabled
+        );
+        assert!(
+            !settings
+                .strategy
+                .pulse_arb
+                .routing
+                .get("eth")
+                .expect("eth route")
+                .enabled
+        );
+    }
+
+    #[test]
+    fn build_pulse_inspect_view_lists_only_enabled_routes() {
+        let settings: Settings =
+            serde_json::from_value(pulse_settings_json()).expect("deserialize pulse settings");
+
+        let inspect = build_pulse_inspect_view("default", &settings);
+
+        assert!(inspect.runtime_enabled);
+        assert_eq!(inspect.enabled_assets, vec!["btc".to_owned(), "eth".to_owned()]);
+        assert_eq!(inspect.routes.len(), 2);
+        assert!(inspect
+            .routes
+            .iter()
+            .all(|route| route.anchor_provider == "deribit_primary"));
+    }
+
+    #[tokio::test]
+    async fn pulse_polymarket_ws_price_change_keeps_monotonic_poly_book_sequence() {
+        let market = sample_pulse_market();
+        let registry = SymbolRegistry::new(vec![market.clone()]);
+        let channels = create_channels(std::slice::from_ref(&market.symbol));
+        let manager = build_data_manager(&registry, channels.market_data_tx.clone());
+        let books = Arc::new(Mutex::new(HashMap::new()));
+        let mut market_data_rx = channels.market_data_tx.subscribe();
+
+        handle_pulse_polymarket_ws_text(
+            &manager,
+            &books,
+            r#"{
+                "asset_id": "yes",
+                "timestamp": "1715000000000",
+                "sequence": "7",
+                "bids": [{"price":"0.49","size":"12"}],
+                "asks": [{"price":"0.51","size":"13"}]
+            }"#,
+        )
+        .await
+        .expect("full snapshot should parse");
+        handle_pulse_polymarket_ws_text(
+            &manager,
+            &books,
+            r#"{
+                "event_type": "price_change",
+                "asset_id": "yes",
+                "timestamp": "1715000000123",
+                "changes": [{
+                    "price": "0.52",
+                    "size": "9",
+                    "side": "ask"
+                }]
+            }"#,
+        )
+        .await
+        .expect("price change should parse");
+
+        let mut observed_sequences = Vec::new();
+        loop {
+            match market_data_rx.try_recv() {
+                Ok(MarketDataEvent::OrderBookUpdate { snapshot })
+                    if snapshot.exchange == Exchange::Polymarket
+                        && snapshot.instrument == InstrumentKind::PolyYes =>
+                {
+                    observed_sequences.push(snapshot.sequence);
+                }
+                Ok(_) => continue,
+                Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+                Err(TryRecvError::Lagged(_)) => continue,
+            }
+        }
+
+        assert_eq!(observed_sequences.first().copied(), Some(7));
+        assert_eq!(observed_sequences.get(1).copied(), Some(8));
+    }
+
+    fn break_audit_warehouse_path(data_dir: &str) {
+        let warehouse_dir = PathBuf::from(data_dir).join("audit").join("warehouse");
+        let _ = fs::remove_dir_all(&warehouse_dir);
+        fs::write(&warehouse_dir, b"blocked").expect("replace warehouse dir with file");
+    }
+
+    #[tokio::test]
+    async fn pulse_audit_runtime_finalize_marks_summary_completed() {
+        let mut settings: Settings =
+            serde_json::from_value(pulse_settings_json()).expect("deserialize pulse settings");
+        let root = std::env::temp_dir().join(format!("polyalpha-pulse-finalize-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp root");
+        settings.general.data_dir = root.to_string_lossy().into_owned();
+
+        let now_ms = 1_717_171_717_000;
+        let mut audit = PulseAuditRuntime::start(&settings, "test", PulseExecutionMode::Paper, now_ms)
+            .expect("start audit runtime")
+            .expect("audit runtime enabled");
+        let runtime = PulseRuntimeBuilder::new(settings.clone())
+            .with_execution_mode(PulseExecutionMode::Paper)
+            .build()
+            .await
+            .expect("build runtime");
+        let mut monitor_state = MonitorState::default();
+        monitor_state.timestamp_ms = now_ms + 1_000;
+        monitor_state.mode = TradingMode::Paper;
+
+        audit
+            .finalize(
+                &runtime,
+                &monitor_state,
+                now_ms + 1_000,
+                AuditSessionStatus::Completed,
+            )
+            .expect("finalize audit runtime");
+
+        let summary = AuditReader::load_summary(&root, &audit.summary.session_id)
+            .expect("load finalized summary");
+        assert_eq!(summary.status, AuditSessionStatus::Completed);
+        assert_eq!(summary.ended_at_ms, Some(now_ms + 1_000));
+    }
+
+    #[tokio::test]
+    async fn pulse_audit_runtime_finalize_keeps_summary_when_warehouse_sync_fails() {
+        let mut settings: Settings =
+            serde_json::from_value(pulse_settings_json()).expect("deserialize pulse settings");
+        let root = std::env::temp_dir().join(format!("polyalpha-pulse-finalize-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp root");
+        settings.general.data_dir = root.to_string_lossy().into_owned();
+
+        let now_ms = 1_717_171_717_000;
+        let mut audit = PulseAuditRuntime::start(&settings, "test", PulseExecutionMode::Paper, now_ms)
+            .expect("start audit runtime")
+            .expect("audit runtime enabled");
+        let runtime = PulseRuntimeBuilder::new(settings.clone())
+            .with_execution_mode(PulseExecutionMode::Paper)
+            .build()
+            .await
+            .expect("build runtime");
+        let mut monitor_state = MonitorState::default();
+        monitor_state.timestamp_ms = now_ms + 1_000;
+        monitor_state.mode = TradingMode::Paper;
+
+        break_audit_warehouse_path(&settings.general.data_dir);
+
+        audit
+            .finalize(
+                &runtime,
+                &monitor_state,
+                now_ms + 1_000,
+                AuditSessionStatus::Completed,
+            )
+            .expect("finalize should keep raw audit artifacts even if warehouse sync fails");
+
+        let summary = AuditReader::load_summary(&root, &audit.summary.session_id)
+            .expect("load finalized summary");
+        assert_eq!(summary.status, AuditSessionStatus::Completed);
+        assert_eq!(summary.ended_at_ms, Some(now_ms + 1_000));
+    }
 }

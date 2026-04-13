@@ -532,15 +532,127 @@ pub struct PulseRuntimeConfig {
     pub max_concurrent_sessions_per_asset: usize,
 }
 
+fn default_pulse_window_ms() -> u64 {
+    5_000
+}
+
+fn default_pulse_min_claim_price_move_bps() -> Decimal {
+    Decimal::new(80, 0)
+}
+
+fn default_pulse_max_fair_claim_move_bps() -> Decimal {
+    Decimal::new(35, 0)
+}
+
+fn default_pulse_max_cex_mid_move_bps() -> Decimal {
+    Decimal::new(30, 0)
+}
+
+fn default_pulse_min_score_bps() -> Decimal {
+    Decimal::new(50, 0)
+}
+
+fn default_pulse_max_anchor_latency_delta_ms() -> u64 {
+    5_000
+}
+
+fn default_pulse_exit_base_target_ticks() -> u64 {
+    1
+}
+
+fn default_pulse_exit_medium_target_ticks() -> u64 {
+    2
+}
+
+fn default_pulse_exit_strong_target_ticks() -> u64 {
+    3
+}
+
+fn default_pulse_exit_medium_score_bps() -> Decimal {
+    Decimal::new(150, 0)
+}
+
+fn default_pulse_exit_strong_score_bps() -> Decimal {
+    Decimal::new(250, 0)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PulseSessionConfig {
     pub max_holding_secs: u64,
+    #[serde(default)]
+    pub opening_request_notional_usd: Option<UsdNotional>,
     pub min_opening_notional_usd: UsdNotional,
+    #[serde(default)]
+    pub require_nonzero_hedge: bool,
+    #[serde(default)]
+    pub min_expected_net_pnl_usd: Option<UsdNotional>,
+    #[serde(default)]
+    pub min_open_fill_ratio: Option<Decimal>,
+    #[serde(default)]
+    pub min_open_notional_reject_cooldown_secs: u64,
+}
+
+impl PulseSessionConfig {
+    pub fn effective_opening_request_notional_usd(&self) -> UsdNotional {
+        self.opening_request_notional_usd
+            .unwrap_or(self.min_opening_notional_usd)
+    }
+
+    pub fn effective_min_expected_net_pnl_usd(&self) -> UsdNotional {
+        self.min_expected_net_pnl_usd.unwrap_or(UsdNotional::ZERO)
+    }
+
+    pub fn effective_min_open_fill_ratio(&self) -> Decimal {
+        self.min_open_fill_ratio
+            .unwrap_or(Decimal::ZERO)
+            .max(Decimal::ZERO)
+            .min(Decimal::ONE)
+    }
+
+    pub fn effective_min_open_notional_reject_cooldown_secs(&self) -> u64 {
+        self.min_open_notional_reject_cooldown_secs
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PulseEntryConfig {
     pub min_net_session_edge_bps: Decimal,
+    #[serde(default = "default_pulse_window_ms")]
+    pub pulse_window_ms: u64,
+    #[serde(default = "default_pulse_min_claim_price_move_bps")]
+    pub min_claim_price_move_bps: Decimal,
+    #[serde(default = "default_pulse_max_fair_claim_move_bps")]
+    pub max_fair_claim_move_bps: Decimal,
+    #[serde(default = "default_pulse_max_cex_mid_move_bps")]
+    pub max_cex_mid_move_bps: Decimal,
+    #[serde(default = "default_pulse_min_score_bps")]
+    pub min_pulse_score_bps: Decimal,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PulseExitConfig {
+    #[serde(default = "default_pulse_exit_base_target_ticks")]
+    pub base_target_ticks: u64,
+    #[serde(default = "default_pulse_exit_medium_target_ticks")]
+    pub medium_target_ticks: u64,
+    #[serde(default = "default_pulse_exit_strong_target_ticks")]
+    pub strong_target_ticks: u64,
+    #[serde(default = "default_pulse_exit_medium_score_bps")]
+    pub medium_pulse_score_bps: Decimal,
+    #[serde(default = "default_pulse_exit_strong_score_bps")]
+    pub strong_pulse_score_bps: Decimal,
+}
+
+impl Default for PulseExitConfig {
+    fn default() -> Self {
+        Self {
+            base_target_ticks: default_pulse_exit_base_target_ticks(),
+            medium_target_ticks: default_pulse_exit_medium_target_ticks(),
+            strong_target_ticks: default_pulse_exit_strong_target_ticks(),
+            medium_pulse_score_bps: default_pulse_exit_medium_score_bps(),
+            strong_pulse_score_bps: default_pulse_exit_strong_score_bps(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -565,6 +677,8 @@ pub struct PulseProviderConfig {
     pub kind: String,
     pub enabled: bool,
     pub max_anchor_age_ms: u64,
+    #[serde(default = "default_pulse_max_anchor_latency_delta_ms")]
+    pub max_anchor_latency_delta_ms: u64,
     pub soft_mismatch_window_minutes: u64,
     pub hard_expiry_mismatch_minutes: u64,
 }
@@ -584,6 +698,8 @@ pub struct PulseArbStrategyConfig {
     pub runtime: PulseRuntimeConfig,
     pub session: PulseSessionConfig,
     pub entry: PulseEntryConfig,
+    #[serde(default)]
+    pub exit: PulseExitConfig,
     pub rehedge: PulseRehedgeConfig,
     pub pin_risk: PulsePinRiskConfig,
     pub providers: HashMap<String, PulseProviderConfig>,
@@ -1008,7 +1124,15 @@ mod tests {
     fn pulse_arb_config_deserializes_deribit_binance_routing() {
         let config: PulseArbStrategyConfig = serde_json::from_value(serde_json::json!({
             "runtime": { "enabled": true, "max_concurrent_sessions_per_asset": 2 },
-            "session": { "max_holding_secs": 900, "min_opening_notional_usd": "250" },
+            "session": {
+                "max_holding_secs": 900,
+                "opening_request_notional_usd": "250",
+                "min_opening_notional_usd": "50",
+                "require_nonzero_hedge": true,
+                "min_expected_net_pnl_usd": "0.5",
+                "min_open_fill_ratio": "0.05",
+                "min_open_notional_reject_cooldown_secs": 30
+            },
             "entry": { "min_net_session_edge_bps": "25" },
             "rehedge": {
                 "delta_drift_threshold": "0.03",
@@ -1028,6 +1152,7 @@ mod tests {
                     "kind": "deribit",
                     "enabled": true,
                     "max_anchor_age_ms": 250,
+                    "max_anchor_latency_delta_ms": 5000,
                     "soft_mismatch_window_minutes": 360,
                     "hard_expiry_mismatch_minutes": 720
                 },
@@ -1035,6 +1160,7 @@ mod tests {
                     "kind": "binance_options",
                     "enabled": false,
                     "max_anchor_age_ms": 250,
+                    "max_anchor_latency_delta_ms": 5000,
                     "soft_mismatch_window_minutes": 360,
                     "hard_expiry_mismatch_minutes": 720
                 }
@@ -1050,6 +1176,49 @@ mod tests {
         assert_eq!(config.routing["btc"].anchor_provider, "deribit_primary");
         assert_eq!(config.routing["eth"].hedge_venue.as_str(), "binance_perp");
         assert!(!config.routing["sol"].enabled);
+        assert_eq!(
+            config.session.effective_opening_request_notional_usd(),
+            UsdNotional(Decimal::new(250, 0))
+        );
+        assert_eq!(config.session.min_opening_notional_usd, UsdNotional(Decimal::new(50, 0)));
+        assert!(config.session.require_nonzero_hedge);
+        assert_eq!(
+            config.session.effective_min_expected_net_pnl_usd(),
+            UsdNotional(Decimal::new(5, 1))
+        );
+        assert_eq!(
+            config.session.effective_min_open_fill_ratio(),
+            Decimal::new(5, 2)
+        );
+        let encoded = serde_json::to_value(&config).expect("serialize pulse config");
+        assert_eq!(
+            encoded["session"]["min_open_notional_reject_cooldown_secs"],
+            serde_json::json!(30)
+        );
+        assert_eq!(
+            encoded["providers"]["deribit_primary"]["max_anchor_latency_delta_ms"],
+            serde_json::json!(5000)
+        );
+    }
+
+    #[test]
+    fn pulse_session_config_effective_values_fallback_to_legacy_fields() {
+        let config: PulseSessionConfig = serde_json::from_value(serde_json::json!({
+            "max_holding_secs": 900,
+            "min_opening_notional_usd": "250"
+        }))
+        .expect("pulse session config should deserialize");
+
+        assert_eq!(
+            config.effective_opening_request_notional_usd(),
+            UsdNotional(Decimal::new(250, 0))
+        );
+        assert_eq!(
+            config.effective_min_expected_net_pnl_usd(),
+            UsdNotional::ZERO
+        );
+        assert_eq!(config.effective_min_open_fill_ratio(), Decimal::ZERO);
+        assert!(!config.require_nonzero_hedge);
     }
 
     #[test]
