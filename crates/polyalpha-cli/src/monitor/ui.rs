@@ -401,7 +401,7 @@ fn pulse_summary_lines(state: &TuiState) -> Vec<Line<'static>> {
                     .iter()
                     .map(|row| {
                         format!(
-                            "{} anchor{} lag{} poly{} cex{} open{} netΔ{} pos{}{}{}",
+                            "{} anchor{} lag{} poly{} cex{} open{} netΔ{} pos{}{}",
                             row.asset,
                             row.anchor_age_ms
                                 .map(|value| format!("{value}ms"))
@@ -422,14 +422,10 @@ fn pulse_summary_lines(state: &TuiState) -> Vec<Line<'static>> {
                             row.actual_exchange_position
                                 .map(|value| format!("{value:.2}"))
                                 .unwrap_or_else(|| "-".to_owned()),
-                            row.status
-                                .as_deref()
-                                .map(|status| format!(" {status}"))
-                                .unwrap_or_default(),
-                            row.disable_reason
-                                .as_deref()
-                                .map(|reason| format!(" {reason}"))
-                                .unwrap_or_default(),
+                            pulse_asset_health_label(
+                                row.status.as_deref(),
+                                row.disable_reason.as_deref(),
+                            ),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -494,7 +490,7 @@ pub fn render_signals(state: &TuiState) -> Paragraph<'static> {
             Span::styled("评估 ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("{} 次", evaluation.attempts)),
             Span::raw("  "),
-            Span::styled("可评估 ", Style::default().fg(Color::DarkGray)),
+            Span::styled("可定价 ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!("{} 次", evaluation.evaluable_passes),
                 Style::default().fg(Color::Green),
@@ -827,7 +823,7 @@ fn render_pulse_markets(state: &TuiState, markets: &[PulseMarketMonitorRow]) -> 
                     )),
                 ),
                 right_styled_cell(
-                    fit_display_right(&market.status, 14),
+                    fit_display_right(pulse_market_status_label(market), 14),
                     Style::default().fg(status_color),
                 ),
             ])
@@ -856,10 +852,17 @@ fn render_pulse_markets(state: &TuiState, markets: &[PulseMarketMonitorRow]) -> 
 }
 
 fn pulse_market_status_color(market: &PulseMarketMonitorRow) -> Color {
-    match market.status.as_str() {
+    match market
+        .disable_reason
+        .as_deref()
+        .unwrap_or(market.status.as_str())
+    {
+        "hedge_drift" => Color::Yellow,
         "ready" => Color::Green,
         "degraded" => Color::Yellow,
         "expired" => Color::Red,
+        "anchor_stale" | "anchor_latency_delta_high" => Color::Yellow,
+        "residual_hedge" => Color::Yellow,
         "waiting_anchor" | "waiting_books" => Color::DarkGray,
         _ => Color::Gray,
     }
@@ -870,6 +873,41 @@ fn pulse_claim_side_color(side: Option<&str>) -> Color {
         Some("NO") => Color::Green,
         Some("YES") => Color::Red,
         _ => Color::Gray,
+    }
+}
+
+fn pulse_market_status_label(market: &PulseMarketMonitorRow) -> &'static str {
+    pulse_status_label(
+        Some(market.status.as_str()),
+        market.disable_reason.as_deref(),
+    )
+}
+
+fn pulse_asset_health_label(status: Option<&str>, disable_reason: Option<&str>) -> String {
+    format!(" {}", pulse_status_label(status, disable_reason))
+}
+
+fn pulse_status_label(status: Option<&str>, disable_reason: Option<&str>) -> &'static str {
+    match disable_reason.or(status) {
+        Some("ready") => "可定价",
+        Some("enabled") | Some("healthy") => "正常",
+        Some("warning") => "注意",
+        Some("waiting_anchor") => "等待期权锚",
+        Some("anchor_surface_insufficient") => "期权锚缺面",
+        Some("anchor_stale") => "期权锚过期",
+        Some("anchor_latency_delta_high") => "期权锚滞后",
+        Some("waiting_books") | Some("waiting_poly_quote") | Some("waiting_cex_quote") => {
+            "等待盘口"
+        }
+        Some("poly_quote_stale") => "Poly 过旧",
+        Some("cex_quote_stale") => "CEX 过旧",
+        Some("residual_hedge") => "残余对冲仓位",
+        Some("hedge_drift") => "对冲偏移",
+        Some("expired") => "已到期",
+        Some("disabled") => "已停用",
+        Some("degraded") => "降级",
+        Some("no_markets") | Some("no_future_markets") => "无可用市场",
+        _ => "--",
     }
 }
 
@@ -2517,7 +2555,7 @@ fn skip_reason_label(reason: &str) -> &'static str {
 
 fn evaluable_status_label(status: &str) -> &'static str {
     match status {
-        "evaluable" => "可评估",
+        "evaluable" => "可定价",
         "not_evaluable_no_poly" => "缺少新的 Polymarket 样本",
         "not_evaluable_no_cex" => "缺少可用的交易所参考价",
         "not_evaluable_misaligned" => "双腿时间未对齐",
@@ -2546,7 +2584,7 @@ fn async_classification_label(classification: &str) -> &'static str {
 fn compact_evaluable_status_label(status: EvaluableStatus) -> &'static str {
     match status {
         EvaluableStatus::Unknown => "未知",
-        EvaluableStatus::Evaluable => "可评估",
+        EvaluableStatus::Evaluable => "可定价",
         EvaluableStatus::NotEvaluableNoPoly => "Poly无样本",
         EvaluableStatus::NotEvaluableNoCex => "交易所无价",
         EvaluableStatus::NotEvaluableMisaligned => "双腿未对齐",
@@ -3074,7 +3112,7 @@ mod tests {
         assert!(compact.contains("NO"));
         assert!(compact.contains("182.5"));
         assert!(compact.contains("97.4"));
-        assert!(compact.contains("ready"));
+        assert!(compact.contains("可定价"));
     }
 
     #[test]
@@ -3374,8 +3412,8 @@ mod tests {
                 open_sessions: 1,
                 net_target_delta: Some(0.41),
                 actual_exchange_position: Some(0.39),
-                status: Some("healthy".to_owned()),
-                disable_reason: None,
+                status: Some("warning".to_owned()),
+                disable_reason: Some("hedge_drift".to_owned()),
             }],
             markets: Vec::new(),
             selected_session: None,
@@ -3389,6 +3427,7 @@ mod tests {
         assert!(compact.contains("活跃1"));
         assert!(compact.contains("btc"));
         assert!(compact.contains("anchor42ms"));
+        assert!(compact.contains("对冲偏移"));
     }
 
     #[test]

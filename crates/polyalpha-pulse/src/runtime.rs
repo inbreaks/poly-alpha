@@ -1683,7 +1683,10 @@ impl PulseRuntime {
                 .market_data
                 .resolved_cex_open_max_quote_age_ms(),
             now_ms,
+            open_sessions,
+            net_target_delta,
             actual_exchange_position,
+            asset_hedge_qty_step(self.markets_by_asset.get(&asset)),
         );
 
         let row = PulseAssetHealthRow {
@@ -2045,18 +2048,42 @@ impl PulseRuntime {
         cex_quote_age_ms: Option<u64>,
         now_ms: u64,
     ) -> (String, Option<String>) {
-        if anchor.is_none() {
+        let Some(anchor) = anchor else {
             return (
                 "waiting_anchor".to_owned(),
                 Some("waiting_anchor".to_owned()),
             );
-        }
+        };
         if poly_quote_age_ms.is_none() || cex_quote_age_ms.is_none() {
             return ("waiting_books".to_owned(), Some("waiting_books".to_owned()));
         }
-        let asset_row = self.asset_health.get(&asset);
-        if let Some(reason) = asset_row.and_then(|row| row.disable_reason.clone()) {
-            return ("degraded".to_owned(), Some(reason));
+        if !anchor.quality.has_strike_coverage
+            || !anchor.quality.has_liquidity
+            || !anchor.quality.greeks_complete
+        {
+            return (
+                "degraded".to_owned(),
+                Some("anchor_surface_insufficient".to_owned()),
+            );
+        }
+        let anchor_age_limit = self
+            .max_anchor_age_ms
+            .get(&asset)
+            .copied()
+            .unwrap_or(u64::MAX);
+        if anchor.quality.anchor_age_ms > anchor_age_limit {
+            return ("degraded".to_owned(), Some("anchor_stale".to_owned()));
+        }
+        let anchor_latency_delta_limit_ms = self
+            .max_anchor_latency_delta_ms
+            .get(&asset)
+            .copied()
+            .unwrap_or(u64::MAX);
+        if now_ms.saturating_sub(anchor.ts_ms) > anchor_latency_delta_limit_ms {
+            return (
+                "degraded".to_owned(),
+                Some("anchor_latency_delta_high".to_owned()),
+            );
         }
         if poly_quote_age_ms.unwrap_or_default()
             > self
@@ -3143,7 +3170,10 @@ fn asset_status(
     poly_quote_age_limit_ms: u64,
     cex_quote_age_limit_ms: u64,
     now_ms: u64,
+    open_sessions: usize,
+    net_target_delta: Decimal,
     actual_exchange_position: Decimal,
+    hedge_qty_step: Decimal,
 ) -> (&'static str, Option<String>) {
     let Some(markets) = markets else {
         return ("disabled", Some("no_markets".to_owned()));
@@ -3183,11 +3213,30 @@ fn asset_status(
         _ => {}
     }
 
-    if actual_exchange_position != Decimal::ZERO {
+    let hedge_drift = (actual_exchange_position - net_target_delta).abs();
+    let hedge_drift_tolerance = if hedge_qty_step > Decimal::ZERO {
+        hedge_qty_step * Decimal::TWO
+    } else {
+        Decimal::ZERO
+    };
+    if open_sessions == 0 && actual_exchange_position != Decimal::ZERO {
         return ("degraded", Some("residual_hedge".to_owned()));
+    }
+    if open_sessions > 0 && hedge_drift > hedge_drift_tolerance {
+        return ("warning", Some("hedge_drift".to_owned()));
     }
 
     ("enabled", None)
+}
+
+fn asset_hedge_qty_step(markets: Option<&Vec<MarketConfig>>) -> Decimal {
+    markets
+        .into_iter()
+        .flatten()
+        .map(|market| market.cex_qty_step.abs())
+        .filter(|step| *step > Decimal::ZERO)
+        .min()
+        .unwrap_or(Decimal::ZERO)
 }
 
 struct SessionRuntimeInputs {
@@ -5179,7 +5228,10 @@ mod tests {
             5_000,
             5_000,
             1_700_000_002_000,
+            0,
             Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::new(1, 3),
         );
 
         assert_eq!(status, "enabled");
@@ -5202,11 +5254,62 @@ mod tests {
             5_000,
             5_000,
             1_700_000_002_000,
+            0,
             Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::new(1, 3),
         );
 
         assert_eq!(status, "degraded");
         assert_eq!(disable_reason.as_deref(), Some("anchor_latency_delta_high"));
+    }
+
+    #[test]
+    fn asset_status_marks_residual_hedge_only_after_sessions_are_flat() {
+        let anchor = btc_anchor_snapshot(1_700_000_000_000, 1_700_086_400_000);
+
+        let (status, disable_reason) = asset_status(
+            Some(&vec![btc_signal_market(1_700_086_400)]),
+            Some(&anchor),
+            250,
+            5_000,
+            Some(100),
+            Some(80),
+            5_000,
+            5_000,
+            1_700_000_002_000,
+            0,
+            Decimal::ZERO,
+            Decimal::new(15, 2),
+            Decimal::new(1, 3),
+        );
+
+        assert_eq!(status, "degraded");
+        assert_eq!(disable_reason.as_deref(), Some("residual_hedge"));
+    }
+
+    #[test]
+    fn asset_status_does_not_treat_live_session_hedge_as_residual_inventory() {
+        let anchor = btc_anchor_snapshot(1_700_000_000_000, 1_700_086_400_000);
+
+        let (status, disable_reason) = asset_status(
+            Some(&vec![btc_signal_market(1_700_086_400)]),
+            Some(&anchor),
+            250,
+            5_000,
+            Some(100),
+            Some(80),
+            5_000,
+            5_000,
+            1_700_000_002_000,
+            2,
+            Decimal::new(291, 3),
+            Decimal::new(145, 3),
+            Decimal::new(1, 3),
+        );
+
+        assert_eq!(status, "warning");
+        assert_eq!(disable_reason.as_deref(), Some("hedge_drift"));
     }
 
     #[tokio::test]
