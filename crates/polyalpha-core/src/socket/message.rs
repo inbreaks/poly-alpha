@@ -124,6 +124,8 @@ pub struct PulseMonitorView {
     pub active_sessions: Vec<PulseSessionMonitorRow>,
     #[serde(default)]
     pub asset_health: Vec<PulseAssetHealthRow>,
+    #[serde(default)]
+    pub markets: Vec<PulseMarketMonitorRow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_session: Option<PulseSessionDetailView>,
 }
@@ -158,6 +160,40 @@ pub struct PulseAssetHealthRow {
     pub actual_exchange_position: Option<f64>,
     #[serde(default)]
     pub status: Option<String>,
+    #[serde(default)]
+    pub disable_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PulseMarketMonitorRow {
+    pub symbol: String,
+    pub asset: String,
+    #[serde(default)]
+    pub claim_side: Option<String>,
+    #[serde(default)]
+    pub pulse_score_bps: Option<f64>,
+    #[serde(default)]
+    pub net_edge_bps: Option<f64>,
+    #[serde(default)]
+    pub poly_yes_price: Option<f64>,
+    #[serde(default)]
+    pub poly_no_price: Option<f64>,
+    #[serde(default)]
+    pub cex_price: Option<f64>,
+    #[serde(default)]
+    pub fair_prob_yes: Option<f64>,
+    #[serde(default)]
+    pub anchor_age_ms: Option<u64>,
+    #[serde(default)]
+    pub anchor_latency_delta_ms: Option<u64>,
+    #[serde(default)]
+    pub poly_quote_age_ms: Option<u64>,
+    #[serde(default)]
+    pub cex_quote_age_ms: Option<u64>,
+    #[serde(default)]
+    pub open_sessions: usize,
+    #[serde(default)]
+    pub status: String,
     #[serde(default)]
     pub disable_reason: Option<String>,
 }
@@ -1585,11 +1621,30 @@ mod tests {
                 net_edge_bps: 31.4,
             }],
             asset_health: vec![],
+            markets: vec![PulseMarketMonitorRow {
+                symbol: "btc-above-100k".to_owned(),
+                asset: "btc".to_owned(),
+                claim_side: Some("NO".to_owned()),
+                pulse_score_bps: Some(182.5),
+                net_edge_bps: Some(97.4),
+                poly_yes_price: Some(0.645),
+                poly_no_price: Some(0.355),
+                cex_price: Some(100_005.0),
+                fair_prob_yes: Some(0.602),
+                anchor_age_ms: Some(42),
+                anchor_latency_delta_ms: Some(18),
+                poly_quote_age_ms: Some(15),
+                cex_quote_age_ms: Some(8),
+                open_sessions: 0,
+                status: "ready".to_owned(),
+                disable_reason: None,
+            }],
             selected_session: None,
         });
 
         let encoded = serde_json::to_string(&state).expect("serialize monitor state");
         assert!(encoded.contains("\"pulse\""));
         assert!(encoded.contains("\"active_sessions\""));
+        assert!(encoded.contains("\"markets\""));
     }
 }

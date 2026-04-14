@@ -195,7 +195,10 @@ fn current_time_ms() -> u64 {
         .unwrap_or_default()
 }
 
-fn signed_expiry_mismatch_minutes(selected_expiry_ts_ms: u64, target_event_expiry_ts_ms: u64) -> i64 {
+fn signed_expiry_mismatch_minutes(
+    selected_expiry_ts_ms: u64,
+    target_event_expiry_ts_ms: u64,
+) -> i64 {
     let diff_ms = selected_expiry_ts_ms as i128 - target_event_expiry_ts_ms as i128;
     (diff_ms / 60_000) as i64
 }
@@ -205,7 +208,10 @@ mod tests {
     use std::sync::Arc;
 
     use polyalpha_core::PulseProviderConfig;
-    use polyalpha_data::{DeribitAsset, DeribitOptionType, DeribitOptionsClient, DeribitTickerMessage, DiscoveryFilter};
+    use polyalpha_data::{
+        DeribitAsset, DeribitOptionType, DeribitOptionsClient, DeribitTickerMessage,
+        DiscoveryFilter,
+    };
 
     use super::*;
 

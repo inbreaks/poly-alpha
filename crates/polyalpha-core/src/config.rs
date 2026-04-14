@@ -1180,7 +1180,10 @@ mod tests {
             config.session.effective_opening_request_notional_usd(),
             UsdNotional(Decimal::new(250, 0))
         );
-        assert_eq!(config.session.min_opening_notional_usd, UsdNotional(Decimal::new(50, 0)));
+        assert_eq!(
+            config.session.min_opening_notional_usd,
+            UsdNotional(Decimal::new(50, 0))
+        );
         assert!(config.session.require_nonzero_hedge);
         assert_eq!(
             config.session.effective_min_expected_net_pnl_usd(),

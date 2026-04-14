@@ -30,15 +30,15 @@ impl AuditWarehouse {
         let tx = conn.transaction().context("开启审计仓库同步事务失败")?;
 
         let mut existing_seq_stmt = tx
-            .prepare(
-                "SELECT seq FROM audit_events WHERE session_id = ? ORDER BY seq DESC LIMIT 1",
-            )
+            .prepare("SELECT seq FROM audit_events WHERE session_id = ? ORDER BY seq DESC LIMIT 1")
             .with_context(|| format!("准备审计会话 `{session_id}` 已同步序号查询失败"))?;
         let mut existing_seq_rows = existing_seq_stmt
             .query_map(params![session_id], |row| row.get::<_, i64>(0))
             .with_context(|| format!("查询审计会话 `{session_id}` 已同步序号失败"))?;
         let existing_max_seq = match existing_seq_rows.next() {
-            Some(row) => row.with_context(|| format!("读取审计会话 `{session_id}` 已同步序号失败"))?,
+            Some(row) => {
+                row.with_context(|| format!("读取审计会话 `{session_id}` 已同步序号失败"))?
+            }
             None => 0,
         };
         drop(existing_seq_rows);
@@ -296,9 +296,7 @@ impl AuditWarehouse {
                 continue;
             }
             conn.execute(
-                &format!(
-                    "ALTER TABLE pulse_session_summaries ADD COLUMN {name} {definition}"
-                ),
+                &format!("ALTER TABLE pulse_session_summaries ADD COLUMN {name} {definition}"),
                 [],
             )
             .with_context(|| format!("为 pulse 会话摘要补列 `{name}` 失败"))?;

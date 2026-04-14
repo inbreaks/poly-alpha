@@ -512,8 +512,8 @@ pub struct AuditEvent {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditEventPayload, AuditSessionSummary, PulseBookLevelAuditRow,
-        PulseBookSnapshotAudit, PulseBookTapeAuditEvent, PulseLifecycleAuditEvent,
+        AuditEventPayload, AuditSessionSummary, PulseBookLevelAuditRow, PulseBookSnapshotAudit,
+        PulseBookTapeAuditEvent, PulseLifecycleAuditEvent,
     };
 
     #[test]

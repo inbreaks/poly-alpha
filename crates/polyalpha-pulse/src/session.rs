@@ -106,8 +106,7 @@ impl PulseSession {
             TokenSide::Yes => -target_event_delta,
             TokenSide::No => target_event_delta,
         };
-        let signed_delta =
-            Decimal::from_f64_retain(signed_hedge_delta).unwrap_or(Decimal::ZERO);
+        let signed_delta = Decimal::from_f64_retain(signed_hedge_delta).unwrap_or(Decimal::ZERO);
         self.target_delta_exposure = self.actual_poly_filled_qty * signed_delta;
     }
 
@@ -301,7 +300,10 @@ mod tests {
         session.recompute_target_delta(Decimal::new(4, 4).to_f64().unwrap());
 
         assert_eq!(session.claim_side(), TokenSide::No);
-        assert_eq!(session.target_delta_exposure().round_dp(1), Decimal::new(14, 1));
+        assert_eq!(
+            session.target_delta_exposure().round_dp(1),
+            Decimal::new(14, 1)
+        );
     }
 
     #[test]

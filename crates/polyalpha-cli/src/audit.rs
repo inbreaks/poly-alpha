@@ -373,12 +373,9 @@ pub fn run_audit_command(command: AuditCommand) -> Result<()> {
             session_id,
             pulse_session_id,
             format,
-        } => run_pulse_session_detail_report(
-            &env,
-            session_id.as_deref(),
-            &pulse_session_id,
-            format,
-        ),
+        } => {
+            run_pulse_session_detail_report(&env, session_id.as_deref(), &pulse_session_id, format)
+        }
         AuditCommand::Market {
             env,
             session_id,
@@ -2050,7 +2047,10 @@ fn run_pulse_sessions_report(
         AuditOutputFormat::Table => {
             println!("Pulse 会话列表: {}", report.summary.session_id);
             println!("环境: {}", report.summary.env);
-            println!("资产过滤: {}", format_option_text(report.asset_filter.as_deref()));
+            println!(
+                "资产过滤: {}",
+                format_option_text(report.asset_filter.as_deref())
+            );
             println!(
                 "Raw Opening KPI: attempts={} positive_fill={} effective_open={} ({:.2}%) active_effective_open={}",
                 report.raw_opening_kpi.opening_attempts,
@@ -2061,7 +2061,12 @@ fn run_pulse_sessions_report(
             );
             println!(
                 "Raw Opening 峰值: max_fill_notional={} max_expected_open_pnl={}",
-                format_option_text(report.raw_opening_kpi.max_actual_fill_notional_usd.as_deref()),
+                format_option_text(
+                    report
+                        .raw_opening_kpi
+                        .max_actual_fill_notional_usd
+                        .as_deref()
+                ),
                 format_option_text(
                     report
                         .raw_opening_kpi
@@ -2169,7 +2174,10 @@ fn collect_pulse_raw_opening_kpi(
     }
 
     let opening_attempts = sessions.len();
-    let positive_fill_count = sessions.values().filter(|session| session.positive_fill).count();
+    let positive_fill_count = sessions
+        .values()
+        .filter(|session| session.positive_fill)
+        .count();
     let effective_open_count = sessions
         .values()
         .filter(|session| session.effective_open)
@@ -2210,9 +2218,7 @@ fn collect_pulse_raw_opening_kpi(
                 asset: session.asset,
                 state: session.latest_state,
                 actual_fill_notional_usd: format_decimal(session.latest_actual_fill_notional_usd),
-                expected_open_net_pnl_usd: format_decimal(
-                    session.latest_expected_open_net_pnl_usd,
-                ),
+                expected_open_net_pnl_usd: format_decimal(session.latest_expected_open_net_pnl_usd),
                 opening_allocated_hedge_qty: session.latest_opening_allocated_hedge_qty,
                 anchor_latency_delta_ms: session.latest_anchor_latency_delta_ms,
             })
@@ -2333,9 +2339,9 @@ fn run_pulse_session_detail_report(
                 report.session.target_exit_price.as_deref(),
                 report.session.final_exit_price.as_deref(),
             ) {
-                (Some(target), Some(final_price)) => Some(
-                    parse_decimal_or_zero(final_price) - parse_decimal_or_zero(target),
-                ),
+                (Some(target), Some(final_price)) => {
+                    Some(parse_decimal_or_zero(final_price) - parse_decimal_or_zero(target))
+                }
                 _ => None,
             };
             println!(
@@ -2404,9 +2410,7 @@ fn build_pulse_session_timeline(
                     instrument: None,
                 })
             }
-            AuditEventPayload::PulseBookTape(payload)
-                if payload.session_id == pulse_session_id =>
-            {
+            AuditEventPayload::PulseBookTape(payload) if payload.session_id == pulse_session_id => {
                 Some(PulseSessionTimelineItem {
                     seq: event.seq,
                     timestamp_ms: event.timestamp_ms,

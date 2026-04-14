@@ -7,12 +7,12 @@ use polyalpha_audit::{
     PulseBookTapeAuditEvent, PulseLifecycleAuditEvent, PulseSessionSummaryRow,
 };
 use polyalpha_core::{
-    asset_key_from_cex_symbol, CexBaseQty, CexOrderRequest, ClientOrderId, Exchange,
-    EvaluationStats, MarketConfig, MarketDataEvent, MarketRule, OrderBookSnapshot,
-    OrderExecutor, OrderRequest, OrderResponse, OrderSide, OrderType, PolyOrderRequest,
-    PolyShares, PolySizingInstruction, Price, PulseAssetHealthRow, PulseMonitorView,
-    PulseSessionDetailView, PulseSessionMonitorRow, SignalStats, Symbol, TimeInForce,
-    TokenSide, UsdNotional, VenueQuantity,
+    asset_key_from_cex_symbol, CexBaseQty, CexOrderRequest, ClientOrderId, EvaluationStats,
+    Exchange, MarketConfig, MarketDataEvent, MarketRule, MarketView, OrderBookSnapshot,
+    OrderExecutor, OrderRequest, OrderResponse, OrderSide, OrderType, PolyOrderRequest, PolyShares,
+    PolySizingInstruction, Price, PulseAssetHealthRow, PulseMarketMonitorRow, PulseMonitorView,
+    PulseSessionDetailView, PulseSessionMonitorRow, SignalStats, Symbol, TimeInForce, TokenSide,
+    UsdNotional, VenueQuantity,
 };
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -20,9 +20,9 @@ use thiserror::Error;
 
 use polyalpha_core::Settings;
 
-use crate::audit::{PulseAuditRecord, PulseAuditSink, PulseSessionAuditSummary};
 use crate::anchor::provider::AnchorProvider;
 use crate::anchor::router::AnchorRouter;
+use crate::audit::{PulseAuditRecord, PulseAuditSink, PulseSessionAuditSummary};
 use crate::detector::{PulseDetector, PulseDetectorConfig};
 use crate::hedge::GlobalHedgeAggregator;
 use crate::model::{AnchorSnapshot, GammaCapMode, PulseAsset, PulseSessionState};
@@ -118,9 +118,7 @@ pub struct PulseRuntime {
 }
 
 pub type ActualPositionSync =
-    dyn Fn(PulseAsset, &MarketConfig) -> std::result::Result<Option<Decimal>, String>
-        + Send
-        + Sync;
+    dyn Fn(PulseAsset, &MarketConfig) -> std::result::Result<Option<Decimal>, String> + Send + Sync;
 
 #[derive(Clone, Debug, Default)]
 struct ObservedMarketBooks {
@@ -203,6 +201,14 @@ struct PolyExitIntent {
 struct HedgeExecutionOutcome {
     filled_qty: Decimal,
     avg_price: Option<Decimal>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PulseMarketSignalSnapshot {
+    claim_side: TokenSide,
+    pulse_score_bps: f64,
+    net_edge_bps: f64,
+    fair_prob_yes: f64,
 }
 
 #[derive(Debug, Error)]
@@ -292,7 +298,9 @@ impl PulseRuntimeBuilder {
         let max_anchor_age_ms = max_anchor_age_from_settings(&self.settings, &enabled_assets);
         let max_anchor_latency_delta_ms =
             max_anchor_latency_delta_from_settings(&self.settings, &enabled_assets);
-        let markets = self.markets.unwrap_or_else(|| self.settings.markets.clone());
+        let markets = self
+            .markets
+            .unwrap_or_else(|| self.settings.markets.clone());
         let markets_by_asset = filter_pulse_markets(&enabled_assets, markets);
         let detector = PulseDetector::new(PulseDetectorConfig {
             min_net_session_edge_bps: self
@@ -395,6 +403,22 @@ impl PulseRuntime {
 
     pub fn last_monitor_view(&self) -> Option<&PulseMonitorView> {
         self.last_monitor_view.as_ref()
+    }
+
+    pub fn market_views(&self, now_ms: u64) -> Vec<MarketView> {
+        let mut rows = self
+            .enabled_assets
+            .iter()
+            .flat_map(|asset| {
+                self.markets_by_asset
+                    .get(asset)
+                    .into_iter()
+                    .flat_map(move |markets| markets.iter().map(move |market| (*asset, market)))
+            })
+            .map(|(asset, market)| self.monitor_market_view(asset, market, now_ms))
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+        rows
     }
 
     pub fn recorded_binance_orders(&self) -> &[RecordedBinanceOrder] {
@@ -604,6 +628,7 @@ impl PulseRuntime {
                 status: Some("enabled".to_owned()),
                 disable_reason: None,
             }],
+            Vec::new(),
             Some(session_detail_view(&session, 0, 31.4, reconcile.order_qty)),
         ));
 
@@ -714,6 +739,7 @@ impl PulseRuntime {
                 status: Some("degraded".to_owned()),
                 disable_reason: Some("residual_hedge".to_owned()),
             }],
+            Vec::new(),
             None,
         ));
 
@@ -812,8 +838,9 @@ impl PulseRuntime {
                 }
 
                 if let Some(market) = pending_rehedge_market {
-                    let hedge_outcome =
-                        self.reconcile_and_execute_hedge_detailed(asset, &market).await?;
+                    let hedge_outcome = self
+                        .reconcile_and_execute_hedge_detailed(asset, &market)
+                        .await?;
                     {
                         let managed = self
                             .active_sessions
@@ -851,9 +878,9 @@ impl PulseRuntime {
                     lifecycle_recorded = true;
                 }
             } else if let Some(managed) = self.active_sessions.get_mut(&session_id) {
-                managed
-                    .session
-                    .trigger_emergency_flatten(crate::model::PulseFailureCode::DataFreshnessRejected);
+                managed.session.trigger_emergency_flatten(
+                    crate::model::PulseFailureCode::DataFreshnessRejected,
+                );
                 close_reason = Some((managed.entry_price, false));
                 let _ = managed;
                 self.record_session_lifecycle(&session_id)?;
@@ -1058,14 +1085,7 @@ impl PulseRuntime {
                 self.maybe_start_min_open_notional_cooldown(&managed.market.symbol, now_ms);
             }
             self.record_managed_lifecycle(&managed);
-            self.finalize_managed_session(
-                managed,
-                now_ms,
-                avg_price,
-                false,
-                Decimal::ZERO,
-                None,
-            );
+            self.finalize_managed_session(managed, now_ms, avg_price, false, Decimal::ZERO, None);
             return Ok(());
         }
         managed.session.set_pin_risk_active(self.is_pin_risk(
@@ -1074,37 +1094,37 @@ impl PulseRuntime {
             now_ms,
             candidate.fair_prob_yes,
         ));
-        managed.session.recompute_target_delta(candidate.event_delta_yes);
+        managed
+            .session
+            .recompute_target_delta(candidate.event_delta_yes);
 
-        let rounded_hedge_qty =
-            rounded_hedge_qty_for_target(managed.session.target_delta_exposure(), &candidate.market);
+        let rounded_hedge_qty = rounded_hedge_qty_for_target(
+            managed.session.target_delta_exposure(),
+            &candidate.market,
+        );
         let expected_net_pnl_usd = expected_open_net_pnl_usd;
         if (requires_nonzero_hedge && rounded_hedge_qty <= Decimal::ZERO)
             || expected_net_pnl_usd < min_expected_net_pnl_usd
         {
             managed.opening_outcome = OPENING_OUTCOME_REJECTED.to_owned();
-            managed.opening_rejection_reason = Some(if requires_nonzero_hedge
-                && rounded_hedge_qty <= Decimal::ZERO
-            {
-                OPENING_REJECTION_ZERO_HEDGE_QTY.to_owned()
-            } else {
-                OPENING_REJECTION_MIN_EXPECTED_NET_PNL.to_owned()
-            });
+            managed.opening_rejection_reason = Some(
+                if requires_nonzero_hedge && rounded_hedge_qty <= Decimal::ZERO {
+                    OPENING_REJECTION_ZERO_HEDGE_QTY.to_owned()
+                } else {
+                    OPENING_REJECTION_MIN_EXPECTED_NET_PNL.to_owned()
+                },
+            );
             managed.session.mark_closed();
             self.record_managed_lifecycle(&managed);
-            self.finalize_managed_session(
-                managed,
-                now_ms,
-                avg_price,
-                false,
-                Decimal::ZERO,
-                None,
-            );
+            self.finalize_managed_session(managed, now_ms, avg_price, false, Decimal::ZERO, None);
             return Ok(());
         }
 
-        self.hedge_aggregator
-            .upsert(session_id.clone(), asset, managed.session.target_delta_exposure());
+        self.hedge_aggregator.upsert(
+            session_id.clone(),
+            asset,
+            managed.session.target_delta_exposure(),
+        );
         let hedge_outcome = self
             .reconcile_and_execute_hedge_detailed(asset, &candidate.market)
             .await?;
@@ -1175,7 +1195,11 @@ impl PulseRuntime {
         let limit_price = aggressive_hedge_limit_price(side, self.books_for_symbol(&market.symbol))
             .ok_or_else(|| format!("missing cex quote for pulse hedge `{}`", market.symbol.0))?;
         let request = OrderRequest::Cex(CexOrderRequest {
-            client_order_id: ClientOrderId(format!("pulse-hedge-{}-{}", asset.as_str(), self.recorded_binance_orders.len() + 1)),
+            client_order_id: ClientOrderId(format!(
+                "pulse-hedge-{}-{}",
+                asset.as_str(),
+                self.recorded_binance_orders.len() + 1
+            )),
             exchange: Exchange::Binance,
             symbol: market.symbol.clone(),
             venue_symbol: market.cex_symbol.clone(),
@@ -1196,9 +1220,13 @@ impl PulseRuntime {
         } else {
             -filled_qty
         };
-        let avg_price = response.average_price.map(|price| price.0).or(Some(limit_price));
+        let avg_price = response
+            .average_price
+            .map(|price| price.0)
+            .or(Some(limit_price));
         let new_actual_position = actual_position + signed_filled_qty;
-        self.actual_hedge_positions.insert(asset, new_actual_position);
+        self.actual_hedge_positions
+            .insert(asset, new_actual_position);
         self.hedge_aggregator
             .sync_actual_position(asset, new_actual_position);
         self.recorded_binance_orders.push(RecordedBinanceOrder {
@@ -1279,10 +1307,7 @@ impl PulseRuntime {
         Ok(())
     }
 
-    async fn cancel_poly_working_orders(
-        &self,
-        symbol: &Symbol,
-    ) -> std::result::Result<(), String> {
+    async fn cancel_poly_working_orders(&self, symbol: &Symbol) -> std::result::Result<(), String> {
         let Some(executor) = self.executor.clone() else {
             return Ok(());
         };
@@ -1308,8 +1333,7 @@ impl PulseRuntime {
             return Ok(None);
         };
         let books = self.books_for_symbol(&managed.market.symbol);
-        let Some(current_sell_price) =
-            best_bid_for_claim_side(books, managed.session.claim_side())
+        let Some(current_sell_price) = best_bid_for_claim_side(books, managed.session.claim_side())
         else {
             return Ok(None);
         };
@@ -1319,7 +1343,11 @@ impl PulseRuntime {
             .ok_or_else(|| format!("market `{}` missing rule", managed.market.symbol.0))?;
         let priced = self
             .pricer
-            .price(&anchor, &market_rule, managed.market.settlement_timestamp * 1_000)
+            .price(
+                &anchor,
+                &market_rule,
+                managed.market.settlement_timestamp * 1_000,
+            )
             .map_err(|err| format!("price pulse session `{session_id}` failed: {err}"))?;
         Ok(Some(SessionRuntimeInputs {
             current_sell_price,
@@ -1373,11 +1401,7 @@ impl PulseRuntime {
     }
 
     fn market_in_opening_reject_cooldown(&mut self, symbol: &Symbol, now_ms: u64) -> bool {
-        let Some(until_ms) = self
-            .opening_reject_cooldowns
-            .get(&symbol.0)
-            .copied()
-        else {
+        let Some(until_ms) = self.opening_reject_cooldowns.get(&symbol.0).copied() else {
             return false;
         };
         if now_ms < until_ms {
@@ -1438,17 +1462,20 @@ impl PulseRuntime {
             None => return Ok(None),
         };
         self.stats.evaluation_attempts = self.stats.evaluation_attempts.saturating_add(1);
-        let priced = match self
-            .pricer
-            .price(&anchor, &market_rule, market.settlement_timestamp * 1_000)
-        {
-            Ok(priced) => priced,
-            Err(crate::pricing::PricingError::HardExpiryGapExceeded { .. }) => {
-                self.record_rejection(crate::model::PulseFailureCode::HardExpiryGapExceeded);
-                return Ok(None);
-            }
-            Err(err) => return Err(format!("price market `{}` failed: {err}", market.symbol.0)),
-        };
+        let priced =
+            match self
+                .pricer
+                .price(&anchor, &market_rule, market.settlement_timestamp * 1_000)
+            {
+                Ok(priced) => priced,
+                Err(crate::pricing::PricingError::HardExpiryGapExceeded { .. }) => {
+                    self.record_rejection(crate::model::PulseFailureCode::HardExpiryGapExceeded);
+                    return Ok(None);
+                }
+                Err(err) => {
+                    return Err(format!("price market `{}` failed: {err}", market.symbol.0))
+                }
+            };
 
         let yes_edge_bps = (priced.fair_prob_yes - yes_ask.to_f64().unwrap_or_default()) * 10_000.0;
         let no_edge_bps = (priced.fair_prob_no - no_ask.to_f64().unwrap_or_default()) * 10_000.0;
@@ -1479,8 +1506,8 @@ impl PulseRuntime {
         let prior_cex_mid = prior_tape.and_then(|tape| {
             latest_decimal_before(&tape.cex_mid, cex_book.received_at_ms, pulse_window_ms)
         });
-        let prior_fair_prob_yes =
-            prior_tape.and_then(|tape| latest_float_before(&tape.fair_prob_yes, now_ms, pulse_window_ms));
+        let prior_fair_prob_yes = prior_tape
+            .and_then(|tape| latest_float_before(&tape.fair_prob_yes, now_ms, pulse_window_ms));
         let available_reversion_ticks = prior_claim_ask
             .and_then(|prior| {
                 let move_price = (prior - entry_price).max(Decimal::ZERO);
@@ -1518,9 +1545,28 @@ impl PulseRuntime {
         let has_pulse_history =
             prior_claim_ask.is_some() && prior_cex_mid.is_some() && prior_fair_prob_yes.is_some();
         self.record_fair_prob_sample(&market.symbol, now_ms, priced.fair_prob_yes);
-        let data_fresh = quote_is_fresh(now_ms, yes_book, self.settings.strategy.market_data.resolved_poly_open_max_quote_age_ms())
-            && quote_is_fresh(now_ms, no_book, self.settings.strategy.market_data.resolved_poly_open_max_quote_age_ms())
-            && quote_is_fresh(now_ms, cex_book, self.settings.strategy.market_data.resolved_cex_open_max_quote_age_ms());
+        let data_fresh = quote_is_fresh(
+            now_ms,
+            yes_book,
+            self.settings
+                .strategy
+                .market_data
+                .resolved_poly_open_max_quote_age_ms(),
+        ) && quote_is_fresh(
+            now_ms,
+            no_book,
+            self.settings
+                .strategy
+                .market_data
+                .resolved_poly_open_max_quote_age_ms(),
+        ) && quote_is_fresh(
+            now_ms,
+            cex_book,
+            self.settings
+                .strategy
+                .market_data
+                .resolved_cex_open_max_quote_age_ms(),
+        );
         let anchor_age_limit = self
             .max_anchor_age_ms
             .get(&asset)
@@ -1606,7 +1652,9 @@ impl PulseRuntime {
             .sessions
             .values()
             .filter(|intent| intent.asset == asset)
-            .fold(Decimal::ZERO, |acc, intent| acc + intent.target_delta_exposure);
+            .fold(Decimal::ZERO, |acc, intent| {
+                acc + intent.target_delta_exposure
+            });
         let actual_exchange_position = self.actual_hedge_position(asset);
         let provider_id = self
             .anchor_providers
@@ -1651,19 +1699,22 @@ impl PulseRuntime {
             status: Some(status.to_owned()),
             disable_reason: disable_reason.clone(),
         };
-        self.audit_sink.record_asset_health(PulseAssetHealthAuditEvent {
-            asset: row.asset.clone(),
-            provider_id,
-            anchor_age_ms,
-            anchor_latency_delta_ms,
-            poly_quote_age_ms,
-            cex_quote_age_ms,
-            open_sessions,
-            net_target_delta: row.net_target_delta.map(|value| value.to_string()),
-            actual_exchange_position: row.actual_exchange_position.map(|value| value.to_string()),
-            status: row.status.clone(),
-            disable_reason,
-        });
+        self.audit_sink
+            .record_asset_health(PulseAssetHealthAuditEvent {
+                asset: row.asset.clone(),
+                provider_id,
+                anchor_age_ms,
+                anchor_latency_delta_ms,
+                poly_quote_age_ms,
+                cex_quote_age_ms,
+                open_sessions,
+                net_target_delta: row.net_target_delta.map(|value| value.to_string()),
+                actual_exchange_position: row
+                    .actual_exchange_position
+                    .map(|value| value.to_string()),
+                status: row.status.clone(),
+                disable_reason,
+            });
         self.asset_health.insert(asset, row);
     }
 
@@ -1682,22 +1733,353 @@ impl PulseRuntime {
         active_sessions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
         let mut asset_health = self.asset_health.values().cloned().collect::<Vec<_>>();
         asset_health.sort_by(|left, right| left.asset.cmp(&right.asset));
-        let selected_session = self
-            .active_sessions
-            .values()
-            .next()
-            .map(|managed| {
-                runtime_session_detail_view(
-                    managed,
-                    now_ms,
-                    self.books_for_symbol(&managed.market.symbol),
-                )
-            });
+        let mut markets = Vec::new();
+        for asset in &self.enabled_assets {
+            if let Some(items) = self.markets_by_asset.get(asset) {
+                for market in items {
+                    markets.push(self.pulse_market_monitor_row(*asset, market, now_ms));
+                }
+            }
+        }
+        markets.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+        let selected_session = self.active_sessions.values().next().map(|managed| {
+            runtime_session_detail_view(
+                managed,
+                now_ms,
+                self.books_for_symbol(&managed.market.symbol),
+            )
+        });
         self.last_monitor_view = Some(build_pulse_monitor_view(
             active_sessions,
             asset_health,
+            markets,
             selected_session,
         ));
+    }
+
+    fn pulse_market_monitor_row(
+        &self,
+        asset: PulseAsset,
+        market: &MarketConfig,
+        now_ms: u64,
+    ) -> PulseMarketMonitorRow {
+        let books = self.books_for_symbol(&market.symbol);
+        let yes_book = books.and_then(|books| books.yes.as_ref());
+        let no_book = books.and_then(|books| books.no.as_ref());
+        let cex_book = books.and_then(|books| books.cex.as_ref());
+        let poly_yes_price = yes_book
+            .and_then(mid_price_from_book)
+            .and_then(|value| value.to_f64());
+        let poly_no_price = no_book
+            .and_then(mid_price_from_book)
+            .and_then(|value| value.to_f64());
+        let cex_price = cex_book
+            .and_then(mid_price_from_book)
+            .and_then(|value| value.to_f64());
+        let poly_quote_age_ms = [yes_book, no_book]
+            .into_iter()
+            .flatten()
+            .map(|book| now_ms.saturating_sub(book.received_at_ms))
+            .max();
+        let cex_quote_age_ms = cex_book.map(|book| now_ms.saturating_sub(book.received_at_ms));
+        let anchor = self.anchor_snapshot_for(asset, Some(market.settlement_timestamp * 1_000));
+        let anchor_age_ms = anchor
+            .as_ref()
+            .map(|snapshot| snapshot.quality.anchor_age_ms);
+        let anchor_latency_delta_ms = anchor
+            .as_ref()
+            .map(|snapshot| now_ms.saturating_sub(snapshot.ts_ms));
+        let open_sessions = self
+            .active_sessions
+            .values()
+            .filter(|managed| managed.market.symbol == market.symbol)
+            .count();
+        let (status, disable_reason) = self.monitor_market_status(
+            asset,
+            market,
+            anchor.as_ref(),
+            poly_quote_age_ms,
+            cex_quote_age_ms,
+            now_ms,
+        );
+        let signal = self.monitor_market_signal(asset, market, now_ms, anchor.as_ref(), books);
+
+        PulseMarketMonitorRow {
+            symbol: market.symbol.0.clone(),
+            asset: asset.as_str().to_owned(),
+            claim_side: signal.as_ref().map(|snapshot| match snapshot.claim_side {
+                TokenSide::Yes => "YES".to_owned(),
+                TokenSide::No => "NO".to_owned(),
+            }),
+            pulse_score_bps: signal.as_ref().map(|snapshot| snapshot.pulse_score_bps),
+            net_edge_bps: signal.as_ref().map(|snapshot| snapshot.net_edge_bps),
+            poly_yes_price,
+            poly_no_price,
+            cex_price,
+            fair_prob_yes: signal.as_ref().map(|snapshot| snapshot.fair_prob_yes),
+            anchor_age_ms,
+            anchor_latency_delta_ms,
+            poly_quote_age_ms,
+            cex_quote_age_ms,
+            open_sessions,
+            status,
+            disable_reason,
+        }
+    }
+
+    fn monitor_market_view(
+        &self,
+        asset: PulseAsset,
+        market: &MarketConfig,
+        now_ms: u64,
+    ) -> MarketView {
+        let pulse_row = self.pulse_market_monitor_row(asset, market, now_ms);
+        MarketView {
+            symbol: pulse_row.symbol.clone(),
+            z_score: pulse_row.pulse_score_bps.map(|value| value / 100.0),
+            basis_pct: pulse_row.net_edge_bps.map(|value| value / 100.0),
+            poly_price: pulse_row
+                .claim_side
+                .as_deref()
+                .and_then(|side| match side {
+                    "YES" => pulse_row.poly_yes_price,
+                    "NO" => pulse_row.poly_no_price,
+                    _ => None,
+                })
+                .or(pulse_row.poly_yes_price)
+                .or(pulse_row.poly_no_price),
+            poly_yes_price: pulse_row.poly_yes_price,
+            poly_no_price: pulse_row.poly_no_price,
+            cex_price: pulse_row.cex_price,
+            fair_value: pulse_row.fair_prob_yes,
+            has_position: pulse_row.open_sessions > 0,
+            minutes_to_expiry: Some(
+                market.settlement_timestamp.saturating_sub(now_ms / 1_000) as f64 / 60.0,
+            ),
+            basis_history_len: 0,
+            raw_sigma: None,
+            effective_sigma: None,
+            sigma_source: pulse_row
+                .status
+                .is_empty()
+                .then_some(String::new())
+                .or_else(|| Some("pulse".to_owned())),
+            returns_window_len: 0,
+            active_token_side: pulse_row.claim_side.clone(),
+            poly_updated_at_ms: pulse_row
+                .poly_quote_age_ms
+                .map(|age_ms| now_ms.saturating_sub(age_ms)),
+            cex_updated_at_ms: pulse_row
+                .cex_quote_age_ms
+                .map(|age_ms| now_ms.saturating_sub(age_ms)),
+            poly_quote_age_ms: pulse_row.poly_quote_age_ms,
+            cex_quote_age_ms: pulse_row.cex_quote_age_ms,
+            cross_leg_skew_ms: pulse_row
+                .poly_quote_age_ms
+                .zip(pulse_row.cex_quote_age_ms)
+                .map(|(poly_age, cex_age)| poly_age.abs_diff(cex_age)),
+            evaluable_status: if pulse_row.status == "ready" {
+                polyalpha_core::EvaluableStatus::Evaluable
+            } else if pulse_row.disable_reason.as_deref() == Some("poly_quote_stale") {
+                polyalpha_core::EvaluableStatus::PolyQuoteStale
+            } else if pulse_row.disable_reason.as_deref() == Some("cex_quote_stale") {
+                polyalpha_core::EvaluableStatus::CexQuoteStale
+            } else if pulse_row.disable_reason.as_deref() == Some("waiting_books") {
+                polyalpha_core::EvaluableStatus::NotEvaluableNoPoly
+            } else {
+                polyalpha_core::EvaluableStatus::Unknown
+            },
+            async_classification: polyalpha_core::AsyncClassification::default(),
+            market_tier: polyalpha_core::MarketTier::Observation,
+            retention_reason: if pulse_row.open_sessions > 0 {
+                polyalpha_core::MarketRetentionReason::HasPosition
+            } else {
+                polyalpha_core::MarketRetentionReason::None
+            },
+            last_focus_at_ms: None,
+            last_tradeable_at_ms: None,
+        }
+    }
+
+    fn monitor_market_signal(
+        &self,
+        asset: PulseAsset,
+        market: &MarketConfig,
+        now_ms: u64,
+        anchor: Option<&AnchorSnapshot>,
+        books: Option<&ObservedMarketBooks>,
+    ) -> Option<PulseMarketSignalSnapshot> {
+        let anchor = anchor?;
+        let (Some(yes_ask), Some(no_ask), Some(yes_book), Some(no_book), Some(cex_book)) = (
+            best_ask(books.and_then(|books| books.yes.as_ref())),
+            best_ask(books.and_then(|books| books.no.as_ref())),
+            books.and_then(|books| books.yes.as_ref()),
+            books.and_then(|books| books.no.as_ref()),
+            books.and_then(|books| books.cex.as_ref()),
+        ) else {
+            return None;
+        };
+        let market_rule = market.resolved_market_rule()?;
+        let priced = self
+            .pricer
+            .price(anchor, &market_rule, market.settlement_timestamp * 1_000)
+            .ok()?;
+        let yes_edge_bps = (priced.fair_prob_yes - yes_ask.to_f64().unwrap_or_default()) * 10_000.0;
+        let no_edge_bps = (priced.fair_prob_no - no_ask.to_f64().unwrap_or_default()) * 10_000.0;
+        let (claim_side, instant_basis_bps, current_claim_book) = if no_edge_bps > yes_edge_bps {
+            (TokenSide::No, no_edge_bps, no_book)
+        } else {
+            (TokenSide::Yes, yes_edge_bps, yes_book)
+        };
+        let pulse_window_ms = self.settings.strategy.pulse_arb.entry.pulse_window_ms;
+        let current_cex_mid = mid_price_from_book(cex_book).unwrap_or(Decimal::ZERO);
+        let prior_tape = self.signal_tapes.get(&market.symbol.0);
+        let prior_claim_ask = prior_tape.and_then(|tape| match claim_side {
+            TokenSide::Yes => latest_decimal_before(
+                &tape.yes_ask,
+                current_claim_book.received_at_ms,
+                pulse_window_ms,
+            ),
+            TokenSide::No => latest_decimal_before(
+                &tape.no_ask,
+                current_claim_book.received_at_ms,
+                pulse_window_ms,
+            ),
+        });
+        let prior_cex_mid = prior_tape.and_then(|tape| {
+            latest_decimal_before(&tape.cex_mid, cex_book.received_at_ms, pulse_window_ms)
+        });
+        let prior_fair_prob_yes = prior_tape
+            .and_then(|tape| latest_float_before(&tape.fair_prob_yes, now_ms, pulse_window_ms));
+        let claim_price_move_bps = prior_claim_ask
+            .and_then(|prior| {
+                let current = match claim_side {
+                    TokenSide::Yes => yes_ask,
+                    TokenSide::No => no_ask,
+                };
+                if prior <= Decimal::ZERO || prior <= current {
+                    Some(0.0)
+                } else {
+                    (((prior - current) / prior) * Decimal::from(10_000)).to_f64()
+                }
+            })
+            .unwrap_or(0.0);
+        let fair_claim_move_bps = prior_fair_prob_yes
+            .map(|prior_yes| match claim_side {
+                TokenSide::Yes => (priced.fair_prob_yes - prior_yes).abs() * 10_000.0,
+                TokenSide::No => (priced.fair_prob_no - (1.0 - prior_yes)).abs() * 10_000.0,
+            })
+            .unwrap_or(0.0);
+        let cex_mid_move_bps = prior_cex_mid
+            .and_then(|prior| {
+                if prior <= Decimal::ZERO {
+                    Some(0.0)
+                } else {
+                    (((current_cex_mid - prior).abs() / prior) * Decimal::from(10_000)).to_f64()
+                }
+            })
+            .unwrap_or(0.0);
+        let has_pulse_history =
+            prior_claim_ask.is_some() && prior_cex_mid.is_some() && prior_fair_prob_yes.is_some();
+        let data_fresh = quote_is_fresh(
+            now_ms,
+            yes_book,
+            self.settings
+                .strategy
+                .market_data
+                .resolved_poly_open_max_quote_age_ms(),
+        ) && quote_is_fresh(
+            now_ms,
+            no_book,
+            self.settings
+                .strategy
+                .market_data
+                .resolved_poly_open_max_quote_age_ms(),
+        ) && quote_is_fresh(
+            now_ms,
+            cex_book,
+            self.settings
+                .strategy
+                .market_data
+                .resolved_cex_open_max_quote_age_ms(),
+        );
+        let anchor_age_limit = self
+            .max_anchor_age_ms
+            .get(&asset)
+            .copied()
+            .unwrap_or(u64::MAX);
+        let decision = self.detector.evaluate(crate::model::PulseOpportunityInput {
+            instant_basis_bps,
+            poly_vwap_slippage_bps: self.settings.paper_slippage.poly_slippage_bps as f64,
+            hedge_slippage_bps: self.settings.paper_slippage.cex_slippage_bps as f64,
+            fee_bps: (self.settings.execution_costs.poly_fee_bps
+                + self.settings.execution_costs.cex_taker_fee_bps) as f64,
+            perp_basis_penalty_bps: 0.0,
+            rehedge_reserve_bps: self.settings.execution_costs.cex_taker_fee_bps as f64,
+            timeout_exit_reserve_bps: self.settings.execution_costs.poly_fee_bps as f64 / 2.0,
+            anchor_quality_ok: anchor.quality.anchor_age_ms <= anchor_age_limit
+                && anchor.quality.has_strike_coverage
+                && anchor.quality.has_liquidity
+                && anchor.quality.greeks_complete,
+            data_fresh,
+            has_pulse_history,
+            claim_price_move_bps,
+            fair_claim_move_bps,
+            cex_mid_move_bps,
+        });
+
+        Some(PulseMarketSignalSnapshot {
+            claim_side,
+            pulse_score_bps: decision.pulse_score_bps,
+            net_edge_bps: decision.net_session_edge_bps,
+            fair_prob_yes: priced.fair_prob_yes,
+        })
+    }
+
+    fn monitor_market_status(
+        &self,
+        asset: PulseAsset,
+        market: &MarketConfig,
+        anchor: Option<&AnchorSnapshot>,
+        poly_quote_age_ms: Option<u64>,
+        cex_quote_age_ms: Option<u64>,
+        now_ms: u64,
+    ) -> (String, Option<String>) {
+        if anchor.is_none() {
+            return (
+                "waiting_anchor".to_owned(),
+                Some("waiting_anchor".to_owned()),
+            );
+        }
+        if poly_quote_age_ms.is_none() || cex_quote_age_ms.is_none() {
+            return ("waiting_books".to_owned(), Some("waiting_books".to_owned()));
+        }
+        let asset_row = self.asset_health.get(&asset);
+        if let Some(reason) = asset_row.and_then(|row| row.disable_reason.clone()) {
+            return ("degraded".to_owned(), Some(reason));
+        }
+        if poly_quote_age_ms.unwrap_or_default()
+            > self
+                .settings
+                .strategy
+                .market_data
+                .resolved_poly_open_max_quote_age_ms()
+        {
+            return ("degraded".to_owned(), Some("poly_quote_stale".to_owned()));
+        }
+        if cex_quote_age_ms.unwrap_or_default()
+            > self
+                .settings
+                .strategy
+                .market_data
+                .resolved_cex_open_max_quote_age_ms()
+        {
+            return ("degraded".to_owned(), Some("cex_quote_stale".to_owned()));
+        }
+        if market.settlement_timestamp.saturating_sub(now_ms / 1_000) == 0 {
+            return ("expired".to_owned(), Some("expired".to_owned()));
+        }
+        ("ready".to_owned(), None)
     }
 
     fn anchor_snapshot_for(
@@ -1705,20 +2087,15 @@ impl PulseRuntime {
         asset: PulseAsset,
         target_event_expiry_ts_ms: Option<u64>,
     ) -> Option<AnchorSnapshot> {
-        self.anchor_providers
-            .get(&asset)
-            .and_then(|provider| {
-                provider
-                    .snapshot_for_target(asset, target_event_expiry_ts_ms)
-                    .ok()
-                    .flatten()
-            })
+        self.anchor_providers.get(&asset).and_then(|provider| {
+            provider
+                .snapshot_for_target(asset, target_event_expiry_ts_ms)
+                .ok()
+                .flatten()
+        })
     }
 
-    fn record_session_lifecycle(
-        &mut self,
-        session_id: &str,
-    ) -> std::result::Result<(), String> {
+    fn record_session_lifecycle(&mut self, session_id: &str) -> std::result::Result<(), String> {
         let (asset, symbol) = {
             let managed = self
                 .active_sessions
@@ -1771,21 +2148,19 @@ impl PulseRuntime {
         let audit_event_count = self.audit_sink.audit_event_count_for_session(&session_id) + 1;
         let books = self.books_for_symbol(&managed.market.symbol).cloned();
         let distance_to_mid_bps = current_distance_to_mid_bps(&managed, books.as_ref());
-        let relative_order_age_ms =
-            Some(now_ms.saturating_sub(managed.maker_order_updated_at_ms));
+        let relative_order_age_ms = Some(now_ms.saturating_sub(managed.maker_order_updated_at_ms));
         let exit_path = exit_path_override
             .map(str::to_owned)
             .or_else(|| runtime_exit_path_for_summary(&managed));
-        let (target_exit_price, final_exit_price) = if exit_path.as_deref()
-            == Some("opening_rejected")
-        {
-            (None, None)
-        } else {
-            (
-                Some(managed.target_exit_price.normalize().to_string()),
-                Some(exit_price.normalize().to_string()),
-            )
-        };
+        let (target_exit_price, final_exit_price) =
+            if exit_path.as_deref() == Some("opening_rejected") {
+                (None, None)
+            } else {
+                (
+                    Some(managed.target_exit_price.normalize().to_string()),
+                    Some(exit_price.normalize().to_string()),
+                )
+            };
         self.audit_sink.finalize_session(
             PulseSessionAuditSummary {
                 session_id: session_id.clone(),
@@ -1873,7 +2248,10 @@ impl PulseRuntime {
             .pulse_window_ms
             .saturating_mul(4)
             .max(1_000);
-        let tape = self.signal_tapes.entry(snapshot.symbol.0.clone()).or_default();
+        let tape = self
+            .signal_tapes
+            .entry(snapshot.symbol.0.clone())
+            .or_default();
         match snapshot.instrument {
             polyalpha_core::InstrumentKind::PolyYes => {
                 if let Some(ask) = best_ask(Some(snapshot)) {
@@ -1937,9 +2315,7 @@ impl PulseRuntime {
         else {
             return false;
         };
-        let remaining_secs = market
-            .settlement_timestamp
-            .saturating_sub(now_ms / 1_000);
+        let remaining_secs = market.settlement_timestamp.saturating_sub(now_ms / 1_000);
         if remaining_secs
             > self
                 .settings
@@ -1954,12 +2330,7 @@ impl PulseRuntime {
         let Some(index_price) = anchor.index_price.to_f64() else {
             return false;
         };
-        let zone_bps = self
-            .settings
-            .strategy
-            .pulse_arb
-            .pin_risk
-            .pin_risk_zone_bps as f64;
+        let zone_bps = self.settings.strategy.pulse_arb.pin_risk.pin_risk_zone_bps as f64;
         boundaries.iter().any(|boundary| {
             if *boundary <= 0.0 || fair_prob_yes <= 0.0 || fair_prob_yes >= 1.0 {
                 return false;
@@ -2100,17 +2471,11 @@ fn runtime_lifecycle_event(
             .to_string(),
         actual_poly_fill_ratio: managed.session.actual_poly_fill_ratio(),
         actual_fill_notional_usd: managed.actual_fill_notional_usd.normalize().to_string(),
-        expected_open_net_pnl_usd: managed
-            .expected_open_net_pnl_usd
-            .normalize()
-            .to_string(),
+        expected_open_net_pnl_usd: managed.expected_open_net_pnl_usd.normalize().to_string(),
         effective_open: managed.effective_open,
         opening_outcome: managed.opening_outcome.clone(),
         opening_rejection_reason: managed.opening_rejection_reason.clone(),
-        opening_allocated_hedge_qty: managed
-            .opening_allocated_hedge_qty
-            .normalize()
-            .to_string(),
+        opening_allocated_hedge_qty: managed.opening_allocated_hedge_qty.normalize().to_string(),
         session_target_delta_exposure: managed
             .session
             .target_delta_exposure()
@@ -2130,7 +2495,11 @@ fn runtime_lifecycle_event(
             managed
                 .deadline_ms
                 .saturating_sub(managed.opened_at_ms)
-                .saturating_sub(managed.deadline_ms.saturating_sub(managed.maker_order_updated_at_ms)),
+                .saturating_sub(
+                    managed
+                        .deadline_ms
+                        .saturating_sub(managed.maker_order_updated_at_ms),
+                ),
         ),
         poly_yes_book: book_snapshot_audit(books.and_then(|item| item.yes.as_ref()), "poly_yes"),
         poly_no_book: book_snapshot_audit(books.and_then(|item| item.no.as_ref()), "poly_no"),
@@ -2247,7 +2616,9 @@ fn session_detail_view(
         planned_poly_qty: Some(session.planned_poly_qty().normalize().to_string()),
         actual_poly_filled_qty: Some(session.actual_poly_filled_qty().normalize().to_string()),
         actual_poly_fill_ratio: Some(session.actual_poly_fill_ratio()),
-        session_target_delta_exposure: Some(session.target_delta_exposure().normalize().to_string()),
+        session_target_delta_exposure: Some(
+            session.target_delta_exposure().normalize().to_string(),
+        ),
         session_allocated_hedge_qty: Some(allocated_hedge_qty.normalize().to_string()),
         anchor_latency_delta_ms: Some(18),
         distance_to_mid_bps: Some(8.0),
@@ -2277,11 +2648,7 @@ fn max_anchor_age_from_settings(
     enabled_assets
         .iter()
         .filter_map(|asset| {
-            let route = settings
-                .strategy
-                .pulse_arb
-                .routing
-                .get(asset.as_str())?;
+            let route = settings.strategy.pulse_arb.routing.get(asset.as_str())?;
             let provider = settings
                 .strategy
                 .pulse_arb
@@ -2299,11 +2666,7 @@ fn max_anchor_latency_delta_from_settings(
     enabled_assets
         .iter()
         .filter_map(|asset| {
-            let route = settings
-                .strategy
-                .pulse_arb
-                .routing
-                .get(asset.as_str())?;
+            let route = settings.strategy.pulse_arb.routing.get(asset.as_str())?;
             let provider = settings
                 .strategy
                 .pulse_arb
@@ -2369,13 +2732,7 @@ fn current_time_ms() -> u64 {
 }
 
 fn gamma_cap_mode(settings: &Settings) -> GammaCapMode {
-    match settings
-        .strategy
-        .pulse_arb
-        .pin_risk
-        .gamma_cap_mode
-        .as_str()
-    {
+    match settings.strategy.pulse_arb.pin_risk.gamma_cap_mode.as_str() {
         "protective_only" => GammaCapMode::ProtectiveOnly,
         "freeze" => GammaCapMode::Freeze,
         _ => GammaCapMode::DeltaClamp,
@@ -2383,22 +2740,17 @@ fn gamma_cap_mode(settings: &Settings) -> GammaCapMode {
 }
 
 fn best_bid(books: Option<&OrderBookSnapshot>) -> Option<Decimal> {
-    books?
-        .bids
-        .iter()
-        .map(|level| level.price.0)
-        .max()
+    books?.bids.iter().map(|level| level.price.0).max()
 }
 
 fn best_ask(books: Option<&OrderBookSnapshot>) -> Option<Decimal> {
-    books?
-        .asks
-        .iter()
-        .map(|level| level.price.0)
-        .min()
+    books?.asks.iter().map(|level| level.price.0).min()
 }
 
-fn best_bid_for_claim_side(books: Option<&ObservedMarketBooks>, claim_side: TokenSide) -> Option<Decimal> {
+fn best_bid_for_claim_side(
+    books: Option<&ObservedMarketBooks>,
+    claim_side: TokenSide,
+) -> Option<Decimal> {
     match claim_side {
         TokenSide::Yes => best_bid(books.and_then(|books| books.yes.as_ref())),
         TokenSide::No => best_bid(books.and_then(|books| books.no.as_ref())),
@@ -2520,8 +2872,7 @@ fn rounded_hedge_qty_for_target(target_delta_exposure: Decimal, market: &MarketC
 }
 
 fn expected_net_pnl_usd(filled_notional: Decimal, net_edge_bps: f64) -> Decimal {
-    let edge_fraction =
-        Decimal::from_f64_retain(net_edge_bps / 10_000.0).unwrap_or(Decimal::ZERO);
+    let edge_fraction = Decimal::from_f64_retain(net_edge_bps / 10_000.0).unwrap_or(Decimal::ZERO);
     filled_notional * edge_fraction
 }
 
@@ -2773,10 +3124,7 @@ fn freshest_asset_book_ages(
     (poly_quote_age_ms, cex_quote_age_ms)
 }
 
-fn next_market_settlement_ts_ms(
-    markets: Option<&Vec<MarketConfig>>,
-    now_ms: u64,
-) -> Option<u64> {
+fn next_market_settlement_ts_ms(markets: Option<&Vec<MarketConfig>>, now_ms: u64) -> Option<u64> {
     let now_ts_secs = now_ms / 1_000;
     markets?
         .iter()
@@ -2807,7 +3155,10 @@ fn asset_status(
     let Some(anchor) = anchor_snapshot else {
         return ("degraded", Some("waiting_anchor".to_owned()));
     };
-    if !anchor.quality.has_strike_coverage || !anchor.quality.has_liquidity || !anchor.quality.greeks_complete {
+    if !anchor.quality.has_strike_coverage
+        || !anchor.quality.has_liquidity
+        || !anchor.quality.greeks_complete
+    {
         return ("degraded", Some("anchor_surface_insufficient".to_owned()));
     }
     if anchor.quality.anchor_age_ms > anchor_age_limit {
@@ -2972,9 +3323,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use polyalpha_executor::{
-        dry_run::SlippageConfig, DryRunExecutor, InMemoryOrderbookProvider,
-    };
     use polyalpha_core::{
         CexBaseQty, CexOrderRequest, Exchange, MarketConfig, MarketDataEvent, MarketRule,
         MarketRuleKind, OrderBookSnapshot, OrderExecutor, OrderId, OrderRequest, OrderResponse,
@@ -2985,6 +3333,7 @@ mod tests {
         DeribitAsset, DeribitOptionType, DeribitOptionsClient, DeribitTickerMessage,
         DiscoveryFilter,
     };
+    use polyalpha_executor::{dry_run::SlippageConfig, DryRunExecutor, InMemoryOrderbookProvider};
     use rust_decimal::Decimal;
 
     use super::*;
@@ -3050,7 +3399,9 @@ mod tests {
                 }
             }
 
-            self.runtime.run_timeout_acceptance_scenario(session_id).await
+            self.runtime
+                .run_timeout_acceptance_scenario(session_id)
+                .await
         }
 
         async fn run_until_hedge_reconcile(&mut self) -> std::result::Result<(), String> {
@@ -3058,13 +3409,14 @@ mod tests {
                 EndToEndScenario::OpposingSessions => {}
                 EndToEndScenario::TimeoutExit => {
                     return Err(
-                        "fixture scenario does not support run_until_hedge_reconcile"
-                            .to_owned(),
+                        "fixture scenario does not support run_until_hedge_reconcile".to_owned(),
                     )
                 }
             }
 
-            self.runtime.run_opposing_sessions_acceptance_scenario().await
+            self.runtime
+                .run_opposing_sessions_acceptance_scenario()
+                .await
         }
     }
 
@@ -3233,7 +3585,9 @@ mod tests {
                 .push(request.clone());
 
             let response = match request {
-                OrderRequest::Poly(PolyOrderRequest { client_order_id, .. }) => {
+                OrderRequest::Poly(PolyOrderRequest {
+                    client_order_id, ..
+                }) => {
                     let mut response = self.poly_response.clone();
                     response.client_order_id = client_order_id;
                     response
@@ -3458,10 +3812,7 @@ mod tests {
         assert_eq!(runtime.active_session_count(), 1);
     }
 
-    async fn drive_btc_pulse_entry_attempt_with_cex_venue(
-        runtime: &mut PulseRuntime,
-        now_ms: u64,
-    ) {
+    async fn drive_btc_pulse_entry_attempt_with_cex_venue(runtime: &mut PulseRuntime, now_ms: u64) {
         seed_btc_no_pulse_baseline_with_cex_venue(runtime, now_ms).await;
         runtime
             .run_tick(now_ms + 100)
@@ -3765,7 +4116,10 @@ mod tests {
             vec![level(46, 2, 10_000, 0)],
             now_ms + 200,
         ));
-        runtime.run_tick(now_ms + 300).await.expect("manage session");
+        runtime
+            .run_tick(now_ms + 300)
+            .await
+            .expect("manage session");
 
         let lifecycle_states = runtime
             .audit_records()
@@ -3807,7 +4161,10 @@ mod tests {
         let mut shifted_anchor = btc_anchor_snapshot(now_ms + 200, settlement_timestamp * 1_000);
         shifted_anchor.index_price = Decimal::new(97_000, 0);
         anchor_provider.set_snapshot(Some(shifted_anchor));
-        runtime.run_tick(now_ms + 300).await.expect("manage session");
+        runtime
+            .run_tick(now_ms + 300)
+            .await
+            .expect("manage session");
 
         let lifecycle_states = runtime
             .audit_records()
@@ -3847,7 +4204,10 @@ mod tests {
         open_btc_session_from_confirmed_no_pulse(&mut runtime, now_ms).await;
 
         anchor_provider.set_snapshot(None);
-        runtime.run_tick(now_ms + 300).await.expect("manage session");
+        runtime
+            .run_tick(now_ms + 300)
+            .await
+            .expect("manage session");
 
         let lifecycle_states = runtime
             .audit_records()
@@ -4011,7 +4371,10 @@ mod tests {
             .expect("reconcile hedge");
 
         assert_eq!(allocated, Decimal::new(15, 2));
-        assert_eq!(runtime.actual_hedge_position(PulseAsset::Btc), Decimal::new(35, 2));
+        assert_eq!(
+            runtime.actual_hedge_position(PulseAsset::Btc),
+            Decimal::new(35, 2)
+        );
     }
 
     #[tokio::test]
@@ -4168,8 +4531,8 @@ mod tests {
             .into_iter()
             .find(|row| row.pulse_session_id == "pulse-btc-1")
             .expect("session summary");
-        let poly_realized = (Decimal::new(31, 2) - Decimal::new(35, 2))
-            * Decimal::new(714_285_715, 6);
+        let poly_realized =
+            (Decimal::new(31, 2) - Decimal::new(35, 2)) * Decimal::new(714_285_715, 6);
         let expected_total = poly_realized + open_hedge_qty * Decimal::new(120, 0);
 
         let realized = Decimal::from_f64_retain(
@@ -4179,10 +4542,7 @@ mod tests {
         )
         .expect("convert realized pnl");
 
-        assert_eq!(
-            summary.exit_path.as_deref(),
-            Some("timeout_chase"),
-        );
+        assert_eq!(summary.exit_path.as_deref(), Some("timeout_chase"),);
         let target_exit_price = summary
             .target_exit_price
             .as_deref()
@@ -4225,7 +4585,10 @@ mod tests {
             vec![level(81, 2, 10_000, 0)],
             now_ms + 200,
         ));
-        runtime.run_tick(now_ms + 300).await.expect("maker proxy hit close");
+        runtime
+            .run_tick(now_ms + 300)
+            .await
+            .expect("maker proxy hit close");
 
         let summary = runtime
             .pulse_session_rows()
@@ -4243,10 +4606,7 @@ mod tests {
             .and_then(|value| Decimal::from_str_exact(value).ok())
             .expect("maker summary final exit price");
 
-        assert_eq!(
-            summary.exit_path.as_deref(),
-            Some("maker_proxy_hit"),
-        );
+        assert_eq!(summary.exit_path.as_deref(), Some("maker_proxy_hit"),);
         assert_eq!(final_exit_price, target_exit_price);
     }
 
@@ -4320,7 +4680,9 @@ mod tests {
         assert_eq!(signal_stats.rejected, 1);
         assert_eq!(evaluation_stats.attempts, 1);
         assert_eq!(
-            signal_stats.rejection_reasons.get("data_freshness_rejected"),
+            signal_stats
+                .rejection_reasons
+                .get("data_freshness_rejected"),
             Some(&1)
         );
         assert_eq!(runtime.active_session_count(), 0);
@@ -4410,8 +4772,11 @@ mod tests {
             .pulse_arb
             .session
             .min_open_notional_reject_cooldown_secs = 60;
-        settings.strategy.pulse_arb.session.opening_request_notional_usd =
-            Some(UsdNotional(Decimal::new(250, 0)));
+        settings
+            .strategy
+            .pulse_arb
+            .session
+            .opening_request_notional_usd = Some(UsdNotional(Decimal::new(250, 0)));
         settings.strategy.pulse_arb.session.min_opening_notional_usd =
             UsdNotional(Decimal::new(35, 0));
         settings.strategy.pulse_arb.session.require_nonzero_hedge = true;
@@ -4591,8 +4956,11 @@ mod tests {
     {
         let fixture = runtime_fixture_for_asset(PulseAsset::Btc);
         let mut settings = fixture.settings.clone();
-        settings.strategy.pulse_arb.session.opening_request_notional_usd =
-            Some(UsdNotional(Decimal::new(250, 0)));
+        settings
+            .strategy
+            .pulse_arb
+            .session
+            .opening_request_notional_usd = Some(UsdNotional(Decimal::new(250, 0)));
         settings.strategy.pulse_arb.session.min_opening_notional_usd =
             UsdNotional(Decimal::new(50, 0));
         settings.strategy.pulse_arb.session.require_nonzero_hedge = true;
@@ -4626,8 +4994,7 @@ mod tests {
             .iter()
             .find_map(|record| match &record.payload {
                 polyalpha_audit::AuditEventPayload::PulseLifecycle(event)
-                    if event.session_id == "pulse-btc-1"
-                        && event.state == "maker_exit_working" =>
+                    if event.session_id == "pulse-btc-1" && event.state == "maker_exit_working" =>
                 {
                     Some(event)
                 }
@@ -4648,13 +5015,15 @@ mod tests {
     async fn runtime_tick_closes_when_nonzero_hedge_required_but_floor_to_step_is_zero() {
         let fixture = runtime_fixture_for_asset(PulseAsset::Btc);
         let mut settings = fixture.settings.clone();
-        settings.strategy.pulse_arb.session.opening_request_notional_usd =
-            Some(UsdNotional(Decimal::ONE));
+        settings
+            .strategy
+            .pulse_arb
+            .session
+            .opening_request_notional_usd = Some(UsdNotional(Decimal::ONE));
         settings.strategy.pulse_arb.session.min_opening_notional_usd =
             UsdNotional(Decimal::new(3, 1));
         settings.strategy.pulse_arb.session.require_nonzero_hedge = true;
-        settings.strategy.pulse_arb.session.min_expected_net_pnl_usd =
-            Some(UsdNotional::ZERO);
+        settings.strategy.pulse_arb.session.min_expected_net_pnl_usd = Some(UsdNotional::ZERO);
         settings.strategy.pulse_arb.session.min_open_fill_ratio = Some(Decimal::new(5, 2));
 
         let executor = Arc::new(MockPulseExecutor::with_poly_fill(
@@ -4702,8 +5071,11 @@ mod tests {
     {
         let fixture = runtime_fixture_for_asset(PulseAsset::Btc);
         let mut settings = fixture.settings.clone();
-        settings.strategy.pulse_arb.session.opening_request_notional_usd =
-            Some(UsdNotional(Decimal::new(250, 0)));
+        settings
+            .strategy
+            .pulse_arb
+            .session
+            .opening_request_notional_usd = Some(UsdNotional(Decimal::new(250, 0)));
         settings.strategy.pulse_arb.session.min_opening_notional_usd =
             UsdNotional(Decimal::new(50, 0));
         settings.strategy.pulse_arb.session.require_nonzero_hedge = false;
@@ -4889,10 +5261,7 @@ mod tests {
     #[tokio::test]
     async fn paper_runtime_times_out_to_chasing_exit_and_emits_audit() {
         let fixture = end_to_end_fixture_for_timeout_exit();
-        let mut runtime = fixture
-            .build_paper_runtime()
-            .await
-            .expect("build runtime");
+        let mut runtime = fixture.build_paper_runtime().await.expect("build runtime");
 
         runtime
             .run_until_closed("pulse-session-timeout")

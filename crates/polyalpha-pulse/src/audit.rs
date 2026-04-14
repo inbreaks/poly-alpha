@@ -60,8 +60,10 @@ impl PulseAuditSink {
     ) {
         self.session_summaries
             .insert(summary.session_id.clone(), summary);
-        self.warehouse_rows
-            .insert(warehouse_row.pulse_session_id.clone(), warehouse_row.clone());
+        self.warehouse_rows.insert(
+            warehouse_row.pulse_session_id.clone(),
+            warehouse_row.clone(),
+        );
         self.records.push(PulseAuditRecord {
             timestamp_ms: current_time_ms(),
             kind: AuditEventKind::PulseSessionSummary,

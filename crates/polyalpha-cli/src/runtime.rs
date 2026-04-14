@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 
 use polyalpha_core::{
     asset_key_from_cex_symbol, cex_venue_symbol, CoreError, Exchange, MarketConfig,

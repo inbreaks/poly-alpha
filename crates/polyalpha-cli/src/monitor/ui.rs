@@ -10,7 +10,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use polyalpha_core::{
     AsyncClassification, CommandKind, CommandStatus, ConnectionStatus, EvaluableStatus, EventKind,
-    MarketRetentionReason, MarketTier, MarketView, TradeView,
+    MarketRetentionReason, MarketTier, MarketView, PulseMarketMonitorRow, TradeView,
 };
 
 use super::state::{BannerLevel, Dialog, LogPane, Page, TuiState};
@@ -635,6 +635,16 @@ pub fn render_positions_summary(state: &TuiState) -> Table<'static> {
 }
 
 pub fn render_markets(state: &TuiState) -> Table<'static> {
+    if let Some(pulse_rows) = state
+        .monitor
+        .pulse
+        .as_ref()
+        .filter(|pulse| !pulse.markets.is_empty())
+        .map(|pulse| &pulse.markets)
+    {
+        return render_pulse_markets(state, pulse_rows);
+    }
+
     let sorted = sorted_markets(&state.monitor.markets);
     if sorted.is_empty() {
         return empty_table(" 市场 ", "暂无市场数据");
@@ -738,6 +748,129 @@ pub fn render_markets(state: &TuiState) -> Table<'static> {
         " 市场 ({}) ",
         state.monitor.markets.len()
     )))
+}
+
+fn render_pulse_markets(state: &TuiState, markets: &[PulseMarketMonitorRow]) -> Table<'static> {
+    let header = table_header([
+        left_cell(""),
+        left_cell("市场"),
+        centered_cell("方向"),
+        right_cell("Pulse"),
+        right_cell("净边"),
+        right_cell("YES"),
+        right_cell("NO"),
+        right_cell("对冲价"),
+        right_cell("公允"),
+        right_cell("龄(P/C/A)"),
+        right_cell("状态"),
+    ]);
+
+    let rows = markets
+        .iter()
+        .take(12)
+        .enumerate()
+        .map(|(row_idx, market)| {
+            let selected = row_idx == state.selected_market;
+            let status_color = pulse_market_status_color(market);
+            let side_color = pulse_claim_side_color(market.claim_side.as_deref());
+            let age_summary = format!(
+                "{}/{}/{}",
+                format_optional_age(market.poly_quote_age_ms),
+                format_optional_age(market.cex_quote_age_ms),
+                format_optional_age(market.anchor_age_ms),
+            );
+
+            Row::new([
+                left_styled_cell(
+                    if selected { "›" } else { " " },
+                    Style::default().fg(Color::Cyan),
+                ),
+                left_cell(truncate_display(&market.symbol, 18)),
+                centered_styled_cell(
+                    market.claim_side.clone().unwrap_or_else(|| "--".to_owned()),
+                    Style::default().fg(side_color),
+                ),
+                right_cell(fit_display_right(
+                    &format_optional_metric(market.pulse_score_bps),
+                    7,
+                )),
+                right_cell(fit_display_right(
+                    &format_optional_metric(market.net_edge_bps),
+                    7,
+                )),
+                right_cell(fit_display_right(
+                    &format_optional_price(market.poly_yes_price),
+                    6,
+                )),
+                right_cell(fit_display_right(
+                    &format_optional_price(market.poly_no_price),
+                    6,
+                )),
+                right_cell(fit_display_right(
+                    &format_optional_price(market.cex_price),
+                    7,
+                )),
+                right_cell(fit_display_right(
+                    &format_optional_price(market.fair_prob_yes),
+                    6,
+                )),
+                right_styled_cell(
+                    fit_display_right(&age_summary, 13),
+                    Style::default().fg(combined_age_color(
+                        market
+                            .poly_quote_age_ms
+                            .into_iter()
+                            .chain(market.cex_quote_age_ms)
+                            .chain(market.anchor_age_ms)
+                            .max(),
+                        None,
+                    )),
+                ),
+                right_styled_cell(
+                    fit_display_right(&market.status, 14),
+                    Style::default().fg(status_color),
+                ),
+            ])
+            .style(selected_row_style(selected))
+        });
+
+    Table::new(
+        rows,
+        [
+            Constraint::Length(1),
+            Constraint::Min(10),
+            Constraint::Length(4),
+            Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Length(7),
+            Constraint::Length(6),
+            Constraint::Length(13),
+            Constraint::Length(14),
+        ],
+    )
+    .header(header)
+    .column_spacing(1)
+    .block(titled_block(format!(" 市场 ({}) ", markets.len())))
+}
+
+fn pulse_market_status_color(market: &PulseMarketMonitorRow) -> Color {
+    match market.status.as_str() {
+        "ready" => Color::Green,
+        "degraded" => Color::Yellow,
+        "expired" => Color::Red,
+        "waiting_anchor" | "waiting_books" => Color::DarkGray,
+        _ => Color::Gray,
+    }
+}
+
+fn pulse_claim_side_color(side: Option<&str>) -> Color {
+    match side {
+        Some("NO") => Color::Green,
+        Some("YES") => Color::Red,
+        _ => Color::Gray,
+    }
 }
 
 pub fn render_position_list(state: &TuiState) -> Table<'static> {
@@ -2858,7 +2991,7 @@ mod tests {
     use super::*;
     use polyalpha_core::{
         CommandView, EventKind, MonitorEvent, PositionView, PulseAssetHealthRow,
-        PulseMonitorView, PulseSessionMonitorRow,
+        PulseMarketMonitorRow, PulseMonitorView, PulseSessionMonitorRow,
     };
     use ratatui::{buffer::Buffer, widgets::Widget};
 
@@ -2892,6 +3025,56 @@ mod tests {
             find_sequence(&first, &expected),
             find_sequence(&second, &expected)
         );
+    }
+
+    #[test]
+    fn render_markets_shows_pulse_market_rows_when_present() {
+        let mut state = TuiState::default();
+        state.monitor.pulse = Some(PulseMonitorView {
+            active_sessions: Vec::new(),
+            asset_health: vec![PulseAssetHealthRow {
+                asset: "btc".to_owned(),
+                provider_id: Some("deribit_primary".to_owned()),
+                anchor_age_ms: Some(42),
+                anchor_latency_delta_ms: Some(18),
+                poly_quote_age_ms: Some(15),
+                cex_quote_age_ms: Some(8),
+                open_sessions: 1,
+                net_target_delta: Some(0.41),
+                actual_exchange_position: Some(0.39),
+                status: Some("enabled".to_owned()),
+                disable_reason: None,
+            }],
+            markets: vec![PulseMarketMonitorRow {
+                symbol: "btc-above-100k".to_owned(),
+                asset: "btc".to_owned(),
+                claim_side: Some("NO".to_owned()),
+                pulse_score_bps: Some(182.5),
+                net_edge_bps: Some(97.4),
+                poly_yes_price: Some(0.645),
+                poly_no_price: Some(0.355),
+                cex_price: Some(100_005.0),
+                fair_prob_yes: Some(0.602),
+                anchor_age_ms: Some(42),
+                anchor_latency_delta_ms: Some(18),
+                poly_quote_age_ms: Some(15),
+                cex_quote_age_ms: Some(8),
+                open_sessions: 0,
+                status: "ready".to_owned(),
+                disable_reason: None,
+            }],
+            selected_session: None,
+        });
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 140, 6));
+        render_markets(&state).render(buffer.area, &mut buffer);
+
+        let compact = compact_text(&buffer_text(&buffer));
+        assert!(compact.contains("btc-above-100k"));
+        assert!(compact.contains("NO"));
+        assert!(compact.contains("182.5"));
+        assert!(compact.contains("97.4"));
+        assert!(compact.contains("ready"));
     }
 
     #[test]
@@ -3194,6 +3377,7 @@ mod tests {
                 status: Some("healthy".to_owned()),
                 disable_reason: None,
             }],
+            markets: Vec::new(),
             selected_session: None,
         });
 

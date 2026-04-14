@@ -1,22 +1,25 @@
 use polyalpha_core::{
-    PulseAssetHealthRow, PulseMonitorView, PulseSessionDetailView, PulseSessionMonitorRow,
+    PulseAssetHealthRow, PulseMarketMonitorRow, PulseMonitorView, PulseSessionDetailView,
+    PulseSessionMonitorRow,
 };
 
 pub fn build_pulse_monitor_view(
     active_sessions: Vec<PulseSessionMonitorRow>,
     asset_health: Vec<PulseAssetHealthRow>,
+    markets: Vec<PulseMarketMonitorRow>,
     selected_session: Option<PulseSessionDetailView>,
 ) -> PulseMonitorView {
     PulseMonitorView {
         active_sessions,
         asset_health,
+        markets,
         selected_session,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use polyalpha_core::{PulseAssetHealthRow, PulseSessionMonitorRow};
+    use polyalpha_core::{PulseAssetHealthRow, PulseMarketMonitorRow, PulseSessionMonitorRow};
 
     use super::*;
 
@@ -43,11 +46,30 @@ mod tests {
                 status: Some("healthy".to_owned()),
                 disable_reason: None,
             }],
+            vec![PulseMarketMonitorRow {
+                symbol: "btc-above-100k".to_owned(),
+                asset: "btc".to_owned(),
+                claim_side: Some("NO".to_owned()),
+                pulse_score_bps: Some(182.5),
+                net_edge_bps: Some(97.4),
+                poly_yes_price: Some(0.645),
+                poly_no_price: Some(0.355),
+                cex_price: Some(100_005.0),
+                fair_prob_yes: Some(0.602),
+                anchor_age_ms: Some(42),
+                anchor_latency_delta_ms: Some(18),
+                poly_quote_age_ms: Some(15),
+                cex_quote_age_ms: Some(8),
+                open_sessions: 1,
+                status: "ready".to_owned(),
+                disable_reason: None,
+            }],
             None,
         );
 
         assert_eq!(view.active_sessions.len(), 1);
         assert_eq!(view.asset_health.len(), 1);
+        assert_eq!(view.markets.len(), 1);
         assert_eq!(view.active_sessions[0].asset, "btc");
     }
 }

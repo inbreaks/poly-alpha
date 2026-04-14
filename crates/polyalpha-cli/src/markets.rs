@@ -3062,7 +3062,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_binance_cex_qty_steps_or_warn_falls_back_to_empty_map_when_exchange_info_fails() {
+    async fn fetch_binance_cex_qty_steps_or_warn_falls_back_to_empty_map_when_exchange_info_fails()
+    {
         let base_url = spawn_static_http_server(
             "500 Internal Server Error",
             r#"{"code":"boom"}"#,
@@ -3080,7 +3081,9 @@ mod tests {
         .await;
 
         assert!(steps.is_empty());
-        assert!(warnings.iter().any(|warning| warning.contains("exchangeInfo")));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("exchangeInfo")));
     }
 
     #[test]

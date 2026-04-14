@@ -823,8 +823,7 @@ impl DryRunExecutor {
         let net_position = orders
             .values()
             .filter(|stored| {
-                stored.exchange == exchange
-                    && stored.venue_symbol.as_deref() == Some(venue_symbol)
+                stored.exchange == exchange && stored.venue_symbol.as_deref() == Some(venue_symbol)
             })
             .fold(Decimal::ZERO, |acc, stored| {
                 let filled_qty = match stored.response.filled_quantity {
