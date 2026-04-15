@@ -58,6 +58,154 @@ MVP 只交易：
 
 这次修正的目的不是“调参数”，而是把信号从 `value gap` 拉回 `15m pulse reversion` 主线。
 
+## 2026-04-15 Timeout Admission 修正
+
+在 `2026-04-15` 的真实 `live-mock` 审计之后，entry 主线又出现了一个更本质的问题：
+
+- runtime 已经能真开仓、真挂 maker、真对冲
+- 亏损主因不再是“链路没通”
+- 主因高度集中在：`maker 15m 未成交 -> timeout_chase -> Poly 更差价出场`
+
+因此，MVP 的 admission 语义必须继续收敛：
+
+- 不再把“理论上有 `1~3 tick` target”直接当成可交易 alpha
+- 必须显式估计“如果 `15m` 内 maker 没成交，这笔单大概要亏多少”
+- 必须要求这笔单在保守 timeout 场景下仍然经济上成立，才允许进场
+
+### 15m 未成交的定义
+
+`15m` 未成交不是一个连续分数，而是一个会话级事件。
+
+建议采用下面的统一口径：
+
+```text
+deadline_ms = opened_at_ms + 900_000
+not_sold_15m = remaining_qty(deadline_ms) > 0
+```
+
+含义是：
+
+- 到 `deadline_ms` 时，如果 maker 单还有剩余未成交数量，就视为 `15m` 未成交
+- 如果中途只成交了一部分，则 timeout 逻辑只针对 `remaining_qty`
+
+这个定义必须与 `actual_filled_qty` 语义一致，不能继续使用 `planned_qty` 代替真实已开仓数量。
+
+### Timeout Loss 的 MVP 代理价
+
+MVP 不假装预测 `15m` 之后的真实 Poly 盘口，而是先用一个保守、可重复计算、可成交的代理价进入 admission。
+
+推荐的 `方案 B` 是：
+
+```text
+p_timeout_proxy = sell_vwap(entry_bid_book, actual_open_qty)
+```
+
+其中：
+
+- `entry_bid_book` 是开仓时刻的 Poly bid 盘
+- `actual_open_qty` 是 Poly 真实成交 shares
+- `sell_vwap(...)` 是如果立刻把这笔仓位按 bid 侧扫出去，能够拿到的真实卖出均价
+
+这不是 `15m` 后的真实强平价，但它是：
+
+- 真实可成交的
+- 与真实成交 size 绑定的
+- 足够保守、可在开仓瞬间稳定算出的
+
+### Admission 里的核心公式
+
+对一笔候选单，先定义：
+
+```text
+q_open = actual_open_qty
+p_in = actual_entry_avg_price
+p_tp = target_exit_price
+p_timeout_proxy = sell_vwap(entry_bid_book, q_open)
+
+G = maker 成交场景下的净利润估计
+L = timeout 场景下的净亏损估计绝对值
+m = 最小净收益底线
+```
+
+其中：
+
+```text
+maker_gross_pnl = q_open * (p_tp - p_in)
+timeout_gross_pnl = q_open * (p_timeout_proxy - p_in)
+
+G = maker_gross_pnl - open/hedge/exit 相关摩擦
+L = abs(timeout_gross_pnl - timeout_exit_marginal_costs)
+```
+
+再定义这笔单成立所要求的最低 `15m` maker 成交率：
+
+```text
+required_hit_rate = (L + m) / (G + L)
+```
+
+它来自下面的期望值约束：
+
+```text
+EV_15m = p * G - (1 - p) * L
+EV_15m >= m
+```
+
+因此，MVP 的 timeout admission 推荐语义是：
+
+```text
+still_enter =
+    G > 0
+ && L <= max_timeout_loss_usd
+ && required_hit_rate <= required_hit_rate_max
+ && target_reachability_pass
+ && signal_clean_pass
+```
+
+推荐的 MVP 初始门槛：
+
+- `m = 0.5 USD`
+- `required_hit_rate_max = 0.70`
+- `max_timeout_loss_usd = 15 ~ 20 USD`
+
+### 真实样本带入值
+
+下面这些样本来自 `2026-04-15` 的真实 `live-mock` 审计窗口，统一按 `250 USD` 开仓名义额观察。
+
+当前实现里，`required_hit_rate` 使用：
+
+```text
+m = strategy.pulse_arb.session.min_expected_net_pnl_usd
+```
+
+在 `multi-market-active.fresh` 里，这个值当前是 `0.5 USD`，因此下面表格中的 `required_hit_rate` 已按 `m = 0.5` 计算。
+
+| 会话 | pulse | pocket | 入场 -> target | 改前 `candidate EV` | 入场 -> timeout 代理价 | 改后 `timeout_net_loss_est` | 要求最低 `15m` maker 命中率 | 实际已实现 PnL |
+| --- | ---: | ---: | --- | ---: | --- | ---: | ---: | ---: |
+| `pulse-eth-5` | `555.6 bps` | `1.0 tick` | `0.17085 -> 0.18085` `(+5.85%)` | `+$13.66` | `0.17085 -> 0.14` `(-18.06%)` | `-$46.12` | `78.0%` | `-$75.01` |
+| `pulse-btc-6` | `357.1 bps` | `1.0 tick` | `0.27135 -> 0.28135` `(+3.69%)` | `+$7.20` | `0.27135 -> 0.25` `(-7.87%)` | `-$21.68` | `76.8%` | `-$42.09` |
+| `pulse-btc-10` | `384.6 bps` | `1.0 tick` | `0.25125 -> 0.26125` `(+3.98%)` | `+$5.38` | `0.25125 -> 0.22` `(-12.44%)` | `-$35.66` | `88.1%` | `-$25.18` |
+| `pulse-eth-11` | `625.0 bps` | `1.0 tick` | `0.15075 -> 0.16075` `(+6.63%)` | `+$15.62` | `0.15075 -> 0.12` `(-20.40%)` | `-$51.96` | `77.6%` | `-$63.21` |
+| `pulse-eth-8` | `994.3 bps` | `2.0 tick` | `0.1809 -> 0.2009` `(+11.06%)` | `+$1.01` | `0.1809 -> 0.120036936` `(-33.64%)` | `-$110.74` | `99.5%` | `-$77.21` |
+
+这些样本说明了三件事：
+
+- 改前模型看到的全是正 `candidate EV`
+- 一旦把 timeout 风险正式记进账，大部分样本立刻转成显著负值
+- 当前 admission 不是“执行差了一点”，而是“从准入阶段就把理论 target 当成了高概率可成交 target”
+
+### 设计结论
+
+因此，MVP 接下来的信号修正顺序必须明确：
+
+1. 先把 `timeout_exit` 的坏结果正式记进会话经济学，而不是只记录一个 reserve 字段
+2. 再把 `target_exit_price` 从纯 tick ladder 收敛到“有真实成交路径的可达目标”
+3. 最后把 pulse confirmation 从偏 `quote-based` 继续推向更接近 `flow-based`
+
+这不是参数微调，而是修正 admission 的数学语义：
+
+- 改前：只问“如果按 target 卖掉，能赚多少”
+- 改后：先问“如果 `15m` 卖不掉，这笔单是否仍然值得冒险”
+
 ## 已确认范围
 
 ### MVP 范围

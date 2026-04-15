@@ -191,6 +191,10 @@ pub struct PulseMarketMonitorRow {
     #[serde(default)]
     pub expected_net_pnl_usd: Option<f64>,
     #[serde(default)]
+    pub timeout_loss_estimate_usd: Option<f64>,
+    #[serde(default)]
+    pub required_hit_rate: Option<f64>,
+    #[serde(default)]
     pub reversion_pocket_ticks: Option<f64>,
     #[serde(default)]
     pub reversion_pocket_notional_usd: Option<f64>,
@@ -239,6 +243,10 @@ pub struct PulseSessionDetailView {
     pub candidate_expected_net_pnl_usd: Option<String>,
     #[serde(default)]
     pub expected_open_net_pnl_usd: Option<String>,
+    #[serde(default)]
+    pub timeout_loss_estimate_usd: Option<String>,
+    #[serde(default)]
+    pub required_hit_rate: Option<f64>,
     #[serde(default)]
     pub reversion_pocket_ticks: Option<f64>,
     #[serde(default)]
@@ -1669,6 +1677,8 @@ mod tests {
                 target_exit_price: Some(0.38),
                 timeout_exit_price: Some(0.31),
                 expected_net_pnl_usd: Some(3.85),
+                timeout_loss_estimate_usd: Some(21.68),
+                required_hit_rate: Some(0.768),
                 reversion_pocket_ticks: Some(4.0),
                 reversion_pocket_notional_usd: Some(28.57),
                 vacuum_ratio: Some(1.0),
@@ -1687,5 +1697,7 @@ mod tests {
         assert!(encoded.contains("\"pulse\""));
         assert!(encoded.contains("\"active_sessions\""));
         assert!(encoded.contains("\"markets\""));
+        assert!(encoded.contains("\"timeout_loss_estimate_usd\":21.68"));
+        assert!(encoded.contains("\"required_hit_rate\":0.768"));
     }
 }

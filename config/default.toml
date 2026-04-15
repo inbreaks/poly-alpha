@@ -127,6 +127,8 @@ min_claim_price_move_bps = 80
 max_fair_claim_move_bps = 35
 max_cex_mid_move_bps = 30
 min_pulse_score_bps = 50
+max_timeout_loss_usd = 20
+max_required_hit_rate = 0.70
 
 [strategy.pulse_arb.exit]
 base_target_ticks = 1

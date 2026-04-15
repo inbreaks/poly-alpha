@@ -61,6 +61,39 @@ cargo build -p polyalpha-cli
 - 所以，“真实 feed runtime 已接通” 和 “完整 maker/rehedge/flatten 生命周期在 deterministic runtime tests 中已覆盖” 这两件事要分开理解，不能混写成已经在 live window 里频繁观察到非零 fill
 - `SOL / XRP`、多 anchor provider、次级 hedge venue 仍然只是结构扩展位，不属于当前 MVP 已交付范围
 
+### 2026-04-15 Admission 修正补充
+
+本轮要落实的不是执行骨架重写，而是把 `15m` timeout 风险正式接进 entry economics。
+
+新增统一语义：
+
+```text
+deadline_ms = opened_at_ms + 900_000
+not_sold_15m = remaining_qty(deadline_ms) > 0
+
+p_timeout_proxy = sell_vwap(entry_bid_book, actual_open_qty)
+G = maker 场景净利润估计
+L = timeout 场景净亏损估计绝对值
+required_hit_rate = (L + m) / (G + L)
+```
+
+当前样本已经说明，不加这层 admission 会系统性高估 `15m` 内 maker 落袋能力：
+
+| 会话 | `candidate EV` | `timeout_net_loss_est` | `required_hit_rate` | 实际 PnL |
+| --- | ---: | ---: | ---: | ---: |
+| `pulse-eth-5` | `+$13.66` | `-$46.12` | `78.0%` | `-$75.01` |
+| `pulse-btc-6` | `+$7.20` | `-$21.68` | `76.8%` | `-$42.09` |
+| `pulse-btc-10` | `+$5.38` | `-$35.66` | `88.1%` | `-$25.18` |
+| `pulse-eth-11` | `+$15.62` | `-$51.96` | `77.6%` | `-$63.21` |
+| `pulse-eth-8` | `+$1.01` | `-$110.74` | `99.5%` | `-$77.21` |
+
+本轮实现目标：
+
+- 在 `signal.rs` 里把 `timeout_exit_price_for_shares` 产出的代理价正式转成 `timeout_net_loss_est`
+- 在 `model.rs` / `detector.rs` 里引入 `required_hit_rate`、`max_timeout_loss_usd`、`required_hit_rate_max`
+- 在 `runtime.rs` 的 candidate 评估链中，把这组值写进 `PulseOpportunityInput`、审计和 monitor
+- 先挡掉“必须要求 `75%+` 的 `15m` maker 命中率才成立”的伪机会
+
 ## File Structure
 
 - Modify: `Cargo.toml`

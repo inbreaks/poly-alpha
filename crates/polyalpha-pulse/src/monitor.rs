@@ -60,6 +60,8 @@ mod tests {
                 target_exit_price: Some(0.38),
                 timeout_exit_price: Some(0.31),
                 expected_net_pnl_usd: Some(3.85),
+                timeout_loss_estimate_usd: Some(21.68),
+                required_hit_rate: Some(0.768),
                 reversion_pocket_ticks: Some(4.0),
                 reversion_pocket_notional_usd: Some(28.57),
                 vacuum_ratio: Some(1.0),

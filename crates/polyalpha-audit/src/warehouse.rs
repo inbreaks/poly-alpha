@@ -134,6 +134,8 @@ impl AuditWarehouse {
                     actual_fill_notional_usd,
                     candidate_expected_net_pnl_usd,
                     expected_open_net_pnl_usd,
+                    timeout_loss_estimate_usd,
+                    required_hit_rate,
                     pulse_score_bps,
                     effective_open,
                     opening_outcome,
@@ -155,7 +157,7 @@ impl AuditWarehouse {
                     distance_to_mid_bps,
                     relative_order_age_ms,
                     row_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     summary.session_id.clone(),
                     pulse_summary.pulse_session_id.clone(),
@@ -170,6 +172,8 @@ impl AuditWarehouse {
                     pulse_summary.actual_fill_notional_usd.clone(),
                     pulse_summary.candidate_expected_net_pnl_usd.clone(),
                     pulse_summary.expected_open_net_pnl_usd.clone(),
+                    pulse_summary.timeout_loss_estimate_usd.clone(),
+                    pulse_summary.required_hit_rate,
                     pulse_summary.pulse_score_bps,
                     pulse_summary.effective_open,
                     pulse_summary.opening_outcome.clone(),
@@ -266,6 +270,8 @@ impl AuditWarehouse {
                 actual_fill_notional_usd VARCHAR NOT NULL,
                 candidate_expected_net_pnl_usd VARCHAR,
                 expected_open_net_pnl_usd VARCHAR NOT NULL,
+                timeout_loss_estimate_usd VARCHAR,
+                required_hit_rate DOUBLE,
                 pulse_score_bps DOUBLE,
                 effective_open BOOLEAN NOT NULL,
                 opening_outcome VARCHAR NOT NULL,
@@ -310,6 +316,8 @@ impl AuditWarehouse {
             ("actual_fill_notional_usd", "VARCHAR"),
             ("candidate_expected_net_pnl_usd", "VARCHAR"),
             ("expected_open_net_pnl_usd", "VARCHAR"),
+            ("timeout_loss_estimate_usd", "VARCHAR"),
+            ("required_hit_rate", "DOUBLE"),
             ("pulse_score_bps", "DOUBLE"),
             ("effective_open", "BOOLEAN"),
             ("opening_outcome", "VARCHAR"),
@@ -443,6 +451,8 @@ mod tests {
             String,
             String,
             String,
+            String,
+            f64,
             f64,
             bool,
             String,
@@ -455,8 +465,8 @@ mod tests {
             String,
         ) = conn
             .query_row(
-                "SELECT entry_price, actual_fill_notional_usd, candidate_expected_net_pnl_usd, pulse_score_bps,
-                        effective_open, opening_outcome, opening_allocated_hedge_qty, exit_path,
+                "SELECT entry_price, actual_fill_notional_usd, candidate_expected_net_pnl_usd, timeout_loss_estimate_usd,
+                        required_hit_rate, pulse_score_bps, effective_open, opening_outcome, opening_allocated_hedge_qty, exit_path,
                         target_exit_price, timeout_exit_price, reversion_pocket_ticks,
                         reversion_pocket_notional_usd, vacuum_ratio
                  FROM pulse_session_summaries
@@ -477,6 +487,8 @@ mod tests {
                         row.get(10)?,
                         row.get(11)?,
                         row.get(12)?,
+                        row.get(13)?,
+                        row.get(14)?,
                     ))
                 },
             )
@@ -485,16 +497,18 @@ mod tests {
         assert_eq!(row.0, "0.35");
         assert_eq!(row.1, "1225");
         assert_eq!(row.2, "4.12");
-        assert_eq!(row.3, 182.5);
-        assert!(row.4);
-        assert_eq!(row.5, "effective_open");
-        assert_eq!(row.6, "0.39");
-        assert_eq!(row.7, "maker_proxy_hit");
-        assert_eq!(row.8, "0.38");
-        assert_eq!(row.9, "0.31");
-        assert_eq!(row.10, 4.0);
-        assert_eq!(row.11, "28.57");
-        assert_eq!(row.12, "1");
+        assert_eq!(row.3, "21.68");
+        assert!((row.4 - 0.768).abs() < f64::EPSILON);
+        assert_eq!(row.5, 182.5);
+        assert!(row.6);
+        assert_eq!(row.7, "effective_open");
+        assert_eq!(row.8, "0.39");
+        assert_eq!(row.9, "maker_proxy_hit");
+        assert_eq!(row.10, "0.38");
+        assert_eq!(row.11, "0.31");
+        assert_eq!(row.12, 4.0);
+        assert_eq!(row.13, "28.57");
+        assert_eq!(row.14, "1");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -553,6 +567,8 @@ mod tests {
             actual_fill_notional_usd: "1225".to_owned(),
             candidate_expected_net_pnl_usd: Some("4.12".to_owned()),
             expected_open_net_pnl_usd: "3.85".to_owned(),
+            timeout_loss_estimate_usd: Some("21.68".to_owned()),
+            required_hit_rate: Some(0.768),
             pulse_score_bps: Some(182.5),
             effective_open: true,
             opening_outcome: "effective_open".to_owned(),

@@ -1558,6 +1558,12 @@ fn format_decimal(value: Decimal) -> String {
     value.normalize().to_string()
 }
 
+fn format_hit_rate(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{:.1}%", value * 100.0))
+        .unwrap_or_else(|| "-".to_owned())
+}
+
 fn parse_decimal_or_zero(value: &str) -> Decimal {
     value.parse::<Decimal>().unwrap_or(Decimal::ZERO)
 }
@@ -2108,7 +2114,7 @@ fn run_pulse_sessions_report(
             } else {
                 for row in &report.sessions {
                     println!(
-                        "  {} 资产={} 状态={} fill={}/{} ({:.1}%) edge={} cand={} open={} pocket={} vacuum={} pnl={}",
+                        "  {} 资产={} 状态={} fill={}/{} ({:.1}%) edge={} cand={} open={} timeout_loss={} hit={} pocket={} vacuum={} pnl={}",
                         row.pulse_session_id,
                         row.asset,
                         row.state,
@@ -2120,6 +2126,8 @@ fn run_pulse_sessions_report(
                             .unwrap_or_else(|| "-".to_owned()),
                         format_option_text(row.candidate_expected_net_pnl_usd.as_deref()),
                         row.expected_open_net_pnl_usd,
+                        format_option_text(row.timeout_loss_estimate_usd.as_deref()),
+                        format_hit_rate(row.required_hit_rate),
                         row.reversion_pocket_ticks
                             .map(|value| format!("{value:.1}t"))
                             .unwrap_or_else(|| "-".to_owned()),
@@ -2317,9 +2325,11 @@ fn run_pulse_session_detail_report(
                 format_option_text(report.session.timeout_exit_price.as_deref())
             );
             println!(
-                "会话EV: candidate={} open={} entry_notional={} pocket_ticks={} pocket_notional={} vacuum={}",
+                "会话EV: candidate={} open={} timeout_loss={} hit={} entry_notional={} pocket_ticks={} pocket_notional={} vacuum={}",
                 format_option_text(report.session.candidate_expected_net_pnl_usd.as_deref()),
                 report.session.expected_open_net_pnl_usd,
+                format_option_text(report.session.timeout_loss_estimate_usd.as_deref()),
+                format_hit_rate(report.session.required_hit_rate),
                 format_option_text(report.session.entry_executable_notional_usd.as_deref()),
                 report
                     .session
@@ -3188,6 +3198,8 @@ mod tests {
                     actual_fill_notional_usd: "1225".to_owned(),
                     candidate_expected_net_pnl_usd: Some("4.12".to_owned()),
                     expected_open_net_pnl_usd: "3.85".to_owned(),
+                    timeout_loss_estimate_usd: Some("21.68".to_owned()),
+                    required_hit_rate: Some(0.768),
                     pulse_score_bps: Some(182.5),
                     target_exit_price: Some("0.38".to_owned()),
                     timeout_exit_price: Some("0.31".to_owned()),
@@ -3733,6 +3745,8 @@ mod tests {
                 actual_fill_notional_usd: actual_fill_notional_usd.to_owned(),
                 candidate_expected_net_pnl_usd: Some("4.12".to_owned()),
                 expected_open_net_pnl_usd: expected_open_net_pnl_usd.to_owned(),
+                timeout_loss_estimate_usd: Some("21.68".to_owned()),
+                required_hit_rate: Some(0.768),
                 pulse_score_bps: Some(182.5),
                 target_exit_price: Some("0.38".to_owned()),
                 timeout_exit_price: Some("0.31".to_owned()),

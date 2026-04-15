@@ -438,7 +438,7 @@ fn pulse_summary_lines(state: &TuiState) -> Vec<Line<'static>> {
         lines.push(Line::from(vec![
             Span::styled("Pulse 选中 ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!(
-                "{} {} edge{:.1}bps EV${} 入{} 目{} 超{} pocket{}/$ {} 真空{}",
+                "{} {} edge{:.1}bps EV${} 超亏${} Hit{} 入{} 目{} 超{} pocket{}/$ {} 真空{}",
                 session.asset,
                 session.state,
                 session.net_edge_bps,
@@ -446,6 +446,11 @@ fn pulse_summary_lines(state: &TuiState) -> Vec<Line<'static>> {
                     .candidate_expected_net_pnl_usd
                     .as_deref()
                     .unwrap_or("--"),
+                session
+                    .timeout_loss_estimate_usd
+                    .as_deref()
+                    .unwrap_or("--"),
+                format_optional_ratio_pct(session.required_hit_rate),
                 session.entry_price.as_deref().unwrap_or("--"),
                 session.target_exit_price.as_deref().unwrap_or("--"),
                 session.timeout_exit_price.as_deref().unwrap_or("--"),
@@ -782,8 +787,9 @@ fn render_pulse_markets(state: &TuiState, markets: &[PulseMarketMonitorRow]) -> 
         right_cell("Pulse"),
         right_cell("净边"),
         right_cell("EV$"),
+        right_cell("超亏$"),
+        right_cell("Hit%"),
         right_cell("入/目"),
-        right_cell("超时"),
         right_cell("Pocket"),
         right_cell("真空"),
         right_cell("龄(P/C/A)"),
@@ -828,12 +834,16 @@ fn render_pulse_markets(state: &TuiState, markets: &[PulseMarketMonitorRow]) -> 
                     7,
                 )),
                 right_cell(fit_display_right(
-                    &format_entry_target_pair(market.entry_price, market.target_exit_price),
-                    11,
+                    &format_optional_metric(market.timeout_loss_estimate_usd),
+                    7,
                 )),
                 right_cell(fit_display_right(
-                    &format_optional_price(market.timeout_exit_price),
+                    &format_optional_ratio_pct(market.required_hit_rate),
                     6,
+                )),
+                right_cell(fit_display_right(
+                    &format_entry_target_pair(market.entry_price, market.target_exit_price),
+                    11,
                 )),
                 right_cell(fit_display_right(
                     &format_pocket_summary(
@@ -875,8 +885,9 @@ fn render_pulse_markets(state: &TuiState, markets: &[PulseMarketMonitorRow]) -> 
             Constraint::Length(7),
             Constraint::Length(7),
             Constraint::Length(7),
-            Constraint::Length(11),
+            Constraint::Length(7),
             Constraint::Length(6),
+            Constraint::Length(11),
             Constraint::Length(11),
             Constraint::Length(6),
             Constraint::Length(13),
@@ -2375,6 +2386,12 @@ fn format_optional_pct(value: Option<f64>) -> String {
         .unwrap_or_else(|| "--".to_owned())
 }
 
+fn format_optional_ratio_pct(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{:.1}%", value * 100.0))
+        .unwrap_or_else(|| "--".to_owned())
+}
+
 fn format_price(price: f64) -> String {
     if price <= 0.0 {
         "--".to_owned()
@@ -3150,6 +3167,8 @@ mod tests {
                 target_exit_price: Some(0.38),
                 timeout_exit_price: Some(0.31),
                 expected_net_pnl_usd: Some(3.85),
+                timeout_loss_estimate_usd: Some(21.68),
+                required_hit_rate: Some(0.768),
                 reversion_pocket_ticks: Some(4.0),
                 reversion_pocket_notional_usd: Some(28.57),
                 vacuum_ratio: Some(1.0),
@@ -3495,6 +3514,8 @@ mod tests {
                 entry_executable_notional_usd: Some("250".to_owned()),
                 candidate_expected_net_pnl_usd: Some("4.12".to_owned()),
                 expected_open_net_pnl_usd: Some("3.85".to_owned()),
+                timeout_loss_estimate_usd: Some("21.68".to_owned()),
+                required_hit_rate: Some(0.768),
                 reversion_pocket_ticks: Some(4.0),
                 reversion_pocket_notional_usd: Some("28.57".to_owned()),
                 vacuum_ratio: Some("1".to_owned()),
@@ -3516,6 +3537,8 @@ mod tests {
         assert!(compact.contains("anchor42ms"));
         assert!(compact.contains("对冲偏移"));
         assert!(compact.contains("EV$4.12"));
+        assert!(compact.contains("超亏$21.68"));
+        assert!(compact.contains("Hit76.8%"));
         assert!(compact.contains("入0.35"));
         assert!(compact.contains("目0.38"));
     }

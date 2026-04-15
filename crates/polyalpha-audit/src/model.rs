@@ -356,6 +356,10 @@ pub struct PulseLifecycleAuditEvent {
     pub candidate_expected_net_pnl_usd: Option<String>,
     pub expected_open_net_pnl_usd: String,
     #[serde(default)]
+    pub timeout_loss_estimate_usd: Option<String>,
+    #[serde(default)]
+    pub required_hit_rate: Option<f64>,
+    #[serde(default)]
     pub pulse_score_bps: Option<f64>,
     #[serde(default)]
     pub target_exit_price: Option<String>,
@@ -419,6 +423,10 @@ pub struct PulseSessionSummaryRow {
     #[serde(default)]
     pub candidate_expected_net_pnl_usd: Option<String>,
     pub expected_open_net_pnl_usd: String,
+    #[serde(default)]
+    pub timeout_loss_estimate_usd: Option<String>,
+    #[serde(default)]
+    pub required_hit_rate: Option<f64>,
     #[serde(default)]
     pub pulse_score_bps: Option<f64>,
     pub effective_open: bool,
@@ -617,6 +625,8 @@ mod tests {
             actual_fill_notional_usd: "1225".to_owned(),
             candidate_expected_net_pnl_usd: Some("4.12".to_owned()),
             expected_open_net_pnl_usd: "3.85".to_owned(),
+            timeout_loss_estimate_usd: Some("21.68".to_owned()),
+            required_hit_rate: Some(0.768),
             pulse_score_bps: Some(182.5),
             target_exit_price: Some("0.38".to_owned()),
             timeout_exit_price: Some("0.31".to_owned()),
@@ -645,6 +655,8 @@ mod tests {
         assert!(encoded.contains("\"pulse_lifecycle\""));
         assert!(encoded.contains("\"actual_poly_filled_qty\":\"3500\""));
         assert!(encoded.contains("\"opening_outcome\":\"effective_open\""));
+        assert!(encoded.contains("\"timeout_loss_estimate_usd\":\"21.68\""));
+        assert!(encoded.contains("\"required_hit_rate\":0.768"));
     }
 
     #[test]

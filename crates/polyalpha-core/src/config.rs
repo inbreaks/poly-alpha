@@ -552,6 +552,14 @@ fn default_pulse_min_score_bps() -> Decimal {
     Decimal::new(50, 0)
 }
 
+fn default_pulse_max_timeout_loss_usd() -> UsdNotional {
+    UsdNotional(Decimal::new(20, 0))
+}
+
+fn default_pulse_max_required_hit_rate() -> Decimal {
+    Decimal::new(70, 2)
+}
+
 fn default_pulse_max_anchor_latency_delta_ms() -> u64 {
     5_000
 }
@@ -627,6 +635,10 @@ pub struct PulseEntryConfig {
     pub max_cex_mid_move_bps: Decimal,
     #[serde(default = "default_pulse_min_score_bps")]
     pub min_pulse_score_bps: Decimal,
+    #[serde(default = "default_pulse_max_timeout_loss_usd")]
+    pub max_timeout_loss_usd: UsdNotional,
+    #[serde(default = "default_pulse_max_required_hit_rate")]
+    pub max_required_hit_rate: Decimal,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1193,6 +1205,11 @@ mod tests {
             config.session.effective_min_open_fill_ratio(),
             Decimal::new(5, 2)
         );
+        assert_eq!(
+            config.entry.max_timeout_loss_usd,
+            UsdNotional(Decimal::new(20, 0))
+        );
+        assert_eq!(config.entry.max_required_hit_rate, Decimal::new(70, 2));
         let encoded = serde_json::to_value(&config).expect("serialize pulse config");
         assert_eq!(
             encoded["session"]["min_open_notional_reject_cooldown_secs"],

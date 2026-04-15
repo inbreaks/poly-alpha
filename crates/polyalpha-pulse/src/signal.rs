@@ -38,6 +38,9 @@ pub struct SessionEdgeEstimate {
     pub timeout_exit_haircut_bps: f64,
     pub expected_net_edge_bps: f64,
     pub expected_net_pnl_usd: Decimal,
+    pub timeout_net_edge_bps: f64,
+    pub timeout_net_pnl_usd: Decimal,
+    pub timeout_loss_estimate_usd: Decimal,
 }
 
 pub fn executable_poly_quote(
@@ -174,14 +177,17 @@ pub fn estimate_session_edge(
     reserve_bps: f64,
 ) -> SessionEdgeEstimate {
     let maker_gross_edge_bps = price_edge_bps(entry_price, target_exit_price);
-    let timeout_exit_haircut_bps = if timeout_exit_price <= Decimal::ZERO {
-        0.0
-    } else {
-        price_edge_bps(timeout_exit_price, entry_price).max(0.0)
-    };
+    let timeout_exit_haircut_bps = price_edge_bps(entry_price, timeout_exit_price).abs();
     let expected_net_edge_bps = maker_gross_edge_bps - hedge_cost_bps - fee_bps - reserve_bps;
-    let expected_net_pnl_usd = entry_notional_usd
-        * Decimal::from_f64_retain(expected_net_edge_bps / 10_000.0).unwrap_or(Decimal::ZERO);
+    let expected_net_pnl_usd = edge_pnl_usd(entry_notional_usd, expected_net_edge_bps);
+    let timeout_net_edge_bps =
+        price_edge_bps(entry_price, timeout_exit_price) - hedge_cost_bps - fee_bps - reserve_bps;
+    let timeout_net_pnl_usd = edge_pnl_usd(entry_notional_usd, timeout_net_edge_bps);
+    let timeout_loss_estimate_usd = if timeout_net_pnl_usd < Decimal::ZERO {
+        -timeout_net_pnl_usd
+    } else {
+        Decimal::ZERO
+    };
 
     SessionEdgeEstimate {
         target_exit_price,
@@ -190,6 +196,9 @@ pub fn estimate_session_edge(
         timeout_exit_haircut_bps,
         expected_net_edge_bps,
         expected_net_pnl_usd,
+        timeout_net_edge_bps,
+        timeout_net_pnl_usd,
+        timeout_loss_estimate_usd,
     }
 }
 
@@ -238,6 +247,10 @@ fn price_edge_bps(entry_price: Decimal, exit_price: Decimal) -> f64 {
         .unwrap_or(0.0)
 }
 
+fn edge_pnl_usd(entry_notional_usd: Decimal, edge_bps: f64) -> Decimal {
+    entry_notional_usd * Decimal::from_f64_retain(edge_bps / 10_000.0).unwrap_or(Decimal::ZERO)
+}
+
 #[cfg(test)]
 mod tests {
     use rust_decimal::Decimal;
@@ -247,7 +260,9 @@ mod tests {
         VenueQuantity,
     };
 
-    use super::{executable_poly_quote, reversion_pocket, ExecutableQuoteSide};
+    use super::{
+        estimate_session_edge, executable_poly_quote, reversion_pocket, ExecutableQuoteSide,
+    };
 
     fn level(price: i64, price_scale: u32, qty: i64, qty_scale: u32) -> PriceLevel {
         PriceLevel {
@@ -281,12 +296,8 @@ mod tests {
             ],
         );
 
-        let quote = executable_poly_quote(
-            &book,
-            ExecutableQuoteSide::Buy,
-            Decimal::new(250, 0),
-        )
-        .expect("quote");
+        let quote = executable_poly_quote(&book, ExecutableQuoteSide::Buy, Decimal::new(250, 0))
+            .expect("quote");
 
         assert_eq!(quote.filled_notional_usd, Decimal::new(250, 0));
         assert_eq!(quote.depth_shortfall_usd, Decimal::ZERO);
@@ -296,17 +307,10 @@ mod tests {
 
     #[test]
     fn executable_vwap_returns_shortfall_when_book_depth_is_too_thin() {
-        let book = poly_book(
-            vec![],
-            vec![level(35, 2, 100, 0), level(36, 2, 100, 0)],
-        );
+        let book = poly_book(vec![], vec![level(35, 2, 100, 0), level(36, 2, 100, 0)]);
 
-        let quote = executable_poly_quote(
-            &book,
-            ExecutableQuoteSide::Buy,
-            Decimal::new(250, 0),
-        )
-        .expect("quote");
+        let quote = executable_poly_quote(&book, ExecutableQuoteSide::Buy, Decimal::new(250, 0))
+            .expect("quote");
 
         assert_eq!(quote.filled_shares, Decimal::new(200, 0));
         assert_eq!(quote.filled_notional_usd, Decimal::new(71, 0));
@@ -326,7 +330,36 @@ mod tests {
         assert_eq!(pocket.reference_price, Decimal::new(39, 2));
         assert_eq!(pocket.target_price, Decimal::new(39, 2));
         assert_eq!(pocket.available_ticks, 4.0);
-        assert_eq!(pocket.pocket_notional_usd.round_dp(6), Decimal::new(28571429, 6));
+        assert_eq!(
+            pocket.pocket_notional_usd.round_dp(6),
+            Decimal::new(28571429, 6)
+        );
         assert_eq!(pocket.vacuum_ratio, Decimal::ONE);
+    }
+
+    #[test]
+    fn session_edge_estimate_exposes_timeout_loss_proxy() {
+        let estimate = estimate_session_edge(
+            Decimal::new(250, 0),
+            Decimal::new(20, 2),
+            Decimal::new(21, 2),
+            Decimal::new(18, 2),
+            20.0,
+            20.0,
+            10.0,
+        );
+
+        assert_eq!(
+            estimate.expected_net_pnl_usd.round_dp(2),
+            Decimal::new(1125, 2)
+        );
+        assert_eq!(
+            estimate.timeout_net_pnl_usd.round_dp(2),
+            Decimal::new(-2625, 2)
+        );
+        assert_eq!(
+            estimate.timeout_loss_estimate_usd.round_dp(2),
+            Decimal::new(2625, 2)
+        );
     }
 }

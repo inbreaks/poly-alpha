@@ -104,6 +104,7 @@ pub struct PulseOpportunityInput {
     pub timeout_exit_reserve_bps: f64,
     pub expected_net_edge_bps: f64,
     pub expected_net_pnl_usd: Decimal,
+    pub timeout_loss_estimate_usd: Decimal,
     pub reversion_pocket_ticks: f64,
     pub vacuum_ratio: Decimal,
     pub anchor_quality_ok: bool,
@@ -121,6 +122,7 @@ pub struct DetectorDecision {
     pub net_session_edge_bps: f64,
     pub expected_net_pnl_usd: Decimal,
     pub pulse_score_bps: f64,
+    pub required_hit_rate: f64,
     pub rejection_code: Option<PulseFailureCode>,
 }
 
@@ -132,6 +134,7 @@ pub enum PulseFailureCode {
     DataFreshnessRejected,
     OpeningRejectCooldownActive,
     PulseConfirmationRejected,
+    TimeoutRiskRejected,
     HardExpiryGapExceeded,
 }
 
@@ -144,6 +147,7 @@ impl PulseFailureCode {
             Self::DataFreshnessRejected => "data_freshness_rejected",
             Self::OpeningRejectCooldownActive => "opening_reject_cooldown_active",
             Self::PulseConfirmationRejected => "pulse_confirmation_rejected",
+            Self::TimeoutRiskRejected => "timeout_risk_rejected",
             Self::HardExpiryGapExceeded => "hard_expiry_gap_exceeded",
         }
     }

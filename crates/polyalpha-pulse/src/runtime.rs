@@ -167,6 +167,8 @@ struct ManagedSession {
     vacuum_ratio: Decimal,
     entry_executable_notional_usd: Decimal,
     candidate_expected_net_pnl_usd: Decimal,
+    timeout_loss_estimate_usd: Decimal,
+    required_hit_rate: f64,
     last_allocated_hedge_qty: Decimal,
     opening_allocated_hedge_qty: Decimal,
     actual_fill_notional_usd: Decimal,
@@ -191,6 +193,8 @@ struct EntryCandidate {
     timeout_exit_price: Decimal,
     net_edge_bps: f64,
     expected_net_pnl_usd: Decimal,
+    timeout_loss_estimate_usd: Decimal,
+    required_hit_rate: f64,
     pulse_score_bps: f64,
     available_reversion_ticks: f64,
     entry_executable_notional_usd: Decimal,
@@ -228,6 +232,8 @@ struct PulseMarketSignalSnapshot {
     target_exit_price: Decimal,
     timeout_exit_price: Decimal,
     expected_net_pnl_usd: Decimal,
+    timeout_loss_estimate_usd: Decimal,
+    required_hit_rate: f64,
     reversion_pocket_ticks: f64,
     reversion_pocket_notional_usd: Decimal,
     vacuum_ratio: Decimal,
@@ -372,6 +378,28 @@ impl PulseRuntimeBuilder {
                 .exit
                 .base_target_ticks
                 .max(1) as f64,
+            max_timeout_loss_usd: self
+                .settings
+                .strategy
+                .pulse_arb
+                .entry
+                .max_timeout_loss_usd
+                .0,
+            max_required_hit_rate: self
+                .settings
+                .strategy
+                .pulse_arb
+                .entry
+                .max_required_hit_rate
+                .to_f64()
+                .unwrap_or(1.0),
+            min_expected_net_pnl_usd: self
+                .settings
+                .strategy
+                .pulse_arb
+                .session
+                .effective_min_expected_net_pnl_usd()
+                .0,
         });
         let pricer = EventPricer::new(event_pricer_config(&self.settings));
 
@@ -682,6 +710,8 @@ impl PulseRuntime {
                 actual_fill_notional_usd: "1225".to_owned(),
                 candidate_expected_net_pnl_usd: Some("4.12".to_owned()),
                 expected_open_net_pnl_usd: "3.85".to_owned(),
+                timeout_loss_estimate_usd: Some("21.68".to_owned()),
+                required_hit_rate: Some(0.768),
                 pulse_score_bps: Some(182.5),
                 effective_open: true,
                 opening_outcome: OPENING_OUTCOME_EFFECTIVE_OPEN.to_owned(),
@@ -1044,6 +1074,8 @@ impl PulseRuntime {
             vacuum_ratio: candidate.vacuum_ratio,
             entry_executable_notional_usd: candidate.entry_executable_notional_usd,
             candidate_expected_net_pnl_usd: candidate.expected_net_pnl_usd,
+            timeout_loss_estimate_usd: candidate.timeout_loss_estimate_usd,
+            required_hit_rate: candidate.required_hit_rate,
             last_allocated_hedge_qty: Decimal::ZERO,
             opening_allocated_hedge_qty: Decimal::ZERO,
             actual_fill_notional_usd: Decimal::ZERO,
@@ -1643,9 +1675,13 @@ impl PulseRuntime {
             .session
             .effective_opening_request_notional_usd()
             .0;
-        let entry_quote =
-            executable_poly_quote(claim_book, ExecutableQuoteSide::Buy, opening_request_notional)?;
-        if entry_quote.filled_notional_usd <= Decimal::ZERO || entry_quote.avg_price <= Decimal::ZERO
+        let entry_quote = executable_poly_quote(
+            claim_book,
+            ExecutableQuoteSide::Buy,
+            opening_request_notional,
+        )?;
+        if entry_quote.filled_notional_usd <= Decimal::ZERO
+            || entry_quote.avg_price <= Decimal::ZERO
         {
             return None;
         }
@@ -1654,8 +1690,7 @@ impl PulseRuntime {
             TokenSide::Yes => priced.fair_prob_yes,
             TokenSide::No => priced.fair_prob_no,
         };
-        let fair_claim_price =
-            Decimal::from_f64_retain(fair_claim_prob).unwrap_or(Decimal::ZERO);
+        let fair_claim_price = Decimal::from_f64_retain(fair_claim_prob).unwrap_or(Decimal::ZERO);
         let pocket = reversion_pocket(
             entry_quote.avg_price,
             prior_claim_ask.unwrap_or(entry_quote.avg_price),
@@ -1729,6 +1764,7 @@ impl PulseRuntime {
             timeout_exit_reserve_bps: self.settings.execution_costs.poly_fee_bps as f64 / 2.0,
             expected_net_edge_bps: session_edge.expected_net_edge_bps,
             expected_net_pnl_usd: session_edge.expected_net_pnl_usd,
+            timeout_loss_estimate_usd: session_edge.timeout_loss_estimate_usd,
             reversion_pocket_ticks: pocket.available_ticks,
             vacuum_ratio: pocket.vacuum_ratio,
             anchor_quality_ok,
@@ -1754,6 +1790,8 @@ impl PulseRuntime {
             timeout_exit_price: session_edge.timeout_exit_price,
             net_edge_bps: decision.net_session_edge_bps,
             expected_net_pnl_usd: decision.expected_net_pnl_usd,
+            timeout_loss_estimate_usd: session_edge.timeout_loss_estimate_usd,
+            required_hit_rate: decision.required_hit_rate,
             pulse_score_bps: decision.pulse_score_bps,
             available_reversion_ticks: pocket.available_ticks,
             entry_executable_notional_usd: entry_quote.filled_notional_usd,
@@ -1985,7 +2023,13 @@ impl PulseRuntime {
             expected_net_pnl_usd: signal
                 .as_ref()
                 .and_then(|snapshot| snapshot.expected_net_pnl_usd.to_f64()),
-            reversion_pocket_ticks: signal.as_ref().map(|snapshot| snapshot.reversion_pocket_ticks),
+            timeout_loss_estimate_usd: signal
+                .as_ref()
+                .and_then(|snapshot| snapshot.timeout_loss_estimate_usd.to_f64()),
+            required_hit_rate: signal.as_ref().map(|snapshot| snapshot.required_hit_rate),
+            reversion_pocket_ticks: signal
+                .as_ref()
+                .map(|snapshot| snapshot.reversion_pocket_ticks),
             reversion_pocket_notional_usd: signal
                 .as_ref()
                 .and_then(|snapshot| snapshot.reversion_pocket_notional_usd.to_f64()),
@@ -2153,9 +2197,13 @@ impl PulseRuntime {
                               claim_book: &OrderBookSnapshot,
                               prior_claim_ask: Option<Decimal>|
          -> Option<PulseMarketSignalSnapshot> {
-            let entry_quote =
-                executable_poly_quote(claim_book, ExecutableQuoteSide::Buy, opening_request_notional)?;
-            if entry_quote.filled_notional_usd <= Decimal::ZERO || entry_quote.avg_price <= Decimal::ZERO
+            let entry_quote = executable_poly_quote(
+                claim_book,
+                ExecutableQuoteSide::Buy,
+                opening_request_notional,
+            )?;
+            if entry_quote.filled_notional_usd <= Decimal::ZERO
+                || entry_quote.avg_price <= Decimal::ZERO
             {
                 return None;
             }
@@ -2221,8 +2269,9 @@ impl PulseRuntime {
                 self.settings.execution_costs.cex_taker_fee_bps as f64
                     + self.settings.execution_costs.poly_fee_bps as f64 / 2.0,
             );
-            let has_pulse_history =
-                prior_claim_ask.is_some() && prior_cex_mid.is_some() && prior_fair_prob_yes.is_some();
+            let has_pulse_history = prior_claim_ask.is_some()
+                && prior_cex_mid.is_some()
+                && prior_fair_prob_yes.is_some();
             let instant_basis_bps = ((fair_claim_price - entry_quote.avg_price)
                 * Decimal::from(10_000))
             .to_f64()
@@ -2232,12 +2281,14 @@ impl PulseRuntime {
                 poly_vwap_slippage_bps: entry_quote.slippage_bps,
                 hedge_slippage_bps: self.settings.paper_slippage.cex_slippage_bps as f64,
                 fee_bps: (self.settings.execution_costs.poly_fee_bps
-                    + self.settings.execution_costs.cex_taker_fee_bps) as f64,
+                    + self.settings.execution_costs.cex_taker_fee_bps)
+                    as f64,
                 perp_basis_penalty_bps: 0.0,
                 rehedge_reserve_bps: self.settings.execution_costs.cex_taker_fee_bps as f64,
                 timeout_exit_reserve_bps: self.settings.execution_costs.poly_fee_bps as f64 / 2.0,
                 expected_net_edge_bps: session_edge.expected_net_edge_bps,
                 expected_net_pnl_usd: session_edge.expected_net_pnl_usd,
+                timeout_loss_estimate_usd: session_edge.timeout_loss_estimate_usd,
                 reversion_pocket_ticks: pocket.available_ticks,
                 vacuum_ratio: pocket.vacuum_ratio,
                 anchor_quality_ok,
@@ -2261,6 +2312,8 @@ impl PulseRuntime {
                 target_exit_price,
                 timeout_exit_price,
                 expected_net_pnl_usd: decision.expected_net_pnl_usd,
+                timeout_loss_estimate_usd: session_edge.timeout_loss_estimate_usd,
+                required_hit_rate: decision.required_hit_rate,
                 reversion_pocket_ticks: pocket.available_ticks,
                 reversion_pocket_notional_usd: pocket.pocket_notional_usd,
                 vacuum_ratio: pocket.vacuum_ratio,
@@ -2460,12 +2513,19 @@ impl PulseRuntime {
                 entry_price: Some(managed.entry_price.normalize().to_string()),
                 actual_fill_notional_usd: managed.actual_fill_notional_usd.normalize().to_string(),
                 candidate_expected_net_pnl_usd: Some(
-                    managed.candidate_expected_net_pnl_usd.normalize().to_string(),
+                    managed
+                        .candidate_expected_net_pnl_usd
+                        .normalize()
+                        .to_string(),
                 ),
                 expected_open_net_pnl_usd: managed
                     .expected_open_net_pnl_usd
                     .normalize()
                     .to_string(),
+                timeout_loss_estimate_usd: Some(
+                    managed.timeout_loss_estimate_usd.normalize().to_string(),
+                ),
+                required_hit_rate: Some(managed.required_hit_rate),
                 pulse_score_bps: Some(managed.pulse_score_bps),
                 effective_open: managed.effective_open,
                 opening_outcome: managed.opening_outcome.clone(),
@@ -2487,11 +2547,17 @@ impl PulseRuntime {
                 final_exit_price,
                 timeout_exit_price: Some(managed.timeout_exit_price.normalize().to_string()),
                 entry_executable_notional_usd: Some(
-                    managed.entry_executable_notional_usd.normalize().to_string(),
+                    managed
+                        .entry_executable_notional_usd
+                        .normalize()
+                        .to_string(),
                 ),
                 reversion_pocket_ticks: Some(managed.available_reversion_ticks),
                 reversion_pocket_notional_usd: Some(
-                    managed.reversion_pocket_notional_usd.normalize().to_string(),
+                    managed
+                        .reversion_pocket_notional_usd
+                        .normalize()
+                        .to_string(),
                 ),
                 vacuum_ratio: Some(managed.vacuum_ratio.normalize().to_string()),
                 anchor_latency_delta_ms: Some(managed.anchor_latency_delta_ms),
@@ -2763,18 +2829,29 @@ fn runtime_lifecycle_event(
         actual_poly_fill_ratio: managed.session.actual_poly_fill_ratio(),
         actual_fill_notional_usd: managed.actual_fill_notional_usd.normalize().to_string(),
         candidate_expected_net_pnl_usd: Some(
-            managed.candidate_expected_net_pnl_usd.normalize().to_string(),
+            managed
+                .candidate_expected_net_pnl_usd
+                .normalize()
+                .to_string(),
         ),
         expected_open_net_pnl_usd: managed.expected_open_net_pnl_usd.normalize().to_string(),
+        timeout_loss_estimate_usd: Some(managed.timeout_loss_estimate_usd.normalize().to_string()),
+        required_hit_rate: Some(managed.required_hit_rate),
         pulse_score_bps: Some(managed.pulse_score_bps),
         target_exit_price: Some(managed.target_exit_price.normalize().to_string()),
         timeout_exit_price: Some(managed.timeout_exit_price.normalize().to_string()),
         entry_executable_notional_usd: Some(
-            managed.entry_executable_notional_usd.normalize().to_string(),
+            managed
+                .entry_executable_notional_usd
+                .normalize()
+                .to_string(),
         ),
         reversion_pocket_ticks: Some(managed.available_reversion_ticks),
         reversion_pocket_notional_usd: Some(
-            managed.reversion_pocket_notional_usd.normalize().to_string(),
+            managed
+                .reversion_pocket_notional_usd
+                .normalize()
+                .to_string(),
         ),
         vacuum_ratio: Some(managed.vacuum_ratio.normalize().to_string()),
         effective_open: managed.effective_open,
@@ -2856,6 +2933,8 @@ fn lifecycle_event(
         actual_fill_notional_usd: "1225".to_owned(),
         candidate_expected_net_pnl_usd: Some("4.12".to_owned()),
         expected_open_net_pnl_usd: "3.85".to_owned(),
+        timeout_loss_estimate_usd: Some("21.68".to_owned()),
+        required_hit_rate: Some(0.768),
         pulse_score_bps: Some(182.5),
         target_exit_price: Some("0.38".to_owned()),
         timeout_exit_price: Some("0.31".to_owned()),
@@ -2906,17 +2985,26 @@ fn runtime_session_detail_view(
         target_exit_price: Some(managed.target_exit_price.normalize().to_string()),
         timeout_exit_price: Some(managed.timeout_exit_price.normalize().to_string()),
         entry_executable_notional_usd: Some(
-            managed.entry_executable_notional_usd.normalize().to_string(),
+            managed
+                .entry_executable_notional_usd
+                .normalize()
+                .to_string(),
         ),
         candidate_expected_net_pnl_usd: Some(
-            managed.candidate_expected_net_pnl_usd.normalize().to_string(),
+            managed
+                .candidate_expected_net_pnl_usd
+                .normalize()
+                .to_string(),
         ),
-        expected_open_net_pnl_usd: Some(
-            managed.expected_open_net_pnl_usd.normalize().to_string(),
-        ),
+        expected_open_net_pnl_usd: Some(managed.expected_open_net_pnl_usd.normalize().to_string()),
+        timeout_loss_estimate_usd: Some(managed.timeout_loss_estimate_usd.normalize().to_string()),
+        required_hit_rate: Some(managed.required_hit_rate),
         reversion_pocket_ticks: Some(managed.available_reversion_ticks),
         reversion_pocket_notional_usd: Some(
-            managed.reversion_pocket_notional_usd.normalize().to_string(),
+            managed
+                .reversion_pocket_notional_usd
+                .normalize()
+                .to_string(),
         ),
         vacuum_ratio: Some(managed.vacuum_ratio.normalize().to_string()),
         session_target_delta_exposure: Some(
@@ -2955,6 +3043,8 @@ fn session_detail_view(
         entry_executable_notional_usd: Some("250".to_owned()),
         candidate_expected_net_pnl_usd: Some("4.12".to_owned()),
         expected_open_net_pnl_usd: Some("3.85".to_owned()),
+        timeout_loss_estimate_usd: Some("21.68".to_owned()),
+        required_hit_rate: Some(0.768),
         reversion_pocket_ticks: Some(4.0),
         reversion_pocket_notional_usd: Some("28.57".to_owned()),
         vacuum_ratio: Some("1".to_owned()),
@@ -3622,7 +3712,11 @@ fn fixture_settings_for_asset(asset: PulseAsset) -> Settings {
             "pulse_arb": {
                 "runtime": { "enabled": true, "max_concurrent_sessions_per_asset": 2 },
                 "session": { "max_holding_secs": 900, "min_opening_notional_usd": "250" },
-                "entry": { "min_net_session_edge_bps": "25" },
+                "entry": {
+                    "min_net_session_edge_bps": "25",
+                    "max_timeout_loss_usd": "1000",
+                    "max_required_hit_rate": "1.0"
+                },
                 "rehedge": {
                     "delta_drift_threshold": "0.03",
                     "delta_bump_mode": "relative_with_clamp",
@@ -4326,8 +4420,10 @@ mod tests {
             now_ms,
             settlement_timestamp * 1_000,
         )));
-        let thick_market = btc_signal_market_with_symbol("btc-above-100k-thick", settlement_timestamp);
-        let thin_market = btc_signal_market_with_symbol("btc-above-100k-thin", settlement_timestamp);
+        let thick_market =
+            btc_signal_market_with_symbol("btc-above-100k-thick", settlement_timestamp);
+        let thin_market =
+            btc_signal_market_with_symbol("btc-above-100k-thin", settlement_timestamp);
         let mut runtime = PulseRuntimeBuilder::new(fixture.settings.clone())
             .with_anchor_provider(anchor_provider)
             .with_markets(vec![thin_market.clone(), thick_market.clone()])
@@ -5228,6 +5324,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_tick_records_timeout_risk_rejection_stats() {
+        let fixture = runtime_fixture_for_asset(PulseAsset::Btc);
+        let mut settings = fixture.settings.clone();
+        settings.strategy.pulse_arb.entry.max_timeout_loss_usd = UsdNotional(Decimal::new(20, 0));
+        settings.strategy.pulse_arb.entry.max_required_hit_rate = Decimal::new(70, 2);
+        settings.strategy.pulse_arb.session.min_expected_net_pnl_usd =
+            Some(UsdNotional(Decimal::new(5, 1)));
+        let now_ms = current_time_ms();
+        let settlement_timestamp = (now_ms / 1_000) + 3_600;
+        let anchor_provider = Arc::new(StaticAnchorProvider::new(btc_anchor_snapshot(
+            now_ms,
+            settlement_timestamp * 1_000,
+        )));
+        let mut runtime = PulseRuntimeBuilder::new(settings)
+            .with_anchor_provider(anchor_provider)
+            .with_markets(vec![btc_signal_market(settlement_timestamp)])
+            .with_execution_mode(PulseExecutionMode::Paper)
+            .build()
+            .await
+            .expect("build runtime");
+
+        drive_btc_pulse_entry_attempt(&mut runtime, now_ms).await;
+
+        let signal_stats = runtime.signal_stats();
+        assert_eq!(runtime.active_session_count(), 0);
+        assert_eq!(signal_stats.seen, 0);
+        assert!(signal_stats.rejected >= 1);
+        assert_eq!(
+            signal_stats.rejection_reasons.get("timeout_risk_rejected"),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
     async fn runtime_tick_requires_pulse_history_before_opening_session() {
         let fixture = runtime_fixture_for_asset(PulseAsset::Btc);
         let executor = Arc::new(MockPulseExecutor::default());
@@ -5581,6 +5711,7 @@ mod tests {
         settings.strategy.pulse_arb.session.min_expected_net_pnl_usd =
             Some(UsdNotional(Decimal::new(100, 0)));
         settings.strategy.pulse_arb.session.min_open_fill_ratio = Some(Decimal::new(5, 2));
+        settings.strategy.pulse_arb.entry.max_required_hit_rate = Decimal::new(1000, 2);
 
         let executor = Arc::new(MockPulseExecutor::with_poly_fill(
             Decimal::new(300, 0),

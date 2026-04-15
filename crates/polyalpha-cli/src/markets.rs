@@ -3576,6 +3576,8 @@ mod tests {
                         max_fair_claim_move_bps: Decimal::new(35, 0),
                         max_cex_mid_move_bps: Decimal::new(30, 0),
                         min_pulse_score_bps: Decimal::new(50, 0),
+                        max_timeout_loss_usd: UsdNotional(Decimal::new(20, 0)),
+                        max_required_hit_rate: Decimal::new(70, 2),
                     },
                     exit: polyalpha_core::PulseExitConfig::default(),
                     rehedge: polyalpha_core::PulseRehedgeConfig {
