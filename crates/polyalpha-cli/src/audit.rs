@@ -2108,7 +2108,7 @@ fn run_pulse_sessions_report(
             } else {
                 for row in &report.sessions {
                     println!(
-                        "  {} 资产={} 状态={} fill={}/{} ({:.1}%) edge={} pnl={}",
+                        "  {} 资产={} 状态={} fill={}/{} ({:.1}%) edge={} cand={} open={} pocket={} vacuum={} pnl={}",
                         row.pulse_session_id,
                         row.asset,
                         row.state,
@@ -2118,6 +2118,12 @@ fn run_pulse_sessions_report(
                         row.net_edge_bps
                             .map(|value| format!("{value:.1}bps"))
                             .unwrap_or_else(|| "-".to_owned()),
+                        format_option_text(row.candidate_expected_net_pnl_usd.as_deref()),
+                        row.expected_open_net_pnl_usd,
+                        row.reversion_pocket_ticks
+                            .map(|value| format!("{value:.1}t"))
+                            .unwrap_or_else(|| "-".to_owned()),
+                        format_option_text(row.vacuum_ratio.as_deref()),
                         row.realized_pnl_usd
                             .map(format_signed_usd)
                             .unwrap_or_else(|| "-".to_owned())
@@ -2298,6 +2304,30 @@ fn run_pulse_session_detail_report(
                 report.session.actual_poly_filled_qty,
                 report.session.planned_poly_qty,
                 report.session.actual_poly_fill_ratio * 100.0
+            );
+            println!(
+                "信号: pulse={} entry={} target={} timeout={}",
+                report
+                    .session
+                    .pulse_score_bps
+                    .map(|value| format!("{value:.1}bps"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                format_option_text(report.session.entry_price.as_deref()),
+                format_option_text(report.session.target_exit_price.as_deref()),
+                format_option_text(report.session.timeout_exit_price.as_deref())
+            );
+            println!(
+                "会话EV: candidate={} open={} entry_notional={} pocket_ticks={} pocket_notional={} vacuum={}",
+                format_option_text(report.session.candidate_expected_net_pnl_usd.as_deref()),
+                report.session.expected_open_net_pnl_usd,
+                format_option_text(report.session.entry_executable_notional_usd.as_deref()),
+                report
+                    .session
+                    .reversion_pocket_ticks
+                    .map(|value| format!("{value:.1}"))
+                    .unwrap_or_else(|| "-".to_owned()),
+                format_option_text(report.session.reversion_pocket_notional_usd.as_deref()),
+                format_option_text(report.session.vacuum_ratio.as_deref())
             );
             println!(
                 "对冲归因: session_delta={} allocated_hedge={}",
@@ -3151,11 +3181,20 @@ mod tests {
                     session_id: "pulse-session-1".to_owned(),
                     asset: "btc".to_owned(),
                     state: "maker_exit_working".to_owned(),
+                    entry_price: Some("0.35".to_owned()),
                     planned_poly_qty: "10000".to_owned(),
                     actual_poly_filled_qty: "3500".to_owned(),
                     actual_poly_fill_ratio: 0.35,
                     actual_fill_notional_usd: "1225".to_owned(),
+                    candidate_expected_net_pnl_usd: Some("4.12".to_owned()),
                     expected_open_net_pnl_usd: "3.85".to_owned(),
+                    pulse_score_bps: Some(182.5),
+                    target_exit_price: Some("0.38".to_owned()),
+                    timeout_exit_price: Some("0.31".to_owned()),
+                    entry_executable_notional_usd: Some("250".to_owned()),
+                    reversion_pocket_ticks: Some(4.0),
+                    reversion_pocket_notional_usd: Some("28.57".to_owned()),
+                    vacuum_ratio: Some("1".to_owned()),
                     effective_open: true,
                     opening_outcome: "effective_open".to_owned(),
                     opening_rejection_reason: None,
@@ -3687,11 +3726,20 @@ mod tests {
                 session_id: pulse_session_id.to_owned(),
                 asset: asset.to_owned(),
                 state: state.to_owned(),
+                entry_price: Some("0.35".to_owned()),
                 planned_poly_qty: planned_poly_qty.to_owned(),
                 actual_poly_filled_qty: actual_poly_filled_qty.to_owned(),
                 actual_poly_fill_ratio: 0.25,
                 actual_fill_notional_usd: actual_fill_notional_usd.to_owned(),
+                candidate_expected_net_pnl_usd: Some("4.12".to_owned()),
                 expected_open_net_pnl_usd: expected_open_net_pnl_usd.to_owned(),
+                pulse_score_bps: Some(182.5),
+                target_exit_price: Some("0.38".to_owned()),
+                timeout_exit_price: Some("0.31".to_owned()),
+                entry_executable_notional_usd: Some("250".to_owned()),
+                reversion_pocket_ticks: Some(4.0),
+                reversion_pocket_notional_usd: Some("28.57".to_owned()),
+                vacuum_ratio: Some("1".to_owned()),
                 effective_open,
                 opening_outcome: opening_outcome.to_owned(),
                 opening_rejection_reason: opening_rejection_reason.map(str::to_owned),

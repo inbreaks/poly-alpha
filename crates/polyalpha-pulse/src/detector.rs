@@ -1,4 +1,5 @@
 use crate::model::{DetectorDecision, PulseFailureCode, PulseOpportunityInput};
+use rust_decimal::Decimal;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PulseDetectorConfig {
@@ -7,6 +8,7 @@ pub struct PulseDetectorConfig {
     pub max_fair_claim_move_bps: f64,
     pub max_cex_mid_move_bps: f64,
     pub min_pulse_score_bps: f64,
+    pub min_reversion_pocket_ticks: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -20,10 +22,11 @@ impl PulseDetector {
     }
 
     pub fn evaluate(&self, input: PulseOpportunityInput) -> DetectorDecision {
-        if !input.anchor_quality_ok {
+        if !input.anchor_quality_ok || !input.pricing_quality_ok {
             return DetectorDecision {
                 should_trade: false,
                 net_session_edge_bps: f64::NEG_INFINITY,
+                expected_net_pnl_usd: Decimal::ZERO,
                 pulse_score_bps: f64::NEG_INFINITY,
                 rejection_code: Some(PulseFailureCode::AnchorQualityRejected),
             };
@@ -32,6 +35,7 @@ impl PulseDetector {
             return DetectorDecision {
                 should_trade: false,
                 net_session_edge_bps: f64::NEG_INFINITY,
+                expected_net_pnl_usd: Decimal::ZERO,
                 pulse_score_bps: f64::NEG_INFINITY,
                 rejection_code: Some(PulseFailureCode::DataFreshnessRejected),
             };
@@ -47,23 +51,33 @@ impl PulseDetector {
             return DetectorDecision {
                 should_trade: false,
                 net_session_edge_bps: f64::NEG_INFINITY,
+                expected_net_pnl_usd: Decimal::ZERO,
                 pulse_score_bps,
                 rejection_code: Some(PulseFailureCode::PulseConfirmationRejected),
             };
         }
 
-        let friction_bps = input.poly_vwap_slippage_bps
-            + input.hedge_slippage_bps
-            + input.fee_bps
-            + input.perp_basis_penalty_bps
-            + input.rehedge_reserve_bps
-            + input.timeout_exit_reserve_bps;
-        let net_session_edge_bps = input.instant_basis_bps - friction_bps;
+        if input.reversion_pocket_ticks < self.config.min_reversion_pocket_ticks
+            || input.vacuum_ratio <= Decimal::ZERO
+        {
+            return DetectorDecision {
+                should_trade: false,
+                net_session_edge_bps: input.expected_net_edge_bps,
+                expected_net_pnl_usd: input.expected_net_pnl_usd,
+                pulse_score_bps,
+                rejection_code: Some(PulseFailureCode::PulseConfirmationRejected),
+            };
+        }
 
-        if net_session_edge_bps < self.config.min_net_session_edge_bps {
+        let net_session_edge_bps = input.expected_net_edge_bps;
+
+        if net_session_edge_bps < self.config.min_net_session_edge_bps
+            || input.expected_net_pnl_usd <= Decimal::ZERO
+        {
             return DetectorDecision {
                 should_trade: false,
                 net_session_edge_bps,
+                expected_net_pnl_usd: input.expected_net_pnl_usd,
                 pulse_score_bps,
                 rejection_code: Some(PulseFailureCode::NetSessionEdgeBelowThreshold),
             };
@@ -72,6 +86,7 @@ impl PulseDetector {
         DetectorDecision {
             should_trade: true,
             net_session_edge_bps,
+            expected_net_pnl_usd: input.expected_net_pnl_usd,
             pulse_score_bps,
             rejection_code: None,
         }
@@ -89,6 +104,7 @@ mod tests {
             max_fair_claim_move_bps: 35.0,
             max_cex_mid_move_bps: 30.0,
             min_pulse_score_bps: 50.0,
+            min_reversion_pocket_ticks: 1.0,
         }
     }
 
@@ -103,7 +119,12 @@ mod tests {
             perp_basis_penalty_bps: 5.0,
             rehedge_reserve_bps: 6.0,
             timeout_exit_reserve_bps: 5.0,
+            expected_net_edge_bps: 0.0,
+            expected_net_pnl_usd: Decimal::ZERO,
+            reversion_pocket_ticks: 2.0,
+            vacuum_ratio: Decimal::ONE,
             anchor_quality_ok: true,
+            pricing_quality_ok: true,
             data_fresh: true,
             has_pulse_history: true,
             claim_price_move_bps: 180.0,
@@ -116,6 +137,7 @@ mod tests {
             decision.rejection_code.unwrap().as_str(),
             "net_session_edge_below_threshold"
         );
+        assert_eq!(decision.expected_net_pnl_usd, Decimal::ZERO);
     }
 
     #[test]
@@ -129,7 +151,12 @@ mod tests {
             perp_basis_penalty_bps: 0.0,
             rehedge_reserve_bps: 5.0,
             timeout_exit_reserve_bps: 5.0,
+            expected_net_edge_bps: 0.0,
+            expected_net_pnl_usd: Decimal::ZERO,
+            reversion_pocket_ticks: 2.0,
+            vacuum_ratio: Decimal::ONE,
             anchor_quality_ok: true,
+            pricing_quality_ok: true,
             data_fresh: true,
             has_pulse_history: true,
             claim_price_move_bps: 35.0,
@@ -142,6 +169,7 @@ mod tests {
             decision.rejection_code.unwrap().as_str(),
             "pulse_confirmation_rejected"
         );
+        assert_eq!(decision.expected_net_pnl_usd, Decimal::ZERO);
     }
 
     #[test]
@@ -155,7 +183,12 @@ mod tests {
             perp_basis_penalty_bps: 0.0,
             rehedge_reserve_bps: 5.0,
             timeout_exit_reserve_bps: 5.0,
+            expected_net_edge_bps: 120.0,
+            expected_net_pnl_usd: Decimal::new(3, 0),
+            reversion_pocket_ticks: 2.0,
+            vacuum_ratio: Decimal::ONE,
             anchor_quality_ok: true,
+            pricing_quality_ok: true,
             data_fresh: true,
             has_pulse_history: true,
             claim_price_move_bps: 180.0,
@@ -165,5 +198,99 @@ mod tests {
 
         assert!(decision.should_trade);
         assert_eq!(decision.rejection_code, None);
+        assert_eq!(decision.expected_net_pnl_usd, Decimal::new(3, 0));
+    }
+
+    #[test]
+    fn detector_rejects_positive_anchor_gap_when_executable_session_edge_is_negative() {
+        let detector = PulseDetector::new(detector_test_config(25.0));
+        let decision = detector.evaluate(PulseOpportunityInput {
+            instant_basis_bps: 180.0,
+            poly_vwap_slippage_bps: 8.0,
+            hedge_slippage_bps: 6.0,
+            fee_bps: 3.0,
+            perp_basis_penalty_bps: 0.0,
+            rehedge_reserve_bps: 5.0,
+            timeout_exit_reserve_bps: 5.0,
+            expected_net_edge_bps: -12.0,
+            expected_net_pnl_usd: Decimal::new(-25, 2),
+            reversion_pocket_ticks: 3.0,
+            vacuum_ratio: Decimal::ONE,
+            anchor_quality_ok: true,
+            pricing_quality_ok: true,
+            data_fresh: true,
+            has_pulse_history: true,
+            claim_price_move_bps: 180.0,
+            fair_claim_move_bps: 12.0,
+            cex_mid_move_bps: 8.0,
+        });
+
+        assert!(!decision.should_trade);
+        assert_eq!(
+            decision.rejection_code.unwrap().as_str(),
+            "net_session_edge_below_threshold"
+        );
+        assert_eq!(decision.expected_net_pnl_usd, Decimal::new(-25, 2));
+    }
+
+    #[test]
+    fn detector_rejects_when_reversion_pocket_is_too_shallow() {
+        let detector = PulseDetector::new(detector_test_config(25.0));
+        let decision = detector.evaluate(PulseOpportunityInput {
+            instant_basis_bps: 180.0,
+            poly_vwap_slippage_bps: 8.0,
+            hedge_slippage_bps: 6.0,
+            fee_bps: 3.0,
+            perp_basis_penalty_bps: 0.0,
+            rehedge_reserve_bps: 5.0,
+            timeout_exit_reserve_bps: 5.0,
+            expected_net_edge_bps: 80.0,
+            expected_net_pnl_usd: Decimal::new(250, 2),
+            reversion_pocket_ticks: 0.5,
+            vacuum_ratio: Decimal::new(2, 1),
+            anchor_quality_ok: true,
+            pricing_quality_ok: true,
+            data_fresh: true,
+            has_pulse_history: true,
+            claim_price_move_bps: 180.0,
+            fair_claim_move_bps: 12.0,
+            cex_mid_move_bps: 8.0,
+        });
+
+        assert!(!decision.should_trade);
+        assert_eq!(
+            decision.rejection_code.unwrap().as_str(),
+            "pulse_confirmation_rejected"
+        );
+        assert_eq!(decision.expected_net_pnl_usd, Decimal::new(250, 2));
+    }
+
+    #[test]
+    fn detector_accepts_only_when_session_edge_and_pocket_both_pass() {
+        let detector = PulseDetector::new(detector_test_config(25.0));
+        let decision = detector.evaluate(PulseOpportunityInput {
+            instant_basis_bps: 180.0,
+            poly_vwap_slippage_bps: 8.0,
+            hedge_slippage_bps: 6.0,
+            fee_bps: 3.0,
+            perp_basis_penalty_bps: 0.0,
+            rehedge_reserve_bps: 5.0,
+            timeout_exit_reserve_bps: 5.0,
+            expected_net_edge_bps: 80.0,
+            expected_net_pnl_usd: Decimal::new(250, 2),
+            reversion_pocket_ticks: 3.0,
+            vacuum_ratio: Decimal::new(2, 0),
+            anchor_quality_ok: true,
+            pricing_quality_ok: true,
+            data_fresh: true,
+            has_pulse_history: true,
+            claim_price_move_bps: 180.0,
+            fair_claim_move_bps: 12.0,
+            cex_mid_move_bps: 8.0,
+        });
+
+        assert!(decision.should_trade);
+        assert_eq!(decision.rejection_code, None);
+        assert_eq!(decision.expected_net_pnl_usd, Decimal::new(250, 2));
     }
 }

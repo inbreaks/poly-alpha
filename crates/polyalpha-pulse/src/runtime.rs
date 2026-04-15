@@ -29,6 +29,10 @@ use crate::model::{AnchorSnapshot, GammaCapMode, PulseAsset, PulseSessionState};
 use crate::monitor::build_pulse_monitor_view;
 use crate::pricing::{EventPricer, EventPricerConfig, ExpiryGapAdjustment};
 use crate::session::{PolyFillOutcome, PulseSession, PulseSessionConfig};
+use crate::signal::{
+    estimate_session_edge, executable_poly_quote, reversion_pocket, timeout_exit_price_for_shares,
+    ExecutableQuoteSide,
+};
 
 pub type Result<T> = std::result::Result<T, PulseRuntimeBuildError>;
 
@@ -155,9 +159,14 @@ struct ManagedSession {
     deadline_ms: u64,
     entry_price: Decimal,
     target_exit_price: Decimal,
+    timeout_exit_price: Decimal,
     net_edge_bps: f64,
     pulse_score_bps: f64,
     available_reversion_ticks: f64,
+    reversion_pocket_notional_usd: Decimal,
+    vacuum_ratio: Decimal,
+    entry_executable_notional_usd: Decimal,
+    candidate_expected_net_pnl_usd: Decimal,
     last_allocated_hedge_qty: Decimal,
     opening_allocated_hedge_qty: Decimal,
     actual_fill_notional_usd: Decimal,
@@ -178,9 +187,15 @@ struct EntryCandidate {
     market: MarketConfig,
     claim_side: TokenSide,
     entry_price: Decimal,
+    target_exit_price: Decimal,
+    timeout_exit_price: Decimal,
     net_edge_bps: f64,
+    expected_net_pnl_usd: Decimal,
     pulse_score_bps: f64,
     available_reversion_ticks: f64,
+    entry_executable_notional_usd: Decimal,
+    reversion_pocket_notional_usd: Decimal,
+    vacuum_ratio: Decimal,
     event_delta_yes: f64,
     anchor_latency_delta_ms: u64,
     fair_prob_yes: f64,
@@ -209,6 +224,13 @@ struct PulseMarketSignalSnapshot {
     pulse_score_bps: f64,
     net_edge_bps: f64,
     fair_prob_yes: f64,
+    entry_price: Decimal,
+    target_exit_price: Decimal,
+    timeout_exit_price: Decimal,
+    expected_net_pnl_usd: Decimal,
+    reversion_pocket_ticks: f64,
+    reversion_pocket_notional_usd: Decimal,
+    vacuum_ratio: Decimal,
 }
 
 #[derive(Debug, Error)]
@@ -343,6 +365,13 @@ impl PulseRuntimeBuilder {
                 .min_pulse_score_bps
                 .to_f64()
                 .unwrap_or_default(),
+            min_reversion_pocket_ticks: self
+                .settings
+                .strategy
+                .pulse_arb
+                .exit
+                .base_target_ticks
+                .max(1) as f64,
         });
         let pricer = EventPricer::new(event_pricer_config(&self.settings));
 
@@ -649,8 +678,11 @@ impl PulseRuntime {
                 planned_poly_qty: session.planned_poly_qty().normalize().to_string(),
                 actual_poly_filled_qty: session.actual_poly_filled_qty().normalize().to_string(),
                 actual_poly_fill_ratio: session.actual_poly_fill_ratio(),
+                entry_price: Some("0.35".to_owned()),
                 actual_fill_notional_usd: "1225".to_owned(),
+                candidate_expected_net_pnl_usd: Some("4.12".to_owned()),
                 expected_open_net_pnl_usd: "3.85".to_owned(),
+                pulse_score_bps: Some(182.5),
                 effective_open: true,
                 opening_outcome: OPENING_OUTCOME_EFFECTIVE_OPEN.to_owned(),
                 opening_rejection_reason: None,
@@ -665,6 +697,11 @@ impl PulseRuntime {
                 exit_path: Some("maker_proxy_hit".to_owned()),
                 target_exit_price: Some("0.38".to_owned()),
                 final_exit_price: Some("0.38".to_owned()),
+                timeout_exit_price: Some("0.31".to_owned()),
+                entry_executable_notional_usd: Some("250".to_owned()),
+                reversion_pocket_ticks: Some(4.0),
+                reversion_pocket_notional_usd: Some("28.57".to_owned()),
+                vacuum_ratio: Some("1".to_owned()),
                 anchor_latency_delta_ms: Some(18),
                 distance_to_mid_bps: Some(8.0),
                 relative_order_age_ms: Some(950),
@@ -998,16 +1035,15 @@ impl PulseRuntime {
                     .max_holding_secs
                     .saturating_mul(1_000),
             entry_price: candidate.entry_price,
-            target_exit_price: recommended_exit_price_for_settings(
-                &self.settings,
-                candidate.entry_price,
-                candidate.pulse_score_bps,
-                candidate.available_reversion_ticks,
-                candidate.market.min_tick_size.0,
-            ),
+            target_exit_price: candidate.target_exit_price,
+            timeout_exit_price: candidate.timeout_exit_price,
             net_edge_bps: candidate.net_edge_bps,
             pulse_score_bps: candidate.pulse_score_bps,
             available_reversion_ticks: candidate.available_reversion_ticks,
+            reversion_pocket_notional_usd: candidate.reversion_pocket_notional_usd,
+            vacuum_ratio: candidate.vacuum_ratio,
+            entry_executable_notional_usd: candidate.entry_executable_notional_usd,
+            candidate_expected_net_pnl_usd: candidate.expected_net_pnl_usd,
             last_allocated_hedge_qty: Decimal::ZERO,
             opening_allocated_hedge_qty: Decimal::ZERO,
             actual_fill_notional_usd: Decimal::ZERO,
@@ -1053,13 +1089,8 @@ impl PulseRuntime {
         managed.actual_fill_notional_usd = actual_fill_notional_usd;
         managed.expected_open_net_pnl_usd = expected_open_net_pnl_usd;
         managed.entry_price = avg_price;
-        managed.target_exit_price = recommended_exit_price_for_settings(
-            &self.settings,
-            avg_price,
-            candidate.pulse_score_bps,
-            candidate.available_reversion_ticks,
-            candidate.market.min_tick_size.0,
-        );
+        managed.target_exit_price = candidate.target_exit_price.max(avg_price);
+        managed.timeout_exit_price = candidate.timeout_exit_price;
         managed.opening_rejection_reason = opening_fill_rejection_reason(
             planned_qty,
             filled_qty,
@@ -1390,9 +1421,11 @@ impl PulseRuntime {
                 continue;
             };
             if best.as_ref().is_none_or(|current| {
-                candidate.pulse_score_bps > current.pulse_score_bps
-                    || (candidate.pulse_score_bps == current.pulse_score_bps
-                        && candidate.net_edge_bps > current.net_edge_bps)
+                candidate.expected_net_pnl_usd > current.expected_net_pnl_usd
+                    || (candidate.expected_net_pnl_usd == current.expected_net_pnl_usd
+                        && (candidate.net_edge_bps > current.net_edge_bps
+                            || (candidate.net_edge_bps == current.net_edge_bps
+                                && candidate.pulse_score_bps > current.pulse_score_bps)))
             }) {
                 best = Some(candidate);
             }
@@ -1448,7 +1481,7 @@ impl PulseRuntime {
             return Ok(None);
         }
         let books = self.books_for_symbol(&market.symbol).cloned();
-        let (Some(yes_ask), Some(no_ask), Some(yes_book), Some(no_book), Some(cex_book)) = (
+        let (Some(_yes_ask), Some(_no_ask), Some(yes_book), Some(no_book), Some(cex_book)) = (
             best_ask(books.as_ref().and_then(|books| books.yes.as_ref())),
             best_ask(books.as_ref().and_then(|books| books.no.as_ref())),
             books.as_ref().and_then(|books| books.yes.as_ref()),
@@ -1477,73 +1510,20 @@ impl PulseRuntime {
                 }
             };
 
-        let yes_edge_bps = (priced.fair_prob_yes - yes_ask.to_f64().unwrap_or_default()) * 10_000.0;
-        let no_edge_bps = (priced.fair_prob_no - no_ask.to_f64().unwrap_or_default()) * 10_000.0;
-        let (claim_side, entry_price, instant_basis_bps) = if no_edge_bps > yes_edge_bps {
-            (TokenSide::No, no_ask, no_edge_bps)
-        } else {
-            (TokenSide::Yes, yes_ask, yes_edge_bps)
-        };
         let pulse_window_ms = self.settings.strategy.pulse_arb.entry.pulse_window_ms;
-        let current_claim_book = match claim_side {
-            TokenSide::Yes => yes_book,
-            TokenSide::No => no_book,
-        };
         let current_cex_mid = mid_price_from_book(cex_book).unwrap_or(Decimal::ZERO);
         let prior_tape = self.signal_tapes.get(&market.symbol.0);
-        let prior_claim_ask = prior_tape.and_then(|tape| match claim_side {
-            TokenSide::Yes => latest_decimal_before(
-                &tape.yes_ask,
-                current_claim_book.received_at_ms,
-                pulse_window_ms,
-            ),
-            TokenSide::No => latest_decimal_before(
-                &tape.no_ask,
-                current_claim_book.received_at_ms,
-                pulse_window_ms,
-            ),
+        let prior_yes_ask = prior_tape.and_then(|tape| {
+            latest_decimal_before(&tape.yes_ask, yes_book.received_at_ms, pulse_window_ms)
+        });
+        let prior_no_ask = prior_tape.and_then(|tape| {
+            latest_decimal_before(&tape.no_ask, no_book.received_at_ms, pulse_window_ms)
         });
         let prior_cex_mid = prior_tape.and_then(|tape| {
             latest_decimal_before(&tape.cex_mid, cex_book.received_at_ms, pulse_window_ms)
         });
         let prior_fair_prob_yes = prior_tape
             .and_then(|tape| latest_float_before(&tape.fair_prob_yes, now_ms, pulse_window_ms));
-        let available_reversion_ticks = prior_claim_ask
-            .and_then(|prior| {
-                let move_price = (prior - entry_price).max(Decimal::ZERO);
-                if market.min_tick_size.0 <= Decimal::ZERO {
-                    None
-                } else {
-                    (move_price / market.min_tick_size.0).to_f64()
-                }
-            })
-            .unwrap_or(0.0);
-        let claim_price_move_bps = prior_claim_ask
-            .and_then(|prior| {
-                if prior <= Decimal::ZERO || prior <= entry_price {
-                    Some(0.0)
-                } else {
-                    (((prior - entry_price) / prior) * Decimal::from(10_000)).to_f64()
-                }
-            })
-            .unwrap_or(0.0);
-        let fair_claim_move_bps = prior_fair_prob_yes
-            .map(|prior_yes| match claim_side {
-                TokenSide::Yes => (priced.fair_prob_yes - prior_yes).abs() * 10_000.0,
-                TokenSide::No => (priced.fair_prob_no - (1.0 - prior_yes)).abs() * 10_000.0,
-            })
-            .unwrap_or(0.0);
-        let cex_mid_move_bps = prior_cex_mid
-            .and_then(|prior| {
-                if prior <= Decimal::ZERO {
-                    Some(0.0)
-                } else {
-                    (((current_cex_mid - prior).abs() / prior) * Decimal::from(10_000)).to_f64()
-                }
-            })
-            .unwrap_or(0.0);
-        let has_pulse_history =
-            prior_claim_ask.is_some() && prior_cex_mid.is_some() && prior_fair_prob_yes.is_some();
         self.record_fair_prob_sample(&market.symbol, now_ms, priced.fair_prob_yes);
         let data_fresh = quote_is_fresh(
             now_ms,
@@ -1572,19 +1552,187 @@ impl PulseRuntime {
             .get(&asset)
             .copied()
             .unwrap_or(u64::MAX);
+        let anchor_quality_ok = anchor.quality.anchor_age_ms <= anchor_age_limit
+            && anchor.quality.has_strike_coverage
+            && anchor.quality.has_liquidity
+            && anchor.quality.greeks_complete;
+        if !data_fresh {
+            self.record_rejection(crate::model::PulseFailureCode::DataFreshnessRejected);
+            return Ok(None);
+        }
+        if !anchor_quality_ok || !priced.pricing_quality.delta_stable {
+            self.record_rejection(crate::model::PulseFailureCode::AnchorQualityRejected);
+            return Ok(None);
+        }
+        if prior_cex_mid.is_none()
+            || prior_fair_prob_yes.is_none()
+            || (prior_yes_ask.is_none() && prior_no_ask.is_none())
+        {
+            self.record_rejection(crate::model::PulseFailureCode::PulseConfirmationRejected);
+            return Ok(None);
+        }
+        let yes_candidate = self.evaluate_claim_candidate(
+            market,
+            TokenSide::Yes,
+            yes_book,
+            current_cex_mid,
+            prior_yes_ask,
+            prior_cex_mid,
+            prior_fair_prob_yes,
+            &priced,
+            anchor_quality_ok,
+            data_fresh,
+            anchor_latency_delta_ms,
+        );
+        let no_candidate = self.evaluate_claim_candidate(
+            market,
+            TokenSide::No,
+            no_book,
+            current_cex_mid,
+            prior_no_ask,
+            prior_cex_mid,
+            prior_fair_prob_yes,
+            &priced,
+            anchor_quality_ok,
+            data_fresh,
+            anchor_latency_delta_ms,
+        );
+
+        let candidate = match (yes_candidate, no_candidate) {
+            (Some(yes), Some(no)) => {
+                if yes.expected_net_pnl_usd > no.expected_net_pnl_usd
+                    || (yes.expected_net_pnl_usd == no.expected_net_pnl_usd
+                        && (yes.net_edge_bps > no.net_edge_bps
+                            || (yes.net_edge_bps == no.net_edge_bps
+                                && yes.pulse_score_bps >= no.pulse_score_bps)))
+                {
+                    Some(yes)
+                } else {
+                    Some(no)
+                }
+            }
+            (Some(candidate), None) | (None, Some(candidate)) => Some(candidate),
+            (None, None) => None,
+        };
+
+        if candidate.is_some() {
+            self.stats.signals_seen = self.stats.signals_seen.saturating_add(1);
+        }
+
+        Ok(candidate)
+    }
+
+    fn evaluate_claim_candidate(
+        &mut self,
+        market: &MarketConfig,
+        claim_side: TokenSide,
+        claim_book: &OrderBookSnapshot,
+        current_cex_mid: Decimal,
+        prior_claim_ask: Option<Decimal>,
+        prior_cex_mid: Option<Decimal>,
+        prior_fair_prob_yes: Option<f64>,
+        priced: &crate::model::EventPriceOutput,
+        anchor_quality_ok: bool,
+        data_fresh: bool,
+        anchor_latency_delta_ms: u64,
+    ) -> Option<EntryCandidate> {
+        let opening_request_notional = self
+            .settings
+            .strategy
+            .pulse_arb
+            .session
+            .effective_opening_request_notional_usd()
+            .0;
+        let entry_quote =
+            executable_poly_quote(claim_book, ExecutableQuoteSide::Buy, opening_request_notional)?;
+        if entry_quote.filled_notional_usd <= Decimal::ZERO || entry_quote.avg_price <= Decimal::ZERO
+        {
+            return None;
+        }
+
+        let fair_claim_prob = match claim_side {
+            TokenSide::Yes => priced.fair_prob_yes,
+            TokenSide::No => priced.fair_prob_no,
+        };
+        let fair_claim_price =
+            Decimal::from_f64_retain(fair_claim_prob).unwrap_or(Decimal::ZERO);
+        let pocket = reversion_pocket(
+            entry_quote.avg_price,
+            prior_claim_ask.unwrap_or(entry_quote.avg_price),
+            market.min_tick_size.0,
+            entry_quote.filled_notional_usd,
+        );
+        let claim_price_move_bps = prior_claim_ask
+            .and_then(|prior| {
+                if prior <= Decimal::ZERO || prior <= entry_quote.avg_price {
+                    Some(0.0)
+                } else {
+                    (((prior - entry_quote.avg_price) / prior) * Decimal::from(10_000)).to_f64()
+                }
+            })
+            .unwrap_or(0.0);
+        let fair_claim_move_bps = prior_fair_prob_yes
+            .map(|prior_yes| match claim_side {
+                TokenSide::Yes => (priced.fair_prob_yes - prior_yes).abs() * 10_000.0,
+                TokenSide::No => (priced.fair_prob_no - (1.0 - prior_yes)).abs() * 10_000.0,
+            })
+            .unwrap_or(0.0);
+        let cex_mid_move_bps = prior_cex_mid
+            .and_then(|prior| {
+                if prior <= Decimal::ZERO {
+                    Some(0.0)
+                } else {
+                    (((current_cex_mid - prior).abs() / prior) * Decimal::from(10_000)).to_f64()
+                }
+            })
+            .unwrap_or(0.0);
+        let raw_pulse_score_bps = claim_price_move_bps - fair_claim_move_bps;
+        let ladder_target = recommended_exit_price_for_settings(
+            &self.settings,
+            entry_quote.avg_price,
+            raw_pulse_score_bps,
+            pocket.available_ticks,
+            market.min_tick_size.0,
+        );
+        let target_exit_price = ladder_target
+            .min(pocket.target_price.max(entry_quote.avg_price))
+            .min(fair_claim_price.max(entry_quote.avg_price))
+            .min(Decimal::ONE);
+        let timeout_exit_price =
+            timeout_exit_price_for_shares(claim_book, entry_quote.filled_shares)
+                .unwrap_or(Decimal::ZERO);
+        let session_edge = estimate_session_edge(
+            entry_quote.filled_notional_usd,
+            entry_quote.avg_price,
+            target_exit_price,
+            timeout_exit_price,
+            self.settings.paper_slippage.cex_slippage_bps as f64,
+            (self.settings.execution_costs.poly_fee_bps
+                + self.settings.execution_costs.cex_taker_fee_bps) as f64,
+            self.settings.execution_costs.cex_taker_fee_bps as f64
+                + self.settings.execution_costs.poly_fee_bps as f64 / 2.0,
+        );
+        let has_pulse_history =
+            prior_claim_ask.is_some() && prior_cex_mid.is_some() && prior_fair_prob_yes.is_some();
+        let instant_basis_bps = ((fair_claim_price - entry_quote.avg_price)
+            * Decimal::from(10_000))
+        .to_f64()
+        .unwrap_or_default();
         let decision = self.detector.evaluate(crate::model::PulseOpportunityInput {
             instant_basis_bps,
-            poly_vwap_slippage_bps: self.settings.paper_slippage.poly_slippage_bps as f64,
+            poly_vwap_slippage_bps: entry_quote.slippage_bps,
             hedge_slippage_bps: self.settings.paper_slippage.cex_slippage_bps as f64,
             fee_bps: (self.settings.execution_costs.poly_fee_bps
                 + self.settings.execution_costs.cex_taker_fee_bps) as f64,
             perp_basis_penalty_bps: 0.0,
             rehedge_reserve_bps: self.settings.execution_costs.cex_taker_fee_bps as f64,
             timeout_exit_reserve_bps: self.settings.execution_costs.poly_fee_bps as f64 / 2.0,
-            anchor_quality_ok: anchor.quality.anchor_age_ms <= anchor_age_limit
-                && anchor.quality.has_strike_coverage
-                && anchor.quality.has_liquidity
-                && anchor.quality.greeks_complete,
+            expected_net_edge_bps: session_edge.expected_net_edge_bps,
+            expected_net_pnl_usd: session_edge.expected_net_pnl_usd,
+            reversion_pocket_ticks: pocket.available_ticks,
+            vacuum_ratio: pocket.vacuum_ratio,
+            anchor_quality_ok,
+            pricing_quality_ok: priced.pricing_quality.delta_stable,
             data_fresh,
             has_pulse_history,
             claim_price_move_bps,
@@ -1595,21 +1743,26 @@ impl PulseRuntime {
             if let Some(code) = decision.rejection_code {
                 self.record_rejection(code);
             }
-            return Ok(None);
+            return None;
         }
-        self.stats.signals_seen = self.stats.signals_seen.saturating_add(1);
 
-        Ok(Some(EntryCandidate {
+        Some(EntryCandidate {
             market: market.clone(),
             claim_side,
-            entry_price,
+            entry_price: entry_quote.avg_price,
+            target_exit_price: session_edge.target_exit_price,
+            timeout_exit_price: session_edge.timeout_exit_price,
             net_edge_bps: decision.net_session_edge_bps,
+            expected_net_pnl_usd: decision.expected_net_pnl_usd,
             pulse_score_bps: decision.pulse_score_bps,
-            available_reversion_ticks,
+            available_reversion_ticks: pocket.available_ticks,
+            entry_executable_notional_usd: entry_quote.filled_notional_usd,
+            reversion_pocket_notional_usd: pocket.pocket_notional_usd,
+            vacuum_ratio: pocket.vacuum_ratio,
             event_delta_yes: priced.event_delta_yes,
             anchor_latency_delta_ms,
             fair_prob_yes: priced.fair_prob_yes,
-        }))
+        })
     }
 
     fn record_rejection(&mut self, code: crate::model::PulseFailureCode) {
@@ -1820,6 +1973,25 @@ impl PulseRuntime {
             poly_no_price,
             cex_price,
             fair_prob_yes: signal.as_ref().map(|snapshot| snapshot.fair_prob_yes),
+            entry_price: signal
+                .as_ref()
+                .and_then(|snapshot| snapshot.entry_price.to_f64()),
+            target_exit_price: signal
+                .as_ref()
+                .and_then(|snapshot| snapshot.target_exit_price.to_f64()),
+            timeout_exit_price: signal
+                .as_ref()
+                .and_then(|snapshot| snapshot.timeout_exit_price.to_f64()),
+            expected_net_pnl_usd: signal
+                .as_ref()
+                .and_then(|snapshot| snapshot.expected_net_pnl_usd.to_f64()),
+            reversion_pocket_ticks: signal.as_ref().map(|snapshot| snapshot.reversion_pocket_ticks),
+            reversion_pocket_notional_usd: signal
+                .as_ref()
+                .and_then(|snapshot| snapshot.reversion_pocket_notional_usd.to_f64()),
+            vacuum_ratio: signal
+                .as_ref()
+                .and_then(|snapshot| snapshot.vacuum_ratio.to_f64()),
             anchor_age_ms,
             anchor_latency_delta_ms,
             poly_quote_age_ms,
@@ -1913,9 +2085,7 @@ impl PulseRuntime {
         books: Option<&ObservedMarketBooks>,
     ) -> Option<PulseMarketSignalSnapshot> {
         let anchor = anchor?;
-        let (Some(yes_ask), Some(no_ask), Some(yes_book), Some(no_book), Some(cex_book)) = (
-            best_ask(books.and_then(|books| books.yes.as_ref())),
-            best_ask(books.and_then(|books| books.no.as_ref())),
+        let (Some(yes_book), Some(no_book), Some(cex_book)) = (
             books.and_then(|books| books.yes.as_ref()),
             books.and_then(|books| books.no.as_ref()),
             books.and_then(|books| books.cex.as_ref()),
@@ -1927,63 +2097,20 @@ impl PulseRuntime {
             .pricer
             .price(anchor, &market_rule, market.settlement_timestamp * 1_000)
             .ok()?;
-        let yes_edge_bps = (priced.fair_prob_yes - yes_ask.to_f64().unwrap_or_default()) * 10_000.0;
-        let no_edge_bps = (priced.fair_prob_no - no_ask.to_f64().unwrap_or_default()) * 10_000.0;
-        let (claim_side, instant_basis_bps, current_claim_book) = if no_edge_bps > yes_edge_bps {
-            (TokenSide::No, no_edge_bps, no_book)
-        } else {
-            (TokenSide::Yes, yes_edge_bps, yes_book)
-        };
         let pulse_window_ms = self.settings.strategy.pulse_arb.entry.pulse_window_ms;
         let current_cex_mid = mid_price_from_book(cex_book).unwrap_or(Decimal::ZERO);
         let prior_tape = self.signal_tapes.get(&market.symbol.0);
-        let prior_claim_ask = prior_tape.and_then(|tape| match claim_side {
-            TokenSide::Yes => latest_decimal_before(
-                &tape.yes_ask,
-                current_claim_book.received_at_ms,
-                pulse_window_ms,
-            ),
-            TokenSide::No => latest_decimal_before(
-                &tape.no_ask,
-                current_claim_book.received_at_ms,
-                pulse_window_ms,
-            ),
+        let prior_yes_ask = prior_tape.and_then(|tape| {
+            latest_decimal_before(&tape.yes_ask, yes_book.received_at_ms, pulse_window_ms)
+        });
+        let prior_no_ask = prior_tape.and_then(|tape| {
+            latest_decimal_before(&tape.no_ask, no_book.received_at_ms, pulse_window_ms)
         });
         let prior_cex_mid = prior_tape.and_then(|tape| {
             latest_decimal_before(&tape.cex_mid, cex_book.received_at_ms, pulse_window_ms)
         });
         let prior_fair_prob_yes = prior_tape
             .and_then(|tape| latest_float_before(&tape.fair_prob_yes, now_ms, pulse_window_ms));
-        let claim_price_move_bps = prior_claim_ask
-            .and_then(|prior| {
-                let current = match claim_side {
-                    TokenSide::Yes => yes_ask,
-                    TokenSide::No => no_ask,
-                };
-                if prior <= Decimal::ZERO || prior <= current {
-                    Some(0.0)
-                } else {
-                    (((prior - current) / prior) * Decimal::from(10_000)).to_f64()
-                }
-            })
-            .unwrap_or(0.0);
-        let fair_claim_move_bps = prior_fair_prob_yes
-            .map(|prior_yes| match claim_side {
-                TokenSide::Yes => (priced.fair_prob_yes - prior_yes).abs() * 10_000.0,
-                TokenSide::No => (priced.fair_prob_no - (1.0 - prior_yes)).abs() * 10_000.0,
-            })
-            .unwrap_or(0.0);
-        let cex_mid_move_bps = prior_cex_mid
-            .and_then(|prior| {
-                if prior <= Decimal::ZERO {
-                    Some(0.0)
-                } else {
-                    (((current_cex_mid - prior).abs() / prior) * Decimal::from(10_000)).to_f64()
-                }
-            })
-            .unwrap_or(0.0);
-        let has_pulse_history =
-            prior_claim_ask.is_some() && prior_cex_mid.is_some() && prior_fair_prob_yes.is_some();
         let data_fresh = quote_is_fresh(
             now_ms,
             yes_book,
@@ -2011,32 +2138,154 @@ impl PulseRuntime {
             .get(&asset)
             .copied()
             .unwrap_or(u64::MAX);
-        let decision = self.detector.evaluate(crate::model::PulseOpportunityInput {
-            instant_basis_bps,
-            poly_vwap_slippage_bps: self.settings.paper_slippage.poly_slippage_bps as f64,
-            hedge_slippage_bps: self.settings.paper_slippage.cex_slippage_bps as f64,
-            fee_bps: (self.settings.execution_costs.poly_fee_bps
-                + self.settings.execution_costs.cex_taker_fee_bps) as f64,
-            perp_basis_penalty_bps: 0.0,
-            rehedge_reserve_bps: self.settings.execution_costs.cex_taker_fee_bps as f64,
-            timeout_exit_reserve_bps: self.settings.execution_costs.poly_fee_bps as f64 / 2.0,
-            anchor_quality_ok: anchor.quality.anchor_age_ms <= anchor_age_limit
-                && anchor.quality.has_strike_coverage
-                && anchor.quality.has_liquidity
-                && anchor.quality.greeks_complete,
-            data_fresh,
-            has_pulse_history,
-            claim_price_move_bps,
-            fair_claim_move_bps,
-            cex_mid_move_bps,
-        });
+        let anchor_quality_ok = anchor.quality.anchor_age_ms <= anchor_age_limit
+            && anchor.quality.has_strike_coverage
+            && anchor.quality.has_liquidity
+            && anchor.quality.greeks_complete;
+        let opening_request_notional = self
+            .settings
+            .strategy
+            .pulse_arb
+            .session
+            .effective_opening_request_notional_usd()
+            .0;
+        let build_snapshot = |claim_side: TokenSide,
+                              claim_book: &OrderBookSnapshot,
+                              prior_claim_ask: Option<Decimal>|
+         -> Option<PulseMarketSignalSnapshot> {
+            let entry_quote =
+                executable_poly_quote(claim_book, ExecutableQuoteSide::Buy, opening_request_notional)?;
+            if entry_quote.filled_notional_usd <= Decimal::ZERO || entry_quote.avg_price <= Decimal::ZERO
+            {
+                return None;
+            }
+            let fair_claim_prob = match claim_side {
+                TokenSide::Yes => priced.fair_prob_yes,
+                TokenSide::No => priced.fair_prob_no,
+            };
+            let fair_claim_price =
+                Decimal::from_f64_retain(fair_claim_prob).unwrap_or(Decimal::ZERO);
+            let pocket = reversion_pocket(
+                entry_quote.avg_price,
+                prior_claim_ask.unwrap_or(entry_quote.avg_price),
+                market.min_tick_size.0,
+                entry_quote.filled_notional_usd,
+            );
+            let claim_price_move_bps = prior_claim_ask
+                .and_then(|prior| {
+                    if prior <= Decimal::ZERO || prior <= entry_quote.avg_price {
+                        Some(0.0)
+                    } else {
+                        (((prior - entry_quote.avg_price) / prior) * Decimal::from(10_000)).to_f64()
+                    }
+                })
+                .unwrap_or(0.0);
+            let fair_claim_move_bps = prior_fair_prob_yes
+                .map(|prior_yes| match claim_side {
+                    TokenSide::Yes => (priced.fair_prob_yes - prior_yes).abs() * 10_000.0,
+                    TokenSide::No => (priced.fair_prob_no - (1.0 - prior_yes)).abs() * 10_000.0,
+                })
+                .unwrap_or(0.0);
+            let cex_mid_move_bps = prior_cex_mid
+                .and_then(|prior| {
+                    if prior <= Decimal::ZERO {
+                        Some(0.0)
+                    } else {
+                        (((current_cex_mid - prior).abs() / prior) * Decimal::from(10_000)).to_f64()
+                    }
+                })
+                .unwrap_or(0.0);
+            let raw_pulse_score_bps = claim_price_move_bps - fair_claim_move_bps;
+            let ladder_target = recommended_exit_price_for_settings(
+                &self.settings,
+                entry_quote.avg_price,
+                raw_pulse_score_bps,
+                pocket.available_ticks,
+                market.min_tick_size.0,
+            );
+            let target_exit_price = ladder_target
+                .min(pocket.target_price.max(entry_quote.avg_price))
+                .min(fair_claim_price.max(entry_quote.avg_price))
+                .min(Decimal::ONE);
+            let timeout_exit_price =
+                timeout_exit_price_for_shares(claim_book, entry_quote.filled_shares)
+                    .unwrap_or(Decimal::ZERO);
+            let session_edge = estimate_session_edge(
+                entry_quote.filled_notional_usd,
+                entry_quote.avg_price,
+                target_exit_price,
+                timeout_exit_price,
+                self.settings.paper_slippage.cex_slippage_bps as f64,
+                (self.settings.execution_costs.poly_fee_bps
+                    + self.settings.execution_costs.cex_taker_fee_bps) as f64,
+                self.settings.execution_costs.cex_taker_fee_bps as f64
+                    + self.settings.execution_costs.poly_fee_bps as f64 / 2.0,
+            );
+            let has_pulse_history =
+                prior_claim_ask.is_some() && prior_cex_mid.is_some() && prior_fair_prob_yes.is_some();
+            let instant_basis_bps = ((fair_claim_price - entry_quote.avg_price)
+                * Decimal::from(10_000))
+            .to_f64()
+            .unwrap_or_default();
+            let decision = self.detector.evaluate(crate::model::PulseOpportunityInput {
+                instant_basis_bps,
+                poly_vwap_slippage_bps: entry_quote.slippage_bps,
+                hedge_slippage_bps: self.settings.paper_slippage.cex_slippage_bps as f64,
+                fee_bps: (self.settings.execution_costs.poly_fee_bps
+                    + self.settings.execution_costs.cex_taker_fee_bps) as f64,
+                perp_basis_penalty_bps: 0.0,
+                rehedge_reserve_bps: self.settings.execution_costs.cex_taker_fee_bps as f64,
+                timeout_exit_reserve_bps: self.settings.execution_costs.poly_fee_bps as f64 / 2.0,
+                expected_net_edge_bps: session_edge.expected_net_edge_bps,
+                expected_net_pnl_usd: session_edge.expected_net_pnl_usd,
+                reversion_pocket_ticks: pocket.available_ticks,
+                vacuum_ratio: pocket.vacuum_ratio,
+                anchor_quality_ok,
+                pricing_quality_ok: priced.pricing_quality.delta_stable,
+                data_fresh,
+                has_pulse_history,
+                claim_price_move_bps,
+                fair_claim_move_bps,
+                cex_mid_move_bps,
+            });
+            if !decision.should_trade {
+                return None;
+            }
 
-        Some(PulseMarketSignalSnapshot {
-            claim_side,
-            pulse_score_bps: decision.pulse_score_bps,
-            net_edge_bps: decision.net_session_edge_bps,
-            fair_prob_yes: priced.fair_prob_yes,
-        })
+            Some(PulseMarketSignalSnapshot {
+                claim_side,
+                pulse_score_bps: decision.pulse_score_bps,
+                net_edge_bps: decision.net_session_edge_bps,
+                fair_prob_yes: priced.fair_prob_yes,
+                entry_price: entry_quote.avg_price,
+                target_exit_price,
+                timeout_exit_price,
+                expected_net_pnl_usd: decision.expected_net_pnl_usd,
+                reversion_pocket_ticks: pocket.available_ticks,
+                reversion_pocket_notional_usd: pocket.pocket_notional_usd,
+                vacuum_ratio: pocket.vacuum_ratio,
+            })
+        };
+
+        match (
+            build_snapshot(TokenSide::Yes, yes_book, prior_yes_ask),
+            build_snapshot(TokenSide::No, no_book, prior_no_ask),
+        ) {
+            (Some(yes), Some(no)) => {
+                if yes.expected_net_pnl_usd > no.expected_net_pnl_usd
+                    || (yes.expected_net_pnl_usd == no.expected_net_pnl_usd
+                        && (yes.net_edge_bps > no.net_edge_bps
+                            || (yes.net_edge_bps == no.net_edge_bps
+                                && yes.pulse_score_bps >= no.pulse_score_bps)))
+                {
+                    Some(yes)
+                } else {
+                    Some(no)
+                }
+            }
+            (Some(snapshot), None) | (None, Some(snapshot)) => Some(snapshot),
+            (None, None) => None,
+        }
     }
 
     fn monitor_market_status(
@@ -2208,11 +2457,16 @@ impl PulseRuntime {
                     .normalize()
                     .to_string(),
                 actual_poly_fill_ratio: managed.session.actual_poly_fill_ratio(),
+                entry_price: Some(managed.entry_price.normalize().to_string()),
                 actual_fill_notional_usd: managed.actual_fill_notional_usd.normalize().to_string(),
+                candidate_expected_net_pnl_usd: Some(
+                    managed.candidate_expected_net_pnl_usd.normalize().to_string(),
+                ),
                 expected_open_net_pnl_usd: managed
                     .expected_open_net_pnl_usd
                     .normalize()
                     .to_string(),
+                pulse_score_bps: Some(managed.pulse_score_bps),
                 effective_open: managed.effective_open,
                 opening_outcome: managed.opening_outcome.clone(),
                 opening_rejection_reason: managed.opening_rejection_reason.clone(),
@@ -2231,6 +2485,15 @@ impl PulseRuntime {
                 exit_path,
                 target_exit_price,
                 final_exit_price,
+                timeout_exit_price: Some(managed.timeout_exit_price.normalize().to_string()),
+                entry_executable_notional_usd: Some(
+                    managed.entry_executable_notional_usd.normalize().to_string(),
+                ),
+                reversion_pocket_ticks: Some(managed.available_reversion_ticks),
+                reversion_pocket_notional_usd: Some(
+                    managed.reversion_pocket_notional_usd.normalize().to_string(),
+                ),
+                vacuum_ratio: Some(managed.vacuum_ratio.normalize().to_string()),
                 anchor_latency_delta_ms: Some(managed.anchor_latency_delta_ms),
                 distance_to_mid_bps,
                 relative_order_age_ms,
@@ -2490,6 +2753,7 @@ fn runtime_lifecycle_event(
         session_id: managed.session.session_id().to_owned(),
         asset: managed.session.asset().as_str().to_owned(),
         state: pulse_session_state_label(managed.session.state()).to_owned(),
+        entry_price: Some(managed.entry_price.normalize().to_string()),
         planned_poly_qty: managed.session.planned_poly_qty().normalize().to_string(),
         actual_poly_filled_qty: managed
             .session
@@ -2498,7 +2762,21 @@ fn runtime_lifecycle_event(
             .to_string(),
         actual_poly_fill_ratio: managed.session.actual_poly_fill_ratio(),
         actual_fill_notional_usd: managed.actual_fill_notional_usd.normalize().to_string(),
+        candidate_expected_net_pnl_usd: Some(
+            managed.candidate_expected_net_pnl_usd.normalize().to_string(),
+        ),
         expected_open_net_pnl_usd: managed.expected_open_net_pnl_usd.normalize().to_string(),
+        pulse_score_bps: Some(managed.pulse_score_bps),
+        target_exit_price: Some(managed.target_exit_price.normalize().to_string()),
+        timeout_exit_price: Some(managed.timeout_exit_price.normalize().to_string()),
+        entry_executable_notional_usd: Some(
+            managed.entry_executable_notional_usd.normalize().to_string(),
+        ),
+        reversion_pocket_ticks: Some(managed.available_reversion_ticks),
+        reversion_pocket_notional_usd: Some(
+            managed.reversion_pocket_notional_usd.normalize().to_string(),
+        ),
+        vacuum_ratio: Some(managed.vacuum_ratio.normalize().to_string()),
         effective_open: managed.effective_open,
         opening_outcome: managed.opening_outcome.clone(),
         opening_rejection_reason: managed.opening_rejection_reason.clone(),
@@ -2571,11 +2849,20 @@ fn lifecycle_event(
         session_id: session.session_id().to_owned(),
         asset: session.asset().as_str().to_owned(),
         state: pulse_session_state_label(session.state()).to_owned(),
+        entry_price: Some("0.35".to_owned()),
         planned_poly_qty: session.planned_poly_qty().normalize().to_string(),
         actual_poly_filled_qty: session.actual_poly_filled_qty().normalize().to_string(),
         actual_poly_fill_ratio: session.actual_poly_fill_ratio(),
         actual_fill_notional_usd: "1225".to_owned(),
+        candidate_expected_net_pnl_usd: Some("4.12".to_owned()),
         expected_open_net_pnl_usd: "3.85".to_owned(),
+        pulse_score_bps: Some(182.5),
+        target_exit_price: Some("0.38".to_owned()),
+        timeout_exit_price: Some("0.31".to_owned()),
+        entry_executable_notional_usd: Some("250".to_owned()),
+        reversion_pocket_ticks: Some(4.0),
+        reversion_pocket_notional_usd: Some("28.57".to_owned()),
+        vacuum_ratio: Some("1".to_owned()),
         effective_open: true,
         opening_outcome: OPENING_OUTCOME_EFFECTIVE_OPEN.to_owned(),
         opening_rejection_reason: None,
@@ -2605,6 +2892,7 @@ fn runtime_session_detail_view(
         state: pulse_session_state_label(managed.session.state()).to_owned(),
         remaining_secs: managed.deadline_ms.saturating_sub(now_ms) / 1_000,
         net_edge_bps: managed.net_edge_bps,
+        pulse_score_bps: Some(managed.pulse_score_bps),
         planned_poly_qty: Some(managed.session.planned_poly_qty().normalize().to_string()),
         actual_poly_filled_qty: Some(
             managed
@@ -2614,6 +2902,23 @@ fn runtime_session_detail_view(
                 .to_string(),
         ),
         actual_poly_fill_ratio: Some(managed.session.actual_poly_fill_ratio()),
+        entry_price: Some(managed.entry_price.normalize().to_string()),
+        target_exit_price: Some(managed.target_exit_price.normalize().to_string()),
+        timeout_exit_price: Some(managed.timeout_exit_price.normalize().to_string()),
+        entry_executable_notional_usd: Some(
+            managed.entry_executable_notional_usd.normalize().to_string(),
+        ),
+        candidate_expected_net_pnl_usd: Some(
+            managed.candidate_expected_net_pnl_usd.normalize().to_string(),
+        ),
+        expected_open_net_pnl_usd: Some(
+            managed.expected_open_net_pnl_usd.normalize().to_string(),
+        ),
+        reversion_pocket_ticks: Some(managed.available_reversion_ticks),
+        reversion_pocket_notional_usd: Some(
+            managed.reversion_pocket_notional_usd.normalize().to_string(),
+        ),
+        vacuum_ratio: Some(managed.vacuum_ratio.normalize().to_string()),
         session_target_delta_exposure: Some(
             managed
                 .session
@@ -2640,9 +2945,19 @@ fn session_detail_view(
         state: pulse_session_state_label(session.state()).to_owned(),
         remaining_secs,
         net_edge_bps,
+        pulse_score_bps: Some(182.5),
         planned_poly_qty: Some(session.planned_poly_qty().normalize().to_string()),
         actual_poly_filled_qty: Some(session.actual_poly_filled_qty().normalize().to_string()),
         actual_poly_fill_ratio: Some(session.actual_poly_fill_ratio()),
+        entry_price: Some("0.35".to_owned()),
+        target_exit_price: Some("0.38".to_owned()),
+        timeout_exit_price: Some("0.31".to_owned()),
+        entry_executable_notional_usd: Some("250".to_owned()),
+        candidate_expected_net_pnl_usd: Some("4.12".to_owned()),
+        expected_open_net_pnl_usd: Some("3.85".to_owned()),
+        reversion_pocket_ticks: Some(4.0),
+        reversion_pocket_notional_usd: Some("28.57".to_owned()),
+        vacuum_ratio: Some("1".to_owned()),
         session_target_delta_exposure: Some(
             session.target_delta_exposure().normalize().to_string(),
         ),
@@ -3698,8 +4013,12 @@ mod tests {
     }
 
     fn btc_signal_market(settlement_timestamp: u64) -> MarketConfig {
+        btc_signal_market_with_symbol("btc-above-100k", settlement_timestamp)
+    }
+
+    fn btc_signal_market_with_symbol(symbol: &str, settlement_timestamp: u64) -> MarketConfig {
         MarketConfig {
-            symbol: Symbol::new("btc-above-100k"),
+            symbol: Symbol::new(symbol),
             poly_ids: PolymarketIds {
                 condition_id: "condition-1".to_owned(),
                 yes_token_id: "yes-1".to_owned(),
@@ -3996,6 +4315,137 @@ mod tests {
 
         assert_eq!(weak, Decimal::new(36, 2));
         assert_eq!(strong, Decimal::new(38, 2));
+    }
+
+    #[tokio::test]
+    async fn best_entry_candidate_prefers_higher_expected_net_pnl_over_higher_pulse_score() {
+        let fixture = runtime_fixture_for_asset(PulseAsset::Btc);
+        let now_ms = current_time_ms();
+        let settlement_timestamp = (now_ms / 1_000) + 3_600;
+        let anchor_provider = Arc::new(StaticAnchorProvider::new(btc_anchor_snapshot(
+            now_ms,
+            settlement_timestamp * 1_000,
+        )));
+        let thick_market = btc_signal_market_with_symbol("btc-above-100k-thick", settlement_timestamp);
+        let thin_market = btc_signal_market_with_symbol("btc-above-100k-thin", settlement_timestamp);
+        let mut runtime = PulseRuntimeBuilder::new(fixture.settings.clone())
+            .with_anchor_provider(anchor_provider)
+            .with_markets(vec![thin_market.clone(), thick_market.clone()])
+            .with_execution_mode(PulseExecutionMode::Paper)
+            .build()
+            .await
+            .expect("build runtime");
+
+        for market in [&thin_market, &thick_market] {
+            runtime.observe_market_event(poly_book_event(
+                &market.symbol.0,
+                TokenSide::Yes,
+                vec![level(68, 2, 10_000, 0)],
+                vec![level(69, 2, 10_000, 0)],
+                now_ms,
+            ));
+            runtime.observe_market_event(poly_book_event(
+                &market.symbol.0,
+                TokenSide::No,
+                vec![level(39, 2, 10_000, 0)],
+                vec![level(40, 2, 10_000, 0)],
+                now_ms,
+            ));
+            runtime.observe_market_event(cex_book_event(&market.symbol.0, now_ms));
+        }
+
+        runtime
+            .run_tick(now_ms + 100)
+            .await
+            .expect("baseline tick should not open");
+
+        runtime.observe_market_event(poly_book_event(
+            &thin_market.symbol.0,
+            TokenSide::No,
+            vec![level(31, 2, 10_000, 0)],
+            vec![
+                level(35, 2, 10, 0),
+                level(45, 2, 50, 0),
+                level(60, 2, 10_000, 0),
+            ],
+            now_ms + 250,
+        ));
+        runtime.observe_market_event(poly_book_event(
+            &thick_market.symbol.0,
+            TokenSide::No,
+            vec![level(31, 2, 10_000, 0)],
+            vec![level(36, 2, 10_000, 0)],
+            now_ms + 250,
+        ));
+        runtime.observe_market_event(cex_book_event(&thin_market.symbol.0, now_ms + 250));
+        runtime.observe_market_event(cex_book_event(&thick_market.symbol.0, now_ms + 250));
+
+        let candidate = runtime
+            .best_entry_candidate(PulseAsset::Btc, now_ms + 300)
+            .expect("select candidate")
+            .expect("candidate");
+
+        assert_eq!(candidate.market.symbol, thick_market.symbol);
+    }
+
+    #[tokio::test]
+    async fn runtime_rejects_market_when_top_of_book_edge_is_positive_but_executable_session_edge_is_negative(
+    ) {
+        let fixture = runtime_fixture_for_asset(PulseAsset::Btc);
+        let now_ms = current_time_ms();
+        let settlement_timestamp = (now_ms / 1_000) + 3_600;
+        let anchor_provider = Arc::new(StaticAnchorProvider::new(btc_anchor_snapshot(
+            now_ms,
+            settlement_timestamp * 1_000,
+        )));
+        let market = btc_signal_market_with_symbol("btc-above-100k-thin", settlement_timestamp);
+        let mut runtime = PulseRuntimeBuilder::new(fixture.settings.clone())
+            .with_anchor_provider(anchor_provider)
+            .with_markets(vec![market.clone()])
+            .with_execution_mode(PulseExecutionMode::Paper)
+            .build()
+            .await
+            .expect("build runtime");
+
+        runtime.observe_market_event(poly_book_event(
+            &market.symbol.0,
+            TokenSide::Yes,
+            vec![level(68, 2, 10_000, 0)],
+            vec![level(69, 2, 10_000, 0)],
+            now_ms,
+        ));
+        runtime.observe_market_event(poly_book_event(
+            &market.symbol.0,
+            TokenSide::No,
+            vec![level(39, 2, 10_000, 0)],
+            vec![level(40, 2, 10_000, 0)],
+            now_ms,
+        ));
+        runtime.observe_market_event(cex_book_event(&market.symbol.0, now_ms));
+
+        runtime
+            .run_tick(now_ms + 100)
+            .await
+            .expect("baseline tick should not open");
+
+        runtime.observe_market_event(poly_book_event(
+            &market.symbol.0,
+            TokenSide::No,
+            vec![level(31, 2, 10_000, 0)],
+            vec![
+                level(35, 2, 10, 0),
+                level(45, 2, 50, 0),
+                level(60, 2, 10_000, 0),
+            ],
+            now_ms + 250,
+        ));
+        runtime.observe_market_event(cex_book_event(&market.symbol.0, now_ms + 250));
+
+        let candidate = runtime
+            .entry_candidate_for_market(PulseAsset::Btc, &market, now_ms + 300)
+            .expect("evaluate market");
+
+        assert!(candidate.is_none());
     }
 
     #[tokio::test]

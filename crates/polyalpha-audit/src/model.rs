@@ -346,11 +346,29 @@ pub struct PulseLifecycleAuditEvent {
     pub session_id: String,
     pub asset: String,
     pub state: String,
+    #[serde(default)]
+    pub entry_price: Option<String>,
     pub planned_poly_qty: String,
     pub actual_poly_filled_qty: String,
     pub actual_poly_fill_ratio: f64,
     pub actual_fill_notional_usd: String,
+    #[serde(default)]
+    pub candidate_expected_net_pnl_usd: Option<String>,
     pub expected_open_net_pnl_usd: String,
+    #[serde(default)]
+    pub pulse_score_bps: Option<f64>,
+    #[serde(default)]
+    pub target_exit_price: Option<String>,
+    #[serde(default)]
+    pub timeout_exit_price: Option<String>,
+    #[serde(default)]
+    pub entry_executable_notional_usd: Option<String>,
+    #[serde(default)]
+    pub reversion_pocket_ticks: Option<f64>,
+    #[serde(default)]
+    pub reversion_pocket_notional_usd: Option<String>,
+    #[serde(default)]
+    pub vacuum_ratio: Option<String>,
     pub effective_open: bool,
     pub opening_outcome: String,
     #[serde(default)]
@@ -395,8 +413,14 @@ pub struct PulseSessionSummaryRow {
     pub planned_poly_qty: String,
     pub actual_poly_filled_qty: String,
     pub actual_poly_fill_ratio: f64,
+    #[serde(default)]
+    pub entry_price: Option<String>,
     pub actual_fill_notional_usd: String,
+    #[serde(default)]
+    pub candidate_expected_net_pnl_usd: Option<String>,
     pub expected_open_net_pnl_usd: String,
+    #[serde(default)]
+    pub pulse_score_bps: Option<f64>,
     pub effective_open: bool,
     pub opening_outcome: String,
     #[serde(default)]
@@ -414,6 +438,16 @@ pub struct PulseSessionSummaryRow {
     pub target_exit_price: Option<String>,
     #[serde(default)]
     pub final_exit_price: Option<String>,
+    #[serde(default)]
+    pub timeout_exit_price: Option<String>,
+    #[serde(default)]
+    pub entry_executable_notional_usd: Option<String>,
+    #[serde(default)]
+    pub reversion_pocket_ticks: Option<f64>,
+    #[serde(default)]
+    pub reversion_pocket_notional_usd: Option<String>,
+    #[serde(default)]
+    pub vacuum_ratio: Option<String>,
     #[serde(default)]
     pub anchor_latency_delta_ms: Option<u64>,
     #[serde(default)]
@@ -576,11 +610,20 @@ mod tests {
             session_id: "pulse-session-1".to_owned(),
             asset: "btc".to_owned(),
             state: "maker_exit_working".to_owned(),
+            entry_price: Some("0.35".to_owned()),
             planned_poly_qty: "10000".to_owned(),
             actual_poly_filled_qty: "3500".to_owned(),
             actual_poly_fill_ratio: 0.35,
             actual_fill_notional_usd: "1225".to_owned(),
+            candidate_expected_net_pnl_usd: Some("4.12".to_owned()),
             expected_open_net_pnl_usd: "3.85".to_owned(),
+            pulse_score_bps: Some(182.5),
+            target_exit_price: Some("0.38".to_owned()),
+            timeout_exit_price: Some("0.31".to_owned()),
+            entry_executable_notional_usd: Some("250".to_owned()),
+            reversion_pocket_ticks: Some(4.0),
+            reversion_pocket_notional_usd: Some("28.57".to_owned()),
+            vacuum_ratio: Some("1".to_owned()),
             effective_open: true,
             opening_outcome: "effective_open".to_owned(),
             opening_rejection_reason: None,

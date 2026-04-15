@@ -130,8 +130,11 @@ impl AuditWarehouse {
                     planned_poly_qty,
                     actual_poly_filled_qty,
                     actual_poly_fill_ratio,
+                    entry_price,
                     actual_fill_notional_usd,
+                    candidate_expected_net_pnl_usd,
                     expected_open_net_pnl_usd,
+                    pulse_score_bps,
                     effective_open,
                     opening_outcome,
                     opening_rejection_reason,
@@ -143,11 +146,16 @@ impl AuditWarehouse {
                     exit_path,
                     target_exit_price,
                     final_exit_price,
+                    timeout_exit_price,
+                    entry_executable_notional_usd,
+                    reversion_pocket_ticks,
+                    reversion_pocket_notional_usd,
+                    vacuum_ratio,
                     anchor_latency_delta_ms,
                     distance_to_mid_bps,
                     relative_order_age_ms,
                     row_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     summary.session_id.clone(),
                     pulse_summary.pulse_session_id.clone(),
@@ -158,8 +166,11 @@ impl AuditWarehouse {
                     pulse_summary.planned_poly_qty.clone(),
                     pulse_summary.actual_poly_filled_qty.clone(),
                     pulse_summary.actual_poly_fill_ratio,
+                    pulse_summary.entry_price.clone(),
                     pulse_summary.actual_fill_notional_usd.clone(),
+                    pulse_summary.candidate_expected_net_pnl_usd.clone(),
                     pulse_summary.expected_open_net_pnl_usd.clone(),
+                    pulse_summary.pulse_score_bps,
                     pulse_summary.effective_open,
                     pulse_summary.opening_outcome.clone(),
                     pulse_summary.opening_rejection_reason.clone(),
@@ -171,6 +182,11 @@ impl AuditWarehouse {
                     pulse_summary.exit_path.clone(),
                     pulse_summary.target_exit_price.clone(),
                     pulse_summary.final_exit_price.clone(),
+                    pulse_summary.timeout_exit_price.clone(),
+                    pulse_summary.entry_executable_notional_usd.clone(),
+                    pulse_summary.reversion_pocket_ticks,
+                    pulse_summary.reversion_pocket_notional_usd.clone(),
+                    pulse_summary.vacuum_ratio.clone(),
                     pulse_summary.anchor_latency_delta_ms.map(|value| value as i64),
                     pulse_summary.distance_to_mid_bps,
                     pulse_summary.relative_order_age_ms.map(|value| value as i64),
@@ -246,8 +262,11 @@ impl AuditWarehouse {
                 planned_poly_qty VARCHAR NOT NULL,
                 actual_poly_filled_qty VARCHAR NOT NULL,
                 actual_poly_fill_ratio DOUBLE NOT NULL,
+                entry_price VARCHAR,
                 actual_fill_notional_usd VARCHAR NOT NULL,
+                candidate_expected_net_pnl_usd VARCHAR,
                 expected_open_net_pnl_usd VARCHAR NOT NULL,
+                pulse_score_bps DOUBLE,
                 effective_open BOOLEAN NOT NULL,
                 opening_outcome VARCHAR NOT NULL,
                 opening_rejection_reason VARCHAR,
@@ -259,6 +278,11 @@ impl AuditWarehouse {
                 exit_path VARCHAR,
                 target_exit_price VARCHAR,
                 final_exit_price VARCHAR,
+                timeout_exit_price VARCHAR,
+                entry_executable_notional_usd VARCHAR,
+                reversion_pocket_ticks DOUBLE,
+                reversion_pocket_notional_usd VARCHAR,
+                vacuum_ratio VARCHAR,
                 anchor_latency_delta_ms BIGINT,
                 distance_to_mid_bps DOUBLE,
                 relative_order_age_ms BIGINT,
@@ -282,8 +306,11 @@ impl AuditWarehouse {
             .context("收集 pulse 会话摘要 schema 列失败")?;
 
         for (name, definition) in [
+            ("entry_price", "VARCHAR"),
             ("actual_fill_notional_usd", "VARCHAR"),
+            ("candidate_expected_net_pnl_usd", "VARCHAR"),
             ("expected_open_net_pnl_usd", "VARCHAR"),
+            ("pulse_score_bps", "DOUBLE"),
             ("effective_open", "BOOLEAN"),
             ("opening_outcome", "VARCHAR"),
             ("opening_rejection_reason", "VARCHAR"),
@@ -291,6 +318,11 @@ impl AuditWarehouse {
             ("exit_path", "VARCHAR"),
             ("target_exit_price", "VARCHAR"),
             ("final_exit_price", "VARCHAR"),
+            ("timeout_exit_price", "VARCHAR"),
+            ("entry_executable_notional_usd", "VARCHAR"),
+            ("reversion_pocket_ticks", "DOUBLE"),
+            ("reversion_pocket_notional_usd", "VARCHAR"),
+            ("vacuum_ratio", "VARCHAR"),
         ] {
             if columns.iter().any(|column| column == name) {
                 continue;
@@ -407,10 +439,26 @@ mod tests {
             .expect("sync pulse session into legacy warehouse");
 
         let conn = duckdb::Connection::open(warehouse.db_path()).expect("open warehouse");
-        let row: (String, bool, String, String, String, String, String) = conn
+        let row: (
+            String,
+            String,
+            String,
+            f64,
+            bool,
+            String,
+            String,
+            String,
+            String,
+            String,
+            f64,
+            String,
+            String,
+        ) = conn
             .query_row(
-                "SELECT actual_fill_notional_usd, effective_open, opening_outcome, opening_allocated_hedge_qty,
-                        exit_path, target_exit_price, final_exit_price
+                "SELECT entry_price, actual_fill_notional_usd, candidate_expected_net_pnl_usd, pulse_score_bps,
+                        effective_open, opening_outcome, opening_allocated_hedge_qty, exit_path,
+                        target_exit_price, timeout_exit_price, reversion_pocket_ticks,
+                        reversion_pocket_notional_usd, vacuum_ratio
                  FROM pulse_session_summaries
                  WHERE session_id = ?",
                 duckdb::params![session_id],
@@ -423,18 +471,30 @@ mod tests {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
                     ))
                 },
             )
             .expect("query migrated pulse summary row");
 
-        assert_eq!(row.0, "1225");
-        assert!(row.1);
-        assert_eq!(row.2, "effective_open");
-        assert_eq!(row.3, "0.39");
-        assert_eq!(row.4, "maker_proxy_hit");
-        assert_eq!(row.5, "0.38");
-        assert_eq!(row.6, "0.38");
+        assert_eq!(row.0, "0.35");
+        assert_eq!(row.1, "1225");
+        assert_eq!(row.2, "4.12");
+        assert_eq!(row.3, 182.5);
+        assert!(row.4);
+        assert_eq!(row.5, "effective_open");
+        assert_eq!(row.6, "0.39");
+        assert_eq!(row.7, "maker_proxy_hit");
+        assert_eq!(row.8, "0.38");
+        assert_eq!(row.9, "0.31");
+        assert_eq!(row.10, 4.0);
+        assert_eq!(row.11, "28.57");
+        assert_eq!(row.12, "1");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -489,8 +549,11 @@ mod tests {
             planned_poly_qty: "10000".to_owned(),
             actual_poly_filled_qty: "3500".to_owned(),
             actual_poly_fill_ratio: 0.35,
+            entry_price: Some("0.35".to_owned()),
             actual_fill_notional_usd: "1225".to_owned(),
+            candidate_expected_net_pnl_usd: Some("4.12".to_owned()),
             expected_open_net_pnl_usd: "3.85".to_owned(),
+            pulse_score_bps: Some(182.5),
             effective_open: true,
             opening_outcome: "effective_open".to_owned(),
             opening_rejection_reason: None,
@@ -502,6 +565,11 @@ mod tests {
             exit_path: Some("maker_proxy_hit".to_owned()),
             target_exit_price: Some("0.38".to_owned()),
             final_exit_price: Some("0.38".to_owned()),
+            timeout_exit_price: Some("0.31".to_owned()),
+            entry_executable_notional_usd: Some("250".to_owned()),
+            reversion_pocket_ticks: Some(4.0),
+            reversion_pocket_notional_usd: Some("28.57".to_owned()),
+            vacuum_ratio: Some("1".to_owned()),
             anchor_latency_delta_ms: Some(42),
             distance_to_mid_bps: Some(8.0),
             relative_order_age_ms: Some(950),

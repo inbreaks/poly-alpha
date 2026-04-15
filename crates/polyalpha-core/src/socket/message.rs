@@ -183,6 +183,20 @@ pub struct PulseMarketMonitorRow {
     #[serde(default)]
     pub fair_prob_yes: Option<f64>,
     #[serde(default)]
+    pub entry_price: Option<f64>,
+    #[serde(default)]
+    pub target_exit_price: Option<f64>,
+    #[serde(default)]
+    pub timeout_exit_price: Option<f64>,
+    #[serde(default)]
+    pub expected_net_pnl_usd: Option<f64>,
+    #[serde(default)]
+    pub reversion_pocket_ticks: Option<f64>,
+    #[serde(default)]
+    pub reversion_pocket_notional_usd: Option<f64>,
+    #[serde(default)]
+    pub vacuum_ratio: Option<f64>,
+    #[serde(default)]
     pub anchor_age_ms: Option<u64>,
     #[serde(default)]
     pub anchor_latency_delta_ms: Option<u64>,
@@ -206,11 +220,31 @@ pub struct PulseSessionDetailView {
     pub remaining_secs: u64,
     pub net_edge_bps: f64,
     #[serde(default)]
+    pub pulse_score_bps: Option<f64>,
+    #[serde(default)]
     pub planned_poly_qty: Option<String>,
     #[serde(default)]
     pub actual_poly_filled_qty: Option<String>,
     #[serde(default)]
     pub actual_poly_fill_ratio: Option<f64>,
+    #[serde(default)]
+    pub entry_price: Option<String>,
+    #[serde(default)]
+    pub target_exit_price: Option<String>,
+    #[serde(default)]
+    pub timeout_exit_price: Option<String>,
+    #[serde(default)]
+    pub entry_executable_notional_usd: Option<String>,
+    #[serde(default)]
+    pub candidate_expected_net_pnl_usd: Option<String>,
+    #[serde(default)]
+    pub expected_open_net_pnl_usd: Option<String>,
+    #[serde(default)]
+    pub reversion_pocket_ticks: Option<f64>,
+    #[serde(default)]
+    pub reversion_pocket_notional_usd: Option<String>,
+    #[serde(default)]
+    pub vacuum_ratio: Option<String>,
     #[serde(default)]
     pub session_target_delta_exposure: Option<String>,
     #[serde(default)]
@@ -1631,6 +1665,13 @@ mod tests {
                 poly_no_price: Some(0.355),
                 cex_price: Some(100_005.0),
                 fair_prob_yes: Some(0.602),
+                entry_price: Some(0.356),
+                target_exit_price: Some(0.38),
+                timeout_exit_price: Some(0.31),
+                expected_net_pnl_usd: Some(3.85),
+                reversion_pocket_ticks: Some(4.0),
+                reversion_pocket_notional_usd: Some(28.57),
+                vacuum_ratio: Some(1.0),
                 anchor_age_ms: Some(42),
                 anchor_latency_delta_ms: Some(18),
                 poly_quote_age_ms: Some(15),

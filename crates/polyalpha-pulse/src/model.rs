@@ -102,7 +102,12 @@ pub struct PulseOpportunityInput {
     pub perp_basis_penalty_bps: f64,
     pub rehedge_reserve_bps: f64,
     pub timeout_exit_reserve_bps: f64,
+    pub expected_net_edge_bps: f64,
+    pub expected_net_pnl_usd: Decimal,
+    pub reversion_pocket_ticks: f64,
+    pub vacuum_ratio: Decimal,
     pub anchor_quality_ok: bool,
+    pub pricing_quality_ok: bool,
     pub data_fresh: bool,
     pub has_pulse_history: bool,
     pub claim_price_move_bps: f64,
@@ -114,6 +119,7 @@ pub struct PulseOpportunityInput {
 pub struct DetectorDecision {
     pub should_trade: bool,
     pub net_session_edge_bps: f64,
+    pub expected_net_pnl_usd: Decimal,
     pub pulse_score_bps: f64,
     pub rejection_code: Option<PulseFailureCode>,
 }

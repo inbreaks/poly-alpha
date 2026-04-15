@@ -434,6 +434,34 @@ fn pulse_summary_lines(state: &TuiState) -> Vec<Line<'static>> {
         ]));
     }
 
+    if let Some(session) = pulse.selected_session.as_ref() {
+        lines.push(Line::from(vec![
+            Span::styled("Pulse 选中 ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!(
+                "{} {} edge{:.1}bps EV${} 入{} 目{} 超{} pocket{}/$ {} 真空{}",
+                session.asset,
+                session.state,
+                session.net_edge_bps,
+                session
+                    .candidate_expected_net_pnl_usd
+                    .as_deref()
+                    .unwrap_or("--"),
+                session.entry_price.as_deref().unwrap_or("--"),
+                session.target_exit_price.as_deref().unwrap_or("--"),
+                session.timeout_exit_price.as_deref().unwrap_or("--"),
+                session
+                    .reversion_pocket_ticks
+                    .map(|value| format!("{value:.1}"))
+                    .unwrap_or_else(|| "--".to_owned()),
+                session
+                    .reversion_pocket_notional_usd
+                    .as_deref()
+                    .unwrap_or("--"),
+                session.vacuum_ratio.as_deref().unwrap_or("--"),
+            )),
+        ]));
+    }
+
     lines
 }
 
@@ -753,10 +781,11 @@ fn render_pulse_markets(state: &TuiState, markets: &[PulseMarketMonitorRow]) -> 
         centered_cell("方向"),
         right_cell("Pulse"),
         right_cell("净边"),
-        right_cell("YES"),
-        right_cell("NO"),
-        right_cell("对冲价"),
-        right_cell("公允"),
+        right_cell("EV$"),
+        right_cell("入/目"),
+        right_cell("超时"),
+        right_cell("Pocket"),
+        right_cell("真空"),
         right_cell("龄(P/C/A)"),
         right_cell("状态"),
     ]);
@@ -795,19 +824,26 @@ fn render_pulse_markets(state: &TuiState, markets: &[PulseMarketMonitorRow]) -> 
                     7,
                 )),
                 right_cell(fit_display_right(
-                    &format_optional_price(market.poly_yes_price),
-                    6,
-                )),
-                right_cell(fit_display_right(
-                    &format_optional_price(market.poly_no_price),
-                    6,
-                )),
-                right_cell(fit_display_right(
-                    &format_optional_price(market.cex_price),
+                    &format_optional_metric(market.expected_net_pnl_usd),
                     7,
                 )),
                 right_cell(fit_display_right(
-                    &format_optional_price(market.fair_prob_yes),
+                    &format_entry_target_pair(market.entry_price, market.target_exit_price),
+                    11,
+                )),
+                right_cell(fit_display_right(
+                    &format_optional_price(market.timeout_exit_price),
+                    6,
+                )),
+                right_cell(fit_display_right(
+                    &format_pocket_summary(
+                        market.reversion_pocket_ticks,
+                        market.reversion_pocket_notional_usd,
+                    ),
+                    11,
+                )),
+                right_cell(fit_display_right(
+                    &format_optional_metric(market.vacuum_ratio),
                     6,
                 )),
                 right_styled_cell(
@@ -838,9 +874,10 @@ fn render_pulse_markets(state: &TuiState, markets: &[PulseMarketMonitorRow]) -> 
             Constraint::Length(4),
             Constraint::Length(7),
             Constraint::Length(7),
-            Constraint::Length(6),
-            Constraint::Length(6),
             Constraint::Length(7),
+            Constraint::Length(11),
+            Constraint::Length(6),
+            Constraint::Length(11),
             Constraint::Length(6),
             Constraint::Length(13),
             Constraint::Length(14),
@@ -2316,6 +2353,22 @@ fn format_optional_metric(value: Option<f64>) -> String {
         .unwrap_or_else(|| "--".to_owned())
 }
 
+fn format_entry_target_pair(entry_price: Option<f64>, target_exit_price: Option<f64>) -> String {
+    match (entry_price, target_exit_price) {
+        (Some(entry), Some(target)) => format!("{}/{}", format_price(entry), format_price(target)),
+        _ => "--".to_owned(),
+    }
+}
+
+fn format_pocket_summary(ticks: Option<f64>, notional_usd: Option<f64>) -> String {
+    match (ticks, notional_usd) {
+        (Some(ticks), Some(notional_usd)) => format!("{ticks:.0}/${notional_usd:.0}"),
+        (Some(ticks), None) => format!("{ticks:.0}/--"),
+        (None, Some(notional_usd)) => format!("--/${notional_usd:.0}"),
+        (None, None) => "--".to_owned(),
+    }
+}
+
 fn format_optional_pct(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.2}%"))
@@ -3093,6 +3146,13 @@ mod tests {
                 poly_no_price: Some(0.355),
                 cex_price: Some(100_005.0),
                 fair_prob_yes: Some(0.602),
+                entry_price: Some(0.356),
+                target_exit_price: Some(0.38),
+                timeout_exit_price: Some(0.31),
+                expected_net_pnl_usd: Some(3.85),
+                reversion_pocket_ticks: Some(4.0),
+                reversion_pocket_notional_usd: Some(28.57),
+                vacuum_ratio: Some(1.0),
                 anchor_age_ms: Some(42),
                 anchor_latency_delta_ms: Some(18),
                 poly_quote_age_ms: Some(15),
@@ -3112,6 +3172,9 @@ mod tests {
         assert!(compact.contains("NO"));
         assert!(compact.contains("182.5"));
         assert!(compact.contains("97.4"));
+        assert!(compact.contains("3.85"));
+        assert!(compact.contains("0.356/0.380"));
+        assert!(compact.contains("4/$29"));
         assert!(compact.contains("可定价"));
     }
 
@@ -3416,7 +3479,31 @@ mod tests {
                 disable_reason: Some("hedge_drift".to_owned()),
             }],
             markets: Vec::new(),
-            selected_session: None,
+            selected_session: Some(polyalpha_core::PulseSessionDetailView {
+                session_id: "pulse-session-1".to_owned(),
+                asset: "btc".to_owned(),
+                state: "maker_exit_working".to_owned(),
+                remaining_secs: 540,
+                net_edge_bps: 31.4,
+                pulse_score_bps: Some(182.5),
+                planned_poly_qty: Some("10000".to_owned()),
+                actual_poly_filled_qty: Some("3500".to_owned()),
+                actual_poly_fill_ratio: Some(0.35),
+                entry_price: Some("0.35".to_owned()),
+                target_exit_price: Some("0.38".to_owned()),
+                timeout_exit_price: Some("0.31".to_owned()),
+                entry_executable_notional_usd: Some("250".to_owned()),
+                candidate_expected_net_pnl_usd: Some("4.12".to_owned()),
+                expected_open_net_pnl_usd: Some("3.85".to_owned()),
+                reversion_pocket_ticks: Some(4.0),
+                reversion_pocket_notional_usd: Some("28.57".to_owned()),
+                vacuum_ratio: Some("1".to_owned()),
+                session_target_delta_exposure: Some("0.41".to_owned()),
+                session_allocated_hedge_qty: Some("0.39".to_owned()),
+                anchor_latency_delta_ms: Some(18),
+                distance_to_mid_bps: Some(8.0),
+                relative_order_age_ms: Some(900),
+            }),
         });
 
         let mut buffer = Buffer::empty(Rect::new(0, 0, 200, 14));
@@ -3428,6 +3515,9 @@ mod tests {
         assert!(compact.contains("btc"));
         assert!(compact.contains("anchor42ms"));
         assert!(compact.contains("对冲偏移"));
+        assert!(compact.contains("EV$4.12"));
+        assert!(compact.contains("入0.35"));
+        assert!(compact.contains("目0.38"));
     }
 
     #[test]
