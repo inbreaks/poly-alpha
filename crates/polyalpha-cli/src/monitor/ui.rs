@@ -446,10 +446,7 @@ fn pulse_summary_lines(state: &TuiState) -> Vec<Line<'static>> {
                     .candidate_expected_net_pnl_usd
                     .as_deref()
                     .unwrap_or("--"),
-                session
-                    .timeout_loss_estimate_usd
-                    .as_deref()
-                    .unwrap_or("--"),
+                session.timeout_loss_estimate_usd.as_deref().unwrap_or("--"),
                 format_optional_ratio_pct(session.required_hit_rate),
                 session.entry_price.as_deref().unwrap_or("--"),
                 session.target_exit_price.as_deref().unwrap_or("--"),
@@ -910,6 +907,7 @@ fn pulse_market_status_color(market: &PulseMarketMonitorRow) -> Color {
         "degraded" => Color::Yellow,
         "expired" => Color::Red,
         "anchor_stale" | "anchor_latency_delta_high" => Color::Yellow,
+        "poly_transport_stale" | "hedge_transport_stale" => Color::Yellow,
         "residual_hedge" => Color::Yellow,
         "waiting_anchor" | "waiting_books" => Color::DarkGray,
         _ => Color::Gray,
@@ -947,6 +945,8 @@ fn pulse_status_label(status: Option<&str>, disable_reason: Option<&str>) -> &'s
         Some("waiting_books") | Some("waiting_poly_quote") | Some("waiting_cex_quote") => {
             "等待盘口"
         }
+        Some("poly_transport_stale") => "Poly WS 滞后",
+        Some("hedge_transport_stale") => "CEX WS 滞后",
         Some("poly_quote_stale") => "Poly 过旧",
         Some("cex_quote_stale") => "CEX 过旧",
         Some("residual_hedge") => "残余对冲仓位",
@@ -2630,6 +2630,8 @@ fn evaluable_status_label(status: &str) -> &'static str {
         "not_evaluable_no_cex" => "缺少可用的交易所参考价",
         "not_evaluable_misaligned" => "双腿时间未对齐",
         "connection_impaired" => "行情连接异常",
+        "poly_transport_stale" => "Polymarket WS 已超时",
+        "hedge_transport_stale" => "交易所 WS 已超时",
         "poly_quote_stale" => "Polymarket 报价已超时",
         "cex_quote_stale" => "交易所报价已超时",
         _ => "未知状态",
@@ -2643,6 +2645,8 @@ fn async_classification_label(classification: &str) -> &'static str {
         "poly_lag_borderline" => "慢腿临界",
         "no_poly_sample" => "缺少新的 Polymarket 样本",
         "no_cex_reference" => "缺少可用的交易所参考价",
+        "poly_transport_stale" => "Polymarket WS 已超时",
+        "hedge_transport_stale" => "交易所 WS 已超时",
         "poly_quote_stale" => "Polymarket 报价已超时",
         "cex_quote_stale" => "交易所报价已超时",
         "misaligned" => "双腿时间未对齐",
