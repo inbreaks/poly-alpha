@@ -55,6 +55,30 @@ pub struct RecoveryObservation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SignalSample<T> {
+    pub exchange_timestamp_ms: u64,
+    pub received_at_ms: u64,
+    pub sequence: u64,
+    pub value: T,
+}
+
+impl SignalSample<Decimal> {
+    pub fn new_decimal(
+        exchange_timestamp_ms: u64,
+        received_at_ms: u64,
+        sequence: u64,
+        value: Decimal,
+    ) -> Self {
+        Self {
+            exchange_timestamp_ms,
+            received_at_ms,
+            sequence,
+            value,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TargetCandidate {
     pub mode: PulseMode,
     pub target_exit_price: Decimal,
@@ -88,11 +112,8 @@ pub fn build_reachability_envelope(
 ) -> ReachabilityEnvelope {
     let gross_bps = hedge_cost_bps + fee_bps + reserve_bps;
     let min_profitable_target_distance_bps = gross_bps.max(0.0);
-    let min_realizable_target_distance_bps = aligned_tick_floor_bps(
-        entry_price,
-        tick_size,
-        min_profitable_target_distance_bps,
-    );
+    let min_realizable_target_distance_bps =
+        aligned_tick_floor_bps(entry_price, tick_size, min_profitable_target_distance_bps);
     ReachabilityEnvelope {
         min_profitable_target_distance_bps,
         min_realizable_target_distance_bps,
@@ -112,9 +133,9 @@ pub fn classify_pulse_mode(
     swept_notional_usd: Decimal,
     swept_levels_count: usize,
 ) -> PulseMode {
-    let continuation_confirmed =
-        swept_notional_usd >= Decimal::new(CONTINUATION_CONFIRMATION_NOTIONAL_USD, 0)
-            && swept_levels_count >= CONTINUATION_CONFIRMATION_LEVELS;
+    let continuation_confirmed = swept_notional_usd
+        >= Decimal::new(CONTINUATION_CONFIRMATION_NOTIONAL_USD, 0)
+        && swept_levels_count >= CONTINUATION_CONFIRMATION_LEVELS;
     if continuation_confirmed
         && (fair_claim_move_bps >= FAIR_MOVE_CONFIRMATION_BPS
             || cex_mid_move_bps >= FAIR_MOVE_CONFIRMATION_BPS)
@@ -359,6 +380,70 @@ pub fn estimate_session_edge(
     }
 }
 
+pub fn summarize_recovery_observation(
+    samples: &[SignalSample<Decimal>],
+    pulse_exchange_ts_ms: u64,
+    pulse_price: Decimal,
+) -> RecoveryObservation {
+    let mut max_recovery_ratio_within_2s = 0.0_f64;
+    let mut max_recovery_ratio_within_5s = 0.0_f64;
+    let mut previous_ts = pulse_exchange_ts_ms;
+    let mut max_interarrival_gap_ms_5s = 0_u64;
+    let mut post_sweep_update_count_5s = 0_usize;
+    let native_sequence_present = samples.iter().all(|sample| sample.sequence > 0);
+    let used_exchange_ts = samples
+        .iter()
+        .any(|sample| sample.exchange_timestamp_ms > 0);
+
+    for sample in samples {
+        let ts_ms = signal_sample_ts_ms(sample);
+        if ts_ms < pulse_exchange_ts_ms || ts_ms.saturating_sub(pulse_exchange_ts_ms) > 5_000 {
+            continue;
+        }
+        post_sweep_update_count_5s += 1;
+        max_interarrival_gap_ms_5s =
+            max_interarrival_gap_ms_5s.max(ts_ms.saturating_sub(previous_ts));
+        previous_ts = ts_ms;
+
+        let recovery_ratio: f64 = if pulse_price > Decimal::ZERO {
+            ((pulse_price - sample.value) / pulse_price)
+                .to_f64()
+                .unwrap_or(0.0)
+                .max(0.0)
+        } else {
+            0.0
+        };
+        if ts_ms.saturating_sub(pulse_exchange_ts_ms) <= 2_000 {
+            max_recovery_ratio_within_2s = max_recovery_ratio_within_2s.max(recovery_ratio);
+        }
+        max_recovery_ratio_within_5s = max_recovery_ratio_within_5s.max(recovery_ratio);
+    }
+
+    let observation_quality_score = if post_sweep_update_count_5s >= 3
+        && max_interarrival_gap_ms_5s <= 700
+        && native_sequence_present
+    {
+        1.0
+    } else {
+        0.0
+    };
+
+    RecoveryObservation {
+        max_recovery_ratio_within_2s,
+        max_recovery_ratio_within_5s,
+        time_to_first_50pct_refill_ms: None,
+        time_to_first_80pct_refill_ms: None,
+        quality: RecoveryObservationQuality {
+            used_exchange_ts,
+            native_sequence_present,
+            post_sweep_update_count_5s,
+            max_interarrival_gap_ms_5s,
+            observation_quality_score,
+            admission_eligible: observation_quality_score >= 1.0,
+        },
+    }
+}
+
 pub fn reversion_pocket(
     entry_price: Decimal,
     reference_price: Decimal,
@@ -432,7 +517,9 @@ fn aligned_tick_floor_bps(
     }
 
     let min_distance_bps = min_profitable_target_distance_bps.max(one_tick_bps);
-    let tick_steps = ((min_distance_bps / one_tick_bps) - BPS_EPSILON).ceil().max(1.0);
+    let tick_steps = ((min_distance_bps / one_tick_bps) - BPS_EPSILON)
+        .ceil()
+        .max(1.0);
     tick_steps * one_tick_bps
 }
 
@@ -452,11 +539,9 @@ fn mode_timeout_secs(mode: PulseMode) -> u64 {
 
 fn mode_recoil_steps(mode: PulseMode) -> [Decimal; 3] {
     match mode {
-        PulseMode::ElasticSnapback => [
-            Decimal::new(9, 2),
-            Decimal::new(11, 2),
-            Decimal::new(13, 2),
-        ],
+        PulseMode::ElasticSnapback => {
+            [Decimal::new(9, 2), Decimal::new(11, 2), Decimal::new(13, 2)]
+        }
         PulseMode::DeepReversion => [
             Decimal::new(14, 2),
             Decimal::new(16, 2),
@@ -478,6 +563,14 @@ fn price_edge_bps(entry_price: Decimal, exit_price: Decimal) -> f64 {
         .unwrap_or(0.0)
 }
 
+fn signal_sample_ts_ms<T>(sample: &SignalSample<T>) -> u64 {
+    if sample.exchange_timestamp_ms > 0 {
+        sample.exchange_timestamp_ms
+    } else {
+        sample.received_at_ms
+    }
+}
+
 fn edge_pnl_usd(entry_notional_usd: Decimal, edge_bps: f64) -> Decimal {
     entry_notional_usd * Decimal::from_f64_retain(edge_bps / 10_000.0).unwrap_or(Decimal::ZERO)
 }
@@ -493,8 +586,9 @@ mod tests {
 
     use super::{
         build_reachability_envelope, classify_pulse_mode, distance_to_mid_bps,
-        estimate_session_edge, executable_poly_quote, generate_target_candidates,
-        reversion_pocket, select_best_target, ExecutableQuoteSide, TargetCandidate,
+        estimate_session_edge, executable_poly_quote, generate_target_candidates, reversion_pocket,
+        select_best_target, summarize_recovery_observation, ExecutableQuoteSide, SignalSample,
+        TargetCandidate,
     };
     use crate::model::{PulseMode, ReachabilityEnvelope};
 
@@ -615,6 +709,31 @@ mod tests {
     }
 
     #[test]
+    fn recovery_observation_prefers_exchange_timestamp_over_received_time() {
+        let samples = vec![
+            SignalSample::new_decimal(1_000, 1_180, 10, Decimal::new(45, 2)),
+            SignalSample::new_decimal(1_600, 1_950, 11, Decimal::new(443, 3)),
+            SignalSample::new_decimal(2_200, 2_700, 12, Decimal::new(441, 3)),
+        ];
+
+        let recovery = summarize_recovery_observation(&samples, 1_000, Decimal::new(45, 2));
+        assert!(recovery.quality.used_exchange_ts);
+        assert_eq!(recovery.quality.max_interarrival_gap_ms_5s, 600);
+    }
+
+    #[test]
+    fn recovery_observation_marks_metrics_audit_only_when_quality_gate_fails() {
+        let samples = vec![
+            SignalSample::new_decimal(1_000, 1_000, 0, Decimal::new(45, 2)),
+            SignalSample::new_decimal(2_600, 2_700, 0, Decimal::new(444, 3)),
+        ];
+
+        let recovery = summarize_recovery_observation(&samples, 1_000, Decimal::new(45, 2));
+        assert!(!recovery.quality.native_sequence_present);
+        assert!(!recovery.quality.admission_eligible);
+    }
+
+    #[test]
     fn reachability_envelope_rejects_when_min_profitable_distance_exceeds_cap() {
         let envelope = build_reachability_envelope(
             Decimal::new(250, 0),
@@ -686,8 +805,7 @@ mod tests {
 
     #[test]
     fn deep_reversion_targets_respect_break_even_floor_and_reachability_cap() {
-        let envelope =
-            reachability_envelope(Decimal::new(45, 2), Decimal::new(1, 3), 120.0, 200.0);
+        let envelope = reachability_envelope(Decimal::new(45, 2), Decimal::new(1, 3), 120.0, 200.0);
         let targets = generate_target_candidates(
             PulseMode::DeepReversion,
             Decimal::new(45, 2),
@@ -708,8 +826,7 @@ mod tests {
 
     #[test]
     fn elastic_snapback_cent_tick_deduplicates_single_tick_candidate() {
-        let envelope =
-            reachability_envelope(Decimal::new(80, 2), Decimal::new(1, 2), 95.0, 150.0);
+        let envelope = reachability_envelope(Decimal::new(80, 2), Decimal::new(1, 2), 95.0, 150.0);
         let targets = generate_target_candidates(
             PulseMode::ElasticSnapback,
             Decimal::new(80, 2),
@@ -726,8 +843,7 @@ mod tests {
 
     #[test]
     fn generate_target_candidates_respects_explicit_reachability_cap() {
-        let envelope =
-            reachability_envelope(Decimal::new(80, 2), Decimal::new(1, 2), 95.0, 120.0);
+        let envelope = reachability_envelope(Decimal::new(80, 2), Decimal::new(1, 2), 95.0, 120.0);
         let targets = generate_target_candidates(
             PulseMode::ElasticSnapback,
             Decimal::new(80, 2),
@@ -742,8 +858,7 @@ mod tests {
 
     #[test]
     fn envelope_and_generator_share_aligned_tick_floor_contract() {
-        let envelope =
-            reachability_envelope(Decimal::new(80, 2), Decimal::new(1, 2), 150.0, 200.0);
+        let envelope = reachability_envelope(Decimal::new(80, 2), Decimal::new(1, 2), 150.0, 200.0);
         let targets = generate_target_candidates(
             PulseMode::ElasticSnapback,
             Decimal::new(80, 2),

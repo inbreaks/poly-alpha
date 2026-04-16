@@ -30,8 +30,8 @@ use crate::monitor::build_pulse_monitor_view;
 use crate::pricing::{EventPricer, EventPricerConfig, ExpiryGapAdjustment};
 use crate::session::{PolyFillOutcome, PulseSession, PulseSessionConfig};
 use crate::signal::{
-    estimate_session_edge, executable_poly_quote, reversion_pocket, timeout_exit_price_for_shares,
-    ExecutableQuoteSide,
+    estimate_session_edge, executable_poly_quote, reversion_pocket, summarize_recovery_observation,
+    timeout_exit_price_for_shares, ExecutableQuoteSide, SignalSample,
 };
 
 pub type Result<T> = std::result::Result<T, PulseRuntimeBuildError>;
@@ -136,22 +136,10 @@ struct ObservedMarketBooks {
 
 #[derive(Clone, Debug, Default)]
 struct MarketSignalTape {
-    yes_ask: VecDeque<DecimalSample>,
-    no_ask: VecDeque<DecimalSample>,
-    cex_mid: VecDeque<DecimalSample>,
-    fair_prob_yes: VecDeque<FloatSample>,
-}
-
-#[derive(Clone, Debug)]
-struct DecimalSample {
-    ts_ms: u64,
-    value: Decimal,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct FloatSample {
-    ts_ms: u64,
-    value: f64,
+    yes_ask: VecDeque<SignalSample<Decimal>>,
+    no_ask: VecDeque<SignalSample<Decimal>>,
+    cex_mid: VecDeque<SignalSample<Decimal>>,
+    fair_prob_yes: VecDeque<SignalSample<f64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1617,15 +1605,15 @@ impl PulseRuntime {
         let pulse_window_ms = self.settings.strategy.pulse_arb.entry.pulse_window_ms;
         let current_cex_mid = mid_price_from_book(cex_book).unwrap_or(Decimal::ZERO);
         let prior_tape = self.signal_tapes.get(&market.symbol.0);
-        let prior_yes_ask = prior_tape.and_then(|tape| {
-            latest_decimal_before(&tape.yes_ask, yes_book.received_at_ms, pulse_window_ms)
-        });
-        let prior_no_ask = prior_tape.and_then(|tape| {
-            latest_decimal_before(&tape.no_ask, no_book.received_at_ms, pulse_window_ms)
-        });
-        let prior_cex_mid = prior_tape.and_then(|tape| {
-            latest_decimal_before(&tape.cex_mid, cex_book.received_at_ms, pulse_window_ms)
-        });
+        let yes_book_ts_ms = book_signal_timestamp_ms(yes_book);
+        let no_book_ts_ms = book_signal_timestamp_ms(no_book);
+        let cex_book_ts_ms = book_signal_timestamp_ms(cex_book);
+        let prior_yes_ask = prior_tape
+            .and_then(|tape| latest_decimal_before(&tape.yes_ask, yes_book_ts_ms, pulse_window_ms));
+        let prior_no_ask = prior_tape
+            .and_then(|tape| latest_decimal_before(&tape.no_ask, no_book_ts_ms, pulse_window_ms));
+        let prior_cex_mid = prior_tape
+            .and_then(|tape| latest_decimal_before(&tape.cex_mid, cex_book_ts_ms, pulse_window_ms));
         let prior_fair_prob_yes = prior_tape
             .and_then(|tape| latest_float_before(&tape.fair_prob_yes, now_ms, pulse_window_ms));
         self.record_fair_prob_sample(&market.symbol, now_ms, priced.fair_prob_yes);
@@ -2245,15 +2233,15 @@ impl PulseRuntime {
         let pulse_window_ms = self.settings.strategy.pulse_arb.entry.pulse_window_ms;
         let current_cex_mid = mid_price_from_book(cex_book).unwrap_or(Decimal::ZERO);
         let prior_tape = self.signal_tapes.get(&market.symbol.0);
-        let prior_yes_ask = prior_tape.and_then(|tape| {
-            latest_decimal_before(&tape.yes_ask, yes_book.received_at_ms, pulse_window_ms)
-        });
-        let prior_no_ask = prior_tape.and_then(|tape| {
-            latest_decimal_before(&tape.no_ask, no_book.received_at_ms, pulse_window_ms)
-        });
-        let prior_cex_mid = prior_tape.and_then(|tape| {
-            latest_decimal_before(&tape.cex_mid, cex_book.received_at_ms, pulse_window_ms)
-        });
+        let yes_book_ts_ms = book_signal_timestamp_ms(yes_book);
+        let no_book_ts_ms = book_signal_timestamp_ms(no_book);
+        let cex_book_ts_ms = book_signal_timestamp_ms(cex_book);
+        let prior_yes_ask = prior_tape
+            .and_then(|tape| latest_decimal_before(&tape.yes_ask, yes_book_ts_ms, pulse_window_ms));
+        let prior_no_ask = prior_tape
+            .and_then(|tape| latest_decimal_before(&tape.no_ask, no_book_ts_ms, pulse_window_ms));
+        let prior_cex_mid = prior_tape
+            .and_then(|tape| latest_decimal_before(&tape.cex_mid, cex_book_ts_ms, pulse_window_ms));
         let prior_fair_prob_yes = prior_tape
             .and_then(|tape| latest_float_before(&tape.fair_prob_yes, now_ms, pulse_window_ms));
         let selected_poly_leg_max_age_ms = self.selected_poly_leg_max_age_ms();
@@ -2713,7 +2701,9 @@ impl PulseRuntime {
                 if let Some(ask) = best_ask(Some(snapshot)) {
                     push_decimal_sample(
                         &mut tape.yes_ask,
+                        snapshot.exchange_timestamp_ms,
                         snapshot.received_at_ms,
+                        snapshot.sequence,
                         ask,
                         retention_ms,
                     );
@@ -2723,7 +2713,9 @@ impl PulseRuntime {
                 if let Some(ask) = best_ask(Some(snapshot)) {
                     push_decimal_sample(
                         &mut tape.no_ask,
+                        snapshot.exchange_timestamp_ms,
                         snapshot.received_at_ms,
+                        snapshot.sequence,
                         ask,
                         retention_ms,
                     );
@@ -2733,7 +2725,9 @@ impl PulseRuntime {
                 if let Some(mid) = mid_price_from_book(snapshot) {
                     push_decimal_sample(
                         &mut tape.cex_mid,
+                        snapshot.exchange_timestamp_ms,
                         snapshot.received_at_ms,
+                        snapshot.sequence,
                         mid,
                         retention_ms,
                     );
@@ -2752,7 +2746,14 @@ impl PulseRuntime {
             .saturating_mul(4)
             .max(1_000);
         let tape = self.signal_tapes.entry(symbol.0.clone()).or_default();
-        push_float_sample(&mut tape.fair_prob_yes, ts_ms, fair_prob_yes, retention_ms);
+        push_float_sample(
+            &mut tape.fair_prob_yes,
+            ts_ms,
+            ts_ms,
+            1,
+            fair_prob_yes,
+            retention_ms,
+        );
     }
 
     fn books_for_symbol(&self, symbol: &Symbol) -> Option<&ObservedMarketBooks> {
@@ -3503,46 +3504,86 @@ fn mid_price_from_book(book: &OrderBookSnapshot) -> Option<Decimal> {
     Some((best_bid + best_ask) / Decimal::from(2))
 }
 
+fn book_signal_timestamp_ms(book: &OrderBookSnapshot) -> u64 {
+    if book.exchange_timestamp_ms > 0 {
+        book.exchange_timestamp_ms
+    } else {
+        book.received_at_ms
+    }
+}
+
+fn signal_sample_timestamp_ms<T>(sample: &SignalSample<T>) -> u64 {
+    if sample.exchange_timestamp_ms > 0 {
+        sample.exchange_timestamp_ms
+    } else {
+        sample.received_at_ms
+    }
+}
+
 fn push_decimal_sample(
-    samples: &mut VecDeque<DecimalSample>,
-    ts_ms: u64,
+    samples: &mut VecDeque<SignalSample<Decimal>>,
+    exchange_timestamp_ms: u64,
+    received_at_ms: u64,
+    sequence: u64,
     value: Decimal,
     retention_ms: u64,
 ) {
-    samples.push_back(DecimalSample { ts_ms, value });
-    prune_decimal_samples(samples, ts_ms.saturating_sub(retention_ms));
+    samples.push_back(SignalSample {
+        exchange_timestamp_ms,
+        received_at_ms,
+        sequence,
+        value,
+    });
+    let sample_ts_ms = signal_sample_timestamp_ms(
+        samples
+            .back()
+            .expect("sample just pushed should be present for pruning"),
+    );
+    prune_decimal_samples(samples, sample_ts_ms.saturating_sub(retention_ms));
 }
 
 fn push_float_sample(
-    samples: &mut VecDeque<FloatSample>,
-    ts_ms: u64,
+    samples: &mut VecDeque<SignalSample<f64>>,
+    exchange_timestamp_ms: u64,
+    received_at_ms: u64,
+    sequence: u64,
     value: f64,
     retention_ms: u64,
 ) {
-    samples.push_back(FloatSample { ts_ms, value });
-    prune_float_samples(samples, ts_ms.saturating_sub(retention_ms));
+    samples.push_back(SignalSample {
+        exchange_timestamp_ms,
+        received_at_ms,
+        sequence,
+        value,
+    });
+    let sample_ts_ms = signal_sample_timestamp_ms(
+        samples
+            .back()
+            .expect("sample just pushed should be present for pruning"),
+    );
+    prune_float_samples(samples, sample_ts_ms.saturating_sub(retention_ms));
 }
 
-fn prune_decimal_samples(samples: &mut VecDeque<DecimalSample>, min_ts_ms: u64) {
+fn prune_decimal_samples(samples: &mut VecDeque<SignalSample<Decimal>>, min_ts_ms: u64) {
     while samples
         .front()
-        .is_some_and(|sample| sample.ts_ms < min_ts_ms)
+        .is_some_and(|sample| signal_sample_timestamp_ms(sample) < min_ts_ms)
     {
         samples.pop_front();
     }
 }
 
-fn prune_float_samples(samples: &mut VecDeque<FloatSample>, min_ts_ms: u64) {
+fn prune_float_samples(samples: &mut VecDeque<SignalSample<f64>>, min_ts_ms: u64) {
     while samples
         .front()
-        .is_some_and(|sample| sample.ts_ms < min_ts_ms)
+        .is_some_and(|sample| signal_sample_timestamp_ms(sample) < min_ts_ms)
     {
         samples.pop_front();
     }
 }
 
 fn latest_decimal_before(
-    samples: &VecDeque<DecimalSample>,
+    samples: &VecDeque<SignalSample<Decimal>>,
     before_ts_ms: u64,
     window_ms: u64,
 ) -> Option<Decimal> {
@@ -3550,12 +3591,15 @@ fn latest_decimal_before(
     samples
         .iter()
         .rev()
-        .find(|sample| sample.ts_ms >= min_ts_ms && sample.ts_ms < before_ts_ms)
+        .find(|sample| {
+            let sample_ts_ms = signal_sample_timestamp_ms(sample);
+            sample_ts_ms >= min_ts_ms && sample_ts_ms < before_ts_ms
+        })
         .map(|sample| sample.value)
 }
 
 fn latest_float_before(
-    samples: &VecDeque<FloatSample>,
+    samples: &VecDeque<SignalSample<f64>>,
     before_ts_ms: u64,
     window_ms: u64,
 ) -> Option<f64> {
@@ -3563,7 +3607,10 @@ fn latest_float_before(
     samples
         .iter()
         .rev()
-        .find(|sample| sample.ts_ms >= min_ts_ms && sample.ts_ms < before_ts_ms)
+        .find(|sample| {
+            let sample_ts_ms = signal_sample_timestamp_ms(sample);
+            sample_ts_ms >= min_ts_ms && sample_ts_ms < before_ts_ms
+        })
         .map(|sample| sample.value)
 }
 
@@ -4452,6 +4499,140 @@ mod tests {
                 expiry_mismatch_minutes: 0,
                 greeks_complete: true,
             },
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct EntryCandidateDiagnostics {
+        base_hit_rate: f64,
+        predicted_hit_rate: f64,
+        observation_quality_score: f64,
+    }
+
+    struct RuntimeCandidateCase {
+        runtime: PulseRuntime,
+        now_ms: u64,
+        markets: Vec<MarketConfig>,
+    }
+
+    impl RuntimeCandidateCase {
+        async fn new_low_quality_recovery() -> Self {
+            let fixture = runtime_fixture_for_asset(PulseAsset::Btc);
+            let now_ms = current_time_ms();
+            let settlement_timestamp = (now_ms / 1_000) + 3_600;
+            let market = btc_signal_market_with_symbol("btc-above-100k", settlement_timestamp);
+            let anchor_provider = Arc::new(StaticAnchorProvider::new(btc_anchor_snapshot(
+                now_ms,
+                settlement_timestamp * 1_000,
+            )));
+            let mut runtime = PulseRuntimeBuilder::new(fixture.settings.clone())
+                .with_anchor_provider(anchor_provider)
+                .with_markets(vec![market.clone()])
+                .with_execution_mode(PulseExecutionMode::Paper)
+                .build()
+                .await
+                .expect("build runtime");
+            seed_btc_no_pulse_baseline(&mut runtime, now_ms).await;
+            runtime
+                .run_tick(now_ms + 100)
+                .await
+                .expect("baseline tick should not open");
+            Self {
+                runtime,
+                now_ms,
+                markets: vec![market],
+            }
+        }
+
+        async fn inspect_entry_candidate(
+            &mut self,
+            symbol: &str,
+        ) -> Option<EntryCandidateDiagnostics> {
+            assert!(self.markets.iter().any(|market| market.symbol.0 == symbol));
+            inject_low_quality_recovery_pulse(&mut self.runtime, self.now_ms, symbol).await;
+            self.runtime.inspect_entry_candidate_for_test(symbol).await
+        }
+    }
+
+    impl PulseRuntime {
+        async fn inspect_entry_candidate_for_test(
+            &mut self,
+            symbol: &str,
+        ) -> Option<EntryCandidateDiagnostics> {
+            let (asset, market) = self.markets_by_asset.iter().find_map(|(asset, markets)| {
+                markets
+                    .iter()
+                    .find(|market| market.symbol.0 == symbol)
+                    .cloned()
+                    .map(|market| (*asset, market))
+            })?;
+            let books = self.books_for_symbol(&market.symbol).cloned()?;
+            let now_ms = [books.yes.as_ref(), books.no.as_ref(), books.cex.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(|book| book.received_at_ms)
+                .max()?
+                .saturating_add(50);
+            let candidate = self
+                .entry_candidate_for_market(asset, &market, now_ms)
+                .ok()??;
+            let claim_book = match candidate.claim_side {
+                TokenSide::Yes => books.yes.as_ref()?,
+                TokenSide::No => books.no.as_ref()?,
+            };
+            let pulse_exchange_ts_ms = book_signal_timestamp_ms(claim_book);
+            let pulse_price = best_ask(Some(claim_book)).unwrap_or(candidate.entry_price);
+            let tape = self.signal_tapes.get(&market.symbol.0)?;
+            let claim_samples = match candidate.claim_side {
+                TokenSide::Yes => tape.yes_ask.iter().copied().collect::<Vec<_>>(),
+                TokenSide::No => tape.no_ask.iter().copied().collect::<Vec<_>>(),
+            };
+            let recovery =
+                summarize_recovery_observation(&claim_samples, pulse_exchange_ts_ms, pulse_price);
+            let base_hit_rate = (1.0 - candidate.required_hit_rate).clamp(0.0, 1.0);
+            let recovery_bonus = if recovery.quality.admission_eligible {
+                recovery.max_recovery_ratio_within_5s.min(0.25)
+            } else {
+                0.0
+            };
+            Some(EntryCandidateDiagnostics {
+                base_hit_rate,
+                predicted_hit_rate: (base_hit_rate + recovery_bonus).clamp(0.0, 1.0),
+                observation_quality_score: recovery.quality.observation_quality_score,
+            })
+        }
+    }
+
+    async fn inject_low_quality_recovery_pulse(
+        runtime: &mut PulseRuntime,
+        now_ms: u64,
+        symbol: &str,
+    ) {
+        let pulse_ts_ms = now_ms + 250;
+        runtime.observe_market_event(poly_book_event(
+            symbol,
+            TokenSide::No,
+            vec![level(31, 2, 10_000, 0)],
+            vec![level(35, 2, 10_000, 0)],
+            pulse_ts_ms,
+        ));
+        runtime.observe_market_event(cex_book_event(symbol, pulse_ts_ms));
+
+        for (exchange_timestamp_ms, received_at_ms, ask_price, sequence) in [
+            (pulse_ts_ms + 600, pulse_ts_ms + 850, 344, 0),
+            (pulse_ts_ms + 1_200, pulse_ts_ms + 1_450, 343, 0),
+        ] {
+            runtime.record_signal_sample_for_snapshot(&OrderBookSnapshot {
+                exchange: Exchange::Polymarket,
+                symbol: Symbol::new(symbol),
+                instrument: polyalpha_core::InstrumentKind::PolyNo,
+                bids: vec![level(31, 2, 10_000, 0)],
+                asks: vec![level(ask_price, 3, 10_000, 0)],
+                exchange_timestamp_ms,
+                received_at_ms,
+                sequence,
+                last_trade_price: None,
+            });
         }
     }
 
@@ -5569,6 +5750,18 @@ mod tests {
             signal_stats.rejection_reasons.get("timeout_risk_rejected"),
             Some(&1)
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_does_not_apply_recovery_bonus_when_observation_quality_is_low() {
+        let mut case = RuntimeCandidateCase::new_low_quality_recovery().await;
+        let candidate = case
+            .inspect_entry_candidate("btc-above-100k")
+            .await
+            .expect("candidate");
+
+        assert!(candidate.observation_quality_score < 0.5);
+        assert_eq!(candidate.predicted_hit_rate, candidate.base_hit_rate);
     }
 
     #[tokio::test]
