@@ -88,8 +88,11 @@ pub fn build_reachability_envelope(
 ) -> ReachabilityEnvelope {
     let gross_bps = hedge_cost_bps + fee_bps + reserve_bps;
     let min_profitable_target_distance_bps = gross_bps.max(0.0);
-    let min_realizable_target_distance_bps =
-        min_profitable_target_distance_bps.max(one_tick_distance_bps(entry_price, tick_size));
+    let min_realizable_target_distance_bps = aligned_tick_floor_bps(
+        entry_price,
+        tick_size,
+        min_profitable_target_distance_bps,
+    );
     ReachabilityEnvelope {
         min_profitable_target_distance_bps,
         min_realizable_target_distance_bps,
@@ -418,6 +421,21 @@ fn one_tick_distance_bps(current_mid_price: Decimal, tick_size: Decimal) -> f64 
         .unwrap_or(0.0)
 }
 
+fn aligned_tick_floor_bps(
+    current_mid_price: Decimal,
+    tick_size: Decimal,
+    min_profitable_target_distance_bps: f64,
+) -> f64 {
+    let one_tick_bps = one_tick_distance_bps(current_mid_price, tick_size);
+    if one_tick_bps <= 0.0 {
+        return min_profitable_target_distance_bps.max(0.0);
+    }
+
+    let min_distance_bps = min_profitable_target_distance_bps.max(one_tick_bps);
+    let tick_steps = ((min_distance_bps / one_tick_bps) - BPS_EPSILON).ceil().max(1.0);
+    tick_steps * one_tick_bps
+}
+
 fn mode_distance_cap_bps(mode: PulseMode) -> f64 {
     match mode {
         PulseMode::ElasticSnapback => ELASTIC_DISTANCE_CAP_BPS,
@@ -628,6 +646,23 @@ mod tests {
         assert!(!envelope.reachable);
         assert_eq!(envelope.min_profitable_target_distance_bps, 95.0);
         assert!(envelope.min_realizable_target_distance_bps > 200.0);
+    }
+
+    #[test]
+    fn reachability_envelope_uses_next_realizable_tick_when_gross_floor_sits_between_ticks() {
+        let envelope = build_reachability_envelope(
+            Decimal::new(250, 0),
+            Decimal::new(80, 2),
+            Decimal::new(1, 2),
+            150.0,
+            0.0,
+            0.0,
+            200.0,
+        );
+
+        assert!(!envelope.reachable);
+        assert_eq!(envelope.min_profitable_target_distance_bps, 150.0);
+        assert!((envelope.min_realizable_target_distance_bps - 250.0).abs() < 0.1);
     }
 
     #[test]
