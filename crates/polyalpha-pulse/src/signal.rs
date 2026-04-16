@@ -390,10 +390,8 @@ pub fn summarize_recovery_observation(
     let mut previous_ts = pulse_exchange_ts_ms;
     let mut max_interarrival_gap_ms_5s = 0_u64;
     let mut post_sweep_update_count_5s = 0_usize;
-    let native_sequence_present = samples.iter().all(|sample| sample.sequence > 0);
-    let used_exchange_ts = samples
-        .iter()
-        .any(|sample| sample.exchange_timestamp_ms > 0);
+    let mut native_sequence_present = true;
+    let mut used_exchange_ts = false;
 
     for sample in samples {
         let ts_ms = signal_sample_ts_ms(sample);
@@ -401,6 +399,8 @@ pub fn summarize_recovery_observation(
             continue;
         }
         post_sweep_update_count_5s += 1;
+        used_exchange_ts |= sample.exchange_timestamp_ms > 0;
+        native_sequence_present &= sample.sequence > 0;
         max_interarrival_gap_ms_5s =
             max_interarrival_gap_ms_5s.max(ts_ms.saturating_sub(previous_ts));
         previous_ts = ts_ms;
@@ -417,6 +417,10 @@ pub fn summarize_recovery_observation(
             max_recovery_ratio_within_2s = max_recovery_ratio_within_2s.max(recovery_ratio);
         }
         max_recovery_ratio_within_5s = max_recovery_ratio_within_5s.max(recovery_ratio);
+    }
+
+    if post_sweep_update_count_5s == 0 {
+        native_sequence_present = false;
     }
 
     let observation_quality_score = if post_sweep_update_count_5s >= 3
@@ -731,6 +735,23 @@ mod tests {
         let recovery = summarize_recovery_observation(&samples, 1_000, Decimal::new(45, 2));
         assert!(!recovery.quality.native_sequence_present);
         assert!(!recovery.quality.admission_eligible);
+    }
+
+    #[test]
+    fn recovery_observation_quality_ignores_samples_outside_post_pulse_window() {
+        let samples = vec![
+            SignalSample::new_decimal(0, 900, 0, Decimal::new(46, 2)),
+            SignalSample::new_decimal(1_000, 1_000, 10, Decimal::new(45, 2)),
+            SignalSample::new_decimal(1_600, 1_950, 11, Decimal::new(443, 3)),
+            SignalSample::new_decimal(2_200, 2_700, 12, Decimal::new(441, 3)),
+        ];
+
+        let recovery = summarize_recovery_observation(&samples, 1_000, Decimal::new(45, 2));
+
+        assert!(recovery.quality.used_exchange_ts);
+        assert!(recovery.quality.native_sequence_present);
+        assert_eq!(recovery.quality.post_sweep_update_count_5s, 3);
+        assert!(recovery.quality.admission_eligible);
     }
 
     #[test]

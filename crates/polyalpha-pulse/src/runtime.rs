@@ -194,6 +194,9 @@ struct EntryCandidate {
     event_delta_yes: f64,
     anchor_latency_delta_ms: u64,
     fair_prob_yes: f64,
+    base_hit_rate: f64,
+    predicted_hit_rate: f64,
+    observation_quality_score: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -1857,6 +1860,16 @@ impl PulseRuntime {
             return None;
         }
 
+        let recovery_observation =
+            self.summarize_recovery_observation_for_claim(market, claim_side, claim_book);
+        let base_hit_rate = (1.0 - decision.required_hit_rate).clamp(0.0, 1.0);
+        let recovery_bonus = if recovery_observation.quality.admission_eligible {
+            recovery_observation.max_recovery_ratio_within_5s.min(0.25)
+        } else {
+            0.0
+        };
+        let predicted_hit_rate = (base_hit_rate + recovery_bonus).clamp(0.0, 1.0);
+
         Some(EntryCandidate {
             market: market.clone(),
             claim_side,
@@ -1875,7 +1888,28 @@ impl PulseRuntime {
             event_delta_yes: priced.event_delta_yes,
             anchor_latency_delta_ms,
             fair_prob_yes: priced.fair_prob_yes,
+            base_hit_rate,
+            predicted_hit_rate,
+            observation_quality_score: recovery_observation.quality.observation_quality_score,
         })
+    }
+
+    fn summarize_recovery_observation_for_claim(
+        &self,
+        market: &MarketConfig,
+        claim_side: TokenSide,
+        claim_book: &OrderBookSnapshot,
+    ) -> crate::signal::RecoveryObservation {
+        let pulse_exchange_ts_ms = book_signal_timestamp_ms(claim_book);
+        let pulse_price = best_ask(Some(claim_book)).unwrap_or(Decimal::ZERO);
+        let Some(tape) = self.signal_tapes.get(&market.symbol.0) else {
+            return summarize_recovery_observation(&[], pulse_exchange_ts_ms, pulse_price);
+        };
+        let claim_samples = match claim_side {
+            TokenSide::Yes => tape.yes_ask.iter().copied().collect::<Vec<_>>(),
+            TokenSide::No => tape.no_ask.iter().copied().collect::<Vec<_>>(),
+        };
+        summarize_recovery_observation(&claim_samples, pulse_exchange_ts_ms, pulse_price)
     }
 
     fn record_rejection(&mut self, code: crate::model::PulseFailureCode) {
@@ -3528,17 +3562,14 @@ fn push_decimal_sample(
     value: Decimal,
     retention_ms: u64,
 ) {
-    samples.push_back(SignalSample {
+    let sample = SignalSample {
         exchange_timestamp_ms,
         received_at_ms,
         sequence,
         value,
-    });
-    let sample_ts_ms = signal_sample_timestamp_ms(
-        samples
-            .back()
-            .expect("sample just pushed should be present for pruning"),
-    );
+    };
+    let sample_ts_ms = signal_sample_timestamp_ms(&sample);
+    insert_signal_sample(samples, sample);
     prune_decimal_samples(samples, sample_ts_ms.saturating_sub(retention_ms));
 }
 
@@ -3550,18 +3581,24 @@ fn push_float_sample(
     value: f64,
     retention_ms: u64,
 ) {
-    samples.push_back(SignalSample {
+    let sample = SignalSample {
         exchange_timestamp_ms,
         received_at_ms,
         sequence,
         value,
-    });
-    let sample_ts_ms = signal_sample_timestamp_ms(
-        samples
-            .back()
-            .expect("sample just pushed should be present for pruning"),
-    );
+    };
+    let sample_ts_ms = signal_sample_timestamp_ms(&sample);
+    insert_signal_sample(samples, sample);
     prune_float_samples(samples, sample_ts_ms.saturating_sub(retention_ms));
+}
+
+fn insert_signal_sample<T>(samples: &mut VecDeque<SignalSample<T>>, sample: SignalSample<T>) {
+    let sample_ts_ms = signal_sample_timestamp_ms(&sample);
+    let insert_idx = {
+        let slice = samples.make_contiguous();
+        slice.partition_point(|existing| signal_sample_timestamp_ms(existing) <= sample_ts_ms)
+    };
+    samples.insert(insert_idx, sample);
 }
 
 fn prune_decimal_samples(samples: &mut VecDeque<SignalSample<Decimal>>, min_ts_ms: u64) {
@@ -4576,29 +4613,10 @@ mod tests {
             let candidate = self
                 .entry_candidate_for_market(asset, &market, now_ms)
                 .ok()??;
-            let claim_book = match candidate.claim_side {
-                TokenSide::Yes => books.yes.as_ref()?,
-                TokenSide::No => books.no.as_ref()?,
-            };
-            let pulse_exchange_ts_ms = book_signal_timestamp_ms(claim_book);
-            let pulse_price = best_ask(Some(claim_book)).unwrap_or(candidate.entry_price);
-            let tape = self.signal_tapes.get(&market.symbol.0)?;
-            let claim_samples = match candidate.claim_side {
-                TokenSide::Yes => tape.yes_ask.iter().copied().collect::<Vec<_>>(),
-                TokenSide::No => tape.no_ask.iter().copied().collect::<Vec<_>>(),
-            };
-            let recovery =
-                summarize_recovery_observation(&claim_samples, pulse_exchange_ts_ms, pulse_price);
-            let base_hit_rate = (1.0 - candidate.required_hit_rate).clamp(0.0, 1.0);
-            let recovery_bonus = if recovery.quality.admission_eligible {
-                recovery.max_recovery_ratio_within_5s.min(0.25)
-            } else {
-                0.0
-            };
             Some(EntryCandidateDiagnostics {
-                base_hit_rate,
-                predicted_hit_rate: (base_hit_rate + recovery_bonus).clamp(0.0, 1.0),
-                observation_quality_score: recovery.quality.observation_quality_score,
+                base_hit_rate: candidate.base_hit_rate,
+                predicted_hit_rate: candidate.predicted_hit_rate,
+                observation_quality_score: candidate.observation_quality_score,
             })
         }
     }
@@ -5755,13 +5773,59 @@ mod tests {
     #[tokio::test]
     async fn runtime_does_not_apply_recovery_bonus_when_observation_quality_is_low() {
         let mut case = RuntimeCandidateCase::new_low_quality_recovery().await;
+        let market = case
+            .markets
+            .iter()
+            .find(|market| market.symbol.0 == "btc-above-100k")
+            .cloned()
+            .expect("market");
+        inject_low_quality_recovery_pulse(&mut case.runtime, case.now_ms, "btc-above-100k").await;
         let candidate = case
-            .inspect_entry_candidate("btc-above-100k")
-            .await
+            .runtime
+            .entry_candidate_for_market(PulseAsset::Btc, &market, case.now_ms + 1_500)
+            .expect("evaluate market")
             .expect("candidate");
 
         assert!(candidate.observation_quality_score < 0.5);
         assert_eq!(candidate.predicted_hit_rate, candidate.base_hit_rate);
+    }
+
+    #[tokio::test]
+    async fn inspect_entry_candidate_for_test_reads_production_candidate_fields() {
+        let mut case = RuntimeCandidateCase::new_low_quality_recovery().await;
+        let diagnostics = case
+            .inspect_entry_candidate("btc-above-100k")
+            .await
+            .expect("helper diagnostics");
+        let market = case
+            .markets
+            .iter()
+            .find(|market| market.symbol.0 == "btc-above-100k")
+            .cloned()
+            .expect("market");
+        let candidate = case
+            .runtime
+            .entry_candidate_for_market(PulseAsset::Btc, &market, case.now_ms + 1_500)
+            .expect("evaluate market")
+            .expect("candidate");
+
+        assert_eq!(diagnostics.base_hit_rate, candidate.base_hit_rate);
+        assert_eq!(diagnostics.predicted_hit_rate, candidate.predicted_hit_rate);
+        assert_eq!(
+            diagnostics.observation_quality_score,
+            candidate.observation_quality_score
+        );
+    }
+
+    #[test]
+    fn latest_decimal_before_uses_signal_timestamp_under_out_of_order_receive() {
+        let mut samples = VecDeque::new();
+        push_decimal_sample(&mut samples, 1_200, 1_200, 1, Decimal::new(42, 2), 10_000);
+        push_decimal_sample(&mut samples, 1_100, 1_500, 2, Decimal::new(41, 2), 10_000);
+
+        let latest = latest_decimal_before(&samples, 1_300, 500).expect("latest");
+
+        assert_eq!(latest, Decimal::new(42, 2));
     }
 
     #[tokio::test]
