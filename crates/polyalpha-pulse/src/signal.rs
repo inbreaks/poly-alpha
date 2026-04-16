@@ -741,6 +741,24 @@ mod tests {
     }
 
     #[test]
+    fn envelope_and_generator_share_aligned_tick_floor_contract() {
+        let envelope =
+            reachability_envelope(Decimal::new(80, 2), Decimal::new(1, 2), 150.0, 200.0);
+        let targets = generate_target_candidates(
+            PulseMode::ElasticSnapback,
+            Decimal::new(80, 2),
+            Decimal::new(75, 2),
+            Decimal::new(1, 2),
+            envelope.min_realizable_target_distance_bps,
+            envelope.reachability_cap_bps,
+        );
+
+        assert!(!envelope.reachable);
+        assert!((envelope.min_realizable_target_distance_bps - 250.0).abs() < 0.1);
+        assert!(targets.is_empty());
+    }
+
+    #[test]
     fn distance_to_mid_bps_uses_mid_normalized_denominator() {
         let distance = distance_to_mid_bps(Decimal::new(45, 2), Decimal::new(44, 2));
 
