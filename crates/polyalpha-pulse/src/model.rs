@@ -39,6 +39,39 @@ impl PulseAsset {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PulseMode {
+    ElasticSnapback,
+    DeepReversion,
+}
+
+impl PulseMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ElasticSnapback => "elastic_snapback",
+            Self::DeepReversion => "deep_reversion",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReachabilityEnvelope {
+    pub min_profitable_target_distance_bps: f64,
+    pub reachability_cap_bps: f64,
+    pub in_gray_zone: bool,
+    pub reachable: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RecoveryObservationQuality {
+    pub used_exchange_ts: bool,
+    pub native_sequence_present: bool,
+    pub post_sweep_update_count_5s: usize,
+    pub max_interarrival_gap_ms_5s: u64,
+    pub observation_quality_score: f64,
+    pub admission_eligible: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnchorSnapshot {
     pub asset: PulseAsset,

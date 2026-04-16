@@ -219,6 +219,8 @@ pub enum AuditEventKind {
     PulseBookTape,
     PulseSessionSummary,
     PulseAssetHealth,
+    PulseMarketTape,
+    PulseSignalSnapshot,
 }
 
 impl AuditEventKind {
@@ -236,6 +238,8 @@ impl AuditEventKind {
             Self::PulseBookTape => "pulse_book_tape",
             Self::PulseSessionSummary => "pulse_session_summary",
             Self::PulseAssetHealth => "pulse_asset_health",
+            Self::PulseMarketTape => "pulse_market_tape",
+            Self::PulseSignalSnapshot => "pulse_signal_snapshot",
         }
     }
 
@@ -253,6 +257,8 @@ impl AuditEventKind {
             Self::PulseBookTape => "Pulse 盘口 Tape",
             Self::PulseSessionSummary => "Pulse 会话摘要",
             Self::PulseAssetHealth => "Pulse 资产健康",
+            Self::PulseMarketTape => "Pulse 市场 Tape",
+            Self::PulseSignalSnapshot => "Pulse 信号快照",
         }
     }
 }
@@ -323,7 +329,7 @@ pub struct AuditAnomalyEvent {
     pub correlation_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PulseBookLevelAuditRow {
     pub price: String,
     pub quantity: String,
@@ -404,6 +410,59 @@ pub struct PulseBookTapeAuditEvent {
     pub state: String,
     pub symbol: String,
     pub book: PulseBookSnapshotAudit,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PulseMarketTapeAuditEvent {
+    pub asset: String,
+    pub symbol: String,
+    pub exchange: String,
+    pub instrument: String,
+    pub exchange_timestamp_ms: u64,
+    pub received_at_ms: u64,
+    pub sequence: u64,
+    #[serde(default)]
+    pub best_bid: Option<String>,
+    #[serde(default)]
+    pub best_ask: Option<String>,
+    #[serde(default)]
+    pub mid: Option<String>,
+    #[serde(default)]
+    pub last_trade_price: Option<String>,
+    #[serde(default)]
+    pub bids: Vec<PulseBookLevelAuditRow>,
+    #[serde(default)]
+    pub asks: Vec<PulseBookLevelAuditRow>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PulseSignalSnapshotAuditEvent {
+    pub asset: String,
+    pub symbol: String,
+    pub mode_candidate: String,
+    pub admission_result: String,
+    #[serde(default)]
+    pub rejection_reason: Option<String>,
+    pub pulse_score_bps: f64,
+    pub claim_price_move_bps: f64,
+    pub fair_claim_move_bps: f64,
+    pub cex_mid_move_bps: f64,
+    pub swept_notional_usd: String,
+    pub swept_levels_count: usize,
+    pub post_pulse_depth_gap_bps: f64,
+    pub min_profitable_target_distance_bps: f64,
+    #[serde(default)]
+    pub target_distance_to_mid_bps: Option<f64>,
+    #[serde(default)]
+    pub predicted_hit_rate: Option<f64>,
+    #[serde(default)]
+    pub maker_net_pnl_usd: Option<String>,
+    #[serde(default)]
+    pub timeout_net_pnl_usd: Option<String>,
+    #[serde(default)]
+    pub realizable_ev_usd: Option<String>,
+    #[serde(default)]
+    pub observation_quality_score: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -506,6 +565,14 @@ pub enum AuditEventPayload {
     PulseBookTape(PulseBookTapeAuditEvent),
     PulseSessionSummary(PulseSessionSummaryEvent),
     PulseAssetHealth(PulseAssetHealthAuditEvent),
+    PulseMarketTape(PulseMarketTapeAuditEvent),
+    PulseSignalSnapshot(PulseSignalSnapshotAuditEvent),
+}
+
+impl PartialEq for AuditEventPayload {
+    fn eq(&self, other: &Self) -> bool {
+        serde_json::to_value(self).ok() == serde_json::to_value(other).ok()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -555,7 +622,8 @@ pub struct AuditEvent {
 mod tests {
     use super::{
         AuditEventPayload, AuditSessionSummary, PulseBookLevelAuditRow, PulseBookSnapshotAudit,
-        PulseBookTapeAuditEvent, PulseLifecycleAuditEvent,
+        PulseBookTapeAuditEvent, PulseLifecycleAuditEvent, PulseMarketTapeAuditEvent,
+        PulseSignalSnapshotAuditEvent,
     };
 
     #[test]
@@ -686,5 +754,63 @@ mod tests {
         assert!(encoded.contains("\"pulse_book_tape\""));
         assert!(encoded.contains("\"instrument\":\"cex_perp\""));
         assert!(encoded.contains("\"sequence\":42"));
+    }
+
+    #[test]
+    fn pulse_market_tape_payload_round_trips_with_exchange_timestamp_and_top5_levels() {
+        let payload = AuditEventPayload::PulseMarketTape(PulseMarketTapeAuditEvent {
+            asset: "btc".to_owned(),
+            symbol: "btc-above-100k".to_owned(),
+            exchange: "Polymarket".to_owned(),
+            instrument: "poly_no".to_owned(),
+            exchange_timestamp_ms: 1_710_000_100,
+            received_at_ms: 1_710_000_140,
+            sequence: 42,
+            best_bid: Some("0.38".to_owned()),
+            best_ask: Some("0.39".to_owned()),
+            mid: Some("0.385".to_owned()),
+            last_trade_price: Some("0.39".to_owned()),
+            bids: vec![PulseBookLevelAuditRow {
+                price: "0.38".to_owned(),
+                quantity: "250".to_owned(),
+            }],
+            asks: vec![PulseBookLevelAuditRow {
+                price: "0.39".to_owned(),
+                quantity: "300".to_owned(),
+            }],
+        });
+
+        let json = serde_json::to_string(&payload).expect("serialize");
+        let decoded: AuditEventPayload = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn pulse_signal_snapshot_payload_round_trips_dual_mode_fields() {
+        let payload = AuditEventPayload::PulseSignalSnapshot(PulseSignalSnapshotAuditEvent {
+            asset: "eth".to_owned(),
+            symbol: "eth-above-4k".to_owned(),
+            mode_candidate: "elastic_snapback".to_owned(),
+            admission_result: "rejected".to_owned(),
+            rejection_reason: Some("realizable_ev_below_threshold".to_owned()),
+            pulse_score_bps: 188.4,
+            claim_price_move_bps: 206.0,
+            fair_claim_move_bps: 15.0,
+            cex_mid_move_bps: 21.0,
+            swept_notional_usd: "420".to_owned(),
+            swept_levels_count: 3,
+            post_pulse_depth_gap_bps: 145.0,
+            min_profitable_target_distance_bps: 92.0,
+            target_distance_to_mid_bps: Some(118.0),
+            predicted_hit_rate: Some(0.61),
+            maker_net_pnl_usd: Some("4.72".to_owned()),
+            timeout_net_pnl_usd: Some("-3.10".to_owned()),
+            realizable_ev_usd: Some("1.62".to_owned()),
+            observation_quality_score: Some(0.86),
+        });
+
+        let json = serde_json::to_string(&payload).expect("serialize");
+        let decoded: AuditEventPayload = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, payload);
     }
 }

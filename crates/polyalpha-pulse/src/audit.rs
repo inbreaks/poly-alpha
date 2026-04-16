@@ -3,7 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use polyalpha_audit::{
     AuditEventKind, AuditEventPayload, PulseAssetHealthAuditEvent, PulseBookTapeAuditEvent,
-    PulseLifecycleAuditEvent, PulseSessionSummaryRow,
+    PulseLifecycleAuditEvent, PulseMarketTapeAuditEvent, PulseSessionSummaryRow,
+    PulseSignalSnapshotAuditEvent,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,6 +51,22 @@ impl PulseAuditSink {
             timestamp_ms: current_time_ms(),
             kind: AuditEventKind::PulseBookTape,
             payload: AuditEventPayload::PulseBookTape(event),
+        });
+    }
+
+    pub fn record_market_tape(&mut self, event: PulseMarketTapeAuditEvent) {
+        self.records.push(PulseAuditRecord {
+            timestamp_ms: current_time_ms(),
+            kind: AuditEventKind::PulseMarketTape,
+            payload: AuditEventPayload::PulseMarketTape(event),
+        });
+    }
+
+    pub fn record_signal_snapshot(&mut self, event: PulseSignalSnapshotAuditEvent) {
+        self.records.push(PulseAuditRecord {
+            timestamp_ms: current_time_ms(),
+            kind: AuditEventKind::PulseSignalSnapshot,
+            payload: AuditEventPayload::PulseSignalSnapshot(event),
         });
     }
 
@@ -115,7 +132,7 @@ fn current_time_ms() -> u64 {
 mod tests {
     use polyalpha_audit::{
         PulseAssetHealthAuditEvent, PulseBookSnapshotAudit, PulseBookTapeAuditEvent,
-        PulseLifecycleAuditEvent,
+        PulseLifecycleAuditEvent, PulseMarketTapeAuditEvent, PulseSignalSnapshotAuditEvent,
     };
 
     use super::*;
@@ -244,5 +261,56 @@ mod tests {
         assert!(warehouse_row.effective_open);
         assert_eq!(warehouse_row.opening_outcome, "effective_open");
         assert_eq!(warehouse_row.opening_allocated_hedge_qty, "0.39");
+    }
+
+    #[test]
+    fn audit_sink_tracks_market_tape_and_signal_snapshot_without_active_session() {
+        let mut sink = PulseAuditSink::default();
+        sink.record_market_tape(PulseMarketTapeAuditEvent {
+            asset: "btc".to_owned(),
+            symbol: "btc-above-100k".to_owned(),
+            exchange: "Polymarket".to_owned(),
+            instrument: "poly_no".to_owned(),
+            exchange_timestamp_ms: 100,
+            received_at_ms: 120,
+            sequence: 7,
+            best_bid: Some("0.38".to_owned()),
+            best_ask: Some("0.39".to_owned()),
+            mid: Some("0.385".to_owned()),
+            last_trade_price: Some("0.39".to_owned()),
+            bids: Vec::new(),
+            asks: Vec::new(),
+        });
+        sink.record_signal_snapshot(PulseSignalSnapshotAuditEvent {
+            asset: "btc".to_owned(),
+            symbol: "btc-above-100k".to_owned(),
+            mode_candidate: "deep_reversion".to_owned(),
+            admission_result: "rejected".to_owned(),
+            rejection_reason: Some("reachability_dead_zone".to_owned()),
+            pulse_score_bps: 162.0,
+            claim_price_move_bps: 180.0,
+            fair_claim_move_bps: 12.0,
+            cex_mid_move_bps: 8.0,
+            swept_notional_usd: "500".to_owned(),
+            swept_levels_count: 4,
+            post_pulse_depth_gap_bps: 210.0,
+            min_profitable_target_distance_bps: 540.0,
+            target_distance_to_mid_bps: None,
+            predicted_hit_rate: None,
+            maker_net_pnl_usd: None,
+            timeout_net_pnl_usd: None,
+            realizable_ev_usd: None,
+            observation_quality_score: Some(0.42),
+        });
+
+        assert_eq!(sink.records().len(), 2);
+        assert!(matches!(
+            sink.records()[0].payload,
+            AuditEventPayload::PulseMarketTape(_)
+        ));
+        assert!(matches!(
+            sink.records()[1].payload,
+            AuditEventPayload::PulseSignalSnapshot(_)
+        ));
     }
 }
