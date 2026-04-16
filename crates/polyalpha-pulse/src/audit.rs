@@ -131,8 +131,9 @@ fn current_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use polyalpha_audit::{
-        PulseAssetHealthAuditEvent, PulseBookSnapshotAudit, PulseBookTapeAuditEvent,
-        PulseLifecycleAuditEvent, PulseMarketTapeAuditEvent, PulseSignalSnapshotAuditEvent,
+        AuditGateResult, PulseAssetHealthAuditEvent, PulseBookSnapshotAudit,
+        PulseBookTapeAuditEvent, PulseLifecycleAuditEvent, PulseMarketTapeAuditEvent,
+        PulseSignalMode, PulseSignalSnapshotAuditEvent,
     };
 
     use super::*;
@@ -284,8 +285,8 @@ mod tests {
         sink.record_signal_snapshot(PulseSignalSnapshotAuditEvent {
             asset: "btc".to_owned(),
             symbol: "btc-above-100k".to_owned(),
-            mode_candidate: "deep_reversion".to_owned(),
-            admission_result: "rejected".to_owned(),
+            mode_candidate: PulseSignalMode::DeepReversion,
+            admission_result: AuditGateResult::Rejected,
             rejection_reason: Some("reachability_dead_zone".to_owned()),
             pulse_score_bps: 162.0,
             claim_price_move_bps: 180.0,
@@ -295,19 +296,29 @@ mod tests {
             swept_levels_count: 4,
             post_pulse_depth_gap_bps: 210.0,
             min_profitable_target_distance_bps: 540.0,
+            reachability_cap_bps: 470.0,
+            in_gray_zone: true,
+            reachable: false,
             target_distance_to_mid_bps: None,
             predicted_hit_rate: None,
             maker_net_pnl_usd: None,
             timeout_net_pnl_usd: None,
             realizable_ev_usd: None,
+            used_exchange_ts: true,
+            native_sequence_present: false,
+            post_sweep_update_count_5s: 1,
+            max_interarrival_gap_ms_5s: 2600,
             observation_quality_score: Some(0.42),
+            admission_eligible: false,
         });
 
         assert_eq!(sink.records().len(), 2);
+        assert_eq!(sink.records()[0].kind, AuditEventKind::PulseMarketTape);
         assert!(matches!(
             sink.records()[0].payload,
             AuditEventPayload::PulseMarketTape(_)
         ));
+        assert_eq!(sink.records()[1].kind, AuditEventKind::PulseSignalSnapshot);
         assert!(matches!(
             sink.records()[1].payload,
             AuditEventPayload::PulseSignalSnapshot(_)

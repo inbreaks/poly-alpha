@@ -470,11 +470,18 @@ fn book_levels_equal(
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PulseSignalMode {
+    ElasticSnapback,
+    DeepReversion,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PulseSignalSnapshotAuditEvent {
     pub asset: String,
     pub symbol: String,
-    pub mode_candidate: String,
-    pub admission_result: String,
+    pub mode_candidate: PulseSignalMode,
+    pub admission_result: AuditGateResult,
     #[serde(default)]
     pub rejection_reason: Option<String>,
     pub pulse_score_bps: f64,
@@ -485,6 +492,9 @@ pub struct PulseSignalSnapshotAuditEvent {
     pub swept_levels_count: usize,
     pub post_pulse_depth_gap_bps: f64,
     pub min_profitable_target_distance_bps: f64,
+    pub reachability_cap_bps: f64,
+    pub in_gray_zone: bool,
+    pub reachable: bool,
     #[serde(default)]
     pub target_distance_to_mid_bps: Option<f64>,
     #[serde(default)]
@@ -495,8 +505,13 @@ pub struct PulseSignalSnapshotAuditEvent {
     pub timeout_net_pnl_usd: Option<String>,
     #[serde(default)]
     pub realizable_ev_usd: Option<String>,
+    pub used_exchange_ts: bool,
+    pub native_sequence_present: bool,
+    pub post_sweep_update_count_5s: usize,
+    pub max_interarrival_gap_ms_5s: u64,
     #[serde(default)]
     pub observation_quality_score: Option<f64>,
+    pub admission_eligible: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -649,9 +664,9 @@ pub struct AuditEvent {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditEventPayload, AuditSessionSummary, PulseBookLevelAuditRow, PulseBookSnapshotAudit,
-        PulseBookTapeAuditEvent, PulseLifecycleAuditEvent, PulseMarketTapeAuditEvent,
-        PulseSignalSnapshotAuditEvent,
+        AuditEventPayload, AuditGateResult, AuditSessionSummary, PulseBookLevelAuditRow,
+        PulseBookSnapshotAudit, PulseBookTapeAuditEvent, PulseLifecycleAuditEvent,
+        PulseMarketTapeAuditEvent, PulseSignalMode, PulseSignalSnapshotAuditEvent,
     };
 
     #[test]
@@ -891,8 +906,8 @@ mod tests {
         let payload = AuditEventPayload::PulseSignalSnapshot(PulseSignalSnapshotAuditEvent {
             asset: "eth".to_owned(),
             symbol: "eth-above-4k".to_owned(),
-            mode_candidate: "elastic_snapback".to_owned(),
-            admission_result: "rejected".to_owned(),
+            mode_candidate: PulseSignalMode::ElasticSnapback,
+            admission_result: AuditGateResult::Rejected,
             rejection_reason: Some("realizable_ev_below_threshold".to_owned()),
             pulse_score_bps: 188.4,
             claim_price_move_bps: 206.0,
@@ -902,12 +917,20 @@ mod tests {
             swept_levels_count: 3,
             post_pulse_depth_gap_bps: 145.0,
             min_profitable_target_distance_bps: 92.0,
+            reachability_cap_bps: 130.0,
+            in_gray_zone: false,
+            reachable: true,
             target_distance_to_mid_bps: Some(118.0),
             predicted_hit_rate: Some(0.61),
             maker_net_pnl_usd: Some("4.72".to_owned()),
             timeout_net_pnl_usd: Some("-3.10".to_owned()),
             realizable_ev_usd: Some("1.62".to_owned()),
+            used_exchange_ts: true,
+            native_sequence_present: true,
+            post_sweep_update_count_5s: 7,
+            max_interarrival_gap_ms_5s: 120,
             observation_quality_score: Some(0.86),
+            admission_eligible: true,
         });
 
         let json = serde_json::to_string(&payload).expect("serialize");
@@ -918,14 +941,22 @@ mod tests {
             AuditEventPayload::PulseSignalSnapshot(event) => event,
             _ => panic!("decoded payload should be PulseSignalSnapshot"),
         };
-        assert_eq!(event.mode_candidate, "elastic_snapback");
-        assert_eq!(event.admission_result, "rejected");
+        assert_eq!(event.mode_candidate, PulseSignalMode::ElasticSnapback);
+        assert_eq!(event.admission_result, AuditGateResult::Rejected);
         assert_eq!(
             event.rejection_reason.as_deref(),
             Some("realizable_ev_below_threshold")
         );
+        assert_eq!(event.reachability_cap_bps, 130.0);
+        assert!(!event.in_gray_zone);
+        assert!(event.reachable);
         assert_eq!(event.target_distance_to_mid_bps, Some(118.0));
         assert_eq!(event.predicted_hit_rate, Some(0.61));
+        assert!(event.used_exchange_ts);
+        assert!(event.native_sequence_present);
+        assert_eq!(event.post_sweep_update_count_5s, 7);
+        assert_eq!(event.max_interarrival_gap_ms_5s, 120);
         assert_eq!(event.observation_quality_score, Some(0.86));
+        assert!(event.admission_eligible);
     }
 }
