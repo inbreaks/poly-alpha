@@ -1131,14 +1131,7 @@ impl PulseRuntime {
             }),
             market: candidate.market.clone(),
             opened_at_ms: now_ms,
-            deadline_ms: now_ms
-                + self
-                    .settings
-                    .strategy
-                    .pulse_arb
-                    .session
-                    .max_holding_secs
-                    .saturating_mul(1_000),
+            deadline_ms: now_ms + candidate.timeout_secs.saturating_mul(1_000),
             entry_price: candidate.entry_price,
             target_exit_price: candidate.target_exit_price,
             timeout_exit_price: candidate.timeout_exit_price,
@@ -5205,6 +5198,64 @@ mod tests {
         assert_eq!(deep.mode, PulseMode::DeepReversion);
         assert!(snapback.timeout_secs <= 120);
         assert!(deep.timeout_secs >= 300);
+    }
+
+    #[tokio::test]
+    async fn runtime_open_session_uses_candidate_timeout_for_deadline() {
+        let fixture = runtime_fixture_for_asset(PulseAsset::Btc);
+        let executor = Arc::new(MockPulseExecutor::default());
+        let now_ms = current_time_ms();
+        let settlement_timestamp = (now_ms / 1_000) + 3_600;
+        let anchor_provider = Arc::new(StaticAnchorProvider::new(btc_anchor_snapshot(
+            now_ms,
+            settlement_timestamp * 1_000,
+        )));
+        let market = btc_signal_market(settlement_timestamp);
+        let mut runtime = PulseRuntimeBuilder::new(fixture.settings.clone())
+            .with_anchor_provider(anchor_provider)
+            .with_markets(vec![market.clone()])
+            .with_executor(executor)
+            .with_execution_mode(PulseExecutionMode::Paper)
+            .build()
+            .await
+            .expect("build runtime");
+
+        seed_btc_no_pulse_baseline(&mut runtime, now_ms).await;
+        runtime
+            .run_tick(now_ms + 100)
+            .await
+            .expect("baseline tick should not open");
+        runtime.observe_market_event(poly_book_event(
+            "btc-above-100k",
+            TokenSide::No,
+            vec![level(388, 3, 10_000, 0)],
+            vec![
+                level(390, 3, 500, 0),
+                level(391, 3, 500, 0),
+                level(395, 3, 10_000, 0),
+            ],
+            now_ms + 250,
+        ));
+        runtime.observe_market_event(cex_book_event("btc-above-100k", now_ms + 250));
+
+        let candidate = runtime
+            .entry_candidate_for_market(PulseAsset::Btc, &market, now_ms + 300)
+            .expect("evaluate market")
+            .expect("candidate");
+
+        runtime
+            .run_tick(now_ms + 300)
+            .await
+            .expect("pulse tick should open");
+
+        let managed = runtime
+            .active_sessions
+            .get("pulse-btc-1")
+            .expect("active pulse session");
+        assert_eq!(
+            managed.deadline_ms - managed.opened_at_ms,
+            candidate.timeout_secs * 1_000
+        );
     }
 
     #[tokio::test]
