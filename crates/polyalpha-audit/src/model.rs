@@ -329,7 +329,7 @@ pub struct AuditAnomalyEvent {
     pub correlation_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PulseBookLevelAuditRow {
     pub price: String,
     pub quantity: String,
@@ -412,7 +412,7 @@ pub struct PulseBookTapeAuditEvent {
     pub book: PulseBookSnapshotAudit,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PulseMarketTapeAuditEvent {
     pub asset: String,
     pub symbol: String,
@@ -433,6 +433,40 @@ pub struct PulseMarketTapeAuditEvent {
     pub bids: Vec<PulseBookLevelAuditRow>,
     #[serde(default)]
     pub asks: Vec<PulseBookLevelAuditRow>,
+}
+
+impl PartialEq for PulseMarketTapeAuditEvent {
+    fn eq(&self, other: &Self) -> bool {
+        self.asset == other.asset
+            && self.symbol == other.symbol
+            && self.exchange == other.exchange
+            && self.instrument == other.instrument
+            && self.exchange_timestamp_ms == other.exchange_timestamp_ms
+            && self.received_at_ms == other.received_at_ms
+            && self.sequence == other.sequence
+            && self.best_bid == other.best_bid
+            && self.best_ask == other.best_ask
+            && self.mid == other.mid
+            && self.last_trade_price == other.last_trade_price
+            && book_levels_equal(&self.bids, &other.bids)
+            && book_levels_equal(&self.asks, &other.asks)
+    }
+}
+
+impl Eq for PulseMarketTapeAuditEvent {}
+
+fn book_levels_equal(
+    left: &[PulseBookLevelAuditRow],
+    right: &[PulseBookLevelAuditRow],
+) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left_level, right_level)| {
+                left_level.price == right_level.price
+                    && left_level.quantity == right_level.quantity
+            })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -567,12 +601,6 @@ pub enum AuditEventPayload {
     PulseAssetHealth(PulseAssetHealthAuditEvent),
     PulseMarketTape(PulseMarketTapeAuditEvent),
     PulseSignalSnapshot(PulseSignalSnapshotAuditEvent),
-}
-
-impl PartialEq for AuditEventPayload {
-    fn eq(&self, other: &Self) -> bool {
-        serde_json::to_value(self).ok() == serde_json::to_value(other).ok()
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -770,19 +798,92 @@ mod tests {
             best_ask: Some("0.39".to_owned()),
             mid: Some("0.385".to_owned()),
             last_trade_price: Some("0.39".to_owned()),
-            bids: vec![PulseBookLevelAuditRow {
-                price: "0.38".to_owned(),
-                quantity: "250".to_owned(),
-            }],
-            asks: vec![PulseBookLevelAuditRow {
-                price: "0.39".to_owned(),
-                quantity: "300".to_owned(),
-            }],
+            bids: vec![
+                PulseBookLevelAuditRow {
+                    price: "0.38".to_owned(),
+                    quantity: "250".to_owned(),
+                },
+                PulseBookLevelAuditRow {
+                    price: "0.37".to_owned(),
+                    quantity: "200".to_owned(),
+                },
+                PulseBookLevelAuditRow {
+                    price: "0.36".to_owned(),
+                    quantity: "180".to_owned(),
+                },
+                PulseBookLevelAuditRow {
+                    price: "0.35".to_owned(),
+                    quantity: "160".to_owned(),
+                },
+                PulseBookLevelAuditRow {
+                    price: "0.34".to_owned(),
+                    quantity: "140".to_owned(),
+                },
+            ],
+            asks: vec![
+                PulseBookLevelAuditRow {
+                    price: "0.39".to_owned(),
+                    quantity: "300".to_owned(),
+                },
+                PulseBookLevelAuditRow {
+                    price: "0.40".to_owned(),
+                    quantity: "260".to_owned(),
+                },
+                PulseBookLevelAuditRow {
+                    price: "0.41".to_owned(),
+                    quantity: "220".to_owned(),
+                },
+                PulseBookLevelAuditRow {
+                    price: "0.42".to_owned(),
+                    quantity: "190".to_owned(),
+                },
+                PulseBookLevelAuditRow {
+                    price: "0.43".to_owned(),
+                    quantity: "170".to_owned(),
+                },
+            ],
         });
 
         let json = serde_json::to_string(&payload).expect("serialize");
         let decoded: AuditEventPayload = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(decoded, payload);
+        let reencoded = serde_json::to_string(&decoded).expect("re-serialize");
+        assert_eq!(reencoded, json);
+        let event = match decoded {
+            AuditEventPayload::PulseMarketTape(event) => event,
+            _ => panic!("decoded payload should be PulseMarketTape"),
+        };
+        assert_eq!(event.bids.len(), 5);
+        assert_eq!(event.asks.len(), 5);
+        let bid_levels = event
+            .bids
+            .iter()
+            .map(|level| (level.price.as_str(), level.quantity.as_str()))
+            .collect::<Vec<_>>();
+        let ask_levels = event
+            .asks
+            .iter()
+            .map(|level| (level.price.as_str(), level.quantity.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bid_levels,
+            vec![
+                ("0.38", "250"),
+                ("0.37", "200"),
+                ("0.36", "180"),
+                ("0.35", "160"),
+                ("0.34", "140"),
+            ]
+        );
+        assert_eq!(
+            ask_levels,
+            vec![
+                ("0.39", "300"),
+                ("0.40", "260"),
+                ("0.41", "220"),
+                ("0.42", "190"),
+                ("0.43", "170"),
+            ]
+        );
     }
 
     #[test]
@@ -811,6 +912,20 @@ mod tests {
 
         let json = serde_json::to_string(&payload).expect("serialize");
         let decoded: AuditEventPayload = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(decoded, payload);
+        let reencoded = serde_json::to_string(&decoded).expect("re-serialize");
+        assert_eq!(reencoded, json);
+        let event = match decoded {
+            AuditEventPayload::PulseSignalSnapshot(event) => event,
+            _ => panic!("decoded payload should be PulseSignalSnapshot"),
+        };
+        assert_eq!(event.mode_candidate, "elastic_snapback");
+        assert_eq!(event.admission_result, "rejected");
+        assert_eq!(
+            event.rejection_reason.as_deref(),
+            Some("realizable_ev_below_threshold")
+        );
+        assert_eq!(event.target_distance_to_mid_bps, Some(118.0));
+        assert_eq!(event.predicted_hit_rate, Some(0.61));
+        assert_eq!(event.observation_quality_score, Some(0.86));
     }
 }
