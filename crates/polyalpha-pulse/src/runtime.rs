@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -3568,9 +3569,9 @@ fn push_decimal_sample(
         sequence,
         value,
     };
-    let sample_ts_ms = signal_sample_timestamp_ms(&sample);
     insert_signal_sample(samples, sample);
-    prune_decimal_samples(samples, sample_ts_ms.saturating_sub(retention_ms));
+    let newest_ts_ms = latest_retained_signal_timestamp_ms(samples).unwrap_or(0);
+    prune_decimal_samples(samples, newest_ts_ms.saturating_sub(retention_ms));
 }
 
 fn push_float_sample(
@@ -3587,18 +3588,33 @@ fn push_float_sample(
         sequence,
         value,
     };
-    let sample_ts_ms = signal_sample_timestamp_ms(&sample);
     insert_signal_sample(samples, sample);
-    prune_float_samples(samples, sample_ts_ms.saturating_sub(retention_ms));
+    let newest_ts_ms = latest_retained_signal_timestamp_ms(samples).unwrap_or(0);
+    prune_float_samples(samples, newest_ts_ms.saturating_sub(retention_ms));
 }
 
 fn insert_signal_sample<T>(samples: &mut VecDeque<SignalSample<T>>, sample: SignalSample<T>) {
-    let sample_ts_ms = signal_sample_timestamp_ms(&sample);
     let insert_idx = {
         let slice = samples.make_contiguous();
-        slice.partition_point(|existing| signal_sample_timestamp_ms(existing) <= sample_ts_ms)
+        slice.partition_point(|existing| compare_signal_samples(existing, &sample).is_le())
     };
     samples.insert(insert_idx, sample);
+}
+
+fn compare_signal_samples<T>(left: &SignalSample<T>, right: &SignalSample<T>) -> Ordering {
+    signal_sample_timestamp_ms(left)
+        .cmp(&signal_sample_timestamp_ms(right))
+        .then_with(|| match (left.sequence > 0, right.sequence > 0) {
+            (true, true) => left.sequence.cmp(&right.sequence),
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => Ordering::Equal,
+        })
+        .then_with(|| left.received_at_ms.cmp(&right.received_at_ms))
+}
+
+fn latest_retained_signal_timestamp_ms<T>(samples: &VecDeque<SignalSample<T>>) -> Option<u64> {
+    samples.back().map(signal_sample_timestamp_ms)
 }
 
 fn prune_decimal_samples(samples: &mut VecDeque<SignalSample<Decimal>>, min_ts_ms: u64) {
@@ -5826,6 +5842,31 @@ mod tests {
         let latest = latest_decimal_before(&samples, 1_300, 500).expect("latest");
 
         assert_eq!(latest, Decimal::new(42, 2));
+    }
+
+    #[test]
+    fn latest_decimal_before_prefers_higher_sequence_for_same_signal_timestamp() {
+        let mut samples = VecDeque::new();
+        push_decimal_sample(&mut samples, 1_200, 1_220, 11, Decimal::new(42, 2), 10_000);
+        push_decimal_sample(&mut samples, 1_200, 1_500, 10, Decimal::new(41, 2), 10_000);
+
+        let latest = latest_decimal_before(&samples, 1_300, 500).expect("latest");
+
+        assert_eq!(latest, Decimal::new(42, 2));
+    }
+
+    #[test]
+    fn push_decimal_sample_prunes_late_stale_packet_against_latest_signal_timestamp() {
+        let mut samples = VecDeque::new();
+        push_decimal_sample(&mut samples, 2_000, 2_020, 20, Decimal::new(42, 2), 500);
+        push_decimal_sample(&mut samples, 1_000, 3_000, 10, Decimal::new(41, 2), 500);
+
+        assert_eq!(samples.len(), 1);
+        assert_eq!(
+            signal_sample_timestamp_ms(samples.front().expect("retained sample")),
+            2_000
+        );
+        assert_eq!(samples.front().expect("retained sample").value, Decimal::new(42, 2));
     }
 
     #[tokio::test]
