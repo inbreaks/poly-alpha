@@ -57,6 +57,7 @@ impl PulseMode {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ReachabilityEnvelope {
     pub min_profitable_target_distance_bps: f64,
+    pub min_realizable_target_distance_bps: f64,
     pub reachability_cap_bps: f64,
     pub in_gray_zone: bool,
     pub reachable: bool,
