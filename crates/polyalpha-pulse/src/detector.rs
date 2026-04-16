@@ -13,6 +13,9 @@ pub struct PulseDetectorConfig {
     pub max_timeout_loss_usd: Decimal,
     pub max_required_hit_rate: f64,
     pub min_expected_net_pnl_usd: Decimal,
+    pub reachability_cap_bps: f64,
+    pub hit_rate_safety_margin_pp: f64,
+    pub min_realizable_ev_usd: Decimal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -27,24 +30,10 @@ impl PulseDetector {
 
     pub fn evaluate(&self, input: PulseOpportunityInput) -> DetectorDecision {
         if !input.anchor_quality_ok || !input.pricing_quality_ok {
-            return DetectorDecision {
-                should_trade: false,
-                net_session_edge_bps: f64::NEG_INFINITY,
-                expected_net_pnl_usd: Decimal::ZERO,
-                pulse_score_bps: f64::NEG_INFINITY,
-                required_hit_rate: 0.0,
-                rejection_code: Some(PulseFailureCode::AnchorQualityRejected),
-            };
+            return rejected(PulseFailureCode::AnchorQualityRejected);
         }
         if !input.data_fresh {
-            return DetectorDecision {
-                should_trade: false,
-                net_session_edge_bps: f64::NEG_INFINITY,
-                expected_net_pnl_usd: Decimal::ZERO,
-                pulse_score_bps: f64::NEG_INFINITY,
-                required_hit_rate: 0.0,
-                rejection_code: Some(PulseFailureCode::DataFreshnessRejected),
-            };
+            return rejected(PulseFailureCode::DataFreshnessRejected);
         }
 
         let pulse_score_bps = input.claim_price_move_bps - input.fair_claim_move_bps;
@@ -55,12 +44,8 @@ impl PulseDetector {
             || pulse_score_bps < self.config.min_pulse_score_bps
         {
             return DetectorDecision {
-                should_trade: false,
-                net_session_edge_bps: f64::NEG_INFINITY,
-                expected_net_pnl_usd: Decimal::ZERO,
                 pulse_score_bps,
-                required_hit_rate: 0.0,
-                rejection_code: Some(PulseFailureCode::PulseConfirmationRejected),
+                ..rejected(PulseFailureCode::PulseConfirmationRejected)
             };
         }
 
@@ -74,6 +59,15 @@ impl PulseDetector {
                 pulse_score_bps,
                 required_hit_rate: 0.0,
                 rejection_code: Some(PulseFailureCode::PulseConfirmationRejected),
+            };
+        }
+
+        if input.min_profitable_target_distance_bps > self.config.reachability_cap_bps {
+            return DetectorDecision {
+                net_session_edge_bps: input.expected_net_edge_bps,
+                expected_net_pnl_usd: input.expected_net_pnl_usd,
+                pulse_score_bps,
+                ..rejected(PulseFailureCode::PulseConfirmationRejected)
             };
         }
 
@@ -98,8 +92,32 @@ impl PulseDetector {
             self.config.min_expected_net_pnl_usd,
         );
 
+        let Some(predicted_hit_rate) = input.predicted_hit_rate else {
+            return DetectorDecision {
+                net_session_edge_bps,
+                expected_net_pnl_usd: input.expected_net_pnl_usd,
+                pulse_score_bps,
+                required_hit_rate,
+                rejection_code: Some(PulseFailureCode::PulseConfirmationRejected),
+                should_trade: false,
+            };
+        };
+        let Some(realizable_ev_usd) = input.realizable_ev_usd else {
+            return DetectorDecision {
+                net_session_edge_bps,
+                expected_net_pnl_usd: input.expected_net_pnl_usd,
+                pulse_score_bps,
+                required_hit_rate,
+                rejection_code: Some(PulseFailureCode::NetSessionEdgeBelowThreshold),
+                should_trade: false,
+            };
+        };
+        let required_with_margin = required_hit_rate + self.config.hit_rate_safety_margin_pp / 100.0;
+
         if input.timeout_loss_estimate_usd > self.config.max_timeout_loss_usd
             || required_hit_rate > self.config.max_required_hit_rate
+            || predicted_hit_rate < required_with_margin
+            || realizable_ev_usd < self.config.min_realizable_ev_usd
         {
             return DetectorDecision {
                 should_trade: false,
@@ -119,6 +137,17 @@ impl PulseDetector {
             required_hit_rate,
             rejection_code: None,
         }
+    }
+}
+
+fn rejected(code: PulseFailureCode) -> DetectorDecision {
+    DetectorDecision {
+        should_trade: false,
+        net_session_edge_bps: f64::NEG_INFINITY,
+        expected_net_pnl_usd: Decimal::ZERO,
+        pulse_score_bps: f64::NEG_INFINITY,
+        required_hit_rate: 0.0,
+        rejection_code: Some(code),
     }
 }
 
@@ -161,6 +190,9 @@ mod tests {
             max_timeout_loss_usd: Decimal::new(20, 0),
             max_required_hit_rate: 0.70,
             min_expected_net_pnl_usd: Decimal::new(50, 2),
+            reachability_cap_bps: 500.0,
+            hit_rate_safety_margin_pp: 10.0,
+            min_realizable_ev_usd: Decimal::ONE,
         }
     }
 
@@ -176,6 +208,10 @@ mod tests {
             expected_net_edge_bps: 80.0,
             expected_net_pnl_usd: Decimal::new(300, 2),
             timeout_loss_estimate_usd: Decimal::new(5, 0),
+            min_profitable_target_distance_bps: 118.0,
+            target_distance_to_mid_bps: Some(118.0),
+            predicted_hit_rate: Some(0.80),
+            realizable_ev_usd: Some(Decimal::new(3, 0)),
             reversion_pocket_ticks: 3.0,
             vacuum_ratio: Decimal::ONE,
             anchor_quality_ok: true,
@@ -312,5 +348,43 @@ mod tests {
             "timeout_risk_rejected"
         );
         assert!((decision.required_hit_rate - 0.7673).abs() < 0.001);
+    }
+
+    #[test]
+    fn detector_rejects_when_min_profitable_target_distance_exceeds_reachability_cap() {
+        let detector = PulseDetector::new(detector_test_config(25.0));
+        let decision = detector.evaluate(PulseOpportunityInput {
+            min_profitable_target_distance_bps: 540.0,
+            target_distance_to_mid_bps: None,
+            predicted_hit_rate: None,
+            realizable_ev_usd: None,
+            ..base_input()
+        });
+
+        assert!(!decision.should_trade);
+        assert_eq!(
+            decision.rejection_code.unwrap().as_str(),
+            "pulse_confirmation_rejected"
+        );
+    }
+
+    #[test]
+    fn detector_rejects_when_predicted_hit_rate_does_not_clear_required_plus_margin() {
+        let detector = PulseDetector::new(detector_test_config(25.0));
+        let decision = detector.evaluate(PulseOpportunityInput {
+            min_profitable_target_distance_bps: 118.0,
+            target_distance_to_mid_bps: Some(118.0),
+            predicted_hit_rate: Some(0.41),
+            realizable_ev_usd: Some(Decimal::new(162, 2)),
+            timeout_loss_estimate_usd: Decimal::new(310, 2),
+            expected_net_pnl_usd: Decimal::new(472, 2),
+            ..base_input()
+        });
+
+        assert!(!decision.should_trade);
+        assert_eq!(
+            decision.rejection_code.unwrap().as_str(),
+            "timeout_risk_rejected"
+        );
     }
 }
