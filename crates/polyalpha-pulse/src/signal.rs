@@ -118,14 +118,14 @@ pub fn generate_target_candidates(
     };
     let recoil_steps = match mode {
         PulseMode::ElasticSnapback => [
-            Decimal::new(20, 2),
-            Decimal::new(28, 2),
-            Decimal::new(35, 2),
+            Decimal::new(9, 2),
+            Decimal::new(11, 2),
+            Decimal::new(13, 2),
         ],
         PulseMode::DeepReversion => [
-            Decimal::new(35, 2),
-            Decimal::new(50, 2),
-            Decimal::new(65, 2),
+            Decimal::new(14, 2),
+            Decimal::new(16, 2),
+            Decimal::new(18, 2),
         ],
     };
 
@@ -371,11 +371,11 @@ fn round_to_tick(price: Decimal, tick_size: Decimal) -> Decimal {
     ((price / tick_size).floor() * tick_size).max(Decimal::ZERO)
 }
 
-fn distance_to_mid_bps(entry_price: Decimal, target_price: Decimal) -> f64 {
-    if entry_price <= Decimal::ZERO {
+fn distance_to_mid_bps(current_mid_price: Decimal, target_price: Decimal) -> f64 {
+    if current_mid_price <= Decimal::ZERO {
         return 0.0;
     }
-    ((target_price - entry_price).abs() * Decimal::from(10_000))
+    (((target_price - current_mid_price).abs() / current_mid_price) * Decimal::from(10_000))
         .to_f64()
         .unwrap_or(0.0)
 }
