@@ -66,9 +66,20 @@ pub struct TargetCandidate {
     pub realizable_ev_usd: Decimal,
 }
 
+const CONTINUATION_CONFIRMATION_NOTIONAL_USD: i64 = 300;
+const CONTINUATION_CONFIRMATION_LEVELS: usize = 2;
+const FAIR_MOVE_CONFIRMATION_BPS: f64 = 20.0;
+const DEEP_REVERSION_EXCESS_BPS: f64 = 30.0;
+const ELASTIC_TIMEOUT_SECS: u64 = 60;
+const DEEP_TIMEOUT_SECS: u64 = 900;
+const ELASTIC_DISTANCE_CAP_BPS: f64 = 150.0;
+const DEEP_DISTANCE_CAP_BPS: f64 = 200.0;
+const BPS_EPSILON: f64 = 1e-6;
+
 pub fn build_reachability_envelope(
     entry_notional_usd: Decimal,
     entry_price: Decimal,
+    tick_size: Decimal,
     hedge_cost_bps: f64,
     fee_bps: f64,
     reserve_bps: f64,
@@ -76,13 +87,16 @@ pub fn build_reachability_envelope(
 ) -> ReachabilityEnvelope {
     let gross_bps = hedge_cost_bps + fee_bps + reserve_bps;
     let min_profitable_target_distance_bps = gross_bps.max(0.0);
+    let min_realizable_target_distance_bps =
+        min_profitable_target_distance_bps.max(one_tick_distance_bps(entry_price, tick_size));
     ReachabilityEnvelope {
         min_profitable_target_distance_bps,
         reachability_cap_bps,
-        in_gray_zone: min_profitable_target_distance_bps > 150.0,
-        reachable: min_profitable_target_distance_bps <= reachability_cap_bps
+        in_gray_zone: min_realizable_target_distance_bps > ELASTIC_DISTANCE_CAP_BPS,
+        reachable: min_realizable_target_distance_bps <= reachability_cap_bps
             && entry_notional_usd > Decimal::ZERO
-            && entry_price > Decimal::ZERO,
+            && entry_price > Decimal::ZERO
+            && tick_size > Decimal::ZERO,
     }
 }
 
@@ -94,10 +108,16 @@ pub fn classify_pulse_mode(
     swept_levels_count: usize,
 ) -> PulseMode {
     let continuation_confirmed =
-        swept_notional_usd >= Decimal::new(300, 0) && swept_levels_count >= 2;
-    if continuation_confirmed && (fair_claim_move_bps >= 20.0 || cex_mid_move_bps >= 20.0) {
+        swept_notional_usd >= Decimal::new(CONTINUATION_CONFIRMATION_NOTIONAL_USD, 0)
+            && swept_levels_count >= CONTINUATION_CONFIRMATION_LEVELS;
+    if continuation_confirmed
+        && (fair_claim_move_bps >= FAIR_MOVE_CONFIRMATION_BPS
+            || cex_mid_move_bps >= FAIR_MOVE_CONFIRMATION_BPS)
+    {
         PulseMode::ElasticSnapback
-    } else if claim_price_move_bps > fair_claim_move_bps + cex_mid_move_bps + 30.0 {
+    } else if claim_price_move_bps
+        > fair_claim_move_bps + cex_mid_move_bps + DEEP_REVERSION_EXCESS_BPS
+    {
         PulseMode::DeepReversion
     } else {
         PulseMode::ElasticSnapback
@@ -110,63 +130,70 @@ pub fn generate_target_candidates(
     pre_pulse_price: Decimal,
     tick_size: Decimal,
     min_profitable_target_distance_bps: f64,
+    reachability_cap_bps: f64,
 ) -> Vec<TargetCandidate> {
-    let pulse_span = (pulse_price - pre_pulse_price).max(Decimal::ZERO);
-    let max_distance_bps = match mode {
-        PulseMode::ElasticSnapback => 150.0,
-        PulseMode::DeepReversion => 200.0,
-    };
-    let recoil_steps = match mode {
-        PulseMode::ElasticSnapback => [
-            Decimal::new(9, 2),
-            Decimal::new(11, 2),
-            Decimal::new(13, 2),
-        ],
-        PulseMode::DeepReversion => [
-            Decimal::new(14, 2),
-            Decimal::new(16, 2),
-            Decimal::new(18, 2),
-        ],
-    };
+    if pulse_price <= Decimal::ZERO || tick_size <= Decimal::ZERO || reachability_cap_bps <= 0.0 {
+        return Vec::new();
+    }
 
-    recoil_steps
-        .into_iter()
-        .filter_map(|ratio| {
-            let raw_target = pulse_price - pulse_span * ratio;
-            let rounded = round_to_tick(raw_target, tick_size);
-            let distance_bps = distance_to_mid_bps(pulse_price, rounded);
-            if distance_bps < min_profitable_target_distance_bps || distance_bps > max_distance_bps
-            {
-                return None;
-            }
-            Some(TargetCandidate {
-                mode,
-                target_exit_price: rounded,
-                target_distance_to_mid_bps: distance_bps,
-                timeout_secs: match mode {
-                    PulseMode::ElasticSnapback => 60,
-                    PulseMode::DeepReversion => 900,
-                },
-                predicted_hit_rate: 0.0,
-                maker_net_pnl_usd: Decimal::ZERO,
-                timeout_net_pnl_usd: Decimal::ZERO,
-                realizable_ev_usd: Decimal::ZERO,
-            })
-        })
-        .collect()
+    let pulse_span = (pulse_price - pre_pulse_price).max(Decimal::ZERO);
+    let one_tick_distance_bps = one_tick_distance_bps(pulse_price, tick_size);
+    let min_distance_bps = min_profitable_target_distance_bps.max(one_tick_distance_bps);
+    let max_distance_bps = mode_distance_cap_bps(mode)
+        .max(one_tick_distance_bps)
+        .min(reachability_cap_bps);
+    if min_distance_bps > max_distance_bps + BPS_EPSILON {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    for ratio in mode_recoil_steps(mode) {
+        let raw_target = pulse_price - pulse_span * ratio;
+        let rounded = round_to_tick(raw_target, tick_size);
+        if rounded <= Decimal::ZERO || rounded >= pulse_price {
+            continue;
+        }
+        let distance_bps = distance_to_mid_bps(pulse_price, rounded);
+        if distance_bps + BPS_EPSILON < min_distance_bps
+            || distance_bps - BPS_EPSILON > max_distance_bps
+        {
+            continue;
+        }
+        if candidates
+            .iter()
+            .any(|candidate: &TargetCandidate| candidate.target_exit_price == rounded)
+        {
+            continue;
+        }
+        candidates.push(TargetCandidate {
+            mode,
+            target_exit_price: rounded,
+            target_distance_to_mid_bps: distance_bps,
+            timeout_secs: mode_timeout_secs(mode),
+            predicted_hit_rate: 0.0,
+            maker_net_pnl_usd: Decimal::ZERO,
+            timeout_net_pnl_usd: Decimal::ZERO,
+            realizable_ev_usd: Decimal::ZERO,
+        });
+    }
+
+    candidates
 }
 
 pub fn select_best_target(candidates: Vec<TargetCandidate>) -> Option<TargetCandidate> {
-    candidates.into_iter().max_by(|left, right| {
-        left.realizable_ev_usd
-            .cmp(&right.realizable_ev_usd)
-            .then_with(|| left.predicted_hit_rate.total_cmp(&right.predicted_hit_rate))
-            .then_with(|| {
-                right
-                    .target_distance_to_mid_bps
-                    .total_cmp(&left.target_distance_to_mid_bps)
-            })
-    })
+    candidates
+        .into_iter()
+        .filter(candidate_is_evaluated)
+        .max_by(|left, right| {
+            left.realizable_ev_usd
+                .cmp(&right.realizable_ev_usd)
+                .then_with(|| left.predicted_hit_rate.total_cmp(&right.predicted_hit_rate))
+                .then_with(|| {
+                    right
+                        .target_distance_to_mid_bps
+                        .total_cmp(&left.target_distance_to_mid_bps)
+                })
+        })
 }
 
 pub fn executable_poly_quote(
@@ -368,6 +395,7 @@ fn round_to_tick(price: Decimal, tick_size: Decimal) -> Decimal {
     if tick_size <= Decimal::ZERO {
         return price.max(Decimal::ZERO);
     }
+    // Pulse exits must sit on the venue grid and not cross through the discrete tick.
     ((price / tick_size).floor() * tick_size).max(Decimal::ZERO)
 }
 
@@ -378,6 +406,52 @@ fn distance_to_mid_bps(current_mid_price: Decimal, target_price: Decimal) -> f64
     (((target_price - current_mid_price).abs() / current_mid_price) * Decimal::from(10_000))
         .to_f64()
         .unwrap_or(0.0)
+}
+
+fn one_tick_distance_bps(current_mid_price: Decimal, tick_size: Decimal) -> f64 {
+    if current_mid_price <= Decimal::ZERO || tick_size <= Decimal::ZERO {
+        return 0.0;
+    }
+    ((tick_size / current_mid_price) * Decimal::from(10_000))
+        .to_f64()
+        .unwrap_or(0.0)
+}
+
+fn mode_distance_cap_bps(mode: PulseMode) -> f64 {
+    match mode {
+        PulseMode::ElasticSnapback => ELASTIC_DISTANCE_CAP_BPS,
+        PulseMode::DeepReversion => DEEP_DISTANCE_CAP_BPS,
+    }
+}
+
+fn mode_timeout_secs(mode: PulseMode) -> u64 {
+    match mode {
+        PulseMode::ElasticSnapback => ELASTIC_TIMEOUT_SECS,
+        PulseMode::DeepReversion => DEEP_TIMEOUT_SECS,
+    }
+}
+
+fn mode_recoil_steps(mode: PulseMode) -> [Decimal; 3] {
+    match mode {
+        PulseMode::ElasticSnapback => [
+            Decimal::new(9, 2),
+            Decimal::new(11, 2),
+            Decimal::new(13, 2),
+        ],
+        PulseMode::DeepReversion => [
+            Decimal::new(14, 2),
+            Decimal::new(16, 2),
+            Decimal::new(18, 2),
+        ],
+    }
+}
+
+fn candidate_is_evaluated(candidate: &TargetCandidate) -> bool {
+    candidate.predicted_hit_rate.is_finite()
+        && candidate.predicted_hit_rate > 0.0
+        && (candidate.maker_net_pnl_usd != Decimal::ZERO
+            || candidate.timeout_net_pnl_usd != Decimal::ZERO
+            || candidate.realizable_ev_usd != Decimal::ZERO)
 }
 
 fn price_edge_bps(entry_price: Decimal, exit_price: Decimal) -> f64 {
@@ -403,9 +477,9 @@ mod tests {
     };
 
     use super::{
-        build_reachability_envelope, estimate_session_edge, executable_poly_quote,
-        generate_target_candidates, reversion_pocket, select_best_target, ExecutableQuoteSide,
-        TargetCandidate,
+        build_reachability_envelope, classify_pulse_mode, distance_to_mid_bps,
+        estimate_session_edge, executable_poly_quote, generate_target_candidates,
+        reversion_pocket, select_best_target, ExecutableQuoteSide, TargetCandidate,
     };
     use crate::model::PulseMode;
 
@@ -513,6 +587,7 @@ mod tests {
         let envelope = build_reachability_envelope(
             Decimal::new(250, 0),
             Decimal::new(35, 2),
+            Decimal::new(1, 2),
             120.0,
             60.0,
             40.0,
@@ -524,6 +599,22 @@ mod tests {
     }
 
     #[test]
+    fn reachability_envelope_rejects_when_one_tick_exceeds_cap() {
+        let envelope = build_reachability_envelope(
+            Decimal::new(250, 0),
+            Decimal::new(45, 2),
+            Decimal::new(1, 2),
+            40.0,
+            30.0,
+            25.0,
+            200.0,
+        );
+
+        assert!(!envelope.reachable);
+        assert_eq!(envelope.min_profitable_target_distance_bps, 95.0);
+    }
+
+    #[test]
     fn elastic_snapback_targets_stay_inside_shallow_recoil_band() {
         let targets = generate_target_candidates(
             PulseMode::ElasticSnapback,
@@ -531,6 +622,7 @@ mod tests {
             Decimal::new(40, 2),
             Decimal::new(1, 3),
             95.0,
+            150.0,
         );
 
         assert!(!targets.is_empty());
@@ -548,6 +640,7 @@ mod tests {
             Decimal::new(40, 2),
             Decimal::new(1, 3),
             120.0,
+            200.0,
         );
 
         assert!(!targets.is_empty());
@@ -557,6 +650,50 @@ mod tests {
         assert!(targets
             .iter()
             .all(|item| item.target_distance_to_mid_bps <= 200.0));
+    }
+
+    #[test]
+    fn elastic_snapback_cent_tick_keeps_single_tick_candidate_when_cap_allows() {
+        let targets = generate_target_candidates(
+            PulseMode::ElasticSnapback,
+            Decimal::new(45, 2),
+            Decimal::new(40, 2),
+            Decimal::new(1, 2),
+            95.0,
+            250.0,
+        );
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].target_exit_price, Decimal::new(44, 2));
+        assert_eq!(targets[0].target_distance_to_mid_bps.round(), 222.0);
+    }
+
+    #[test]
+    fn generate_target_candidates_respects_explicit_reachability_cap() {
+        let targets = generate_target_candidates(
+            PulseMode::ElasticSnapback,
+            Decimal::new(45, 2),
+            Decimal::new(40, 2),
+            Decimal::new(1, 2),
+            95.0,
+            200.0,
+        );
+
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn distance_to_mid_bps_uses_mid_normalized_denominator() {
+        let distance = distance_to_mid_bps(Decimal::new(45, 2), Decimal::new(44, 2));
+
+        assert!((distance - 222.22).abs() < 0.1);
+    }
+
+    #[test]
+    fn classify_pulse_mode_detects_deep_reversion_without_anchor_confirmation() {
+        let mode = classify_pulse_mode(160.0, 20.0, 10.0, Decimal::new(100, 0), 1);
+
+        assert_eq!(mode, PulseMode::DeepReversion);
     }
 
     #[test]
@@ -587,5 +724,51 @@ mod tests {
 
         assert_eq!(winner.mode, PulseMode::ElasticSnapback);
         assert_eq!(winner.target_distance_to_mid_bps, 118.0);
+    }
+
+    #[test]
+    fn select_best_target_prefers_higher_hit_rate_when_realizable_ev_ties() {
+        let winner = select_best_target(vec![
+            TargetCandidate {
+                mode: PulseMode::DeepReversion,
+                target_exit_price: Decimal::new(2512, 4),
+                target_distance_to_mid_bps: 160.0,
+                timeout_secs: 900,
+                predicted_hit_rate: 0.41,
+                maker_net_pnl_usd: Decimal::new(500, 2),
+                timeout_net_pnl_usd: Decimal::new(-176, 2),
+                realizable_ev_usd: Decimal::new(162, 2),
+            },
+            TargetCandidate {
+                mode: PulseMode::ElasticSnapback,
+                target_exit_price: Decimal::new(2444, 4),
+                target_distance_to_mid_bps: 118.0,
+                timeout_secs: 60,
+                predicted_hit_rate: 0.63,
+                maker_net_pnl_usd: Decimal::new(472, 2),
+                timeout_net_pnl_usd: Decimal::new(-310, 2),
+                realizable_ev_usd: Decimal::new(162, 2),
+            },
+        ])
+        .expect("best target");
+
+        assert_eq!(winner.mode, PulseMode::ElasticSnapback);
+        assert_eq!(winner.predicted_hit_rate, 0.63);
+    }
+
+    #[test]
+    fn select_best_target_rejects_unevaluated_candidates() {
+        let winner = select_best_target(vec![TargetCandidate {
+            mode: PulseMode::ElasticSnapback,
+            target_exit_price: Decimal::new(2444, 4),
+            target_distance_to_mid_bps: 118.0,
+            timeout_secs: 60,
+            predicted_hit_rate: 0.0,
+            maker_net_pnl_usd: Decimal::ZERO,
+            timeout_net_pnl_usd: Decimal::ZERO,
+            realizable_ev_usd: Decimal::ZERO,
+        }]);
+
+        assert!(winner.is_none());
     }
 }
