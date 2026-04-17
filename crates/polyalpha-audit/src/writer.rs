@@ -118,9 +118,7 @@ impl AuditWriter {
             manifest,
             paths,
             raw_segment_max_bytes: raw_segment_max_bytes.max(1_024),
-            raw_flush_threshold_bytes: raw_segment_max_bytes
-                .max(4_096)
-                .min(256 * 1_024),
+            raw_flush_threshold_bytes: raw_segment_max_bytes.max(4_096).min(256 * 1_024),
             current_segment: 1,
             current_segment_bytes: 0,
             pending_flush_bytes: 0,
@@ -135,6 +133,10 @@ impl AuditWriter {
 
     pub fn paths(&self) -> &AuditPaths {
         &self.paths
+    }
+
+    pub fn event_count(&self) -> u64 {
+        self.next_seq.saturating_sub(1)
     }
 
     pub fn append_event(&mut self, event: NewAuditEvent) -> Result<AuditEvent> {
@@ -355,7 +357,10 @@ mod tests {
         let decoded: PulseExecutionContext =
             serde_json::from_str(&raw).expect("decode execution context");
         assert_eq!(decoded.session_id, session_id);
-        assert_eq!(decoded.hedge_venue_for_asset("btc"), Some("binance_usdm_perp"));
+        assert_eq!(
+            decoded.hedge_venue_for_asset("btc"),
+            Some("binance_usdm_perp")
+        );
 
         let _ = fs::remove_dir_all(root);
     }
