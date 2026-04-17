@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use chrono::{TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -69,6 +73,202 @@ struct PulseInspectView {
 
 const PULSE_RUNTIME_AUDIT_BUFFER_CAPACITY: usize = 4_096;
 const PULSE_MARKET_TAPE_BUFFER_CAPACITY: usize = 8_192;
+const PULSE_TAPE_RECORDER_FLUSH_THRESHOLD_BYTES: u64 = 64 * 1_024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum PulseTapeStream {
+    PolyBook,
+    BinanceBook,
+    DeribitOptionTicker,
+}
+
+impl PulseTapeStream {
+    fn file_prefix(self) -> &'static str {
+        match self {
+            Self::PolyBook => "poly_book",
+            Self::BinanceBook => "binance_book",
+            Self::DeribitOptionTicker => "deribit_option_ticker",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PulseTapeSegmentState {
+    partition: String,
+    segment_index: u64,
+    bytes_written: u64,
+    pending_flush_bytes: u64,
+    segment_started_at_ms: u64,
+    writer: Option<BufWriter<File>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PulseTapeRecord {
+    stream: String,
+    asset: String,
+    venue: String,
+    symbol: String,
+    market_symbol: Option<String>,
+    venue_symbol: Option<String>,
+    instrument: String,
+    token_side: Option<String>,
+    ts_exchange_ms: u64,
+    ts_recv_ms: u64,
+    sequence: Option<u64>,
+    payload: Value,
+}
+
+struct PulseTapeRecorder {
+    root_dir: PathBuf,
+    rotate_bytes: u64,
+    rotate_secs: u64,
+    streams: HashMap<PulseTapeStream, PulseTapeSegmentState>,
+}
+
+impl PulseTapeRecorder {
+    fn new(root_dir: PathBuf, rotate_bytes: u64, rotate_secs: u64) -> Result<Self> {
+        fs::create_dir_all(&root_dir)
+            .with_context(|| format!("create recorder root `{}`", root_dir.display()))?;
+        Ok(Self {
+            root_dir,
+            rotate_bytes: rotate_bytes.max(1_024),
+            rotate_secs: rotate_secs.max(60),
+            streams: HashMap::new(),
+        })
+    }
+
+    #[cfg(test)]
+    fn write_market_event(&mut self, event: &MarketDataEvent) -> Result<usize> {
+        self.write_market_event_for_registry(None, event)
+    }
+
+    fn write_market_event_for_registry(
+        &mut self,
+        registry: Option<&SymbolRegistry>,
+        event: &MarketDataEvent,
+    ) -> Result<usize> {
+        let records = pulse_tape_records_from_market_event(registry, event);
+        let mut written = 0usize;
+        for (stream, record) in records {
+            self.write_record(stream, record.ts_recv_ms, &record)?;
+            written = written.saturating_add(1);
+        }
+        Ok(written)
+    }
+
+    fn write_deribit_ticker(&mut self, ticker: &DeribitTickerMessage) -> Result<()> {
+        let record = PulseTapeRecord {
+            stream: PulseTapeStream::DeribitOptionTicker
+                .file_prefix()
+                .to_owned(),
+            asset: match ticker.asset {
+                polyalpha_data::DeribitAsset::Btc => "btc".to_owned(),
+                polyalpha_data::DeribitAsset::Eth => "eth".to_owned(),
+            },
+            venue: "Deribit".to_owned(),
+            symbol: ticker.instrument_name.clone(),
+            market_symbol: None,
+            venue_symbol: None,
+            instrument: ticker.instrument_name.clone(),
+            token_side: None,
+            ts_exchange_ms: ticker.timestamp_ms,
+            ts_recv_ms: ticker.received_at_ms,
+            sequence: None,
+            payload: pulse_deribit_ticker_payload(ticker),
+        };
+        self.write_record(
+            PulseTapeStream::DeribitOptionTicker,
+            record.ts_recv_ms,
+            &record,
+        )
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        for state in self.streams.values_mut() {
+            if let Some(writer) = state.writer.as_mut() {
+                writer.flush().context("flush recorder segment")?;
+                state.pending_flush_bytes = 0;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_record(
+        &mut self,
+        stream: PulseTapeStream,
+        ts_recv_ms: u64,
+        record: &PulseTapeRecord,
+    ) -> Result<()> {
+        let payload = serde_json::to_vec(record).context("serialize pulse tape record")?;
+        self.rotate_if_needed(stream, ts_recv_ms, payload.len() as u64 + 1)?;
+        let state = self
+            .streams
+            .get_mut(&stream)
+            .expect("stream state should exist after rotation");
+        let writer = state
+            .writer
+            .as_mut()
+            .expect("stream writer should exist after rotation");
+        writer
+            .write_all(&payload)
+            .context("write pulse tape record payload")?;
+        writer
+            .write_all(b"\n")
+            .context("write pulse tape record newline")?;
+        let appended_len = payload.len() as u64 + 1;
+        state.bytes_written = state.bytes_written.saturating_add(appended_len);
+        state.pending_flush_bytes = state.pending_flush_bytes.saturating_add(appended_len);
+        if state.pending_flush_bytes >= PULSE_TAPE_RECORDER_FLUSH_THRESHOLD_BYTES {
+            writer.flush().context("flush recorder segment threshold")?;
+            state.pending_flush_bytes = 0;
+        }
+        Ok(())
+    }
+
+    fn rotate_if_needed(
+        &mut self,
+        stream: PulseTapeStream,
+        ts_recv_ms: u64,
+        next_entry_len: u64,
+    ) -> Result<()> {
+        let partition = pulse_tape_partition(ts_recv_ms);
+        let day_dir = self.root_dir.join(&partition);
+        let prefix = stream.file_prefix();
+
+        let state = self.streams.entry(stream).or_default();
+        let should_rotate = state.writer.is_none()
+            || state.partition != partition
+            || state.bytes_written.saturating_add(next_entry_len) > self.rotate_bytes
+            || ts_recv_ms.saturating_sub(state.segment_started_at_ms)
+                >= self.rotate_secs.saturating_mul(1_000);
+        if !should_rotate {
+            return Ok(());
+        }
+
+        if let Some(mut writer) = state.writer.take() {
+            writer
+                .flush()
+                .context("flush recorder segment before rotate")?;
+        }
+
+        fs::create_dir_all(&day_dir)
+            .with_context(|| format!("create recorder partition `{}`", day_dir.display()))?;
+        let segment_index = pulse_tape_next_segment_index(&day_dir, prefix)?;
+        let path = day_dir.join(format!("{prefix}-{segment_index:06}.jsonl"));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open recorder segment `{}`", path.display()))?;
+        state.partition = partition;
+        state.segment_index = segment_index;
+        state.bytes_written = 0;
+        state.pending_flush_bytes = 0;
+        state.segment_started_at_ms = ts_recv_ms;
+        state.writer = Some(BufWriter::new(file));
+        Ok(())
+    }
+}
 
 struct PulseAuditRuntime {
     data_dir: String,
@@ -578,6 +778,286 @@ fn pulse_decimal_to_string(value: Decimal) -> String {
     value.normalize().to_string()
 }
 
+fn pulse_tape_records_from_market_event(
+    registry: Option<&SymbolRegistry>,
+    event: &MarketDataEvent,
+) -> Vec<(PulseTapeStream, PulseTapeRecord)> {
+    match event {
+        MarketDataEvent::OrderBookUpdate { snapshot } => {
+            pulse_tape_record_from_snapshot(registry, snapshot)
+                .into_iter()
+                .collect()
+        }
+        MarketDataEvent::CexVenueOrderBookUpdate {
+            exchange,
+            venue_symbol,
+            bids,
+            asks,
+            exchange_timestamp_ms,
+            received_at_ms,
+            sequence,
+        } if *exchange == Exchange::Binance => {
+            let Some(asset) =
+                PulseAsset::from_routing_key(&asset_key_from_cex_symbol(venue_symbol))
+            else {
+                return Vec::new();
+            };
+            vec![(
+                PulseTapeStream::BinanceBook,
+                PulseTapeRecord {
+                    stream: PulseTapeStream::BinanceBook.file_prefix().to_owned(),
+                    asset: asset.as_str().to_owned(),
+                    venue: "Binance".to_owned(),
+                    symbol: venue_symbol.clone(),
+                    market_symbol: None,
+                    venue_symbol: Some(venue_symbol.clone()),
+                    instrument: "cex_perp".to_owned(),
+                    token_side: None,
+                    ts_exchange_ms: *exchange_timestamp_ms,
+                    ts_recv_ms: *received_at_ms,
+                    sequence: Some(*sequence),
+                    payload: serde_json::json!({
+                        "exchange": exchange,
+                        "venue_symbol": venue_symbol,
+                        "bids": bids,
+                        "asks": asks,
+                        "exchange_timestamp_ms": exchange_timestamp_ms,
+                        "received_at_ms": received_at_ms,
+                        "sequence": sequence,
+                    }),
+                },
+            )]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn pulse_tape_record_from_snapshot(
+    registry: Option<&SymbolRegistry>,
+    snapshot: &OrderBookSnapshot,
+) -> Option<(PulseTapeStream, PulseTapeRecord)> {
+    match snapshot.exchange {
+        Exchange::Polymarket => {
+            let asset = pulse_tape_asset_from_market_symbol(registry, &snapshot.symbol.0)?;
+            Some((
+                PulseTapeStream::PolyBook,
+                PulseTapeRecord {
+                    stream: PulseTapeStream::PolyBook.file_prefix().to_owned(),
+                    asset: asset.as_str().to_owned(),
+                    venue: "Polymarket".to_owned(),
+                    symbol: snapshot.symbol.0.clone(),
+                    market_symbol: Some(snapshot.symbol.0.clone()),
+                    venue_symbol: None,
+                    instrument: pulse_market_tape_instrument_label(snapshot.instrument).to_owned(),
+                    token_side: pulse_market_tape_token_side(snapshot.instrument),
+                    ts_exchange_ms: snapshot.exchange_timestamp_ms,
+                    ts_recv_ms: snapshot.received_at_ms,
+                    sequence: Some(snapshot.sequence),
+                    payload: serde_json::to_value(snapshot)
+                        .expect("orderbook snapshot should serialize"),
+                },
+            ))
+        }
+        Exchange::Binance if snapshot.instrument == InstrumentKind::CexPerp => {
+            let (asset, venue_symbol) = pulse_tape_binance_symbol_context(registry, snapshot)?;
+            Some((
+                PulseTapeStream::BinanceBook,
+                PulseTapeRecord {
+                    stream: PulseTapeStream::BinanceBook.file_prefix().to_owned(),
+                    asset: asset.as_str().to_owned(),
+                    venue: "Binance".to_owned(),
+                    symbol: snapshot.symbol.0.clone(),
+                    market_symbol: Some(snapshot.symbol.0.clone()),
+                    venue_symbol: Some(venue_symbol),
+                    instrument: pulse_market_tape_instrument_label(snapshot.instrument).to_owned(),
+                    token_side: None,
+                    ts_exchange_ms: snapshot.exchange_timestamp_ms,
+                    ts_recv_ms: snapshot.received_at_ms,
+                    sequence: Some(snapshot.sequence),
+                    payload: serde_json::to_value(snapshot)
+                        .expect("orderbook snapshot should serialize"),
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn pulse_tape_asset_from_market_symbol(
+    registry: Option<&SymbolRegistry>,
+    symbol: &str,
+) -> Option<PulseAsset> {
+    registry
+        .and_then(|registry| registry.get_config(&polyalpha_core::Symbol::new(symbol)))
+        .and_then(|market| {
+            PulseAsset::from_routing_key(&asset_key_from_cex_symbol(&market.cex_symbol))
+        })
+        .or_else(|| pulse_tape_infer_asset(symbol))
+}
+
+fn pulse_tape_binance_symbol_context(
+    registry: Option<&SymbolRegistry>,
+    snapshot: &OrderBookSnapshot,
+) -> Option<(PulseAsset, String)> {
+    if let Some(market) = registry.and_then(|registry| registry.get_config(&snapshot.symbol)) {
+        return PulseAsset::from_routing_key(&asset_key_from_cex_symbol(&market.cex_symbol))
+            .map(|asset| (asset, market.cex_symbol.clone()));
+    }
+
+    pulse_tape_infer_asset(&snapshot.symbol.0).map(|asset| (asset, snapshot.symbol.0.clone()))
+}
+
+fn pulse_tape_infer_asset(raw: &str) -> Option<PulseAsset> {
+    let by_cex = asset_key_from_cex_symbol(raw);
+    PulseAsset::from_routing_key(&by_cex).or_else(|| {
+        let prefix = raw
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .find(|segment| !segment.is_empty())?
+            .to_ascii_lowercase();
+        PulseAsset::from_routing_key(&prefix)
+    })
+}
+
+fn pulse_deribit_ticker_payload(ticker: &DeribitTickerMessage) -> Value {
+    serde_json::json!({
+        "instrument_name": ticker.instrument_name,
+        "asset": ticker.asset.as_str(),
+        "expiry_ts_ms": ticker.expiry_ts_ms,
+        "strike": ticker.strike,
+        "option_type": match ticker.option_type {
+            polyalpha_data::DeribitOptionType::Call => "call",
+            polyalpha_data::DeribitOptionType::Put => "put",
+        },
+        "timestamp_ms": ticker.timestamp_ms,
+        "received_at_ms": ticker.received_at_ms,
+        "mark_price": ticker.mark_price,
+        "mark_iv": ticker.mark_iv,
+        "best_bid_price": ticker.best_bid_price,
+        "best_ask_price": ticker.best_ask_price,
+        "bid_iv": ticker.bid_iv,
+        "ask_iv": ticker.ask_iv,
+        "delta": ticker.delta,
+        "gamma": ticker.gamma,
+        "index_price": ticker.index_price,
+    })
+}
+
+fn pulse_tape_partition(ts_ms: u64) -> String {
+    Utc.timestamp_millis_opt(ts_ms as i64)
+        .single()
+        .map(|dt| dt.format("%Y%m%d").to_string())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn pulse_tape_next_segment_index(day_dir: &Path, prefix: &str) -> Result<u64> {
+    let mut max_index = 0u64;
+    if !day_dir.exists() {
+        return Ok(1);
+    }
+
+    for entry in fs::read_dir(day_dir)
+        .with_context(|| format!("read recorder partition `{}`", day_dir.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("read recorder entry in partition `{}`", day_dir.display()))?;
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        let Some(raw_index) = file_name
+            .strip_prefix(prefix)
+            .and_then(|name| name.strip_prefix('-'))
+            .and_then(|name| name.strip_suffix(".jsonl"))
+        else {
+            continue;
+        };
+        if let Ok(index) = raw_index.parse::<u64>() {
+            max_index = max_index.max(index);
+        }
+    }
+
+    Ok(max_index.saturating_add(1))
+}
+
+pub async fn run_record_pulse_tape(
+    env: &str,
+    assets: &[PulseAsset],
+    output_dir: Option<&str>,
+    rotate_secs: u64,
+    rotate_mb: u64,
+) -> Result<()> {
+    let settings = filtered_pulse_settings(env, assets)?;
+    if settings.markets.is_empty() {
+        return Err(anyhow!(
+            "pulse recorder env `{env}` has no eligible BTC/ETH markets after filtering"
+        ));
+    }
+
+    let registry = SymbolRegistry::new(settings.markets.clone());
+    let (market_data_tx, _) = broadcast::channel(4_096);
+    let mut market_data_rx = market_data_tx.subscribe();
+    let manager = build_data_manager(&registry, market_data_tx);
+    let deribit_provider = build_deribit_anchor_provider(&settings, assets)
+        .await
+        .context("build Deribit anchor provider for recorder")?;
+    let (deribit_tape_tx, mut deribit_tape_rx) = mpsc::channel(PULSE_MARKET_TAPE_BUFFER_CAPACITY);
+    let mut data_tasks = spawn_pulse_market_data_tasks(
+        manager,
+        &settings,
+        &settings.markets,
+        20,
+        deribit_provider,
+        Some(deribit_tape_tx),
+    )
+    .await
+    .context("spawn pulse recorder market data tasks")?;
+
+    let root_dir = output_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&settings.general.data_dir).join("pulse-recorder"));
+    let mut recorder = PulseTapeRecorder::new(
+        root_dir.clone(),
+        rotate_mb.max(1) * 1_024 * 1_024,
+        rotate_secs,
+    )?;
+
+    println!(
+        "pulse tape recorder running: env={}, assets={:?}, markets={}, output_dir={}",
+        env,
+        assets,
+        settings.markets.len(),
+        root_dir.display()
+    );
+
+    let result: Result<()> = loop {
+        tokio::select! {
+            recv = market_data_rx.recv() => {
+                match recv {
+                    Ok(event) => {
+                        recorder
+                            .write_market_event_for_registry(Some(&registry), &event)
+                            .context("persist market tape event")?;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break Ok(()),
+                }
+            }
+            ticker = deribit_tape_rx.recv() => {
+                match ticker {
+                    Some(ticker) => recorder.write_deribit_ticker(&ticker)
+                        .context("persist Deribit ticker")?,
+                    None => break Ok(()),
+                }
+            }
+            _ = tokio::signal::ctrl_c() => break Ok(()),
+        }
+    };
+
+    recorder.flush()?;
+    for task in data_tasks.drain(..) {
+        task.abort();
+    }
+    result
+}
+
 pub async fn run_pulse_paper(env: &str, assets: &[PulseAsset]) -> Result<()> {
     run_pulse(env, assets, PulseExecutionMode::Paper, None).await
 }
@@ -714,10 +1194,16 @@ async fn run_pulse(
         .context("build pulse runtime")?;
 
     let (state_broadcaster, _socket_handle) = spawn_pulse_monitor_server(&settings);
-    let _data_tasks =
-        spawn_pulse_market_data_tasks(manager, &settings, &settings.markets, 20, deribit_provider)
-            .await
-            .context("spawn pulse market data tasks")?;
+    let _data_tasks = spawn_pulse_market_data_tasks(
+        manager,
+        &settings,
+        &settings.markets,
+        20,
+        deribit_provider,
+        None,
+    )
+    .await
+    .context("spawn pulse market data tasks")?;
     let mut audit_runtime = match (runtime_events_rx, market_tape_rx) {
         (Some(runtime_events_rx), Some(market_tape_rx)) => PulseAuditRuntime::start(
             &settings,
@@ -1642,6 +2128,7 @@ async fn spawn_pulse_market_data_tasks(
     markets: &[polyalpha_core::MarketConfig],
     depth: u16,
     deribit: DeribitRuntimeProvider,
+    deribit_tape_tx: Option<mpsc::Sender<DeribitTickerMessage>>,
 ) -> Result<Vec<JoinHandle<()>>> {
     let mut tasks = Vec::new();
     let proxy_settings = WsProxySettings::detect();
@@ -1663,6 +2150,7 @@ async fn spawn_pulse_market_data_tasks(
         settings.deribit.ws_url.clone(),
         markets,
         proxy_settings,
+        deribit_tape_tx,
     ));
     Ok(tasks)
 }
@@ -1846,6 +2334,7 @@ fn spawn_deribit_ws_task(
     ws_url: String,
     markets: &[polyalpha_core::MarketConfig],
     proxy_settings: WsProxySettings,
+    recorder_tx: Option<mpsc::Sender<DeribitTickerMessage>>,
 ) -> JoinHandle<()> {
     let assets = markets
         .iter()
@@ -1917,6 +2406,9 @@ fn spawn_deribit_ws_task(
                                 match message {
                                     Some(Ok(Message::Text(text))) => {
                                         if let Ok(ticker) = DeribitTickerMessage::from_text(&text) {
+                                            if let Some(tx) = recorder_tx.as_ref() {
+                                                let _ = tx.send(ticker.clone()).await;
+                                            }
                                             client.ingest_ticker(ticker);
                                         }
                                     }
@@ -2183,6 +2675,102 @@ mod tests {
     fn parse_pulse_assets_rejects_unknown_asset() {
         let err = parse_pulse_assets("btc,doge").expect_err("unknown asset should fail");
         assert!(err.to_string().contains("unsupported pulse asset `doge`"));
+    }
+
+    #[test]
+    fn pulse_tape_recorder_persists_market_and_deribit_jsonl() {
+        let root =
+            std::env::temp_dir().join(format!("polyalpha-pulse-recorder-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp recorder root");
+        let mut recorder =
+            PulseTapeRecorder::new(root.clone(), 64 * 1024 * 1024, 600).expect("new recorder");
+
+        recorder
+            .write_market_event(&poly_book_update(
+                "btc-pulse-test",
+                InstrumentKind::PolyYes,
+                Decimal::new(45, 2),
+                Decimal::new(46, 2),
+                1_744_848_000_000,
+            ))
+            .expect("write poly book");
+        recorder
+            .write_market_event(&cex_book_update(
+                "BTCUSDT",
+                Decimal::new(99_995, 0),
+                Decimal::new(100_005, 0),
+                1_744_848_060_000,
+            ))
+            .expect("write cex book");
+        recorder
+            .write_deribit_ticker(&DeribitTickerMessage {
+                instrument_name: "BTC-26APR26-100000-C".to_owned(),
+                asset: polyalpha_data::DeribitAsset::Btc,
+                expiry_ts_ms: 1_777_190_400_000,
+                strike: 100_000.0,
+                option_type: polyalpha_data::DeribitOptionType::Call,
+                timestamp_ms: 1_744_848_120_000,
+                received_at_ms: 1_744_848_120_040,
+                mark_price: 0.12,
+                mark_iv: 55.0,
+                best_bid_price: Some(0.11),
+                best_ask_price: Some(0.13),
+                bid_iv: Some(54.5),
+                ask_iv: Some(55.5),
+                delta: Some(0.5),
+                gamma: Some(0.0002),
+                index_price: Some(100_000.0),
+            })
+            .expect("write deribit ticker");
+        recorder.flush().expect("flush recorder");
+
+        let partition_dir = root.join("20250417");
+        assert!(partition_dir.exists(), "partition dir should exist");
+
+        let poly_path = partition_dir.join("poly_book-000001.jsonl");
+        let binance_path = partition_dir.join("binance_book-000001.jsonl");
+        let deribit_path = partition_dir.join("deribit_option_ticker-000001.jsonl");
+        assert!(poly_path.exists(), "poly segment should exist");
+        assert!(binance_path.exists(), "binance segment should exist");
+        assert!(deribit_path.exists(), "deribit segment should exist");
+
+        let poly_line = fs::read_to_string(&poly_path)
+            .expect("read poly jsonl")
+            .lines()
+            .next()
+            .expect("poly jsonl should contain a line")
+            .to_owned();
+        let poly_json: serde_json::Value =
+            serde_json::from_str(&poly_line).expect("decode poly json");
+        assert_eq!(poly_json["stream"], "poly_book");
+        assert_eq!(poly_json["asset"], "btc");
+        assert_eq!(poly_json["instrument"], "poly_yes");
+        assert_eq!(poly_json["symbol"], "btc-pulse-test");
+
+        let binance_line = fs::read_to_string(&binance_path)
+            .expect("read binance jsonl")
+            .lines()
+            .next()
+            .expect("binance jsonl should contain a line")
+            .to_owned();
+        let binance_json: serde_json::Value =
+            serde_json::from_str(&binance_line).expect("decode binance json");
+        assert_eq!(binance_json["stream"], "binance_book");
+        assert_eq!(binance_json["asset"], "btc");
+        assert_eq!(binance_json["instrument"], "cex_perp");
+
+        let deribit_line = fs::read_to_string(&deribit_path)
+            .expect("read deribit jsonl")
+            .lines()
+            .next()
+            .expect("deribit jsonl should contain a line")
+            .to_owned();
+        let deribit_json: serde_json::Value =
+            serde_json::from_str(&deribit_line).expect("decode deribit json");
+        assert_eq!(deribit_json["stream"], "deribit_option_ticker");
+        assert_eq!(deribit_json["asset"], "btc");
+        assert_eq!(deribit_json["instrument"], "BTC-26APR26-100000-C");
+        assert_eq!(deribit_json["sequence"], serde_json::Value::Null);
     }
 
     #[test]

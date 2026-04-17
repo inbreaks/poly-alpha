@@ -60,6 +60,10 @@ pub enum Command {
         #[command(subcommand)]
         command: MarketCommand,
     },
+    Record {
+        #[command(subcommand)]
+        command: RecordCommand,
+    },
     Sim {
         #[command(subcommand)]
         command: SimCommand,
@@ -479,6 +483,22 @@ pub enum PulseCommand {
     Inspect {
         #[arg(long, default_value = "default")]
         env: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RecordCommand {
+    PulseTape {
+        #[arg(long, default_value = "default")]
+        env: String,
+        #[arg(long)]
+        assets: String,
+        #[arg(long)]
+        output_dir: Option<String>,
+        #[arg(long, default_value_t = 600)]
+        rotate_secs: u64,
+        #[arg(long, default_value_t = 256)]
+        rotate_mb: u64,
     },
 }
 
@@ -1016,7 +1036,7 @@ pub enum MarketAsset {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuditCommand, Cli, Command, LiveCommand, PaperCommand};
+    use super::{AuditCommand, Cli, Command, LiveCommand, PaperCommand, RecordCommand};
     use clap::{error::ErrorKind, Parser};
 
     #[test]
@@ -1277,6 +1297,32 @@ mod tests {
             cli.command,
             Command::Live {
                 command: LiveCommand::Pulse { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_record_pulse_tape_command() {
+        let cli = Cli::parse_from([
+            "polyalpha-cli",
+            "record",
+            "pulse-tape",
+            "--env",
+            "multi-market-active.fresh",
+            "--assets",
+            "btc,eth",
+            "--output-dir",
+            "./data/pulse-recorder",
+            "--rotate-secs",
+            "600",
+            "--rotate-mb",
+            "256",
+        ]);
+
+        assert!(matches!(
+            cli.command,
+            Command::Record {
+                command: RecordCommand::PulseTape { .. }
             }
         ));
     }

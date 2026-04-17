@@ -15,7 +15,9 @@ mod strategy_scope;
 use anyhow::Result;
 use clap::Parser;
 
-use args::{Cli, Command, LiveCommand, MarketCommand, PaperCommand, PulseCommand, SimCommand};
+use args::{
+    Cli, Command, LiveCommand, MarketCommand, PaperCommand, PulseCommand, RecordCommand, SimCommand,
+};
 
 fn install_rustls_crypto_provider() -> Result<()> {
     if rustls::crypto::CryptoProvider::get_default().is_some() {
@@ -264,6 +266,25 @@ async fn main() -> Result<()> {
                     min_volume_24h_usd,
                     output.as_deref(),
                     report_json.as_deref(),
+                )
+                .await?
+            }
+        },
+        Command::Record { command } => match command {
+            RecordCommand::PulseTape {
+                env,
+                assets,
+                output_dir,
+                rotate_secs,
+                rotate_mb,
+            } => {
+                let parsed_assets = pulse::parse_pulse_assets(&assets)?;
+                pulse::run_record_pulse_tape(
+                    &env,
+                    &parsed_assets,
+                    output_dir.as_deref(),
+                    rotate_secs,
+                    rotate_mb,
                 )
                 .await?
             }
