@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 
 use crate::model::{
     AuditCheckpoint, AuditEvent, AuditSessionManifest, AuditSessionSummary, NewAuditEvent,
+    PulseExecutionContext,
 };
 
 #[derive(Clone, Debug)]
@@ -16,6 +17,7 @@ pub struct AuditPaths {
     manifest_path: PathBuf,
     summary_path: PathBuf,
     checkpoint_path: PathBuf,
+    execution_context_path: PathBuf,
     warehouse_dir: PathBuf,
 }
 
@@ -30,6 +32,7 @@ impl AuditPaths {
             manifest_path: session_dir.join("manifest.json"),
             summary_path: session_dir.join("summary.json"),
             checkpoint_path: session_dir.join("checkpoint.json"),
+            execution_context_path: session_dir.join("execution_context.json"),
             warehouse_dir: audit_root.join("warehouse"),
         }
     }
@@ -58,6 +61,10 @@ impl AuditPaths {
         &self.checkpoint_path
     }
 
+    pub fn execution_context_path(&self) -> &Path {
+        &self.execution_context_path
+    }
+
     pub fn warehouse_dir(&self) -> &Path {
         &self.warehouse_dir
     }
@@ -76,8 +83,10 @@ pub struct AuditWriter {
     manifest: AuditSessionManifest,
     paths: AuditPaths,
     raw_segment_max_bytes: u64,
+    raw_flush_threshold_bytes: u64,
     current_segment: usize,
     current_segment_bytes: u64,
+    pending_flush_bytes: u64,
     next_seq: u64,
     raw_writer: Option<BufWriter<File>>,
 }
@@ -109,8 +118,12 @@ impl AuditWriter {
             manifest,
             paths,
             raw_segment_max_bytes: raw_segment_max_bytes.max(1_024),
+            raw_flush_threshold_bytes: raw_segment_max_bytes
+                .max(4_096)
+                .min(256 * 1_024),
             current_segment: 1,
             current_segment_bytes: 0,
+            pending_flush_bytes: 0,
             next_seq: 1,
             raw_writer: None,
         })
@@ -162,6 +175,11 @@ impl AuditWriter {
         write_json(self.paths.checkpoint_path(), checkpoint)
     }
 
+    pub fn write_execution_context(&mut self, context: &PulseExecutionContext) -> Result<()> {
+        self.flush_raw()?;
+        write_json(self.paths.execution_context_path(), context)
+    }
+
     pub fn flush_raw(&mut self) -> Result<()> {
         if let Some(writer) = self.raw_writer.as_mut() {
             writer.flush().with_context(|| {
@@ -171,6 +189,7 @@ impl AuditWriter {
                 )
             })?;
         }
+        self.pending_flush_bytes = 0;
         Ok(())
     }
 
@@ -208,12 +227,18 @@ impl AuditWriter {
         writer
             .write_all(b"\n")
             .with_context(|| format!("写入审计换行 `{}` 失败", path.display()))?;
-        writer
-            .flush()
-            .with_context(|| format!("刷新审计事件文件 `{}` 失败", path.display()))?;
         self.current_segment_bytes = self
             .current_segment_bytes
             .saturating_add(payload.len() as u64 + 1);
+        self.pending_flush_bytes = self
+            .pending_flush_bytes
+            .saturating_add(payload.len() as u64 + 1);
+        if self.pending_flush_bytes >= self.raw_flush_threshold_bytes {
+            writer
+                .flush()
+                .with_context(|| format!("刷新审计事件文件 `{}` 失败", path.display()))?;
+            self.pending_flush_bytes = 0;
+        }
         Ok(())
     }
 }
@@ -227,7 +252,7 @@ impl Drop for AuditWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reader::AuditReader;
+    use crate::{model::PulseExecutionRouteContext, reader::AuditReader};
     use polyalpha_core::TradingMode;
 
     fn unique_test_root(label: &str) -> PathBuf {
@@ -250,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn append_event_remains_readable_while_writer_is_alive() {
+    fn append_event_becomes_readable_after_explicit_flush() {
         let root = unique_test_root("readable");
         let session_id = "session-readable";
         let mut writer = AuditWriter::create(&root, test_manifest(session_id), 1_024 * 1_024)
@@ -280,9 +305,57 @@ mod tests {
             })
             .expect("append event");
 
-        let events = AuditReader::load_events(&root, session_id).expect("load events");
+        let events = AuditReader::load_events(&root, session_id).expect("load events before flush");
+        assert!(events.is_empty());
+
+        writer.flush_raw().expect("flush raw");
+
+        let events = AuditReader::load_events(&root, session_id).expect("load events after flush");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].summary, "test anomaly");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn writer_persists_execution_context_sidecar() {
+        let root = unique_test_root("execution-context");
+        let session_id = "session-execution-context";
+        let mut writer = AuditWriter::create(&root, test_manifest(session_id), 1_024 * 1_024)
+            .expect("create writer");
+        let context = PulseExecutionContext {
+            session_id: session_id.to_owned(),
+            env: "test".to_owned(),
+            mode: "paper".to_owned(),
+            enabled_assets: vec!["btc".to_owned()],
+            market_symbols: vec!["btc-above-100k".to_owned()],
+            routes: vec![PulseExecutionRouteContext {
+                asset: "btc".to_owned(),
+                anchor_provider: "deribit_primary".to_owned(),
+                hedge_venue: "binance_usdm_perp".to_owned(),
+            }],
+            poly_fee_bps: 100,
+            cex_taker_fee_bps: 5,
+            cex_slippage_bps: 2,
+            maker_proxy_version: "book_proxy_v1".to_owned(),
+            max_holding_secs: 900,
+            opening_request_notional_usd: "250".to_owned(),
+            min_opening_notional_usd: "50".to_owned(),
+            min_expected_net_pnl_usd: "0.5".to_owned(),
+            require_nonzero_hedge: true,
+            min_open_fill_ratio: Some("0.05".to_owned()),
+        };
+
+        writer
+            .write_execution_context(&context)
+            .expect("write execution context");
+
+        let raw = fs::read_to_string(writer.paths().execution_context_path())
+            .expect("read execution context");
+        let decoded: PulseExecutionContext =
+            serde_json::from_str(&raw).expect("decode execution context");
+        assert_eq!(decoded.session_id, session_id);
+        assert_eq!(decoded.hedge_venue_for_asset("btc"), Some("binance_usdm_perp"));
 
         let _ = fs::remove_dir_all(root);
     }

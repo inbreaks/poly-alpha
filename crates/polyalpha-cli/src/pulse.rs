@@ -17,8 +17,9 @@ use uuid::Uuid;
 
 use polyalpha_audit::{
     AuditAnomalyEvent, AuditCheckpoint, AuditCounterSnapshot, AuditEventKind, AuditEventPayload,
-    AuditSessionManifest, AuditSessionStatus, AuditSessionSummary, AuditSeverity, AuditWarehouse,
-    AuditWriter, NewAuditEvent,
+    AuditSessionManifest, AuditSessionStatus, AuditSessionSummary, AuditSeverity,
+    AuditWarehouse, AuditWriter, NewAuditEvent, PulseExecutionContext,
+    PulseExecutionRouteContext,
 };
 use polyalpha_core::{
     asset_key_from_cex_symbol, AsyncClassification, ConnectionInfo, ConnectionStatus,
@@ -110,11 +111,17 @@ impl PulseAuditRuntime {
                 .collect(),
         };
         let warehouse = AuditWarehouse::new(&settings.general.data_dir)?;
-        let writer = AuditWriter::create(
+        let mut writer = AuditWriter::create(
             &settings.general.data_dir,
             manifest.clone(),
             settings.audit.raw_segment_max_bytes,
         )?;
+        writer.write_execution_context(&build_pulse_execution_context(
+            &manifest.session_id,
+            env,
+            mode,
+            settings,
+        ))?;
         let summary = AuditSessionSummary::new_running(&manifest);
 
         Ok(Some(Self {
@@ -313,6 +320,14 @@ fn pulse_audit_event(record: &PulseAuditRecord) -> NewAuditEvent {
         polyalpha_audit::AuditEventPayload::PulseBookTape(event) => {
             format!("pulse tape {} {}", event.asset, event.book.instrument)
         }
+        polyalpha_audit::AuditEventPayload::PulseMarketTape(event) => {
+            format!("pulse market tape {} {}", event.asset, event.instrument)
+        }
+        polyalpha_audit::AuditEventPayload::PulseSignalSnapshot(event) => format!(
+            "pulse signal {} {}",
+            event.asset,
+            event.admission_result.as_str()
+        ),
         polyalpha_audit::AuditEventPayload::PulseSessionSummary(event) => {
             format!("pulse summary {} {}", event.asset, event.state)
         }
@@ -599,6 +614,87 @@ fn filtered_pulse_settings(env: &str, assets: &[PulseAsset]) -> Result<Settings>
     let settings =
         Settings::load(env).with_context(|| format!("failed to load config env `{env}`"))?;
     Ok(apply_pulse_asset_filter(settings, assets))
+}
+
+fn build_pulse_execution_context(
+    session_id: &str,
+    env: &str,
+    mode: PulseExecutionMode,
+    settings: &Settings,
+) -> PulseExecutionContext {
+    let mut routes = settings
+        .strategy
+        .pulse_arb
+        .routing
+        .iter()
+        .filter(|(_, route)| route.enabled)
+        .map(|(asset, route)| PulseExecutionRouteContext {
+            asset: asset.to_owned(),
+            anchor_provider: route.anchor_provider.clone(),
+            hedge_venue: route.hedge_venue.clone(),
+        })
+        .collect::<Vec<_>>();
+    routes.sort_by(|left, right| left.asset.cmp(&right.asset));
+
+    let enabled_assets = routes
+        .iter()
+        .map(|route| route.asset.clone())
+        .collect::<Vec<_>>();
+    let mut market_symbols = settings
+        .markets
+        .iter()
+        .map(|market| market.symbol.0.clone())
+        .collect::<Vec<_>>();
+    market_symbols.sort();
+    market_symbols.dedup();
+
+    PulseExecutionContext {
+        session_id: session_id.to_owned(),
+        env: env.to_owned(),
+        mode: match mode {
+            PulseExecutionMode::Paper => "paper".to_owned(),
+            PulseExecutionMode::LiveMock => "live_mock".to_owned(),
+        },
+        enabled_assets,
+        market_symbols,
+        routes,
+        poly_fee_bps: settings.execution_costs.poly_fee_bps,
+        cex_taker_fee_bps: settings.execution_costs.cex_taker_fee_bps,
+        cex_slippage_bps: settings.paper_slippage.cex_slippage_bps as u32,
+        maker_proxy_version: "book_proxy_v1".to_owned(),
+        max_holding_secs: settings.strategy.pulse_arb.session.max_holding_secs,
+        opening_request_notional_usd: settings
+            .strategy
+            .pulse_arb
+            .session
+            .effective_opening_request_notional_usd()
+            .0
+            .normalize()
+            .to_string(),
+        min_opening_notional_usd: settings
+            .strategy
+            .pulse_arb
+            .session
+            .min_opening_notional_usd
+            .0
+            .normalize()
+            .to_string(),
+        min_expected_net_pnl_usd: settings
+            .strategy
+            .pulse_arb
+            .session
+            .effective_min_expected_net_pnl_usd()
+            .0
+            .normalize()
+            .to_string(),
+        require_nonzero_hedge: settings.strategy.pulse_arb.session.require_nonzero_hedge,
+        min_open_fill_ratio: settings
+            .strategy
+            .pulse_arb
+            .session
+            .min_open_fill_ratio
+            .map(|value| value.normalize().to_string()),
+    }
 }
 
 fn build_pulse_inspect_view(env: &str, settings: &Settings) -> PulseInspectView {
@@ -1611,12 +1707,18 @@ fn current_time_ms() -> u64 {
 mod tests {
     use std::{collections::HashMap, fs, path::PathBuf, sync::Mutex};
 
-    use polyalpha_audit::{AuditReader, AuditSessionStatus};
+    use polyalpha_audit::{AuditReader, AuditSessionStatus, PulseExecutionContext};
     use polyalpha_core::{
-        create_channels, Exchange, InstrumentKind, MarketConfig, MarketDataEvent, PolymarketIds,
-        Price, Symbol,
+        create_channels, CexBaseQty, Exchange, InstrumentKind, MarketConfig, MarketDataEvent,
+        OrderBookSnapshot, PolymarketIds, PolyShares, Price, PriceLevel, Symbol, VenueQuantity,
+    };
+    use polyalpha_pulse::{
+        anchor::provider::{AnchorError, AnchorProvider},
+        model::{AnchorQualityMetrics, AnchorSnapshot, LocalSurfacePoint},
+        runtime::{PulseExecutionMode, PulseRuntimeBuilder},
     };
     use serde_json::json;
+    use rust_decimal::Decimal;
     use tokio::sync::broadcast::error::TryRecvError;
 
     use super::*;
@@ -1748,6 +1850,82 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct StaticAnchorProvider {
+        snapshot: AnchorSnapshot,
+    }
+
+    impl AnchorProvider for StaticAnchorProvider {
+        fn provider_id(&self) -> &str {
+            &self.snapshot.provider_id
+        }
+
+        fn snapshot_for_target(
+            &self,
+            _asset: PulseAsset,
+            _target_event_expiry_ts_ms: Option<u64>,
+        ) -> std::result::Result<Option<AnchorSnapshot>, AnchorError> {
+            Ok(Some(self.snapshot.clone()))
+        }
+    }
+
+    fn price_level(price: Decimal, quantity: VenueQuantity) -> PriceLevel {
+        PriceLevel {
+            price: Price(price),
+            quantity,
+        }
+    }
+
+    fn poly_book_update(
+        symbol: &str,
+        instrument: InstrumentKind,
+        bid_price: Decimal,
+        ask_price: Decimal,
+        ts_ms: u64,
+    ) -> MarketDataEvent {
+        MarketDataEvent::OrderBookUpdate {
+            snapshot: OrderBookSnapshot {
+                exchange: Exchange::Polymarket,
+                symbol: Symbol::new(symbol),
+                instrument,
+                bids: vec![price_level(
+                    bid_price,
+                    VenueQuantity::PolyShares(PolyShares(Decimal::new(10_000, 0))),
+                )],
+                asks: vec![price_level(
+                    ask_price,
+                    VenueQuantity::PolyShares(PolyShares(Decimal::new(10_000, 0))),
+                )],
+                exchange_timestamp_ms: ts_ms,
+                received_at_ms: ts_ms,
+                sequence: 1,
+                last_trade_price: None,
+            },
+        }
+    }
+
+    fn cex_book_update(symbol: &str, bid_price: Decimal, ask_price: Decimal, ts_ms: u64) -> MarketDataEvent {
+        MarketDataEvent::OrderBookUpdate {
+            snapshot: OrderBookSnapshot {
+                exchange: Exchange::Binance,
+                symbol: Symbol::new(symbol),
+                instrument: InstrumentKind::CexPerp,
+                bids: vec![price_level(
+                    bid_price,
+                    VenueQuantity::CexBaseQty(CexBaseQty(Decimal::new(50, 3))),
+                )],
+                asks: vec![price_level(
+                    ask_price,
+                    VenueQuantity::CexBaseQty(CexBaseQty(Decimal::new(50, 3))),
+                )],
+                exchange_timestamp_ms: ts_ms,
+                received_at_ms: ts_ms,
+                sequence: 1,
+                last_trade_price: None,
+            },
+        }
+    }
+
     #[test]
     fn parse_pulse_assets_rejects_unknown_asset() {
         let err = parse_pulse_assets("btc,doge").expect_err("unknown asset should fail");
@@ -1798,6 +1976,143 @@ mod tests {
             .routes
             .iter()
             .all(|route| route.anchor_provider == "deribit_primary"));
+    }
+
+    #[tokio::test]
+    async fn pulse_audit_runtime_start_writes_execution_context_sidecar() {
+        let mut settings: Settings =
+            serde_json::from_value(pulse_settings_json()).expect("deserialize pulse settings");
+        let root =
+            std::env::temp_dir().join(format!("polyalpha-pulse-context-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp root");
+        settings.general.data_dir = root.to_string_lossy().into_owned();
+
+        let now_ms = 1_717_171_717_000;
+        let audit = PulseAuditRuntime::start(&settings, "test", PulseExecutionMode::LiveMock, now_ms)
+            .expect("start audit runtime")
+            .expect("audit runtime enabled");
+
+        let raw = fs::read_to_string(
+            audit.writer.paths().execution_context_path(),
+        )
+        .expect("read execution context");
+        let context: PulseExecutionContext =
+            serde_json::from_str(&raw).expect("decode execution context");
+
+        assert_eq!(context.session_id, audit.summary.session_id);
+        assert_eq!(context.mode, "live_mock");
+        assert_eq!(
+            context.hedge_venue_for_asset("btc"),
+            Some("binance_perp")
+        );
+        assert_eq!(context.min_open_fill_ratio, None);
+    }
+
+    #[tokio::test]
+    async fn pulse_audit_runtime_persists_market_tape_and_signal_snapshot_raw() {
+        let mut settings: Settings =
+            serde_json::from_value(pulse_settings_json()).expect("deserialize pulse settings");
+        let root =
+            std::env::temp_dir().join(format!("polyalpha-pulse-raw-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp root");
+        settings.general.data_dir = root.to_string_lossy().into_owned();
+        settings.markets = vec![sample_pulse_market()];
+
+        let now_ms = 1_717_171_717_000;
+        let anchor_provider = Arc::new(StaticAnchorProvider {
+            snapshot: AnchorSnapshot {
+                asset: PulseAsset::Btc,
+                provider_id: "deribit_primary".to_owned(),
+                ts_ms: now_ms,
+                index_price: Decimal::new(100_000, 0),
+                expiry_ts_ms: settings.markets[0].settlement_timestamp * 1_000,
+                atm_iv: 55.0,
+                local_surface_points: vec![LocalSurfacePoint {
+                    instrument_name: "BTC-26APR26-100000-C".to_owned(),
+                    strike: Decimal::new(100_000, 0),
+                    expiry_ts_ms: settings.markets[0].settlement_timestamp * 1_000,
+                    bid_iv: Some(54.5),
+                    ask_iv: Some(55.5),
+                    mark_iv: 55.0,
+                    delta: Some(0.5),
+                    gamma: Some(0.0002),
+                    best_bid: Some(Decimal::new(12, 2)),
+                    best_ask: Some(Decimal::new(13, 2)),
+                }],
+                quality: AnchorQualityMetrics {
+                    anchor_age_ms: 10,
+                    max_quote_spread_bps: None,
+                    has_strike_coverage: true,
+                    has_liquidity: true,
+                    expiry_mismatch_minutes: 0,
+                    greeks_complete: true,
+                },
+            },
+        });
+        let mut runtime = PulseRuntimeBuilder::new(settings.clone())
+            .with_anchor_provider(anchor_provider)
+            .with_markets(settings.markets.clone())
+            .with_execution_mode(PulseExecutionMode::Paper)
+            .build()
+            .await
+            .expect("build pulse runtime");
+        let mut audit =
+            PulseAuditRuntime::start(&settings, "test", PulseExecutionMode::Paper, now_ms)
+                .expect("start audit runtime")
+                .expect("audit runtime enabled");
+
+        runtime.observe_market_event(poly_book_update(
+            "btc-pulse-test",
+            InstrumentKind::PolyYes,
+            Decimal::new(45, 2),
+            Decimal::new(46, 2),
+            now_ms,
+        ));
+        runtime.observe_market_event(poly_book_update(
+            "btc-pulse-test",
+            InstrumentKind::PolyNo,
+            Decimal::new(54, 2),
+            Decimal::new(55, 2),
+            now_ms,
+        ));
+        runtime.observe_market_event(cex_book_update(
+            "btc-pulse-test",
+            Decimal::new(99_995, 0),
+            Decimal::new(100_005, 0),
+            now_ms,
+        ));
+        runtime
+            .run_tick(now_ms + 100)
+            .await
+            .expect("run pulse tick");
+
+        let mut monitor_state = MonitorState::default();
+        monitor_state.timestamp_ms = now_ms + 100;
+        monitor_state.mode = TradingMode::Paper;
+        audit
+            .finalize(
+                &runtime,
+                &monitor_state,
+                now_ms + 100,
+                AuditSessionStatus::Completed,
+            )
+            .expect("finalize audit runtime");
+
+        let events = AuditReader::load_events(&root, &audit.summary.session_id)
+            .expect("load persisted pulse audit events");
+        assert!(events.iter().any(|event| {
+            matches!(event.payload, AuditEventPayload::PulseMarketTape(_))
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(event.payload, AuditEventPayload::PulseSignalSnapshot(_))
+        }));
+
+        let raw = fs::read_to_string(audit.writer.paths().execution_context_path())
+            .expect("read execution context");
+        let context: PulseExecutionContext =
+            serde_json::from_str(&raw).expect("decode execution context");
+        assert_eq!(context.session_id, audit.summary.session_id);
+        assert_eq!(context.market_symbols, vec!["btc-pulse-test".to_owned()]);
     }
 
     #[test]

@@ -416,11 +416,20 @@ pub struct PulseBookTapeAuditEvent {
 pub struct PulseMarketTapeAuditEvent {
     pub asset: String,
     pub symbol: String,
-    pub exchange: String,
+    #[serde(alias = "exchange")]
+    pub venue: String,
     pub instrument: String,
-    pub exchange_timestamp_ms: u64,
-    pub received_at_ms: u64,
+    #[serde(default)]
+    pub token_side: Option<String>,
+    #[serde(alias = "exchange_timestamp_ms")]
+    pub ts_exchange_ms: u64,
+    #[serde(alias = "received_at_ms")]
+    pub ts_recv_ms: u64,
     pub sequence: u64,
+    #[serde(default = "default_market_update_kind")]
+    pub update_kind: String,
+    #[serde(default)]
+    pub top_n_depth: usize,
     #[serde(default)]
     pub best_bid: Option<String>,
     #[serde(default)]
@@ -430,30 +439,70 @@ pub struct PulseMarketTapeAuditEvent {
     #[serde(default)]
     pub last_trade_price: Option<String>,
     #[serde(default)]
-    pub bids: Vec<PulseBookLevelAuditRow>,
+    pub expiry_ts_ms: Option<u64>,
     #[serde(default)]
-    pub asks: Vec<PulseBookLevelAuditRow>,
+    pub strike: Option<String>,
+    #[serde(default)]
+    pub option_type: Option<String>,
+    #[serde(default)]
+    pub mark_iv: Option<f64>,
+    #[serde(default)]
+    pub bid_iv: Option<f64>,
+    #[serde(default)]
+    pub ask_iv: Option<f64>,
+    #[serde(default)]
+    pub delta: Option<f64>,
+    #[serde(default)]
+    pub gamma: Option<f64>,
+    #[serde(default)]
+    pub index_price: Option<String>,
+    #[serde(default)]
+    pub delta_bids: Vec<PulseBookLevelAuditRow>,
+    #[serde(default)]
+    pub delta_asks: Vec<PulseBookLevelAuditRow>,
+    #[serde(default, alias = "bids")]
+    pub snapshot_bids: Vec<PulseBookLevelAuditRow>,
+    #[serde(default, alias = "asks")]
+    pub snapshot_asks: Vec<PulseBookLevelAuditRow>,
 }
 
 impl PartialEq for PulseMarketTapeAuditEvent {
     fn eq(&self, other: &Self) -> bool {
         self.asset == other.asset
             && self.symbol == other.symbol
-            && self.exchange == other.exchange
+            && self.venue == other.venue
             && self.instrument == other.instrument
-            && self.exchange_timestamp_ms == other.exchange_timestamp_ms
-            && self.received_at_ms == other.received_at_ms
+            && self.token_side == other.token_side
+            && self.ts_exchange_ms == other.ts_exchange_ms
+            && self.ts_recv_ms == other.ts_recv_ms
             && self.sequence == other.sequence
+            && self.update_kind == other.update_kind
+            && self.top_n_depth == other.top_n_depth
             && self.best_bid == other.best_bid
             && self.best_ask == other.best_ask
             && self.mid == other.mid
             && self.last_trade_price == other.last_trade_price
-            && book_levels_equal(&self.bids, &other.bids)
-            && book_levels_equal(&self.asks, &other.asks)
+            && self.expiry_ts_ms == other.expiry_ts_ms
+            && self.strike == other.strike
+            && self.option_type == other.option_type
+            && self.mark_iv == other.mark_iv
+            && self.bid_iv == other.bid_iv
+            && self.ask_iv == other.ask_iv
+            && self.delta == other.delta
+            && self.gamma == other.gamma
+            && self.index_price == other.index_price
+            && book_levels_equal(&self.delta_bids, &other.delta_bids)
+            && book_levels_equal(&self.delta_asks, &other.delta_asks)
+            && book_levels_equal(&self.snapshot_bids, &other.snapshot_bids)
+            && book_levels_equal(&self.snapshot_asks, &other.snapshot_asks)
     }
 }
 
 impl Eq for PulseMarketTapeAuditEvent {}
+
+fn default_market_update_kind() -> String {
+    "snapshot".to_owned()
+}
 
 fn book_levels_equal(
     left: &[PulseBookLevelAuditRow],
@@ -484,6 +533,24 @@ pub struct PulseSignalSnapshotAuditEvent {
     pub admission_result: AuditGateResult,
     #[serde(default)]
     pub rejection_reason: Option<String>,
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub claim_side: Option<String>,
+    #[serde(default)]
+    pub fair_prob_yes: Option<f64>,
+    #[serde(default)]
+    pub entry_price: Option<String>,
+    #[serde(default)]
+    pub net_edge_bps: Option<f64>,
+    #[serde(default)]
+    pub expected_net_pnl_usd: Option<String>,
+    #[serde(default)]
+    pub target_exit_price: Option<String>,
+    #[serde(default)]
+    pub timeout_exit_price: Option<String>,
+    #[serde(default)]
+    pub timeout_loss_estimate_usd: Option<String>,
     pub pulse_score_bps: f64,
     pub claim_price_move_bps: f64,
     pub fair_claim_move_bps: f64,
@@ -512,6 +579,70 @@ pub struct PulseSignalSnapshotAuditEvent {
     #[serde(default)]
     pub observation_quality_score: Option<f64>,
     pub admission_eligible: bool,
+    #[serde(default)]
+    pub anchor_age_ms: Option<u64>,
+    #[serde(default)]
+    pub anchor_latency_delta_ms: Option<u64>,
+    #[serde(default)]
+    pub anchor_expiry_mismatch_minutes: Option<i64>,
+    #[serde(default)]
+    pub yes_quote_age_ms: Option<u64>,
+    #[serde(default)]
+    pub no_quote_age_ms: Option<u64>,
+    #[serde(default)]
+    pub cex_quote_age_ms: Option<u64>,
+    #[serde(default)]
+    pub poly_transport_healthy: Option<bool>,
+    #[serde(default)]
+    pub hedge_transport_healthy: Option<bool>,
+    #[serde(default)]
+    pub poly_yes_sequence_ref: Option<u64>,
+    #[serde(default)]
+    pub poly_no_sequence_ref: Option<u64>,
+    #[serde(default)]
+    pub cex_sequence_ref: Option<u64>,
+    #[serde(default)]
+    pub anchor_sequence_ref: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PulseExecutionRouteContext {
+    pub asset: String,
+    pub anchor_provider: String,
+    pub hedge_venue: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PulseExecutionContext {
+    pub session_id: String,
+    pub env: String,
+    pub mode: String,
+    #[serde(default)]
+    pub enabled_assets: Vec<String>,
+    #[serde(default)]
+    pub market_symbols: Vec<String>,
+    #[serde(default)]
+    pub routes: Vec<PulseExecutionRouteContext>,
+    pub poly_fee_bps: u32,
+    pub cex_taker_fee_bps: u32,
+    pub cex_slippage_bps: u32,
+    pub maker_proxy_version: String,
+    pub max_holding_secs: u64,
+    pub opening_request_notional_usd: String,
+    pub min_opening_notional_usd: String,
+    pub min_expected_net_pnl_usd: String,
+    pub require_nonzero_hedge: bool,
+    #[serde(default)]
+    pub min_open_fill_ratio: Option<String>,
+}
+
+impl PulseExecutionContext {
+    pub fn hedge_venue_for_asset(&self, asset: &str) -> Option<&str> {
+        self.routes
+            .iter()
+            .find(|route| route.asset.eq_ignore_ascii_case(asset))
+            .map(|route| route.hedge_venue.as_str())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -665,8 +796,9 @@ pub struct AuditEvent {
 mod tests {
     use super::{
         AuditEventPayload, AuditGateResult, AuditSessionSummary, PulseBookLevelAuditRow,
-        PulseBookSnapshotAudit, PulseBookTapeAuditEvent, PulseLifecycleAuditEvent,
-        PulseMarketTapeAuditEvent, PulseSignalMode, PulseSignalSnapshotAuditEvent,
+        PulseBookSnapshotAudit, PulseBookTapeAuditEvent, PulseExecutionContext,
+        PulseExecutionRouteContext, PulseLifecycleAuditEvent, PulseMarketTapeAuditEvent,
+        PulseSignalMode, PulseSignalSnapshotAuditEvent,
     };
 
     #[test]
@@ -800,20 +932,40 @@ mod tests {
     }
 
     #[test]
-    fn pulse_market_tape_payload_round_trips_with_exchange_timestamp_and_top5_levels() {
+    fn pulse_market_tape_serializes_sequence_and_level_deltas() {
         let payload = AuditEventPayload::PulseMarketTape(PulseMarketTapeAuditEvent {
             asset: "btc".to_owned(),
             symbol: "btc-above-100k".to_owned(),
-            exchange: "Polymarket".to_owned(),
+            venue: "Polymarket".to_owned(),
             instrument: "poly_no".to_owned(),
-            exchange_timestamp_ms: 1_710_000_100,
-            received_at_ms: 1_710_000_140,
+            token_side: Some("no".to_owned()),
+            ts_exchange_ms: 1_710_000_100,
+            ts_recv_ms: 1_710_000_140,
             sequence: 42,
+            update_kind: "snapshot".to_owned(),
+            top_n_depth: 5,
             best_bid: Some("0.38".to_owned()),
             best_ask: Some("0.39".to_owned()),
             mid: Some("0.385".to_owned()),
             last_trade_price: Some("0.39".to_owned()),
-            bids: vec![
+            expiry_ts_ms: None,
+            strike: None,
+            option_type: None,
+            mark_iv: None,
+            bid_iv: None,
+            ask_iv: None,
+            delta: None,
+            gamma: None,
+            index_price: None,
+            delta_bids: vec![PulseBookLevelAuditRow {
+                price: "0.38".to_owned(),
+                quantity: "25".to_owned(),
+            }],
+            delta_asks: vec![PulseBookLevelAuditRow {
+                price: "0.39".to_owned(),
+                quantity: "30".to_owned(),
+            }],
+            snapshot_bids: vec![
                 PulseBookLevelAuditRow {
                     price: "0.38".to_owned(),
                     quantity: "250".to_owned(),
@@ -835,7 +987,7 @@ mod tests {
                     quantity: "140".to_owned(),
                 },
             ],
-            asks: vec![
+            snapshot_asks: vec![
                 PulseBookLevelAuditRow {
                     price: "0.39".to_owned(),
                     quantity: "300".to_owned(),
@@ -867,15 +1019,19 @@ mod tests {
             AuditEventPayload::PulseMarketTape(event) => event,
             _ => panic!("decoded payload should be PulseMarketTape"),
         };
-        assert_eq!(event.bids.len(), 5);
-        assert_eq!(event.asks.len(), 5);
+        assert_eq!(event.update_kind, "snapshot");
+        assert_eq!(event.top_n_depth, 5);
+        assert_eq!(event.delta_bids.len(), 1);
+        assert_eq!(event.delta_asks.len(), 1);
+        assert_eq!(event.snapshot_bids.len(), 5);
+        assert_eq!(event.snapshot_asks.len(), 5);
         let bid_levels = event
-            .bids
+            .snapshot_bids
             .iter()
             .map(|level| (level.price.as_str(), level.quantity.as_str()))
             .collect::<Vec<_>>();
         let ask_levels = event
-            .asks
+            .snapshot_asks
             .iter()
             .map(|level| (level.price.as_str(), level.quantity.as_str()))
             .collect::<Vec<_>>();
@@ -902,13 +1058,22 @@ mod tests {
     }
 
     #[test]
-    fn pulse_signal_snapshot_payload_round_trips_dual_mode_fields() {
+    fn pulse_signal_snapshot_serializes_pricing_and_exit_fields() {
         let payload = AuditEventPayload::PulseSignalSnapshot(PulseSignalSnapshotAuditEvent {
             asset: "eth".to_owned(),
             symbol: "eth-above-4k".to_owned(),
             mode_candidate: PulseSignalMode::ElasticSnapback,
             admission_result: AuditGateResult::Rejected,
             rejection_reason: Some("realizable_ev_below_threshold".to_owned()),
+            provider_id: Some("deribit_primary".to_owned()),
+            claim_side: Some("no".to_owned()),
+            fair_prob_yes: Some(0.61),
+            entry_price: Some("0.35".to_owned()),
+            net_edge_bps: Some(118.0),
+            expected_net_pnl_usd: Some("4.72".to_owned()),
+            target_exit_price: Some("0.38".to_owned()),
+            timeout_exit_price: Some("0.31".to_owned()),
+            timeout_loss_estimate_usd: Some("21.68".to_owned()),
             pulse_score_bps: 188.4,
             claim_price_move_bps: 206.0,
             fair_claim_move_bps: 15.0,
@@ -931,6 +1096,18 @@ mod tests {
             max_interarrival_gap_ms_5s: 120,
             observation_quality_score: Some(0.86),
             admission_eligible: true,
+            anchor_age_ms: Some(45),
+            anchor_latency_delta_ms: Some(18),
+            anchor_expiry_mismatch_minutes: Some(240),
+            yes_quote_age_ms: Some(15),
+            no_quote_age_ms: Some(12),
+            cex_quote_age_ms: Some(8),
+            poly_transport_healthy: Some(true),
+            hedge_transport_healthy: Some(true),
+            poly_yes_sequence_ref: Some(101),
+            poly_no_sequence_ref: Some(102),
+            cex_sequence_ref: Some(77),
+            anchor_sequence_ref: Some(1_710_000_123),
         });
 
         let json = serde_json::to_string(&payload).expect("serialize");
@@ -947,6 +1124,13 @@ mod tests {
             event.rejection_reason.as_deref(),
             Some("realizable_ev_below_threshold")
         );
+        assert_eq!(event.fair_prob_yes, Some(0.61));
+        assert_eq!(event.entry_price.as_deref(), Some("0.35"));
+        assert_eq!(event.net_edge_bps, Some(118.0));
+        assert_eq!(event.expected_net_pnl_usd.as_deref(), Some("4.72"));
+        assert_eq!(event.target_exit_price.as_deref(), Some("0.38"));
+        assert_eq!(event.timeout_exit_price.as_deref(), Some("0.31"));
+        assert_eq!(event.timeout_loss_estimate_usd.as_deref(), Some("21.68"));
         assert_eq!(event.reachability_cap_bps, 130.0);
         assert!(!event.in_gray_zone);
         assert!(event.reachable);
@@ -957,6 +1141,55 @@ mod tests {
         assert_eq!(event.post_sweep_update_count_5s, 7);
         assert_eq!(event.max_interarrival_gap_ms_5s, 120);
         assert_eq!(event.observation_quality_score, Some(0.86));
+        assert_eq!(event.anchor_latency_delta_ms, Some(18));
+        assert_eq!(event.poly_yes_sequence_ref, Some(101));
+        assert_eq!(event.poly_no_sequence_ref, Some(102));
+        assert_eq!(event.cex_sequence_ref, Some(77));
+        assert_eq!(event.anchor_sequence_ref, Some(1_710_000_123));
         assert!(event.admission_eligible);
+    }
+
+    #[test]
+    fn pulse_execution_context_serializes_static_runtime_constraints() {
+        let context = PulseExecutionContext {
+            session_id: "session-1".to_owned(),
+            env: "multi-market-active".to_owned(),
+            mode: "live_mock".to_owned(),
+            enabled_assets: vec!["btc".to_owned(), "eth".to_owned()],
+            market_symbols: vec!["btc-above-100k".to_owned(), "eth-above-4k".to_owned()],
+            routes: vec![
+                PulseExecutionRouteContext {
+                    asset: "btc".to_owned(),
+                    anchor_provider: "deribit_primary".to_owned(),
+                    hedge_venue: "binance_usdm_perp".to_owned(),
+                },
+                PulseExecutionRouteContext {
+                    asset: "eth".to_owned(),
+                    anchor_provider: "deribit_primary".to_owned(),
+                    hedge_venue: "binance_usdm_perp".to_owned(),
+                },
+            ],
+            poly_fee_bps: 100,
+            cex_taker_fee_bps: 5,
+            cex_slippage_bps: 2,
+            maker_proxy_version: "book_proxy_v1".to_owned(),
+            max_holding_secs: 900,
+            opening_request_notional_usd: "250".to_owned(),
+            min_opening_notional_usd: "50".to_owned(),
+            min_expected_net_pnl_usd: "0.5".to_owned(),
+            require_nonzero_hedge: true,
+            min_open_fill_ratio: Some("0.05".to_owned()),
+        };
+
+        let json = serde_json::to_string(&context).expect("serialize execution context");
+        let decoded: PulseExecutionContext =
+            serde_json::from_str(&json).expect("deserialize execution context");
+
+        assert_eq!(decoded.mode, "live_mock");
+        assert_eq!(decoded.routes.len(), 2);
+        assert_eq!(decoded.routes[0].anchor_provider, "deribit_primary");
+        assert_eq!(decoded.hedge_venue_for_asset("eth"), Some("binance_usdm_perp"));
+        assert_eq!(decoded.min_open_fill_ratio.as_deref(), Some("0.05"));
+        assert!(decoded.require_nonzero_hedge);
     }
 }
