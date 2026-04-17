@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, Instant, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
+use zstd::stream::write::Encoder as ZstdEncoder;
 
 use polyalpha_audit::{
     AuditAnomalyEvent, AuditCheckpoint, AuditCounterSnapshot, AuditEventKind, AuditEventPayload,
@@ -74,6 +75,9 @@ struct PulseInspectView {
 const PULSE_RUNTIME_AUDIT_BUFFER_CAPACITY: usize = 4_096;
 const PULSE_MARKET_TAPE_BUFFER_CAPACITY: usize = 8_192;
 const PULSE_TAPE_RECORDER_FLUSH_THRESHOLD_BYTES: u64 = 64 * 1_024;
+const PULSE_TAPE_ZSTD_LEVEL: i32 = 3;
+const PULSE_BINANCE_RECORDER_TOP_LEVELS: usize = 5;
+const PULSE_POLY_SNAPSHOT_INTERVAL_MS: u64 = 60_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum PulseTapeStream {
@@ -92,14 +96,14 @@ impl PulseTapeStream {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct PulseTapeSegmentState {
     partition: String,
     segment_index: u64,
     bytes_written: u64,
     pending_flush_bytes: u64,
     segment_started_at_ms: u64,
-    writer: Option<BufWriter<File>>,
+    writer: Option<ZstdEncoder<'static, File>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -115,14 +119,34 @@ struct PulseTapeRecord {
     ts_exchange_ms: u64,
     ts_recv_ms: u64,
     sequence: Option<u64>,
+    record_kind: Option<String>,
     payload: Value,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PulsePolyBookKey {
+    symbol: String,
+    instrument: InstrumentKind,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PulsePolyBookState {
+    bids: BTreeMap<Decimal, Decimal>,
+    asks: BTreeMap<Decimal, Decimal>,
+    last_trade_price: Option<Decimal>,
+    last_snapshot_ts_ms: u64,
+    last_sequence: u64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct CompactBookLevel(String, String);
 
 struct PulseTapeRecorder {
     root_dir: PathBuf,
     rotate_bytes: u64,
     rotate_secs: u64,
     streams: HashMap<PulseTapeStream, PulseTapeSegmentState>,
+    poly_books: HashMap<PulsePolyBookKey, PulsePolyBookState>,
 }
 
 impl PulseTapeRecorder {
@@ -134,6 +158,7 @@ impl PulseTapeRecorder {
             rotate_bytes: rotate_bytes.max(1_024),
             rotate_secs: rotate_secs.max(60),
             streams: HashMap::new(),
+            poly_books: HashMap::new(),
         })
     }
 
@@ -147,13 +172,22 @@ impl PulseTapeRecorder {
         registry: Option<&SymbolRegistry>,
         event: &MarketDataEvent,
     ) -> Result<usize> {
-        let records = pulse_tape_records_from_market_event(registry, event);
-        let mut written = 0usize;
-        for (stream, record) in records {
-            self.write_record(stream, record.ts_recv_ms, &record)?;
-            written = written.saturating_add(1);
+        match event {
+            MarketDataEvent::OrderBookUpdate { snapshot }
+                if snapshot.exchange == Exchange::Polymarket =>
+            {
+                self.write_poly_snapshot(registry, snapshot)
+            }
+            _ => {
+                let records = pulse_tape_records_from_market_event(registry, event);
+                let mut written = 0usize;
+                for (stream, record) in records {
+                    self.write_record(stream, record.ts_recv_ms, &record)?;
+                    written = written.saturating_add(1);
+                }
+                Ok(written)
+            }
         }
-        Ok(written)
     }
 
     fn write_deribit_ticker(&mut self, ticker: &DeribitTickerMessage) -> Result<()> {
@@ -174,6 +208,7 @@ impl PulseTapeRecorder {
             ts_exchange_ms: ticker.timestamp_ms,
             ts_recv_ms: ticker.received_at_ms,
             sequence: None,
+            record_kind: None,
             payload: pulse_deribit_ticker_payload(ticker),
         };
         self.write_record(
@@ -181,6 +216,79 @@ impl PulseTapeRecorder {
             record.ts_recv_ms,
             &record,
         )
+    }
+
+    fn write_poly_snapshot(
+        &mut self,
+        registry: Option<&SymbolRegistry>,
+        snapshot: &OrderBookSnapshot,
+    ) -> Result<usize> {
+        let Some(asset) = pulse_tape_asset_from_market_symbol(registry, &snapshot.symbol.0) else {
+            return Ok(0);
+        };
+        let key = PulsePolyBookKey {
+            symbol: snapshot.symbol.0.clone(),
+            instrument: snapshot.instrument,
+        };
+        let current_state = PulsePolyBookState::from_snapshot(snapshot);
+        let previous_state = self.poly_books.get(&key).cloned().unwrap_or_default();
+        let should_snapshot = previous_state.last_snapshot_ts_ms == 0
+            || snapshot
+                .received_at_ms
+                .saturating_sub(previous_state.last_snapshot_ts_ms)
+                >= PULSE_POLY_SNAPSHOT_INTERVAL_MS
+            || snapshot.sequence <= previous_state.last_sequence;
+
+        let (record_kind, bids, asks) = if should_snapshot {
+            (
+                "snapshot",
+                compact_levels_from_map(&current_state.bids, true),
+                compact_levels_from_map(&current_state.asks, false),
+            )
+        } else {
+            (
+                "delta",
+                diff_levels(&previous_state.bids, &current_state.bids, true),
+                diff_levels(&previous_state.asks, &current_state.asks, false),
+            )
+        };
+        let trade_price_changed = previous_state.last_trade_price != current_state.last_trade_price;
+        if !should_snapshot && bids.is_empty() && asks.is_empty() && !trade_price_changed {
+            let mut updated_state = current_state;
+            updated_state.last_snapshot_ts_ms = previous_state.last_snapshot_ts_ms;
+            self.poly_books.insert(key, updated_state);
+            return Ok(0);
+        }
+
+        let record = PulseTapeRecord {
+            stream: PulseTapeStream::PolyBook.file_prefix().to_owned(),
+            asset: asset.as_str().to_owned(),
+            venue: "Polymarket".to_owned(),
+            symbol: snapshot.symbol.0.clone(),
+            market_symbol: Some(snapshot.symbol.0.clone()),
+            venue_symbol: None,
+            instrument: pulse_market_tape_instrument_label(snapshot.instrument).to_owned(),
+            token_side: pulse_market_tape_token_side(snapshot.instrument),
+            ts_exchange_ms: snapshot.exchange_timestamp_ms,
+            ts_recv_ms: snapshot.received_at_ms,
+            sequence: Some(snapshot.sequence),
+            record_kind: Some(record_kind.to_owned()),
+            payload: serde_json::json!({
+                "bids": bids,
+                "asks": asks,
+                "last_trade_price": current_state.last_trade_price.map(pulse_decimal_to_string),
+            }),
+        };
+        self.write_record(PulseTapeStream::PolyBook, record.ts_recv_ms, &record)?;
+
+        let mut updated_state = current_state;
+        updated_state.last_snapshot_ts_ms = if should_snapshot {
+            snapshot.received_at_ms
+        } else {
+            previous_state.last_snapshot_ts_ms
+        };
+        self.poly_books.insert(key, updated_state);
+        Ok(1)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -249,24 +357,52 @@ impl PulseTapeRecorder {
             writer
                 .flush()
                 .context("flush recorder segment before rotate")?;
+            writer
+                .finish()
+                .context("finish compressed recorder segment")?;
         }
 
         fs::create_dir_all(&day_dir)
             .with_context(|| format!("create recorder partition `{}`", day_dir.display()))?;
         let segment_index = pulse_tape_next_segment_index(&day_dir, prefix)?;
-        let path = day_dir.join(format!("{prefix}-{segment_index:06}.jsonl"));
+        let path = day_dir.join(format!("{prefix}-{segment_index:06}.jsonl.zst"));
         let file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&path)
             .with_context(|| format!("open recorder segment `{}`", path.display()))?;
+        let writer = ZstdEncoder::new(file, PULSE_TAPE_ZSTD_LEVEL)
+            .with_context(|| format!("create compressed recorder segment `{}`", path.display()))?;
         state.partition = partition;
         state.segment_index = segment_index;
         state.bytes_written = 0;
         state.pending_flush_bytes = 0;
         state.segment_started_at_ms = ts_recv_ms;
-        state.writer = Some(BufWriter::new(file));
+        state.writer = Some(writer);
         Ok(())
+    }
+}
+
+impl PulsePolyBookState {
+    fn from_snapshot(snapshot: &OrderBookSnapshot) -> Self {
+        Self {
+            bids: levels_to_map(&snapshot.bids),
+            asks: levels_to_map(&snapshot.asks),
+            last_trade_price: snapshot.last_trade_price.map(|price| price.0),
+            last_snapshot_ts_ms: 0,
+            last_sequence: snapshot.sequence,
+        }
+    }
+}
+
+impl Drop for PulseTapeRecorder {
+    fn drop(&mut self) {
+        for state in self.streams.values_mut() {
+            if let Some(mut writer) = state.writer.take() {
+                let _ = writer.flush();
+                let _ = writer.finish();
+            }
+        }
     }
 }
 
@@ -778,6 +914,84 @@ fn pulse_decimal_to_string(value: Decimal) -> String {
     value.normalize().to_string()
 }
 
+fn compact_levels_from_price_levels(
+    levels: &[PriceLevel],
+    max_levels: usize,
+) -> Vec<CompactBookLevel> {
+    levels
+        .iter()
+        .take(max_levels)
+        .filter_map(|level| match level.quantity {
+            VenueQuantity::PolyShares(shares) => Some(CompactBookLevel(
+                pulse_decimal_to_string(level.price.0),
+                pulse_decimal_to_string(shares.0),
+            )),
+            VenueQuantity::CexBaseQty(base_qty) => Some(CompactBookLevel(
+                pulse_decimal_to_string(level.price.0),
+                pulse_decimal_to_string(base_qty.0),
+            )),
+        })
+        .collect()
+}
+
+fn compact_levels_from_map(
+    levels: &BTreeMap<Decimal, Decimal>,
+    descending: bool,
+) -> Vec<CompactBookLevel> {
+    let mut rows = levels
+        .iter()
+        .map(|(price, quantity)| {
+            CompactBookLevel(
+                pulse_decimal_to_string(*price),
+                pulse_decimal_to_string(*quantity),
+            )
+        })
+        .collect::<Vec<_>>();
+    if descending {
+        rows.reverse();
+    }
+    rows
+}
+
+fn diff_levels(
+    previous: &BTreeMap<Decimal, Decimal>,
+    current: &BTreeMap<Decimal, Decimal>,
+    descending: bool,
+) -> Vec<CompactBookLevel> {
+    let mut keys = previous
+        .keys()
+        .chain(current.keys())
+        .copied()
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    if descending {
+        keys.reverse();
+    }
+    keys.into_iter()
+        .filter_map(|price| {
+            let previous_qty = previous.get(&price).copied().unwrap_or(Decimal::ZERO);
+            let current_qty = current.get(&price).copied().unwrap_or(Decimal::ZERO);
+            (previous_qty != current_qty).then(|| {
+                CompactBookLevel(
+                    pulse_decimal_to_string(price),
+                    pulse_decimal_to_string(current_qty),
+                )
+            })
+        })
+        .collect()
+}
+
+fn levels_to_map(levels: &[PriceLevel]) -> BTreeMap<Decimal, Decimal> {
+    levels
+        .iter()
+        .filter_map(|level| match level.quantity {
+            VenueQuantity::PolyShares(shares) => Some((level.price.0, shares.0)),
+            VenueQuantity::CexBaseQty(_) => None,
+        })
+        .collect()
+}
+
 fn pulse_tape_records_from_market_event(
     registry: Option<&SymbolRegistry>,
     event: &MarketDataEvent,
@@ -816,14 +1030,16 @@ fn pulse_tape_records_from_market_event(
                     ts_exchange_ms: *exchange_timestamp_ms,
                     ts_recv_ms: *received_at_ms,
                     sequence: Some(*sequence),
+                    record_kind: None,
                     payload: serde_json::json!({
-                        "exchange": exchange,
-                        "venue_symbol": venue_symbol,
-                        "bids": bids,
-                        "asks": asks,
-                        "exchange_timestamp_ms": exchange_timestamp_ms,
-                        "received_at_ms": received_at_ms,
-                        "sequence": sequence,
+                        "bids": compact_levels_from_price_levels(
+                            bids,
+                            PULSE_BINANCE_RECORDER_TOP_LEVELS,
+                        ),
+                        "asks": compact_levels_from_price_levels(
+                            asks,
+                            PULSE_BINANCE_RECORDER_TOP_LEVELS,
+                        ),
                     }),
                 },
             )]
@@ -837,27 +1053,6 @@ fn pulse_tape_record_from_snapshot(
     snapshot: &OrderBookSnapshot,
 ) -> Option<(PulseTapeStream, PulseTapeRecord)> {
     match snapshot.exchange {
-        Exchange::Polymarket => {
-            let asset = pulse_tape_asset_from_market_symbol(registry, &snapshot.symbol.0)?;
-            Some((
-                PulseTapeStream::PolyBook,
-                PulseTapeRecord {
-                    stream: PulseTapeStream::PolyBook.file_prefix().to_owned(),
-                    asset: asset.as_str().to_owned(),
-                    venue: "Polymarket".to_owned(),
-                    symbol: snapshot.symbol.0.clone(),
-                    market_symbol: Some(snapshot.symbol.0.clone()),
-                    venue_symbol: None,
-                    instrument: pulse_market_tape_instrument_label(snapshot.instrument).to_owned(),
-                    token_side: pulse_market_tape_token_side(snapshot.instrument),
-                    ts_exchange_ms: snapshot.exchange_timestamp_ms,
-                    ts_recv_ms: snapshot.received_at_ms,
-                    sequence: Some(snapshot.sequence),
-                    payload: serde_json::to_value(snapshot)
-                        .expect("orderbook snapshot should serialize"),
-                },
-            ))
-        }
         Exchange::Binance if snapshot.instrument == InstrumentKind::CexPerp => {
             let (asset, venue_symbol) = pulse_tape_binance_symbol_context(registry, snapshot)?;
             Some((
@@ -874,8 +1069,17 @@ fn pulse_tape_record_from_snapshot(
                     ts_exchange_ms: snapshot.exchange_timestamp_ms,
                     ts_recv_ms: snapshot.received_at_ms,
                     sequence: Some(snapshot.sequence),
-                    payload: serde_json::to_value(snapshot)
-                        .expect("orderbook snapshot should serialize"),
+                    record_kind: None,
+                    payload: serde_json::json!({
+                        "bids": compact_levels_from_price_levels(
+                            &snapshot.bids,
+                            PULSE_BINANCE_RECORDER_TOP_LEVELS,
+                        ),
+                        "asks": compact_levels_from_price_levels(
+                            &snapshot.asks,
+                            PULSE_BINANCE_RECORDER_TOP_LEVELS,
+                        ),
+                    }),
                 },
             ))
         }
@@ -920,16 +1124,12 @@ fn pulse_tape_infer_asset(raw: &str) -> Option<PulseAsset> {
 
 fn pulse_deribit_ticker_payload(ticker: &DeribitTickerMessage) -> Value {
     serde_json::json!({
-        "instrument_name": ticker.instrument_name,
-        "asset": ticker.asset.as_str(),
         "expiry_ts_ms": ticker.expiry_ts_ms,
         "strike": ticker.strike,
         "option_type": match ticker.option_type {
             polyalpha_data::DeribitOptionType::Call => "call",
             polyalpha_data::DeribitOptionType::Put => "put",
         },
-        "timestamp_ms": ticker.timestamp_ms,
-        "received_at_ms": ticker.received_at_ms,
         "mark_price": ticker.mark_price,
         "mark_iv": ticker.mark_iv,
         "best_bid_price": ticker.best_bid_price,
@@ -965,7 +1165,7 @@ fn pulse_tape_next_segment_index(day_dir: &Path, prefix: &str) -> Result<u64> {
         let Some(raw_index) = file_name
             .strip_prefix(prefix)
             .and_then(|name| name.strip_prefix('-'))
-            .and_then(|name| name.strip_suffix(".jsonl"))
+            .and_then(|name| name.strip_suffix(".jsonl.zst"))
         else {
             continue;
         };
@@ -2638,7 +2838,7 @@ mod tests {
                 )],
                 exchange_timestamp_ms: ts_ms,
                 received_at_ms: ts_ms,
-                sequence: 1,
+                sequence: ts_ms,
                 last_trade_price: None,
             },
         }
@@ -2671,6 +2871,45 @@ mod tests {
         }
     }
 
+    fn deep_cex_book_update(symbol: &str, ts_ms: u64, levels: usize) -> MarketDataEvent {
+        let bids = (0..levels)
+            .map(|index| {
+                price_level(
+                    Decimal::new(100_000 - index as i64, 0),
+                    VenueQuantity::CexBaseQty(CexBaseQty(Decimal::new(1_000 + index as i64, 3))),
+                )
+            })
+            .collect();
+        let asks = (0..levels)
+            .map(|index| {
+                price_level(
+                    Decimal::new(100_001 + index as i64, 0),
+                    VenueQuantity::CexBaseQty(CexBaseQty(Decimal::new(2_000 + index as i64, 3))),
+                )
+            })
+            .collect();
+        MarketDataEvent::CexVenueOrderBookUpdate {
+            exchange: Exchange::Binance,
+            venue_symbol: symbol.to_owned(),
+            bids,
+            asks,
+            exchange_timestamp_ms: ts_ms,
+            received_at_ms: ts_ms + 1,
+            sequence: ts_ms,
+        }
+    }
+
+    fn read_zstd_jsonl(path: &std::path::Path) -> Vec<serde_json::Value> {
+        let raw = fs::read(path).expect("read compressed segment");
+        let decoded =
+            zstd::stream::decode_all(std::io::Cursor::new(raw)).expect("decode zstd segment");
+        String::from_utf8(decoded)
+            .expect("utf8 jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("decode json line"))
+            .collect()
+    }
+
     #[test]
     fn parse_pulse_assets_rejects_unknown_asset() {
         let err = parse_pulse_assets("btc,doge").expect_err("unknown asset should fail");
@@ -2695,12 +2934,16 @@ mod tests {
             ))
             .expect("write poly book");
         recorder
-            .write_market_event(&cex_book_update(
-                "BTCUSDT",
-                Decimal::new(99_995, 0),
-                Decimal::new(100_005, 0),
-                1_744_848_060_000,
+            .write_market_event(&poly_book_update(
+                "btc-pulse-test",
+                InstrumentKind::PolyYes,
+                Decimal::new(45, 2),
+                Decimal::new(47, 2),
+                1_744_848_010_000,
             ))
+            .expect("write poly delta");
+        recorder
+            .write_market_event(&deep_cex_book_update("BTCUSDT", 1_744_848_060_000, 8))
             .expect("write cex book");
         recorder
             .write_deribit_ticker(&DeribitTickerMessage {
@@ -2723,54 +2966,64 @@ mod tests {
             })
             .expect("write deribit ticker");
         recorder.flush().expect("flush recorder");
+        drop(recorder);
 
         let partition_dir = root.join("20250417");
         assert!(partition_dir.exists(), "partition dir should exist");
 
-        let poly_path = partition_dir.join("poly_book-000001.jsonl");
-        let binance_path = partition_dir.join("binance_book-000001.jsonl");
-        let deribit_path = partition_dir.join("deribit_option_ticker-000001.jsonl");
+        let poly_path = partition_dir.join("poly_book-000001.jsonl.zst");
+        let binance_path = partition_dir.join("binance_book-000001.jsonl.zst");
+        let deribit_path = partition_dir.join("deribit_option_ticker-000001.jsonl.zst");
         assert!(poly_path.exists(), "poly segment should exist");
         assert!(binance_path.exists(), "binance segment should exist");
         assert!(deribit_path.exists(), "deribit segment should exist");
 
-        let poly_line = fs::read_to_string(&poly_path)
-            .expect("read poly jsonl")
-            .lines()
-            .next()
-            .expect("poly jsonl should contain a line")
-            .to_owned();
-        let poly_json: serde_json::Value =
-            serde_json::from_str(&poly_line).expect("decode poly json");
-        assert_eq!(poly_json["stream"], "poly_book");
-        assert_eq!(poly_json["asset"], "btc");
-        assert_eq!(poly_json["instrument"], "poly_yes");
-        assert_eq!(poly_json["symbol"], "btc-pulse-test");
+        let poly_rows = read_zstd_jsonl(&poly_path);
+        assert_eq!(poly_rows.len(), 2, "poly should emit snapshot then delta");
+        assert_eq!(poly_rows[0]["stream"], "poly_book");
+        assert_eq!(poly_rows[0]["asset"], "btc");
+        assert_eq!(poly_rows[0]["instrument"], "poly_yes");
+        assert_eq!(poly_rows[0]["symbol"], "btc-pulse-test");
+        assert_eq!(poly_rows[0]["record_kind"], "snapshot");
+        assert_eq!(poly_rows[1]["record_kind"], "delta");
+        assert_eq!(
+            poly_rows[1]["payload"]["asks"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            poly_rows[1]["payload"]["bids"].as_array().map(Vec::len),
+            Some(0)
+        );
 
-        let binance_line = fs::read_to_string(&binance_path)
-            .expect("read binance jsonl")
-            .lines()
-            .next()
-            .expect("binance jsonl should contain a line")
-            .to_owned();
-        let binance_json: serde_json::Value =
-            serde_json::from_str(&binance_line).expect("decode binance json");
-        assert_eq!(binance_json["stream"], "binance_book");
-        assert_eq!(binance_json["asset"], "btc");
-        assert_eq!(binance_json["instrument"], "cex_perp");
+        let binance_rows = read_zstd_jsonl(&binance_path);
+        assert_eq!(binance_rows.len(), 1);
+        assert_eq!(binance_rows[0]["stream"], "binance_book");
+        assert_eq!(binance_rows[0]["asset"], "btc");
+        assert_eq!(binance_rows[0]["instrument"], "cex_perp");
+        assert_eq!(
+            binance_rows[0]["payload"]["bids"].as_array().map(Vec::len),
+            Some(5)
+        );
+        assert_eq!(
+            binance_rows[0]["payload"]["asks"].as_array().map(Vec::len),
+            Some(5)
+        );
 
-        let deribit_line = fs::read_to_string(&deribit_path)
-            .expect("read deribit jsonl")
-            .lines()
-            .next()
-            .expect("deribit jsonl should contain a line")
-            .to_owned();
-        let deribit_json: serde_json::Value =
-            serde_json::from_str(&deribit_line).expect("decode deribit json");
-        assert_eq!(deribit_json["stream"], "deribit_option_ticker");
-        assert_eq!(deribit_json["asset"], "btc");
-        assert_eq!(deribit_json["instrument"], "BTC-26APR26-100000-C");
-        assert_eq!(deribit_json["sequence"], serde_json::Value::Null);
+        let deribit_rows = read_zstd_jsonl(&deribit_path);
+        assert_eq!(deribit_rows.len(), 1);
+        assert_eq!(deribit_rows[0]["stream"], "deribit_option_ticker");
+        assert_eq!(deribit_rows[0]["asset"], "btc");
+        assert_eq!(deribit_rows[0]["instrument"], "BTC-26APR26-100000-C");
+        assert_eq!(deribit_rows[0]["sequence"], serde_json::Value::Null);
+        let payload = deribit_rows[0]["payload"]
+            .as_object()
+            .expect("deribit payload object");
+        assert!(payload.contains_key("mark_iv"));
+        assert!(payload.contains_key("index_price"));
+        assert!(!payload.contains_key("asset"));
+        assert!(!payload.contains_key("instrument_name"));
+        assert!(!payload.contains_key("timestamp_ms"));
+        assert!(!payload.contains_key("received_at_ms"));
     }
 
     #[test]

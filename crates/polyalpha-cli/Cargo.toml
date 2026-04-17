@@ -34,3 +34,4 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["r
 tracing.workspace = true
 unicode-width = "0.2"
 uuid.workspace = true
+zstd = "0.13"
