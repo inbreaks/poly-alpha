@@ -525,6 +525,14 @@ impl PulseRuntime {
         self.audit_sink.records()
     }
 
+    pub fn drain_audit_records(&mut self) -> Vec<PulseAuditRecord> {
+        self.audit_sink.drain_records()
+    }
+
+    pub fn total_audit_record_count(&self) -> usize {
+        self.audit_sink.total_record_count()
+    }
+
     pub fn pulse_session_rows(&self) -> Vec<PulseSessionSummaryRow> {
         self.audit_sink.warehouse_rows()
     }

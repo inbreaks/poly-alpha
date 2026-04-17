@@ -27,47 +27,46 @@ pub struct PulseAuditSink {
     records: Vec<PulseAuditRecord>,
     session_summaries: HashMap<String, PulseSessionAuditSummary>,
     warehouse_rows: HashMap<String, PulseSessionSummaryRow>,
+    session_event_counts: HashMap<String, usize>,
+    total_record_count: usize,
 }
 
 impl PulseAuditSink {
     pub fn record_lifecycle(&mut self, event: PulseLifecycleAuditEvent) {
-        self.records.push(PulseAuditRecord {
-            timestamp_ms: current_time_ms(),
-            kind: AuditEventKind::PulseLifecycle,
-            payload: AuditEventPayload::PulseLifecycle(event),
-        });
+        self.increment_session_event_count(&event.session_id);
+        self.push_record(
+            AuditEventKind::PulseLifecycle,
+            AuditEventPayload::PulseLifecycle(event),
+        );
     }
 
     pub fn record_asset_health(&mut self, event: PulseAssetHealthAuditEvent) {
-        self.records.push(PulseAuditRecord {
-            timestamp_ms: current_time_ms(),
-            kind: AuditEventKind::PulseAssetHealth,
-            payload: AuditEventPayload::PulseAssetHealth(event),
-        });
+        self.push_record(
+            AuditEventKind::PulseAssetHealth,
+            AuditEventPayload::PulseAssetHealth(event),
+        );
     }
 
     pub fn record_book_tape(&mut self, event: PulseBookTapeAuditEvent) {
-        self.records.push(PulseAuditRecord {
-            timestamp_ms: current_time_ms(),
-            kind: AuditEventKind::PulseBookTape,
-            payload: AuditEventPayload::PulseBookTape(event),
-        });
+        self.increment_session_event_count(&event.session_id);
+        self.push_record(
+            AuditEventKind::PulseBookTape,
+            AuditEventPayload::PulseBookTape(event),
+        );
     }
 
     pub fn record_market_tape(&mut self, event: PulseMarketTapeAuditEvent) {
-        self.records.push(PulseAuditRecord {
-            timestamp_ms: current_time_ms(),
-            kind: AuditEventKind::PulseMarketTape,
-            payload: AuditEventPayload::PulseMarketTape(event),
-        });
+        self.push_record(
+            AuditEventKind::PulseMarketTape,
+            AuditEventPayload::PulseMarketTape(event),
+        );
     }
 
     pub fn record_signal_snapshot(&mut self, event: PulseSignalSnapshotAuditEvent) {
-        self.records.push(PulseAuditRecord {
-            timestamp_ms: current_time_ms(),
-            kind: AuditEventKind::PulseSignalSnapshot,
-            payload: AuditEventPayload::PulseSignalSnapshot(event),
-        });
+        self.push_record(
+            AuditEventKind::PulseSignalSnapshot,
+            AuditEventPayload::PulseSignalSnapshot(event),
+        );
     }
 
     pub fn finalize_session(
@@ -75,17 +74,17 @@ impl PulseAuditSink {
         summary: PulseSessionAuditSummary,
         warehouse_row: PulseSessionSummaryRow,
     ) {
+        self.increment_session_event_count(&summary.session_id);
         self.session_summaries
             .insert(summary.session_id.clone(), summary);
         self.warehouse_rows.insert(
             warehouse_row.pulse_session_id.clone(),
             warehouse_row.clone(),
         );
-        self.records.push(PulseAuditRecord {
-            timestamp_ms: current_time_ms(),
-            kind: AuditEventKind::PulseSessionSummary,
-            payload: AuditEventPayload::PulseSessionSummary(warehouse_row),
-        });
+        self.push_record(
+            AuditEventKind::PulseSessionSummary,
+            AuditEventPayload::PulseSessionSummary(warehouse_row),
+        );
     }
 
     pub fn session_summary(&self, session_id: &str) -> Option<&PulseSessionAuditSummary> {
@@ -97,27 +96,45 @@ impl PulseAuditSink {
     }
 
     pub fn audit_event_count_for_session(&self, session_id: &str) -> usize {
-        self.records
-            .iter()
-            .filter(|record| match &record.payload {
-                AuditEventPayload::PulseLifecycle(event) => event.session_id == session_id,
-                AuditEventPayload::PulseBookTape(event) => event.session_id == session_id,
-                AuditEventPayload::PulseSessionSummary(event) => {
-                    event.pulse_session_id == session_id
-                }
-                _ => false,
-            })
-            .count()
+        self.session_event_counts
+            .get(session_id)
+            .copied()
+            .unwrap_or_default()
     }
 
     pub fn records(&self) -> &[PulseAuditRecord] {
         &self.records
     }
 
+    pub fn drain_records(&mut self) -> Vec<PulseAuditRecord> {
+        std::mem::take(&mut self.records)
+    }
+
+    pub fn total_record_count(&self) -> usize {
+        self.total_record_count
+    }
+
     pub fn warehouse_rows(&self) -> Vec<PulseSessionSummaryRow> {
         let mut rows = self.warehouse_rows.values().cloned().collect::<Vec<_>>();
         rows.sort_by(|left, right| left.pulse_session_id.cmp(&right.pulse_session_id));
         rows
+    }
+
+    fn increment_session_event_count(&mut self, session_id: &str) {
+        let count = self
+            .session_event_counts
+            .entry(session_id.to_owned())
+            .or_default();
+        *count = count.saturating_add(1);
+    }
+
+    fn push_record(&mut self, kind: AuditEventKind, payload: AuditEventPayload) {
+        self.total_record_count = self.total_record_count.saturating_add(1);
+        self.records.push(PulseAuditRecord {
+            timestamp_ms: current_time_ms(),
+            kind,
+            payload,
+        });
     }
 }
 

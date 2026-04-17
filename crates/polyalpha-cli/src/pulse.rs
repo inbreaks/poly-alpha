@@ -71,7 +71,6 @@ struct PulseAuditRuntime {
     writer: AuditWriter,
     warehouse: AuditWarehouse,
     summary: AuditSessionSummary,
-    last_record_index: usize,
     tick_index: u64,
     market_events: u64,
     snapshot_interval_ms: u64,
@@ -129,7 +128,6 @@ impl PulseAuditRuntime {
             writer,
             warehouse,
             summary,
-            last_record_index: 0,
             tick_index: 0,
             market_events: 0,
             snapshot_interval_ms: settings.audit.snapshot_interval_secs.max(1) * 1_000,
@@ -148,7 +146,7 @@ impl PulseAuditRuntime {
 
     fn sync_runtime_state(
         &mut self,
-        runtime: &polyalpha_pulse::runtime::PulseRuntime,
+        runtime: &mut polyalpha_pulse::runtime::PulseRuntime,
         monitor_state: &MonitorState,
         now_ms: u64,
     ) -> Result<()> {
@@ -187,7 +185,7 @@ impl PulseAuditRuntime {
 
     fn finalize(
         &mut self,
-        runtime: &polyalpha_pulse::runtime::PulseRuntime,
+        runtime: &mut polyalpha_pulse::runtime::PulseRuntime,
         monitor_state: &MonitorState,
         now_ms: u64,
         status: AuditSessionStatus,
@@ -216,12 +214,11 @@ impl PulseAuditRuntime {
 
     fn append_new_pulse_records(
         &mut self,
-        runtime: &polyalpha_pulse::runtime::PulseRuntime,
+        runtime: &mut polyalpha_pulse::runtime::PulseRuntime,
     ) -> Result<()> {
-        for record in runtime.audit_records().iter().skip(self.last_record_index) {
-            self.writer.append_event(pulse_audit_event(record))?;
+        for record in runtime.drain_audit_records() {
+            self.writer.append_event(pulse_audit_event(&record))?;
         }
-        self.last_record_index = runtime.audit_records().len();
         Ok(())
     }
 
@@ -261,7 +258,7 @@ impl PulseAuditRuntime {
             signals_seen: signal_stats.seen,
             signals_rejected: signal_stats.rejected,
             evaluation_attempts: evaluation_stats.attempts,
-            state_changes: runtime.audit_records().len() as u64,
+            state_changes: runtime.total_audit_record_count() as u64,
             trades_closed: closed_session_count,
             ..AuditCounterSnapshot::default()
         };
@@ -545,7 +542,7 @@ async fn run_pulse(
                         started_at.elapsed().as_secs(),
                     );
                     if let Some(audit) = audit_runtime.as_mut() {
-                        if let Err(err) = audit.sync_runtime_state(&runtime, &state, now_ms) {
+                        if let Err(err) = audit.sync_runtime_state(&mut runtime, &state, now_ms) {
                             break Err(err.context("sync pulse audit runtime"));
                         }
                     }
@@ -579,7 +576,7 @@ async fn run_pulse(
     if let Some(audit) = audit_runtime.as_mut() {
         audit
             .finalize(
-                &runtime,
+                &mut runtime,
                 &last_monitor_state,
                 last_monitor_state.timestamp_ms,
                 if runtime_result.is_ok() {
@@ -2091,7 +2088,7 @@ mod tests {
         monitor_state.mode = TradingMode::Paper;
         audit
             .finalize(
-                &runtime,
+                &mut runtime,
                 &monitor_state,
                 now_ms + 100,
                 AuditSessionStatus::Completed,
@@ -2113,6 +2110,101 @@ mod tests {
             serde_json::from_str(&raw).expect("decode execution context");
         assert_eq!(context.session_id, audit.summary.session_id);
         assert_eq!(context.market_symbols, vec!["btc-pulse-test".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn pulse_audit_runtime_sync_drains_runtime_records_after_persisting() {
+        let mut settings: Settings =
+            serde_json::from_value(pulse_settings_json()).expect("deserialize pulse settings");
+        let root =
+            std::env::temp_dir().join(format!("polyalpha-pulse-drain-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("create temp root");
+        settings.general.data_dir = root.to_string_lossy().into_owned();
+        settings.markets = vec![sample_pulse_market()];
+
+        let now_ms = 1_717_171_717_000;
+        let anchor_provider = Arc::new(StaticAnchorProvider {
+            snapshot: AnchorSnapshot {
+                asset: PulseAsset::Btc,
+                provider_id: "deribit_primary".to_owned(),
+                ts_ms: now_ms,
+                index_price: Decimal::new(100_000, 0),
+                expiry_ts_ms: settings.markets[0].settlement_timestamp * 1_000,
+                atm_iv: 55.0,
+                local_surface_points: vec![LocalSurfacePoint {
+                    instrument_name: "BTC-26APR26-100000-C".to_owned(),
+                    strike: Decimal::new(100_000, 0),
+                    expiry_ts_ms: settings.markets[0].settlement_timestamp * 1_000,
+                    bid_iv: Some(54.5),
+                    ask_iv: Some(55.5),
+                    mark_iv: 55.0,
+                    delta: Some(0.5),
+                    gamma: Some(0.0002),
+                    best_bid: Some(Decimal::new(12, 2)),
+                    best_ask: Some(Decimal::new(13, 2)),
+                }],
+                quality: AnchorQualityMetrics {
+                    anchor_age_ms: 10,
+                    max_quote_spread_bps: None,
+                    has_strike_coverage: true,
+                    has_liquidity: true,
+                    expiry_mismatch_minutes: 0,
+                    greeks_complete: true,
+                },
+            },
+        });
+        let mut runtime = PulseRuntimeBuilder::new(settings.clone())
+            .with_anchor_provider(anchor_provider)
+            .with_markets(settings.markets.clone())
+            .with_execution_mode(PulseExecutionMode::Paper)
+            .build()
+            .await
+            .expect("build pulse runtime");
+        let mut audit =
+            PulseAuditRuntime::start(&settings, "test", PulseExecutionMode::Paper, now_ms)
+                .expect("start audit runtime")
+                .expect("audit runtime enabled");
+
+        runtime.observe_market_event(poly_book_update(
+            "btc-pulse-test",
+            InstrumentKind::PolyYes,
+            Decimal::new(45, 2),
+            Decimal::new(46, 2),
+            now_ms,
+        ));
+        runtime.observe_market_event(poly_book_update(
+            "btc-pulse-test",
+            InstrumentKind::PolyNo,
+            Decimal::new(54, 2),
+            Decimal::new(55, 2),
+            now_ms,
+        ));
+        runtime.observe_market_event(cex_book_update(
+            "btc-pulse-test",
+            Decimal::new(99_995, 0),
+            Decimal::new(100_005, 0),
+            now_ms,
+        ));
+        runtime
+            .run_tick(now_ms + 100)
+            .await
+            .expect("run pulse tick");
+
+        let expected_state_changes = runtime.audit_records().len() as u64;
+        assert!(expected_state_changes > 0, "runtime should hold fresh audit records");
+
+        let mut monitor_state = MonitorState::default();
+        monitor_state.timestamp_ms = now_ms + 100;
+        monitor_state.mode = TradingMode::Paper;
+        audit
+            .sync_runtime_state(&mut runtime, &monitor_state, now_ms + 100)
+            .expect("sync audit runtime");
+
+        assert!(
+            runtime.audit_records().is_empty(),
+            "persisted audit records should be drained from runtime memory"
+        );
+        assert_eq!(audit.summary.counters.state_changes, expected_state_changes);
     }
 
     #[test]
@@ -2249,7 +2341,7 @@ mod tests {
             PulseAuditRuntime::start(&settings, "test", PulseExecutionMode::Paper, now_ms)
                 .expect("start audit runtime")
                 .expect("audit runtime enabled");
-        let runtime = PulseRuntimeBuilder::new(settings.clone())
+        let mut runtime = PulseRuntimeBuilder::new(settings.clone())
             .with_execution_mode(PulseExecutionMode::Paper)
             .build()
             .await
@@ -2260,7 +2352,7 @@ mod tests {
 
         audit
             .finalize(
-                &runtime,
+                &mut runtime,
                 &monitor_state,
                 now_ms + 1_000,
                 AuditSessionStatus::Completed,
@@ -2287,7 +2379,7 @@ mod tests {
             PulseAuditRuntime::start(&settings, "test", PulseExecutionMode::Paper, now_ms)
                 .expect("start audit runtime")
                 .expect("audit runtime enabled");
-        let runtime = PulseRuntimeBuilder::new(settings.clone())
+        let mut runtime = PulseRuntimeBuilder::new(settings.clone())
             .with_execution_mode(PulseExecutionMode::Paper)
             .build()
             .await
@@ -2300,7 +2392,7 @@ mod tests {
 
         audit
             .finalize(
-                &runtime,
+                &mut runtime,
                 &monitor_state,
                 now_ms + 1_000,
                 AuditSessionStatus::Completed,
