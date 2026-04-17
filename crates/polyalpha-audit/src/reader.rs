@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -42,38 +43,54 @@ impl AuditReader {
     }
 
     pub fn load_events(root: impl AsRef<Path>, session_id: &str) -> Result<Vec<AuditEvent>> {
-        let paths = AuditPaths::new(root, session_id);
-        if !paths.raw_dir().exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut entries = fs::read_dir(paths.raw_dir())
-            .with_context(|| format!("读取审计原始目录 `{}` 失败", paths.raw_dir().display()))?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with("events-"))
-            .collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.file_name());
-
         let mut out = Vec::new();
-        for entry in entries {
-            let raw = fs::read_to_string(entry.path())
-                .with_context(|| format!("读取审计事件文件 `{}` 失败", entry.path().display()))?;
-            for (idx, line) in raw.lines().enumerate() {
+        Self::visit_events_after_seq(root, session_id, 0, |event| {
+            out.push(event.clone());
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    pub fn visit_events_after_seq<F>(
+        root: impl AsRef<Path>,
+        session_id: &str,
+        after_seq: u64,
+        mut visitor: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&AuditEvent) -> Result<()>,
+    {
+        let paths = AuditPaths::new(root, session_id);
+        for entry in raw_event_entries(&paths)? {
+            let file = fs::File::open(entry.path())
+                .with_context(|| format!("打开审计事件文件 `{}` 失败", entry.path().display()))?;
+            let reader = BufReader::new(file);
+            for (idx, line) in reader.lines().enumerate() {
+                let line = line.with_context(|| {
+                    format!(
+                        "读取审计事件 `{}` 第 {} 行失败",
+                        entry.path().display(),
+                        idx + 1
+                    )
+                })?;
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
-                let event = serde_json::from_str(trimmed).with_context(|| {
+                let event: AuditEvent = serde_json::from_str(trimmed).with_context(|| {
                     format!(
                         "解析审计事件 `{}` 第 {} 行失败",
                         entry.path().display(),
                         idx + 1
                     )
                 })?;
-                out.push(event);
+                if event.seq <= after_seq {
+                    continue;
+                }
+                visitor(&event)?;
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     pub fn latest_session_summary(
@@ -123,5 +140,96 @@ impl AuditReader {
         summaries.sort_by_key(|summary| Reverse(summary.updated_at_ms));
         summaries.truncate(limit);
         Ok(summaries)
+    }
+}
+
+fn raw_event_entries(paths: &AuditPaths) -> Result<Vec<fs::DirEntry>> {
+    if !paths.raw_dir().exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = fs::read_dir(paths.raw_dir())
+        .with_context(|| format!("读取审计原始目录 `{}` 失败", paths.raw_dir().display()))?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("events-"))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use polyalpha_core::TradingMode;
+    use uuid::Uuid;
+
+    use super::AuditReader;
+    use crate::{
+        AuditAnomalyEvent, AuditEventKind, AuditEventPayload, AuditSessionManifest,
+        AuditSeverity, AuditWriter, NewAuditEvent,
+    };
+
+    #[test]
+    fn visit_events_after_seq_streams_only_new_rows_in_order() {
+        let root = temp_root("polyalpha-audit-reader");
+        let session_id = "reader-session";
+        let manifest = AuditSessionManifest {
+            version: 1,
+            session_id: session_id.to_owned(),
+            env: "test".to_owned(),
+            mode: TradingMode::Paper,
+            started_at_ms: 1_000,
+            market_count: 1,
+            markets: vec!["test-market".to_owned()],
+        };
+        let mut writer = AuditWriter::create(&root, manifest, 1_024 * 1_024)
+            .expect("create writer");
+        for idx in 1..=3_u64 {
+            writer
+                .append_event(NewAuditEvent {
+                    timestamp_ms: 1_000 + idx,
+                    kind: AuditEventKind::Anomaly,
+                    symbol: Some("test-market".to_owned()),
+                    signal_id: None,
+                    correlation_id: None,
+                    gate: None,
+                    result: None,
+                    reason: Some(format!("reason-{idx}")),
+                    summary: format!("event-{idx}"),
+                    payload: AuditEventPayload::Anomaly(AuditAnomalyEvent {
+                        severity: AuditSeverity::Warning,
+                        code: format!("code-{idx}"),
+                        message: format!("event-{idx}"),
+                        symbol: Some("test-market".to_owned()),
+                        signal_id: None,
+                        correlation_id: None,
+                    }),
+                })
+                .expect("append event");
+        }
+        writer.flush_raw().expect("flush raw");
+
+        let mut summaries = Vec::new();
+        AuditReader::visit_events_after_seq(&root, session_id, 1, |event| {
+            summaries.push((event.seq, event.summary.clone()));
+            Ok(())
+        })
+        .expect("visit events after seq");
+
+        assert_eq!(
+            summaries,
+            vec![
+                (2, "event-2".to_owned()),
+                (3, "event-3".to_owned()),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn temp_root(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()))
     }
 }

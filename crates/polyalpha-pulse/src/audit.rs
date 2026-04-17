@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use polyalpha_audit::{
@@ -22,16 +23,56 @@ pub struct PulseAuditRecord {
     pub payload: AuditEventPayload,
 }
 
-#[derive(Clone, Debug, Default)]
+pub type PulseAuditEmitter = Arc<dyn Fn(PulseAuditRecord) + Send + Sync>;
+
+#[derive(Clone)]
 pub struct PulseAuditSink {
     records: Vec<PulseAuditRecord>,
     session_summaries: HashMap<String, PulseSessionAuditSummary>,
     warehouse_rows: HashMap<String, PulseSessionSummaryRow>,
     session_event_counts: HashMap<String, usize>,
     total_record_count: usize,
+    emitter: Option<PulseAuditEmitter>,
+    retain_records: bool,
+}
+
+impl std::fmt::Debug for PulseAuditSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PulseAuditSink")
+            .field("records", &self.records)
+            .field("session_summaries", &self.session_summaries)
+            .field("warehouse_rows", &self.warehouse_rows)
+            .field("session_event_counts", &self.session_event_counts)
+            .field("total_record_count", &self.total_record_count)
+            .field("has_emitter", &self.emitter.is_some())
+            .field("retain_records", &self.retain_records)
+            .finish()
+    }
+}
+
+impl Default for PulseAuditSink {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            session_summaries: HashMap::new(),
+            warehouse_rows: HashMap::new(),
+            session_event_counts: HashMap::new(),
+            total_record_count: 0,
+            emitter: None,
+            retain_records: true,
+        }
+    }
 }
 
 impl PulseAuditSink {
+    pub fn with_emitter(emitter: PulseAuditEmitter) -> Self {
+        Self {
+            emitter: Some(emitter),
+            retain_records: false,
+            ..Self::default()
+        }
+    }
+
     pub fn record_lifecycle(&mut self, event: PulseLifecycleAuditEvent) {
         self.increment_session_event_count(&event.session_id);
         self.push_record(
@@ -106,10 +147,6 @@ impl PulseAuditSink {
         &self.records
     }
 
-    pub fn drain_records(&mut self) -> Vec<PulseAuditRecord> {
-        std::mem::take(&mut self.records)
-    }
-
     pub fn total_record_count(&self) -> usize {
         self.total_record_count
     }
@@ -130,11 +167,17 @@ impl PulseAuditSink {
 
     fn push_record(&mut self, kind: AuditEventKind, payload: AuditEventPayload) {
         self.total_record_count = self.total_record_count.saturating_add(1);
-        self.records.push(PulseAuditRecord {
+        let record = PulseAuditRecord {
             timestamp_ms: current_time_ms(),
             kind,
             payload,
-        });
+        };
+        if self.retain_records {
+            self.records.push(record.clone());
+        }
+        if let Some(emitter) = &self.emitter {
+            emitter(record);
+        }
     }
 }
 
@@ -375,5 +418,72 @@ mod tests {
             sink.records()[1].payload,
             AuditEventPayload::PulseSignalSnapshot(_)
         ));
+    }
+
+    #[test]
+    fn audit_sink_with_emitter_streams_records_without_retaining_memory() {
+        let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = emitted.clone();
+        let emitter: PulseAuditEmitter = Arc::new(move |record| {
+            captured.lock().expect("lock emitted").push(record);
+        });
+        let mut sink = PulseAuditSink::with_emitter(emitter);
+
+        sink.record_signal_snapshot(PulseSignalSnapshotAuditEvent {
+            asset: "btc".to_owned(),
+            symbol: "btc-above-100k".to_owned(),
+            mode_candidate: PulseSignalMode::ElasticSnapback,
+            admission_result: AuditGateResult::Passed,
+            rejection_reason: None,
+            provider_id: Some("deribit_primary".to_owned()),
+            claim_side: Some("no".to_owned()),
+            fair_prob_yes: Some(0.61),
+            entry_price: Some("0.35".to_owned()),
+            net_edge_bps: Some(118.0),
+            expected_net_pnl_usd: Some("4.72".to_owned()),
+            target_exit_price: Some("0.38".to_owned()),
+            timeout_exit_price: Some("0.31".to_owned()),
+            timeout_loss_estimate_usd: Some("21.68".to_owned()),
+            pulse_score_bps: 162.0,
+            claim_price_move_bps: 180.0,
+            fair_claim_move_bps: 12.0,
+            cex_mid_move_bps: 8.0,
+            swept_notional_usd: "500".to_owned(),
+            swept_levels_count: 4,
+            post_pulse_depth_gap_bps: 210.0,
+            min_profitable_target_distance_bps: 540.0,
+            reachability_cap_bps: 470.0,
+            in_gray_zone: false,
+            reachable: true,
+            target_distance_to_mid_bps: Some(32.0),
+            predicted_hit_rate: Some(0.82),
+            maker_net_pnl_usd: Some("4.72".to_owned()),
+            timeout_net_pnl_usd: Some("-2.15".to_owned()),
+            realizable_ev_usd: Some("2.87".to_owned()),
+            used_exchange_ts: true,
+            native_sequence_present: true,
+            post_sweep_update_count_5s: 3,
+            max_interarrival_gap_ms_5s: 240,
+            observation_quality_score: Some(0.91),
+            admission_eligible: true,
+            anchor_age_ms: Some(45),
+            anchor_latency_delta_ms: Some(18),
+            anchor_expiry_mismatch_minutes: Some(0),
+            yes_quote_age_ms: Some(15),
+            no_quote_age_ms: Some(12),
+            cex_quote_age_ms: Some(8),
+            poly_transport_healthy: Some(true),
+            hedge_transport_healthy: Some(true),
+            poly_yes_sequence_ref: Some(101),
+            poly_no_sequence_ref: Some(102),
+            cex_sequence_ref: Some(77),
+            anchor_sequence_ref: Some(1_710_000_123),
+        });
+
+        assert!(sink.records().is_empty());
+        assert_eq!(sink.total_record_count(), 1);
+        let emitted = emitted.lock().expect("lock emitted");
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].kind, AuditEventKind::PulseSignalSnapshot);
     }
 }

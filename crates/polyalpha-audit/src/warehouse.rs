@@ -24,7 +24,6 @@ impl AuditWarehouse {
     pub fn sync_session(&self, root: impl AsRef<Path>, session_id: &str) -> Result<()> {
         let root = root.as_ref();
         let summary = AuditReader::load_summary(root, session_id)?;
-        let events = AuditReader::load_events(root, session_id)?;
         let mut conn = self.connect()?;
         self.ensure_schema(&conn)?;
         let tx = conn.transaction().context("开启审计仓库同步事务失败")?;
@@ -48,10 +47,7 @@ impl AuditWarehouse {
             .appender("audit_events")
             .context("创建审计事件批量写入器失败")?;
 
-        for event in events
-            .into_iter()
-            .filter(|event| event.seq > existing_max_seq as u64)
-        {
+        AuditReader::visit_events_after_seq(root, session_id, existing_max_seq as u64, |event| {
             let payload_json =
                 serde_json::to_string(&event.payload).context("序列化审计事件负载失败")?;
             appender
@@ -71,7 +67,8 @@ impl AuditWarehouse {
                     payload_json,
                 ])
                 .with_context(|| format!("写入审计事件 seq={} 失败", event.seq))?;
-        }
+            Ok(())
+        })?;
         appender.flush().context("刷新审计事件批量写入器失败")?;
         drop(appender);
 
@@ -349,6 +346,8 @@ impl AuditWarehouse {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::fs::OpenOptions;
+    use std::io::Write;
     use std::path::{Path, PathBuf};
 
     use anyhow::{Context, Result};
@@ -358,8 +357,9 @@ mod tests {
 
     use super::AuditWarehouse;
     use crate::{
-        AuditAnomalyEvent, AuditEventKind, AuditEventPayload, AuditReader, AuditSessionManifest,
-        AuditSeverity, AuditWriter, NewAuditEvent, PulseSessionSummaryRow,
+        AuditAnomalyEvent, AuditEvent, AuditEventKind, AuditEventPayload, AuditPaths,
+        AuditReader, AuditSessionManifest, AuditSeverity, AuditWriter, NewAuditEvent,
+        PulseSessionSummaryRow,
     };
 
     #[test]
@@ -427,6 +427,52 @@ mod tests {
             )
             .expect("query opening outcome");
         assert_eq!(outcome, "effective_open");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn warehouse_sync_appends_only_new_events_on_incremental_resync() {
+        let root = temp_root("polyalpha-audit-incremental-sync");
+        let session_id = "incremental-session";
+
+        write_test_session(&root, session_id).expect("write first event");
+
+        let warehouse = AuditWarehouse::new(&root).expect("create warehouse");
+        warehouse
+            .sync_session(&root, session_id)
+            .expect("initial sync session");
+
+        append_test_event(
+            &root,
+            session_id,
+            1_717_171_717_002,
+            "test anomaly 2",
+            "test_reason_2",
+        )
+        .expect("append second event");
+        warehouse
+            .sync_session(&root, session_id)
+            .expect("incremental sync session");
+
+        let conn = Connection::open(warehouse.db_path()).expect("open warehouse db");
+        let inserted_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE session_id = ?",
+                duckdb::params![session_id],
+                |row| row.get(0),
+            )
+            .expect("query inserted events");
+        assert_eq!(inserted_events, 2);
+
+        let latest_summary: String = conn
+            .query_row(
+                "SELECT summary FROM audit_events WHERE session_id = ? ORDER BY seq DESC LIMIT 1",
+                duckdb::params![session_id],
+                |row| row.get(0),
+            )
+            .expect("query latest summary");
+        assert_eq!(latest_summary, "test anomaly 2");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -547,6 +593,53 @@ mod tests {
                 correlation_id: None,
             }),
         })?;
+        writer.flush_raw()?;
+        Ok(())
+    }
+
+    fn append_test_event(
+        root: &Path,
+        session_id: &str,
+        timestamp_ms: u64,
+        summary: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let existing = AuditReader::load_events(root, session_id)?;
+        let next_seq = existing.last().map(|event| event.seq + 1).unwrap_or(1);
+        let paths = AuditPaths::new(root, session_id);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(paths.segment_path(1))
+            .context("open raw event segment for append")?;
+        let event = AuditEvent {
+            session_id: session_id.to_owned(),
+            env: "test".to_owned(),
+            seq: next_seq,
+            timestamp_ms,
+            kind: AuditEventKind::Anomaly,
+            symbol: Some("test-market".to_owned()),
+            signal_id: None,
+            correlation_id: None,
+            gate: None,
+            result: None,
+            reason: Some(reason.to_owned()),
+            summary: summary.to_owned(),
+            payload: AuditEventPayload::Anomaly(AuditAnomalyEvent {
+                severity: AuditSeverity::Warning,
+                code: reason.to_owned(),
+                message: summary.to_owned(),
+                symbol: Some("test-market".to_owned()),
+                signal_id: None,
+                correlation_id: None,
+            }),
+        };
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&event).context("serialize appended audit event")?
+        )
+        .context("append raw event line")?;
         Ok(())
     }
 

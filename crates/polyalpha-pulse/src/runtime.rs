@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use polyalpha_audit::{
     AuditGateResult, PulseAssetHealthAuditEvent, PulseBookLevelAuditRow,
-    PulseBookSnapshotAudit, PulseBookTapeAuditEvent, PulseLifecycleAuditEvent,
-    PulseMarketTapeAuditEvent, PulseSessionSummaryRow, PulseSignalMode,
+    PulseBookSnapshotAudit, PulseLifecycleAuditEvent, PulseMarketTapeAuditEvent,
+    PulseSessionSummaryRow, PulseSignalMode,
     PulseSignalSnapshotAuditEvent,
 };
 use polyalpha_core::{
@@ -25,7 +25,7 @@ use polyalpha_core::Settings;
 
 use crate::anchor::provider::AnchorProvider;
 use crate::anchor::router::AnchorRouter;
-use crate::audit::{PulseAuditRecord, PulseAuditSink, PulseSessionAuditSummary};
+use crate::audit::{PulseAuditEmitter, PulseAuditRecord, PulseAuditSink, PulseSessionAuditSummary};
 use crate::detector::{PulseDetector, PulseDetectorConfig};
 use crate::hedge::GlobalHedgeAggregator;
 use crate::model::{AnchorSnapshot, GammaCapMode, PulseAsset, PulseMode, PulseSessionState};
@@ -83,6 +83,7 @@ pub struct PulseRuntimeBuilder {
     executor: Option<Arc<dyn OrderExecutor>>,
     markets: Option<Vec<MarketConfig>>,
     position_sync: Option<Arc<ActualPositionSync>>,
+    audit_emitter: Option<PulseAuditEmitter>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -287,6 +288,7 @@ impl PulseRuntimeBuilder {
             executor: None,
             markets: None,
             position_sync: None,
+            audit_emitter: None,
         }
     }
 
@@ -322,6 +324,11 @@ impl PulseRuntimeBuilder {
 
     pub fn with_position_sync(mut self, position_sync: Arc<ActualPositionSync>) -> Self {
         self.position_sync = Some(position_sync);
+        self
+    }
+
+    pub fn with_audit_emitter(mut self, audit_emitter: PulseAuditEmitter) -> Self {
+        self.audit_emitter = Some(audit_emitter);
         self
     }
 
@@ -433,6 +440,11 @@ impl PulseRuntimeBuilder {
         });
         let pricer = EventPricer::new(event_pricer_config(&self.settings));
 
+        let audit_sink = match self.audit_emitter.clone() {
+            Some(emitter) => PulseAuditSink::with_emitter(emitter),
+            None => PulseAuditSink::default(),
+        };
+
         Ok(PulseRuntime {
             settings: self.settings,
             execution_mode: self.execution_mode,
@@ -457,11 +469,11 @@ impl PulseRuntimeBuilder {
             actual_hedge_positions: HashMap::new(),
             asset_health: HashMap::new(),
             hedge_aggregator: GlobalHedgeAggregator::new(Decimal::new(1, 3), 100),
-            audit_sink: PulseAuditSink::default(),
             last_monitor_view: None,
             recorded_binance_orders: Vec::new(),
             stats: PulseRuntimeStats::default(),
             position_sync: self.position_sync,
+            audit_sink,
         })
     }
 }
@@ -523,10 +535,6 @@ impl PulseRuntime {
 
     pub fn audit_records(&self) -> &[PulseAuditRecord] {
         self.audit_sink.records()
-    }
-
-    pub fn drain_audit_records(&mut self) -> Vec<PulseAuditRecord> {
-        self.audit_sink.drain_records()
     }
 
     pub fn total_audit_record_count(&self) -> usize {
@@ -605,8 +613,7 @@ impl PulseRuntime {
     pub fn observe_market_event(&mut self, event: MarketDataEvent) {
         match event {
             MarketDataEvent::OrderBookUpdate { snapshot } => {
-                let snapshot_for_tape = snapshot.clone();
-                let symbol = snapshot.symbol.clone();
+                let snapshot_for_signal = snapshot.clone();
                 self.record_exchange_activity(snapshot.exchange, snapshot.received_at_ms);
                 let books = self
                     .observed_books
@@ -617,9 +624,7 @@ impl PulseRuntime {
                     polyalpha_core::InstrumentKind::PolyNo => books.no = Some(snapshot),
                     polyalpha_core::InstrumentKind::CexPerp => books.cex = Some(snapshot),
                 }
-                self.record_book_tape_for_snapshot(&symbol, &snapshot_for_tape);
-                self.record_market_tape_for_snapshot(&symbol, &snapshot_for_tape);
-                self.record_signal_sample_for_snapshot(&snapshot_for_tape);
+                self.record_signal_sample_for_snapshot(&snapshot_for_signal);
             }
             MarketDataEvent::CexVenueOrderBookUpdate {
                 exchange,
@@ -655,8 +660,6 @@ impl PulseRuntime {
                     };
                     let books = self.observed_books.entry(symbol.0.clone()).or_default();
                     books.cex = Some(snapshot.clone());
-                    self.record_book_tape_for_snapshot(&symbol, &snapshot);
-                    self.record_market_tape_for_snapshot(&symbol, &snapshot);
                     self.record_signal_sample_for_snapshot(&snapshot);
                 }
             }
@@ -2961,74 +2964,6 @@ impl PulseRuntime {
         );
     }
 
-    fn record_book_tape_for_snapshot(&mut self, symbol: &Symbol, snapshot: &OrderBookSnapshot) {
-        let book = book_snapshot_audit(Some(snapshot), instrument_label(snapshot.instrument));
-        let Some(book) = book else {
-            return;
-        };
-        let sessions = self
-            .active_sessions
-            .values()
-            .filter(|managed| managed.market.symbol == *symbol)
-            .map(|managed| {
-                (
-                    managed.session.session_id().to_owned(),
-                    managed.session.asset().as_str().to_owned(),
-                    pulse_session_state_label(managed.session.state()).to_owned(),
-                )
-            })
-            .collect::<Vec<_>>();
-        for (session_id, asset, state) in sessions {
-            self.audit_sink.record_book_tape(PulseBookTapeAuditEvent {
-                session_id,
-                asset,
-                state,
-                symbol: symbol.0.clone(),
-                book: book.clone(),
-            });
-        }
-    }
-
-    fn record_market_tape_for_snapshot(&mut self, symbol: &Symbol, snapshot: &OrderBookSnapshot) {
-        let Some(asset) = self.asset_for_symbol(symbol) else {
-            return;
-        };
-        let Some(book) = book_snapshot_audit(Some(snapshot), instrument_label(snapshot.instrument))
-        else {
-            return;
-        };
-
-        self.audit_sink.record_market_tape(PulseMarketTapeAuditEvent {
-            asset: asset.as_str().to_owned(),
-            symbol: symbol.0.clone(),
-            venue: format!("{:?}", snapshot.exchange),
-            instrument: instrument_label(snapshot.instrument).to_owned(),
-            token_side: instrument_token_side(snapshot.instrument),
-            ts_exchange_ms: snapshot.exchange_timestamp_ms,
-            ts_recv_ms: snapshot.received_at_ms,
-            sequence: snapshot.sequence,
-            update_kind: "snapshot".to_owned(),
-            top_n_depth: book.bids.len().max(book.asks.len()),
-            best_bid: book.bids.first().map(|level| level.price.clone()),
-            best_ask: book.asks.first().map(|level| level.price.clone()),
-            mid: mid_price_from_book(snapshot).map(decimal_to_audit_string),
-            last_trade_price: snapshot.last_trade_price.map(|price| decimal_to_audit_string(price.0)),
-            expiry_ts_ms: None,
-            strike: None,
-            option_type: None,
-            mark_iv: None,
-            bid_iv: None,
-            ask_iv: None,
-            delta: None,
-            gamma: None,
-            index_price: None,
-            delta_bids: Vec::new(),
-            delta_asks: Vec::new(),
-            snapshot_bids: book.bids,
-            snapshot_asks: book.asks,
-        });
-    }
-
     fn record_anchor_market_tape_if_needed(&mut self, asset: PulseAsset, anchor: &AnchorSnapshot) {
         let already_recorded = self
             .last_anchor_tape_ts_by_asset
@@ -3208,15 +3143,6 @@ impl PulseRuntime {
 
     fn books_for_symbol(&self, symbol: &Symbol) -> Option<&ObservedMarketBooks> {
         self.observed_books.get(&symbol.0)
-    }
-
-    fn asset_for_symbol(&self, symbol: &Symbol) -> Option<PulseAsset> {
-        self.markets_by_asset.iter().find_map(|(asset, markets)| {
-            markets
-                .iter()
-                .any(|market| market.symbol == *symbol)
-                .then_some(*asset)
-        })
     }
 
     fn is_pin_risk(
@@ -4244,22 +4170,6 @@ fn book_snapshot_audit(
             })
             .collect(),
     })
-}
-
-fn instrument_label(instrument: polyalpha_core::InstrumentKind) -> &'static str {
-    match instrument {
-        polyalpha_core::InstrumentKind::PolyYes => "poly_yes",
-        polyalpha_core::InstrumentKind::PolyNo => "poly_no",
-        polyalpha_core::InstrumentKind::CexPerp => "cex_perp",
-    }
-}
-
-fn instrument_token_side(instrument: polyalpha_core::InstrumentKind) -> Option<String> {
-    match instrument {
-        polyalpha_core::InstrumentKind::PolyYes => Some("yes".to_owned()),
-        polyalpha_core::InstrumentKind::PolyNo => Some("no".to_owned()),
-        polyalpha_core::InstrumentKind::CexPerp => None,
-    }
 }
 
 fn decimal_to_audit_string(value: Decimal) -> String {
@@ -7115,7 +7025,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_records_book_tape_for_active_session_updates() {
+    async fn runtime_does_not_record_raw_book_tape_for_active_session_updates() {
         let fixture = runtime_fixture_for_asset(PulseAsset::Btc);
         let executor = Arc::new(MockPulseExecutor::default());
         let now_ms = current_time_ms();
@@ -7147,15 +7057,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert!(!tape_events.is_empty());
-        assert_eq!(tape_events[0].session_id, "pulse-btc-1");
-        assert_eq!(tape_events[0].symbol, "btc-above-100k");
-        assert_eq!(tape_events[0].book.instrument, "cex_perp");
-        assert_eq!(tape_events[0].book.received_at_ms, tape_ts_ms);
+        assert!(
+            tape_events.is_empty(),
+            "runtime should not emit raw book tape from market updates"
+        );
     }
 
     #[tokio::test]
-    async fn runtime_records_market_tape_for_poly_and_cex_updates_without_active_session() {
+    async fn runtime_does_not_record_raw_market_tape_for_poly_and_cex_updates() {
         let fixture = runtime_fixture_for_asset(PulseAsset::Btc);
         let now_ms = current_time_ms();
         let settlement_timestamp = (now_ms / 1_000) + 3_600;
@@ -7197,31 +7106,61 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(tape_events.len(), 3);
-        assert_eq!(
-            tape_events
-                .iter()
-                .filter(|event| event.instrument == "poly_yes")
-                .count(),
-            1
+        assert!(
+            tape_events.is_empty(),
+            "raw poly/binance tape must be recorded outside runtime"
         );
-        assert_eq!(
-            tape_events
-                .iter()
-                .filter(|event| event.instrument == "poly_no")
-                .count(),
-            1
-        );
-        assert_eq!(
-            tape_events
-                .iter()
-                .filter(|event| event.instrument == "cex_perp")
-                .count(),
-            1
-        );
-        assert_eq!(tape_events[0].symbol, market.symbol.0);
-        assert_eq!(tape_events[0].top_n_depth, 1);
-        assert_eq!(tape_events[0].ts_recv_ms, now_ms);
+    }
+
+    #[tokio::test]
+    async fn runtime_records_deribit_anchor_tape_during_tick() {
+        let fixture = runtime_fixture_for_asset(PulseAsset::Btc);
+        let now_ms = current_time_ms();
+        let settlement_timestamp = (now_ms / 1_000) + 3_600;
+        let anchor_provider = Arc::new(StaticAnchorProvider::new(btc_anchor_snapshot(
+            now_ms,
+            settlement_timestamp * 1_000,
+        )));
+        let market = btc_signal_market(settlement_timestamp);
+        let mut runtime = PulseRuntimeBuilder::new(fixture.settings.clone())
+            .with_anchor_provider(anchor_provider)
+            .with_markets(vec![market.clone()])
+            .with_execution_mode(PulseExecutionMode::Paper)
+            .build()
+            .await
+            .expect("build runtime");
+
+        runtime.observe_market_event(poly_book_event(
+            &market.symbol.0,
+            TokenSide::Yes,
+            vec![level(449, 3, 10_000, 0)],
+            vec![level(450, 3, 10_000, 0)],
+            now_ms,
+        ));
+        runtime.observe_market_event(poly_book_event(
+            &market.symbol.0,
+            TokenSide::No,
+            vec![level(549, 3, 10_000, 0)],
+            vec![level(550, 3, 10_000, 0)],
+            now_ms,
+        ));
+        runtime.observe_market_event(cex_book_event(&market.symbol.0, now_ms));
+        runtime
+            .run_tick(now_ms + 100)
+            .await
+            .expect("run runtime tick");
+
+        let tape_events = runtime
+            .audit_records()
+            .iter()
+            .filter_map(|record| match &record.payload {
+                polyalpha_audit::AuditEventPayload::PulseMarketTape(event) => Some(event),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!tape_events.is_empty());
+        assert!(tape_events.iter().all(|event| event.venue == "Deribit"));
     }
 
     #[tokio::test]

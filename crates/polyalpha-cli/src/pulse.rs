@@ -9,7 +9,7 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Instant, MissedTickBehavior};
 use tokio_tungstenite::tungstenite::Message;
@@ -18,21 +18,22 @@ use uuid::Uuid;
 use polyalpha_audit::{
     AuditAnomalyEvent, AuditCheckpoint, AuditCounterSnapshot, AuditEventKind, AuditEventPayload,
     AuditSessionManifest, AuditSessionStatus, AuditSessionSummary, AuditSeverity,
-    AuditWarehouse, AuditWriter, NewAuditEvent, PulseExecutionContext,
-    PulseExecutionRouteContext,
+    AuditWarehouse, AuditWriter, NewAuditEvent, PulseBookLevelAuditRow,
+    PulseExecutionContext, PulseExecutionRouteContext, PulseMarketTapeAuditEvent,
 };
 use polyalpha_core::{
-    asset_key_from_cex_symbol, AsyncClassification, ConnectionInfo, ConnectionStatus,
-    EvaluableStatus, MarketRetentionReason, MarketTier, MarketView, Message as MonitorMessage,
-    MonitorAssetStrategyConfig, MonitorSocketServer, MonitorState, MonitorStrategyConfig,
-    PolyShares, Price, Settings, SymbolRegistry, TradingMode,
+    asset_key_from_cex_symbol, AsyncClassification, ConnectionInfo, ConnectionStatus, Exchange,
+    EvaluableStatus, InstrumentKind, MarketDataEvent, MarketRetentionReason, MarketTier,
+    MarketView, Message as MonitorMessage, MonitorAssetStrategyConfig, MonitorSocketServer,
+    MonitorState, MonitorStrategyConfig, OrderBookSnapshot, PolyShares, Price, PriceLevel,
+    Settings, SymbolRegistry, TradingMode, VenueQuantity,
 };
 use polyalpha_data::{
     BinanceFuturesDataSource, DataManager, DeribitOptionsClient, DeribitTickerMessage,
     PolyBookLevel, PolyBookUpdate, PolymarketLiveDataSource,
 };
 use polyalpha_pulse::anchor::deribit::DeribitAnchorProvider;
-use polyalpha_pulse::audit::PulseAuditRecord;
+use polyalpha_pulse::audit::{PulseAuditEmitter, PulseAuditRecord};
 use polyalpha_pulse::model::PulseAsset;
 use polyalpha_pulse::runtime::{
     ActualPositionSync, PulseBookFeedStub, PulseExecutionMode, PulseRuntimeBuilder,
@@ -66,6 +67,9 @@ struct PulseInspectView {
     routes: Vec<PulseInspectRouteView>,
 }
 
+const PULSE_RUNTIME_AUDIT_BUFFER_CAPACITY: usize = 4_096;
+const PULSE_MARKET_TAPE_BUFFER_CAPACITY: usize = 8_192;
+
 struct PulseAuditRuntime {
     data_dir: String,
     writer: AuditWriter,
@@ -80,6 +84,8 @@ struct PulseAuditRuntime {
     last_checkpoint_ms: u64,
     last_warehouse_sync_ms: u64,
     warehouse_sync_degraded: bool,
+    runtime_events_rx: mpsc::Receiver<PulseAuditRecord>,
+    market_tape_rx: mpsc::Receiver<NewAuditEvent>,
 }
 
 impl PulseAuditRuntime {
@@ -88,6 +94,8 @@ impl PulseAuditRuntime {
         env: &str,
         mode: PulseExecutionMode,
         now_ms: u64,
+        runtime_events_rx: mpsc::Receiver<PulseAuditRecord>,
+        market_tape_rx: mpsc::Receiver<NewAuditEvent>,
     ) -> Result<Option<Self>> {
         if !settings.audit.enabled {
             return Ok(None);
@@ -137,6 +145,8 @@ impl PulseAuditRuntime {
             last_checkpoint_ms: now_ms,
             last_warehouse_sync_ms: now_ms,
             warehouse_sync_degraded: false,
+            runtime_events_rx,
+            market_tape_rx,
         }))
     }
 
@@ -146,12 +156,12 @@ impl PulseAuditRuntime {
 
     fn sync_runtime_state(
         &mut self,
-        runtime: &mut polyalpha_pulse::runtime::PulseRuntime,
+        runtime: &polyalpha_pulse::runtime::PulseRuntime,
         monitor_state: &MonitorState,
         now_ms: u64,
     ) -> Result<()> {
         self.tick_index = self.tick_index.saturating_add(1);
-        self.append_new_pulse_records(runtime)?;
+        self.append_new_pulse_records()?;
         self.refresh_summary(runtime, monitor_state, now_ms);
 
         let checkpoint_due =
@@ -185,12 +195,12 @@ impl PulseAuditRuntime {
 
     fn finalize(
         &mut self,
-        runtime: &mut polyalpha_pulse::runtime::PulseRuntime,
+        runtime: &polyalpha_pulse::runtime::PulseRuntime,
         monitor_state: &MonitorState,
         now_ms: u64,
         status: AuditSessionStatus,
     ) -> Result<()> {
-        self.append_new_pulse_records(runtime)?;
+        self.append_new_pulse_records()?;
         self.refresh_summary(runtime, monitor_state, now_ms);
         self.summary.status = status;
         self.summary.updated_at_ms = now_ms;
@@ -212,12 +222,24 @@ impl PulseAuditRuntime {
         Ok(())
     }
 
-    fn append_new_pulse_records(
-        &mut self,
-        runtime: &mut polyalpha_pulse::runtime::PulseRuntime,
-    ) -> Result<()> {
-        for record in runtime.drain_audit_records() {
-            self.writer.append_event(pulse_audit_event(&record))?;
+    fn append_new_pulse_records(&mut self) -> Result<()> {
+        loop {
+            match self.runtime_events_rx.try_recv() {
+                Ok(record) => {
+                    self.writer.append_event(pulse_audit_event(&record))?;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        loop {
+            match self.market_tape_rx.try_recv() {
+                Ok(event) => {
+                    self.writer.append_event(event)?;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
         }
         Ok(())
     }
@@ -350,6 +372,189 @@ fn pulse_audit_event(record: &PulseAuditRecord) -> NewAuditEvent {
     }
 }
 
+fn pulse_audit_channels() -> (
+    mpsc::Sender<PulseAuditRecord>,
+    mpsc::Receiver<PulseAuditRecord>,
+    mpsc::Sender<NewAuditEvent>,
+    mpsc::Receiver<NewAuditEvent>,
+) {
+    let (runtime_events_tx, runtime_events_rx) =
+        mpsc::channel(PULSE_RUNTIME_AUDIT_BUFFER_CAPACITY);
+    let (market_tape_tx, market_tape_rx) = mpsc::channel(PULSE_MARKET_TAPE_BUFFER_CAPACITY);
+    (
+        runtime_events_tx,
+        runtime_events_rx,
+        market_tape_tx,
+        market_tape_rx,
+    )
+}
+
+fn build_runtime_audit_emitter(runtime_events_tx: mpsc::Sender<PulseAuditRecord>) -> PulseAuditEmitter {
+    Arc::new(move |record| {
+        let _ = runtime_events_tx.try_send(record);
+    })
+}
+
+fn noop_runtime_audit_emitter() -> PulseAuditEmitter {
+    Arc::new(|_record| {})
+}
+
+fn spawn_pulse_market_tape_task(
+    mut market_data_rx: broadcast::Receiver<MarketDataEvent>,
+    registry: SymbolRegistry,
+    market_tape_tx: mpsc::Sender<NewAuditEvent>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match market_data_rx.recv().await {
+                Ok(event) => {
+                    if forward_market_event_to_pulse_audit(&registry, &market_tape_tx, &event)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+async fn forward_market_event_to_pulse_audit(
+    registry: &SymbolRegistry,
+    market_tape_tx: &mpsc::Sender<NewAuditEvent>,
+    event: &MarketDataEvent,
+) -> Result<()> {
+    for audit_event in pulse_market_tape_events(registry, event) {
+        market_tape_tx
+            .send(audit_event)
+            .await
+            .map_err(|_| anyhow!("pulse market tape channel closed"))?;
+    }
+    Ok(())
+}
+
+fn pulse_market_tape_events(
+    registry: &SymbolRegistry,
+    event: &MarketDataEvent,
+) -> Vec<NewAuditEvent> {
+    event
+        .expand_for_registry(registry)
+        .into_iter()
+        .filter_map(|expanded| match expanded {
+            MarketDataEvent::OrderBookUpdate { snapshot } => {
+                pulse_market_tape_event_from_snapshot(registry, &snapshot)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn pulse_market_tape_event_from_snapshot(
+    registry: &SymbolRegistry,
+    snapshot: &OrderBookSnapshot,
+) -> Option<NewAuditEvent> {
+    let market = registry.get_config(&snapshot.symbol)?;
+    let asset = PulseAsset::from_routing_key(&asset_key_from_cex_symbol(&market.cex_symbol))?;
+    let bids = audit_book_levels(&snapshot.bids);
+    let asks = audit_book_levels(&snapshot.asks);
+    let payload = PulseMarketTapeAuditEvent {
+        asset: asset.as_str().to_owned(),
+        symbol: snapshot.symbol.0.clone(),
+        venue: pulse_market_tape_venue_label(snapshot.exchange).to_owned(),
+        instrument: pulse_market_tape_instrument_label(snapshot.instrument).to_owned(),
+        token_side: pulse_market_tape_token_side(snapshot.instrument),
+        ts_exchange_ms: snapshot.exchange_timestamp_ms,
+        ts_recv_ms: snapshot.received_at_ms,
+        sequence: snapshot.sequence,
+        update_kind: "snapshot".to_owned(),
+        top_n_depth: bids.len().max(asks.len()),
+        best_bid: bids.first().map(|level| level.price.clone()),
+        best_ask: asks.first().map(|level| level.price.clone()),
+        mid: pulse_market_tape_mid(snapshot).map(pulse_decimal_to_string),
+        last_trade_price: snapshot
+            .last_trade_price
+            .map(|price| pulse_decimal_to_string(price.0)),
+        expiry_ts_ms: None,
+        strike: None,
+        option_type: None,
+        mark_iv: None,
+        bid_iv: None,
+        ask_iv: None,
+        delta: None,
+        gamma: None,
+        index_price: None,
+        delta_bids: Vec::new(),
+        delta_asks: Vec::new(),
+        snapshot_bids: bids,
+        snapshot_asks: asks,
+    };
+
+    Some(NewAuditEvent {
+        timestamp_ms: snapshot.received_at_ms.max(snapshot.exchange_timestamp_ms),
+        kind: AuditEventKind::PulseMarketTape,
+        symbol: Some(snapshot.symbol.0.clone()),
+        signal_id: None,
+        correlation_id: None,
+        gate: None,
+        result: None,
+        reason: None,
+        summary: format!("pulse market tape {} {}", payload.asset, payload.instrument),
+        payload: AuditEventPayload::PulseMarketTape(payload),
+    })
+}
+
+fn audit_book_levels(levels: &[PriceLevel]) -> Vec<PulseBookLevelAuditRow> {
+    levels
+        .iter()
+        .take(5)
+        .map(|level| PulseBookLevelAuditRow {
+            price: pulse_decimal_to_string(level.price.0),
+            quantity: match level.quantity {
+                VenueQuantity::PolyShares(shares) => pulse_decimal_to_string(shares.0),
+                VenueQuantity::CexBaseQty(base_qty) => pulse_decimal_to_string(base_qty.0),
+            },
+        })
+        .collect()
+}
+
+fn pulse_market_tape_mid(snapshot: &OrderBookSnapshot) -> Option<Decimal> {
+    let bid = snapshot.bids.first()?.price.0;
+    let ask = snapshot.asks.first()?.price.0;
+    Some((bid + ask) / Decimal::TWO)
+}
+
+fn pulse_market_tape_venue_label(exchange: Exchange) -> &'static str {
+    match exchange {
+        Exchange::Polymarket => "Polymarket",
+        Exchange::Binance => "Binance",
+        Exchange::Okx => "Okx",
+        Exchange::Deribit => "Deribit",
+    }
+}
+
+fn pulse_market_tape_instrument_label(instrument: InstrumentKind) -> &'static str {
+    match instrument {
+        InstrumentKind::PolyYes => "poly_yes",
+        InstrumentKind::PolyNo => "poly_no",
+        InstrumentKind::CexPerp => "cex_perp",
+    }
+}
+
+fn pulse_market_tape_token_side(instrument: InstrumentKind) -> Option<String> {
+    match instrument {
+        InstrumentKind::PolyYes => Some("yes".to_owned()),
+        InstrumentKind::PolyNo => Some("no".to_owned()),
+        InstrumentKind::CexPerp => None,
+    }
+}
+
+fn pulse_decimal_to_string(value: Decimal) -> String {
+    value.normalize().to_string()
+}
+
 pub async fn run_pulse_paper(env: &str, assets: &[PulseAsset]) -> Result<()> {
     run_pulse(env, assets, PulseExecutionMode::Paper, None).await
 }
@@ -439,7 +644,7 @@ async fn run_pulse(
     let registry = SymbolRegistry::new(settings.markets.clone());
     let (market_data_tx, _) = broadcast::channel(4_096);
     let mut market_data_rx = market_data_tx.subscribe();
-    let manager = build_data_manager(&registry, market_data_tx);
+    let manager = build_data_manager(&registry, market_data_tx.clone());
     let executor_start_ms = current_time_ms();
     let runtime_mode = match mode {
         PulseExecutionMode::Paper => RuntimeExecutionMode::Paper,
@@ -455,6 +660,24 @@ async fn run_pulse(
             .await
             .context("build pulse execution stack")?;
 
+    let (runtime_audit_emitter, runtime_events_rx, market_tape_rx, mut market_tape_task) =
+        if settings.audit.enabled {
+            let (runtime_events_tx, runtime_events_rx, market_tape_tx, market_tape_rx) =
+                pulse_audit_channels();
+            (
+                build_runtime_audit_emitter(runtime_events_tx),
+                Some(runtime_events_rx),
+                Some(market_tape_rx),
+                Some(spawn_pulse_market_tape_task(
+                    market_data_tx.subscribe(),
+                    registry.clone(),
+                    market_tape_tx,
+                )),
+            )
+        } else {
+            (noop_runtime_audit_emitter(), None, None, None)
+        };
+
     let deribit_provider = build_deribit_anchor_provider(&settings, assets)
         .await
         .context("build Deribit anchor provider")?;
@@ -467,6 +690,7 @@ async fn run_pulse(
         .with_position_sync(position_sync)
         .with_poly_books(asset_feeds.clone())
         .with_binance_books(asset_feeds)
+        .with_audit_emitter(runtime_audit_emitter)
         .with_execution_mode(mode)
         .build()
         .await
@@ -477,8 +701,18 @@ async fn run_pulse(
         spawn_pulse_market_data_tasks(manager, &settings, &settings.markets, 20, deribit_provider)
             .await
             .context("spawn pulse market data tasks")?;
-    let mut audit_runtime = PulseAuditRuntime::start(&settings, env, mode, executor_start_ms)
-        .context("start pulse audit runtime")?;
+    let mut audit_runtime = match (runtime_events_rx, market_tape_rx) {
+        (Some(runtime_events_rx), Some(market_tape_rx)) => PulseAuditRuntime::start(
+            &settings,
+            env,
+            mode,
+            executor_start_ms,
+            runtime_events_rx,
+            market_tape_rx,
+        )
+        .context("start pulse audit runtime")?,
+        _ => None,
+    };
 
     println!(
         "pulse {:?} runtime running: assets={:?}, markets={}, socket={}",
@@ -542,7 +776,7 @@ async fn run_pulse(
                         started_at.elapsed().as_secs(),
                     );
                     if let Some(audit) = audit_runtime.as_mut() {
-                        if let Err(err) = audit.sync_runtime_state(&mut runtime, &state, now_ms) {
+                        if let Err(err) = audit.sync_runtime_state(&runtime, &state, now_ms) {
                             break Err(err.context("sync pulse audit runtime"));
                         }
                     }
@@ -573,10 +807,13 @@ async fn run_pulse(
         final_timestamp_ms,
         final_uptime_secs,
     );
+    if let Some(handle) = market_tape_task.take() {
+        handle.abort();
+    }
     if let Some(audit) = audit_runtime.as_mut() {
         audit
             .finalize(
-                &mut runtime,
+                &runtime,
                 &last_monitor_state,
                 last_monitor_state.timestamp_ms,
                 if runtime_result.is_ok() {
@@ -1985,9 +2222,17 @@ mod tests {
         settings.general.data_dir = root.to_string_lossy().into_owned();
 
         let now_ms = 1_717_171_717_000;
-        let audit = PulseAuditRuntime::start(&settings, "test", PulseExecutionMode::LiveMock, now_ms)
-            .expect("start audit runtime")
-            .expect("audit runtime enabled");
+        let (_runtime_tx, runtime_rx, _market_tx, market_rx) = pulse_audit_channels();
+        let audit = PulseAuditRuntime::start(
+            &settings,
+            "test",
+            PulseExecutionMode::LiveMock,
+            now_ms,
+            runtime_rx,
+            market_rx,
+        )
+        .expect("start audit runtime")
+        .expect("audit runtime enabled");
 
         let raw = fs::read_to_string(
             audit.writer.paths().execution_context_path(),
@@ -2014,6 +2259,7 @@ mod tests {
         fs::create_dir_all(&root).expect("create temp root");
         settings.general.data_dir = root.to_string_lossy().into_owned();
         settings.markets = vec![sample_pulse_market()];
+        let registry = SymbolRegistry::new(settings.markets.clone());
 
         let now_ms = 1_717_171_717_000;
         let anchor_provider = Arc::new(StaticAnchorProvider {
@@ -2046,38 +2292,60 @@ mod tests {
                 },
             },
         });
+        let (runtime_tx, runtime_rx, market_tape_tx, market_tape_rx) = pulse_audit_channels();
         let mut runtime = PulseRuntimeBuilder::new(settings.clone())
             .with_anchor_provider(anchor_provider)
             .with_markets(settings.markets.clone())
+            .with_audit_emitter(build_runtime_audit_emitter(runtime_tx))
             .with_execution_mode(PulseExecutionMode::Paper)
             .build()
             .await
             .expect("build pulse runtime");
-        let mut audit =
-            PulseAuditRuntime::start(&settings, "test", PulseExecutionMode::Paper, now_ms)
-                .expect("start audit runtime")
-                .expect("audit runtime enabled");
+        let mut audit = PulseAuditRuntime::start(
+            &settings,
+            "test",
+            PulseExecutionMode::Paper,
+            now_ms,
+            runtime_rx,
+            market_tape_rx,
+        )
+        .expect("start audit runtime")
+        .expect("audit runtime enabled");
 
-        runtime.observe_market_event(poly_book_update(
+        let yes_event = poly_book_update(
             "btc-pulse-test",
             InstrumentKind::PolyYes,
             Decimal::new(45, 2),
             Decimal::new(46, 2),
             now_ms,
-        ));
-        runtime.observe_market_event(poly_book_update(
+        );
+        forward_market_event_to_pulse_audit(&registry, &market_tape_tx, &yes_event)
+            .await
+            .expect("persist yes raw tape");
+        runtime.observe_market_event(yes_event);
+
+        let no_event = poly_book_update(
             "btc-pulse-test",
             InstrumentKind::PolyNo,
             Decimal::new(54, 2),
             Decimal::new(55, 2),
             now_ms,
-        ));
-        runtime.observe_market_event(cex_book_update(
+        );
+        forward_market_event_to_pulse_audit(&registry, &market_tape_tx, &no_event)
+            .await
+            .expect("persist no raw tape");
+        runtime.observe_market_event(no_event);
+
+        let cex_event = cex_book_update(
             "btc-pulse-test",
             Decimal::new(99_995, 0),
             Decimal::new(100_005, 0),
             now_ms,
-        ));
+        );
+        forward_market_event_to_pulse_audit(&registry, &market_tape_tx, &cex_event)
+            .await
+            .expect("persist cex raw tape");
+        runtime.observe_market_event(cex_event);
         runtime
             .run_tick(now_ms + 100)
             .await
@@ -2088,7 +2356,7 @@ mod tests {
         monitor_state.mode = TradingMode::Paper;
         audit
             .finalize(
-                &mut runtime,
+                &runtime,
                 &monitor_state,
                 now_ms + 100,
                 AuditSessionStatus::Completed,
@@ -2113,7 +2381,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pulse_audit_runtime_sync_drains_runtime_records_after_persisting() {
+    async fn pulse_audit_runtime_sync_consumes_emitted_runtime_records() {
         let mut settings: Settings =
             serde_json::from_value(pulse_settings_json()).expect("deserialize pulse settings");
         let root =
@@ -2153,17 +2421,25 @@ mod tests {
                 },
             },
         });
+        let (runtime_tx, runtime_rx, _market_tape_tx, market_tape_rx) = pulse_audit_channels();
         let mut runtime = PulseRuntimeBuilder::new(settings.clone())
             .with_anchor_provider(anchor_provider)
             .with_markets(settings.markets.clone())
+            .with_audit_emitter(build_runtime_audit_emitter(runtime_tx))
             .with_execution_mode(PulseExecutionMode::Paper)
             .build()
             .await
             .expect("build pulse runtime");
-        let mut audit =
-            PulseAuditRuntime::start(&settings, "test", PulseExecutionMode::Paper, now_ms)
-                .expect("start audit runtime")
-                .expect("audit runtime enabled");
+        let mut audit = PulseAuditRuntime::start(
+            &settings,
+            "test",
+            PulseExecutionMode::Paper,
+            now_ms,
+            runtime_rx,
+            market_tape_rx,
+        )
+        .expect("start audit runtime")
+        .expect("audit runtime enabled");
 
         runtime.observe_market_event(poly_book_update(
             "btc-pulse-test",
@@ -2190,20 +2466,20 @@ mod tests {
             .await
             .expect("run pulse tick");
 
-        let expected_state_changes = runtime.audit_records().len() as u64;
-        assert!(expected_state_changes > 0, "runtime should hold fresh audit records");
+        let expected_state_changes = runtime.total_audit_record_count() as u64;
+        assert!(expected_state_changes > 0, "runtime should emit sparse audit records");
+        assert!(
+            runtime.audit_records().is_empty(),
+            "service path should not retain runtime audit records in memory"
+        );
 
         let mut monitor_state = MonitorState::default();
         monitor_state.timestamp_ms = now_ms + 100;
         monitor_state.mode = TradingMode::Paper;
         audit
-            .sync_runtime_state(&mut runtime, &monitor_state, now_ms + 100)
+            .sync_runtime_state(&runtime, &monitor_state, now_ms + 100)
             .expect("sync audit runtime");
 
-        assert!(
-            runtime.audit_records().is_empty(),
-            "persisted audit records should be drained from runtime memory"
-        );
         assert_eq!(audit.summary.counters.state_changes, expected_state_changes);
     }
 
@@ -2337,11 +2613,18 @@ mod tests {
         settings.general.data_dir = root.to_string_lossy().into_owned();
 
         let now_ms = 1_717_171_717_000;
-        let mut audit =
-            PulseAuditRuntime::start(&settings, "test", PulseExecutionMode::Paper, now_ms)
-                .expect("start audit runtime")
-                .expect("audit runtime enabled");
-        let mut runtime = PulseRuntimeBuilder::new(settings.clone())
+        let (_runtime_tx, runtime_rx, _market_tx, market_rx) = pulse_audit_channels();
+        let mut audit = PulseAuditRuntime::start(
+            &settings,
+            "test",
+            PulseExecutionMode::Paper,
+            now_ms,
+            runtime_rx,
+            market_rx,
+        )
+        .expect("start audit runtime")
+        .expect("audit runtime enabled");
+        let runtime = PulseRuntimeBuilder::new(settings.clone())
             .with_execution_mode(PulseExecutionMode::Paper)
             .build()
             .await
@@ -2352,7 +2635,7 @@ mod tests {
 
         audit
             .finalize(
-                &mut runtime,
+                &runtime,
                 &monitor_state,
                 now_ms + 1_000,
                 AuditSessionStatus::Completed,
@@ -2375,11 +2658,18 @@ mod tests {
         settings.general.data_dir = root.to_string_lossy().into_owned();
 
         let now_ms = 1_717_171_717_000;
-        let mut audit =
-            PulseAuditRuntime::start(&settings, "test", PulseExecutionMode::Paper, now_ms)
-                .expect("start audit runtime")
-                .expect("audit runtime enabled");
-        let mut runtime = PulseRuntimeBuilder::new(settings.clone())
+        let (_runtime_tx, runtime_rx, _market_tx, market_rx) = pulse_audit_channels();
+        let mut audit = PulseAuditRuntime::start(
+            &settings,
+            "test",
+            PulseExecutionMode::Paper,
+            now_ms,
+            runtime_rx,
+            market_rx,
+        )
+        .expect("start audit runtime")
+        .expect("audit runtime enabled");
+        let runtime = PulseRuntimeBuilder::new(settings.clone())
             .with_execution_mode(PulseExecutionMode::Paper)
             .build()
             .await
@@ -2392,7 +2682,7 @@ mod tests {
 
         audit
             .finalize(
-                &mut runtime,
+                &runtime,
                 &monitor_state,
                 now_ms + 1_000,
                 AuditSessionStatus::Completed,

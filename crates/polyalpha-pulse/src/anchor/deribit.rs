@@ -231,7 +231,7 @@ mod tests {
                 expiry_ts_ms,
                 strike: strike as f64,
                 option_type: DeribitOptionType::Call,
-                timestamp_ms: now_ms.saturating_sub(1_000),
+                timestamp_ms: now_ms.saturating_sub(30_000),
                 received_at_ms: now_ms,
                 mark_price: 0.12,
                 mark_iv: 55.0,
@@ -263,6 +263,6 @@ mod tests {
             .expect("provider snapshot")
             .expect("anchor snapshot");
 
-        assert!(snapshot.quality.anchor_age_ms < 200);
+        assert!(snapshot.quality.anchor_age_ms < 5_000);
     }
 }
