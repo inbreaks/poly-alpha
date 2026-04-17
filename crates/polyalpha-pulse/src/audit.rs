@@ -34,6 +34,7 @@ pub struct PulseAuditSink {
     total_record_count: usize,
     emitter: Option<PulseAuditEmitter>,
     retain_records: bool,
+    capture_high_frequency: bool,
 }
 
 impl std::fmt::Debug for PulseAuditSink {
@@ -46,6 +47,7 @@ impl std::fmt::Debug for PulseAuditSink {
             .field("total_record_count", &self.total_record_count)
             .field("has_emitter", &self.emitter.is_some())
             .field("retain_records", &self.retain_records)
+            .field("capture_high_frequency", &self.capture_high_frequency)
             .finish()
     }
 }
@@ -60,6 +62,7 @@ impl Default for PulseAuditSink {
             total_record_count: 0,
             emitter: None,
             retain_records: true,
+            capture_high_frequency: true,
         }
     }
 }
@@ -69,8 +72,13 @@ impl PulseAuditSink {
         Self {
             emitter: Some(emitter),
             retain_records: false,
+            capture_high_frequency: false,
             ..Self::default()
         }
+    }
+
+    pub fn captures_high_frequency(&self) -> bool {
+        self.capture_high_frequency
     }
 
     pub fn record_lifecycle(&mut self, event: PulseLifecycleAuditEvent) {
@@ -82,9 +90,25 @@ impl PulseAuditSink {
     }
 
     pub fn record_asset_health(&mut self, event: PulseAssetHealthAuditEvent) {
+        if !self.capture_high_frequency {
+            return;
+        }
         self.push_record(
             AuditEventKind::PulseAssetHealth,
             AuditEventPayload::PulseAssetHealth(event),
+        );
+    }
+
+    pub fn record_asset_health_lazy<F>(&mut self, build: F)
+    where
+        F: FnOnce() -> PulseAssetHealthAuditEvent,
+    {
+        if !self.capture_high_frequency {
+            return;
+        }
+        self.push_record(
+            AuditEventKind::PulseAssetHealth,
+            AuditEventPayload::PulseAssetHealth(build()),
         );
     }
 
@@ -97,16 +121,48 @@ impl PulseAuditSink {
     }
 
     pub fn record_market_tape(&mut self, event: PulseMarketTapeAuditEvent) {
+        if !self.capture_high_frequency {
+            return;
+        }
         self.push_record(
             AuditEventKind::PulseMarketTape,
             AuditEventPayload::PulseMarketTape(event),
         );
     }
 
+    pub fn record_market_tape_lazy<F>(&mut self, build: F)
+    where
+        F: FnOnce() -> PulseMarketTapeAuditEvent,
+    {
+        if !self.capture_high_frequency {
+            return;
+        }
+        self.push_record(
+            AuditEventKind::PulseMarketTape,
+            AuditEventPayload::PulseMarketTape(build()),
+        );
+    }
+
     pub fn record_signal_snapshot(&mut self, event: PulseSignalSnapshotAuditEvent) {
+        if !self.capture_high_frequency {
+            return;
+        }
         self.push_record(
             AuditEventKind::PulseSignalSnapshot,
             AuditEventPayload::PulseSignalSnapshot(event),
+        );
+    }
+
+    pub fn record_signal_snapshot_lazy<F>(&mut self, build: F)
+    where
+        F: FnOnce() -> PulseSignalSnapshotAuditEvent,
+    {
+        if !self.capture_high_frequency {
+            return;
+        }
+        self.push_record(
+            AuditEventKind::PulseSignalSnapshot,
+            AuditEventPayload::PulseSignalSnapshot(build()),
         );
     }
 
@@ -421,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_sink_with_emitter_streams_records_without_retaining_memory() {
+    fn audit_sink_with_emitter_drops_high_frequency_records() {
         let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = emitted.clone();
         let emitter: PulseAuditEmitter = Arc::new(move |record| {
@@ -481,9 +537,138 @@ mod tests {
         });
 
         assert!(sink.records().is_empty());
-        assert_eq!(sink.total_record_count(), 1);
+        assert_eq!(sink.total_record_count(), 0);
         let emitted = emitted.lock().expect("lock emitted");
-        assert_eq!(emitted.len(), 1);
-        assert_eq!(emitted[0].kind, AuditEventKind::PulseSignalSnapshot);
+        assert!(emitted.is_empty());
+    }
+
+    #[test]
+    fn audit_sink_with_emitter_does_not_build_high_frequency_records() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let emitted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = emitted.clone();
+        let emitter: PulseAuditEmitter = Arc::new(move |record| {
+            captured.lock().expect("lock emitted").push(record);
+        });
+        let mut sink = PulseAuditSink::with_emitter(emitter);
+        let build_count = Arc::new(AtomicUsize::new(0));
+
+        sink.record_asset_health_lazy({
+            let build_count = build_count.clone();
+            move || {
+                build_count.fetch_add(1, Ordering::SeqCst);
+                PulseAssetHealthAuditEvent {
+                    asset: "btc".to_owned(),
+                    provider_id: Some("deribit_primary".to_owned()),
+                    anchor_age_ms: Some(42),
+                    anchor_latency_delta_ms: Some(18),
+                    poly_quote_age_ms: Some(15),
+                    cex_quote_age_ms: Some(8),
+                    open_sessions: 0,
+                    net_target_delta: Some("0".to_owned()),
+                    actual_exchange_position: Some("0".to_owned()),
+                    status: Some("healthy".to_owned()),
+                    disable_reason: None,
+                }
+            }
+        });
+        sink.record_market_tape_lazy({
+            let build_count = build_count.clone();
+            move || {
+                build_count.fetch_add(1, Ordering::SeqCst);
+                PulseMarketTapeAuditEvent {
+                    asset: "btc".to_owned(),
+                    symbol: "btc-above-100k".to_owned(),
+                    venue: "Polymarket".to_owned(),
+                    instrument: "poly_no".to_owned(),
+                    token_side: Some("no".to_owned()),
+                    ts_exchange_ms: 100,
+                    ts_recv_ms: 120,
+                    sequence: 7,
+                    update_kind: "snapshot".to_owned(),
+                    top_n_depth: 5,
+                    best_bid: Some("0.38".to_owned()),
+                    best_ask: Some("0.39".to_owned()),
+                    mid: Some("0.385".to_owned()),
+                    last_trade_price: Some("0.39".to_owned()),
+                    expiry_ts_ms: None,
+                    strike: None,
+                    option_type: None,
+                    mark_iv: None,
+                    bid_iv: None,
+                    ask_iv: None,
+                    delta: None,
+                    gamma: None,
+                    index_price: None,
+                    delta_bids: Vec::new(),
+                    delta_asks: Vec::new(),
+                    snapshot_bids: Vec::new(),
+                    snapshot_asks: Vec::new(),
+                }
+            }
+        });
+        sink.record_signal_snapshot_lazy({
+            let build_count = build_count.clone();
+            move || {
+                build_count.fetch_add(1, Ordering::SeqCst);
+                PulseSignalSnapshotAuditEvent {
+                    asset: "btc".to_owned(),
+                    symbol: "btc-above-100k".to_owned(),
+                    mode_candidate: PulseSignalMode::ElasticSnapback,
+                    admission_result: AuditGateResult::Passed,
+                    rejection_reason: None,
+                    provider_id: Some("deribit_primary".to_owned()),
+                    claim_side: Some("no".to_owned()),
+                    fair_prob_yes: Some(0.61),
+                    entry_price: Some("0.35".to_owned()),
+                    net_edge_bps: Some(118.0),
+                    expected_net_pnl_usd: Some("4.72".to_owned()),
+                    target_exit_price: Some("0.38".to_owned()),
+                    timeout_exit_price: Some("0.31".to_owned()),
+                    timeout_loss_estimate_usd: Some("21.68".to_owned()),
+                    pulse_score_bps: 162.0,
+                    claim_price_move_bps: 180.0,
+                    fair_claim_move_bps: 12.0,
+                    cex_mid_move_bps: 8.0,
+                    swept_notional_usd: "500".to_owned(),
+                    swept_levels_count: 4,
+                    post_pulse_depth_gap_bps: 210.0,
+                    min_profitable_target_distance_bps: 540.0,
+                    reachability_cap_bps: 470.0,
+                    in_gray_zone: false,
+                    reachable: true,
+                    target_distance_to_mid_bps: Some(32.0),
+                    predicted_hit_rate: Some(0.82),
+                    maker_net_pnl_usd: Some("4.72".to_owned()),
+                    timeout_net_pnl_usd: Some("-2.15".to_owned()),
+                    realizable_ev_usd: Some("2.87".to_owned()),
+                    used_exchange_ts: true,
+                    native_sequence_present: true,
+                    post_sweep_update_count_5s: 3,
+                    max_interarrival_gap_ms_5s: 240,
+                    observation_quality_score: Some(0.91),
+                    admission_eligible: true,
+                    anchor_age_ms: Some(45),
+                    anchor_latency_delta_ms: Some(18),
+                    anchor_expiry_mismatch_minutes: Some(0),
+                    yes_quote_age_ms: Some(15),
+                    no_quote_age_ms: Some(12),
+                    cex_quote_age_ms: Some(8),
+                    poly_transport_healthy: Some(true),
+                    hedge_transport_healthy: Some(true),
+                    poly_yes_sequence_ref: Some(101),
+                    poly_no_sequence_ref: Some(102),
+                    cex_sequence_ref: Some(77),
+                    anchor_sequence_ref: Some(1_710_000_123),
+                }
+            }
+        });
+
+        assert_eq!(build_count.load(Ordering::SeqCst), 0);
+        assert!(sink.records().is_empty());
+        assert_eq!(sink.total_record_count(), 0);
+        let emitted = emitted.lock().expect("lock emitted");
+        assert!(emitted.is_empty());
     }
 }

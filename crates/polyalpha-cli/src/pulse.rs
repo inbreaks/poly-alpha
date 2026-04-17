@@ -2481,9 +2481,9 @@ mod tests {
             .expect("run pulse tick");
 
         let runtime_state_changes = runtime.total_audit_record_count() as u64;
-        assert!(
-            runtime_state_changes > 0,
-            "runtime should emit sparse audit records"
+        assert_eq!(
+            runtime_state_changes, 0,
+            "service path should not emit high-frequency audit records during idle evaluation"
         );
         assert!(
             runtime.audit_records().is_empty(),
@@ -2498,10 +2498,7 @@ mod tests {
             .expect("sync audit runtime");
 
         let persisted_state_changes = audit.writer.event_count();
-        assert!(
-            persisted_state_changes < runtime_state_changes,
-            "raw audit should only persist the low-frequency session tape"
-        );
+        assert_eq!(persisted_state_changes, 0);
         assert_eq!(
             audit.summary.counters.state_changes,
             persisted_state_changes

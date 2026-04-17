@@ -4,9 +4,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use polyalpha_audit::{
-    AuditGateResult, PulseAssetHealthAuditEvent, PulseBookLevelAuditRow,
-    PulseBookSnapshotAudit, PulseLifecycleAuditEvent, PulseMarketTapeAuditEvent,
-    PulseSessionSummaryRow, PulseSignalMode,
+    AuditGateResult, PulseAssetHealthAuditEvent, PulseBookLevelAuditRow, PulseBookSnapshotAudit,
+    PulseLifecycleAuditEvent, PulseMarketTapeAuditEvent, PulseSessionSummaryRow, PulseSignalMode,
     PulseSignalSnapshotAuditEvent,
 };
 use polyalpha_core::{
@@ -33,8 +32,8 @@ use crate::monitor::build_pulse_monitor_view;
 use crate::pricing::{EventPricer, EventPricerConfig, ExpiryGapAdjustment};
 use crate::session::{PolyFillOutcome, PulseSession, PulseSessionConfig};
 use crate::signal::{
-    build_reachability_envelope, classify_pulse_mode, estimate_session_edge,
-    executable_poly_quote, generate_target_candidates, reversion_pocket, select_best_target,
+    build_reachability_envelope, classify_pulse_mode, estimate_session_edge, executable_poly_quote,
+    generate_target_candidates, reversion_pocket, select_best_target,
     summarize_recovery_observation, timeout_exit_price_for_shares, ExecutableQuoteSide,
     RecoveryObservation, SignalSample,
 };
@@ -762,7 +761,7 @@ impl PulseRuntime {
             Decimal::ZERO,
         ));
         self.audit_sink
-            .record_asset_health(PulseAssetHealthAuditEvent {
+            .record_asset_health_lazy(|| PulseAssetHealthAuditEvent {
                 asset: session.asset().as_str().to_owned(),
                 provider_id: Some("deribit_primary".to_owned()),
                 anchor_age_ms: Some(42),
@@ -866,7 +865,7 @@ impl PulseRuntime {
             avg_price: None,
         });
         self.audit_sink
-            .record_asset_health(PulseAssetHealthAuditEvent {
+            .record_asset_health_lazy(|| PulseAssetHealthAuditEvent {
                 asset: "btc".to_owned(),
                 provider_id: Some("deribit_primary".to_owned()),
                 anchor_age_ms: Some(35),
@@ -1655,14 +1654,14 @@ impl PulseRuntime {
                 Ok(priced) => priced,
                 Err(crate::pricing::PricingError::HardExpiryGapExceeded { .. }) => {
                     self.record_rejection(crate::model::PulseFailureCode::HardExpiryGapExceeded);
-                    let mut event = self.base_signal_snapshot_event(&audit_ctx);
-                    event.admission_result = AuditGateResult::Rejected;
-                    event.rejection_reason = Some(
-                        crate::model::PulseFailureCode::HardExpiryGapExceeded
-                            .as_str()
-                            .to_owned(),
-                    );
-                    self.audit_sink.record_signal_snapshot(event);
+                    self.record_signal_snapshot_if_enabled(&audit_ctx, |event| {
+                        event.admission_result = AuditGateResult::Rejected;
+                        event.rejection_reason = Some(
+                            crate::model::PulseFailureCode::HardExpiryGapExceeded
+                                .as_str()
+                                .to_owned(),
+                        );
+                    });
                     return Ok(None);
                 }
                 Err(err) => {
@@ -1707,28 +1706,28 @@ impl PulseRuntime {
             && anchor.quality.greeks_complete;
         if !cex_fresh || (!yes_fresh && !no_fresh) {
             self.record_rejection(crate::model::PulseFailureCode::DataFreshnessRejected);
-            let mut event = self.base_signal_snapshot_event(&audit_ctx);
-            event.admission_result = AuditGateResult::Rejected;
-            event.rejection_reason = Some(
-                crate::model::PulseFailureCode::DataFreshnessRejected
-                    .as_str()
-                    .to_owned(),
-            );
-            event.fair_prob_yes = Some(priced.fair_prob_yes);
-            self.audit_sink.record_signal_snapshot(event);
+            self.record_signal_snapshot_if_enabled(&audit_ctx, |event| {
+                event.admission_result = AuditGateResult::Rejected;
+                event.rejection_reason = Some(
+                    crate::model::PulseFailureCode::DataFreshnessRejected
+                        .as_str()
+                        .to_owned(),
+                );
+                event.fair_prob_yes = Some(priced.fair_prob_yes);
+            });
             return Ok(None);
         }
         if !anchor_quality_ok || !priced.pricing_quality.delta_stable {
             self.record_rejection(crate::model::PulseFailureCode::AnchorQualityRejected);
-            let mut event = self.base_signal_snapshot_event(&audit_ctx);
-            event.admission_result = AuditGateResult::Rejected;
-            event.rejection_reason = Some(
-                crate::model::PulseFailureCode::AnchorQualityRejected
-                    .as_str()
-                    .to_owned(),
-            );
-            event.fair_prob_yes = Some(priced.fair_prob_yes);
-            self.audit_sink.record_signal_snapshot(event);
+            self.record_signal_snapshot_if_enabled(&audit_ctx, |event| {
+                event.admission_result = AuditGateResult::Rejected;
+                event.rejection_reason = Some(
+                    crate::model::PulseFailureCode::AnchorQualityRejected
+                        .as_str()
+                        .to_owned(),
+                );
+                event.fair_prob_yes = Some(priced.fair_prob_yes);
+            });
             return Ok(None);
         }
         if prior_cex_mid.is_none()
@@ -1736,15 +1735,15 @@ impl PulseRuntime {
             || (prior_yes_ask.is_none() && prior_no_ask.is_none())
         {
             self.record_rejection(crate::model::PulseFailureCode::PulseConfirmationRejected);
-            let mut event = self.base_signal_snapshot_event(&audit_ctx);
-            event.admission_result = AuditGateResult::Rejected;
-            event.rejection_reason = Some(
-                crate::model::PulseFailureCode::PulseConfirmationRejected
-                    .as_str()
-                    .to_owned(),
-            );
-            event.fair_prob_yes = Some(priced.fair_prob_yes);
-            self.audit_sink.record_signal_snapshot(event);
+            self.record_signal_snapshot_if_enabled(&audit_ctx, |event| {
+                event.admission_result = AuditGateResult::Rejected;
+                event.rejection_reason = Some(
+                    crate::model::PulseFailureCode::PulseConfirmationRejected
+                        .as_str()
+                        .to_owned(),
+                );
+                event.fair_prob_yes = Some(priced.fair_prob_yes);
+            });
             return Ok(None);
         }
         let yes_candidate = yes_fresh
@@ -1839,12 +1838,12 @@ impl PulseRuntime {
                     .resolved_cex_open_max_quote_age_ms(),
             )
         {
-            let mut event = self.base_signal_snapshot_event(audit_ctx);
-            event.admission_result = AuditGateResult::Rejected;
-            event.claim_side = Some(token_side_label(claim_side).to_owned());
-            event.rejection_reason = Some("claim_quote_stale_during_eval".to_owned());
-            event.fair_prob_yes = Some(priced.fair_prob_yes);
-            self.audit_sink.record_signal_snapshot(event);
+            self.record_signal_snapshot_if_enabled(audit_ctx, |event| {
+                event.admission_result = AuditGateResult::Rejected;
+                event.claim_side = Some(token_side_label(claim_side).to_owned());
+                event.rejection_reason = Some("claim_quote_stale_during_eval".to_owned());
+                event.fair_prob_yes = Some(priced.fair_prob_yes);
+            });
             return None;
         }
         let opening_request_notional = self
@@ -1859,23 +1858,23 @@ impl PulseRuntime {
             ExecutableQuoteSide::Buy,
             opening_request_notional,
         ) else {
-            let mut event = self.base_signal_snapshot_event(audit_ctx);
-            event.admission_result = AuditGateResult::Rejected;
-            event.claim_side = Some(token_side_label(claim_side).to_owned());
-            event.rejection_reason = Some("entry_quote_unavailable".to_owned());
-            event.fair_prob_yes = Some(priced.fair_prob_yes);
-            self.audit_sink.record_signal_snapshot(event);
+            self.record_signal_snapshot_if_enabled(audit_ctx, |event| {
+                event.admission_result = AuditGateResult::Rejected;
+                event.claim_side = Some(token_side_label(claim_side).to_owned());
+                event.rejection_reason = Some("entry_quote_unavailable".to_owned());
+                event.fair_prob_yes = Some(priced.fair_prob_yes);
+            });
             return None;
         };
         if entry_quote.filled_notional_usd <= Decimal::ZERO
             || entry_quote.avg_price <= Decimal::ZERO
         {
-            let mut event = self.base_signal_snapshot_event(audit_ctx);
-            event.admission_result = AuditGateResult::Rejected;
-            event.claim_side = Some(token_side_label(claim_side).to_owned());
-            event.rejection_reason = Some("entry_quote_empty".to_owned());
-            event.fair_prob_yes = Some(priced.fair_prob_yes);
-            self.audit_sink.record_signal_snapshot(event);
+            self.record_signal_snapshot_if_enabled(audit_ctx, |event| {
+                event.admission_result = AuditGateResult::Rejected;
+                event.claim_side = Some(token_side_label(claim_side).to_owned());
+                event.rejection_reason = Some("entry_quote_empty".to_owned());
+                event.fair_prob_yes = Some(priced.fair_prob_yes);
+            });
             return None;
         }
 
@@ -1958,7 +1957,9 @@ impl PulseRuntime {
                 let session_edge = estimate_session_edge(
                     entry_quote.filled_notional_usd,
                     entry_quote.avg_price,
-                    target.target_exit_price.min(fair_claim_price.max(entry_quote.avg_price)),
+                    target
+                        .target_exit_price
+                        .min(fair_claim_price.max(entry_quote.avg_price)),
                     timeout_exit_price,
                     hedge_cost_bps,
                     fee_bps,
@@ -1988,36 +1989,37 @@ impl PulseRuntime {
             })
             .collect::<Vec<_>>();
         let Some(selected_target) = select_best_target(evaluated_targets) else {
-            let mut event = self.base_signal_snapshot_event(audit_ctx);
-            event.admission_result = AuditGateResult::Rejected;
-            event.claim_side = Some(token_side_label(claim_side).to_owned());
-            event.mode_candidate = audit_signal_mode(mode);
-            event.rejection_reason = Some("no_reachable_target".to_owned());
-            event.fair_prob_yes = Some(priced.fair_prob_yes);
-            event.entry_price = Some(decimal_to_audit_string(entry_quote.avg_price));
-            event.timeout_exit_price = Some(decimal_to_audit_string(timeout_exit_price));
-            event.pulse_score_bps = (claim_price_move_bps - fair_claim_move_bps).max(0.0);
-            event.claim_price_move_bps = claim_price_move_bps;
-            event.fair_claim_move_bps = fair_claim_move_bps;
-            event.cex_mid_move_bps = cex_mid_move_bps;
-            event.swept_notional_usd = decimal_to_audit_string(entry_quote.filled_notional_usd);
-            event.swept_levels_count = swept_levels_count;
-            event.post_pulse_depth_gap_bps = post_pulse_depth_gap_bps;
-            event.min_profitable_target_distance_bps =
-                reachability.min_profitable_target_distance_bps;
-            event.reachability_cap_bps = reachability.reachability_cap_bps;
-            event.in_gray_zone = reachability.in_gray_zone;
-            event.reachable = reachability.reachable;
-            event.used_exchange_ts = recovery_observation.quality.used_exchange_ts;
-            event.native_sequence_present = recovery_observation.quality.native_sequence_present;
-            event.post_sweep_update_count_5s =
-                recovery_observation.quality.post_sweep_update_count_5s;
-            event.max_interarrival_gap_ms_5s =
-                recovery_observation.quality.max_interarrival_gap_ms_5s;
-            event.observation_quality_score =
-                Some(recovery_observation.quality.observation_quality_score);
-            event.admission_eligible = recovery_observation.quality.admission_eligible;
-            self.audit_sink.record_signal_snapshot(event);
+            self.record_signal_snapshot_if_enabled(audit_ctx, |event| {
+                event.admission_result = AuditGateResult::Rejected;
+                event.claim_side = Some(token_side_label(claim_side).to_owned());
+                event.mode_candidate = audit_signal_mode(mode);
+                event.rejection_reason = Some("no_reachable_target".to_owned());
+                event.fair_prob_yes = Some(priced.fair_prob_yes);
+                event.entry_price = Some(decimal_to_audit_string(entry_quote.avg_price));
+                event.timeout_exit_price = Some(decimal_to_audit_string(timeout_exit_price));
+                event.pulse_score_bps = (claim_price_move_bps - fair_claim_move_bps).max(0.0);
+                event.claim_price_move_bps = claim_price_move_bps;
+                event.fair_claim_move_bps = fair_claim_move_bps;
+                event.cex_mid_move_bps = cex_mid_move_bps;
+                event.swept_notional_usd = decimal_to_audit_string(entry_quote.filled_notional_usd);
+                event.swept_levels_count = swept_levels_count;
+                event.post_pulse_depth_gap_bps = post_pulse_depth_gap_bps;
+                event.min_profitable_target_distance_bps =
+                    reachability.min_profitable_target_distance_bps;
+                event.reachability_cap_bps = reachability.reachability_cap_bps;
+                event.in_gray_zone = reachability.in_gray_zone;
+                event.reachable = reachability.reachable;
+                event.used_exchange_ts = recovery_observation.quality.used_exchange_ts;
+                event.native_sequence_present =
+                    recovery_observation.quality.native_sequence_present;
+                event.post_sweep_update_count_5s =
+                    recovery_observation.quality.post_sweep_update_count_5s;
+                event.max_interarrival_gap_ms_5s =
+                    recovery_observation.quality.max_interarrival_gap_ms_5s;
+                event.observation_quality_score =
+                    Some(recovery_observation.quality.observation_quality_score);
+                event.admission_eligible = recovery_observation.quality.admission_eligible;
+            });
             return None;
         };
         let session_edge = estimate_session_edge(
@@ -2065,57 +2067,59 @@ impl PulseRuntime {
             fair_claim_move_bps,
             cex_mid_move_bps,
         });
-        let mut audit_event = self.base_signal_snapshot_event(audit_ctx);
-        audit_event.claim_side = Some(token_side_label(claim_side).to_owned());
-        audit_event.mode_candidate = audit_signal_mode(mode);
-        audit_event.fair_prob_yes = Some(priced.fair_prob_yes);
-        audit_event.entry_price = Some(decimal_to_audit_string(entry_quote.avg_price));
-        audit_event.net_edge_bps = Some(decision.net_session_edge_bps);
-        audit_event.expected_net_pnl_usd =
-            Some(decimal_to_audit_string(selected_target.maker_net_pnl_usd));
-        audit_event.target_exit_price =
-            Some(decimal_to_audit_string(selected_target.target_exit_price));
-        audit_event.timeout_exit_price = Some(decimal_to_audit_string(session_edge.timeout_exit_price));
-        audit_event.timeout_loss_estimate_usd =
-            Some(decimal_to_audit_string(session_edge.timeout_loss_estimate_usd));
-        audit_event.pulse_score_bps = decision.pulse_score_bps;
-        audit_event.claim_price_move_bps = claim_price_move_bps;
-        audit_event.fair_claim_move_bps = fair_claim_move_bps;
-        audit_event.cex_mid_move_bps = cex_mid_move_bps;
-        audit_event.swept_notional_usd = decimal_to_audit_string(entry_quote.filled_notional_usd);
-        audit_event.swept_levels_count = swept_levels_count;
-        audit_event.post_pulse_depth_gap_bps = post_pulse_depth_gap_bps;
-        audit_event.min_profitable_target_distance_bps =
-            reachability.min_profitable_target_distance_bps;
-        audit_event.reachability_cap_bps = reachability.reachability_cap_bps;
-        audit_event.in_gray_zone = reachability.in_gray_zone;
-        audit_event.reachable = reachability.reachable;
-        audit_event.target_distance_to_mid_bps = Some(selected_target.target_distance_to_mid_bps);
-        audit_event.predicted_hit_rate = Some(selected_target.predicted_hit_rate);
-        audit_event.maker_net_pnl_usd =
-            Some(decimal_to_audit_string(selected_target.maker_net_pnl_usd));
-        audit_event.timeout_net_pnl_usd =
-            Some(decimal_to_audit_string(selected_target.timeout_net_pnl_usd));
-        audit_event.realizable_ev_usd =
-            Some(decimal_to_audit_string(selected_target.realizable_ev_usd));
-        audit_event.used_exchange_ts = recovery_observation.quality.used_exchange_ts;
-        audit_event.native_sequence_present = recovery_observation.quality.native_sequence_present;
-        audit_event.post_sweep_update_count_5s =
-            recovery_observation.quality.post_sweep_update_count_5s;
-        audit_event.max_interarrival_gap_ms_5s =
-            recovery_observation.quality.max_interarrival_gap_ms_5s;
-        audit_event.observation_quality_score =
-            Some(recovery_observation.quality.observation_quality_score);
-        audit_event.admission_eligible = recovery_observation.quality.admission_eligible;
         if !decision.should_trade {
             if let Some(code) = decision.rejection_code {
                 self.record_rejection(code);
-                audit_event.rejection_reason = Some(code.as_str().to_owned());
+                self.record_signal_snapshot_if_enabled(audit_ctx, |event| {
+                    populate_signal_snapshot_event(
+                        event,
+                        claim_side,
+                        mode,
+                        priced.fair_prob_yes,
+                        entry_quote.avg_price,
+                        decision.net_session_edge_bps,
+                        selected_target,
+                        session_edge.timeout_exit_price,
+                        session_edge.timeout_loss_estimate_usd,
+                        decision.pulse_score_bps,
+                        claim_price_move_bps,
+                        fair_claim_move_bps,
+                        cex_mid_move_bps,
+                        entry_quote.filled_notional_usd,
+                        swept_levels_count,
+                        post_pulse_depth_gap_bps,
+                        &reachability,
+                        &recovery_observation.quality,
+                    );
+                    event.admission_result = AuditGateResult::Rejected;
+                    event.rejection_reason = Some(code.as_str().to_owned());
+                });
             } else {
-                audit_event.rejection_reason = Some("detector_rejected".to_owned());
+                self.record_signal_snapshot_if_enabled(audit_ctx, |event| {
+                    populate_signal_snapshot_event(
+                        event,
+                        claim_side,
+                        mode,
+                        priced.fair_prob_yes,
+                        entry_quote.avg_price,
+                        decision.net_session_edge_bps,
+                        selected_target,
+                        session_edge.timeout_exit_price,
+                        session_edge.timeout_loss_estimate_usd,
+                        decision.pulse_score_bps,
+                        claim_price_move_bps,
+                        fair_claim_move_bps,
+                        cex_mid_move_bps,
+                        entry_quote.filled_notional_usd,
+                        swept_levels_count,
+                        post_pulse_depth_gap_bps,
+                        &reachability,
+                        &recovery_observation.quality,
+                    );
+                    event.admission_result = AuditGateResult::Rejected;
+                    event.rejection_reason = Some("detector_rejected".to_owned());
+                });
             }
-            audit_event.admission_result = AuditGateResult::Rejected;
-            self.audit_sink.record_signal_snapshot(audit_event);
             return None;
         }
 
@@ -2127,8 +2131,29 @@ impl PulseRuntime {
             entry_quote.depth_fill_ratio,
         );
 
-        audit_event.admission_result = AuditGateResult::Passed;
-        self.audit_sink.record_signal_snapshot(audit_event);
+        self.record_signal_snapshot_if_enabled(audit_ctx, |event| {
+            populate_signal_snapshot_event(
+                event,
+                claim_side,
+                mode,
+                priced.fair_prob_yes,
+                entry_quote.avg_price,
+                decision.net_session_edge_bps,
+                selected_target,
+                session_edge.timeout_exit_price,
+                session_edge.timeout_loss_estimate_usd,
+                decision.pulse_score_bps,
+                claim_price_move_bps,
+                fair_claim_move_bps,
+                cex_mid_move_bps,
+                entry_quote.filled_notional_usd,
+                swept_levels_count,
+                post_pulse_depth_gap_bps,
+                &reachability,
+                &recovery_observation.quality,
+            );
+            event.admission_result = AuditGateResult::Passed;
+        });
 
         Some(EntryCandidate {
             market: market.clone(),
@@ -2277,7 +2302,7 @@ impl PulseRuntime {
             disable_reason: disable_reason.clone(),
         };
         self.audit_sink
-            .record_asset_health(PulseAssetHealthAuditEvent {
+            .record_asset_health_lazy(|| PulseAssetHealthAuditEvent {
                 asset: row.asset.clone(),
                 provider_id,
                 anchor_age_ms,
@@ -2293,6 +2318,18 @@ impl PulseRuntime {
                 disable_reason,
             });
         self.asset_health.insert(asset, row);
+    }
+
+    fn record_signal_snapshot_if_enabled<F>(&mut self, ctx: &SignalAuditContext<'_>, build: F)
+    where
+        F: FnOnce(&mut PulseSignalSnapshotAuditEvent),
+    {
+        if !self.audit_sink.captures_high_frequency() {
+            return;
+        }
+        let mut event = self.base_signal_snapshot_event(ctx);
+        build(&mut event);
+        self.audit_sink.record_signal_snapshot(event);
     }
 
     fn refresh_monitor_view(&mut self, now_ms: u64) {
@@ -2965,6 +3002,9 @@ impl PulseRuntime {
     }
 
     fn record_anchor_market_tape_if_needed(&mut self, asset: PulseAsset, anchor: &AnchorSnapshot) {
+        if !self.audit_sink.captures_high_frequency() {
+            return;
+        }
         let already_recorded = self
             .last_anchor_tape_ts_by_asset
             .get(&asset)
@@ -2976,40 +3016,42 @@ impl PulseRuntime {
 
         let approx_recv_ms = anchor.ts_ms.saturating_add(anchor.quality.anchor_age_ms);
         for point in &anchor.local_surface_points {
-            self.audit_sink.record_market_tape(PulseMarketTapeAuditEvent {
-                asset: asset.as_str().to_owned(),
-                symbol: asset.as_str().to_owned(),
-                venue: "Deribit".to_owned(),
-                instrument: point.instrument_name.clone(),
-                token_side: None,
-                ts_exchange_ms: anchor.ts_ms,
-                ts_recv_ms: approx_recv_ms,
-                sequence: anchor.ts_ms,
-                update_kind: "anchor_snapshot".to_owned(),
-                top_n_depth: 0,
-                best_bid: point.best_bid.map(decimal_to_audit_string),
-                best_ask: point.best_ask.map(decimal_to_audit_string),
-                mid: point
-                    .best_bid
-                    .zip(point.best_ask)
-                    .map(|(bid, ask)| decimal_to_audit_string((bid + ask) / Decimal::TWO)),
-                last_trade_price: None,
-                expiry_ts_ms: Some(point.expiry_ts_ms),
-                strike: Some(decimal_to_audit_string(point.strike)),
-                option_type: deribit_option_type_label(&point.instrument_name),
-                mark_iv: Some(point.mark_iv),
-                bid_iv: point.bid_iv,
-                ask_iv: point.ask_iv,
-                delta: point.delta,
-                gamma: point.gamma,
-                index_price: Some(decimal_to_audit_string(anchor.index_price)),
-                delta_bids: Vec::new(),
-                delta_asks: Vec::new(),
-                snapshot_bids: Vec::new(),
-                snapshot_asks: Vec::new(),
-            });
+            self.audit_sink
+                .record_market_tape_lazy(|| PulseMarketTapeAuditEvent {
+                    asset: asset.as_str().to_owned(),
+                    symbol: asset.as_str().to_owned(),
+                    venue: "Deribit".to_owned(),
+                    instrument: point.instrument_name.clone(),
+                    token_side: None,
+                    ts_exchange_ms: anchor.ts_ms,
+                    ts_recv_ms: approx_recv_ms,
+                    sequence: anchor.ts_ms,
+                    update_kind: "anchor_snapshot".to_owned(),
+                    top_n_depth: 0,
+                    best_bid: point.best_bid.map(decimal_to_audit_string),
+                    best_ask: point.best_ask.map(decimal_to_audit_string),
+                    mid: point
+                        .best_bid
+                        .zip(point.best_ask)
+                        .map(|(bid, ask)| decimal_to_audit_string((bid + ask) / Decimal::TWO)),
+                    last_trade_price: None,
+                    expiry_ts_ms: Some(point.expiry_ts_ms),
+                    strike: Some(decimal_to_audit_string(point.strike)),
+                    option_type: deribit_option_type_label(&point.instrument_name),
+                    mark_iv: Some(point.mark_iv),
+                    bid_iv: point.bid_iv,
+                    ask_iv: point.ask_iv,
+                    delta: point.delta,
+                    gamma: point.gamma,
+                    index_price: Some(decimal_to_audit_string(anchor.index_price)),
+                    delta_bids: Vec::new(),
+                    delta_asks: Vec::new(),
+                    snapshot_bids: Vec::new(),
+                    snapshot_asks: Vec::new(),
+                });
         }
-        self.last_anchor_tape_ts_by_asset.insert(asset, anchor.ts_ms);
+        self.last_anchor_tape_ts_by_asset
+            .insert(asset, anchor.ts_ms);
     }
 
     fn base_signal_snapshot_event(
@@ -3642,6 +3684,59 @@ fn event_pricer_config(settings: &Settings) -> EventPricerConfig {
     }
 }
 
+fn populate_signal_snapshot_event(
+    event: &mut PulseSignalSnapshotAuditEvent,
+    claim_side: TokenSide,
+    mode: PulseMode,
+    fair_prob_yes: f64,
+    entry_price: Decimal,
+    net_edge_bps: f64,
+    selected_target: crate::signal::TargetCandidate,
+    timeout_exit_price: Decimal,
+    timeout_loss_estimate_usd: Decimal,
+    pulse_score_bps: f64,
+    claim_price_move_bps: f64,
+    fair_claim_move_bps: f64,
+    cex_mid_move_bps: f64,
+    filled_notional_usd: Decimal,
+    swept_levels_count: usize,
+    post_pulse_depth_gap_bps: f64,
+    reachability: &crate::model::ReachabilityEnvelope,
+    quality: &crate::model::RecoveryObservationQuality,
+) {
+    event.claim_side = Some(token_side_label(claim_side).to_owned());
+    event.mode_candidate = audit_signal_mode(mode);
+    event.fair_prob_yes = Some(fair_prob_yes);
+    event.entry_price = Some(decimal_to_audit_string(entry_price));
+    event.net_edge_bps = Some(net_edge_bps);
+    event.expected_net_pnl_usd = Some(decimal_to_audit_string(selected_target.maker_net_pnl_usd));
+    event.target_exit_price = Some(decimal_to_audit_string(selected_target.target_exit_price));
+    event.timeout_exit_price = Some(decimal_to_audit_string(timeout_exit_price));
+    event.timeout_loss_estimate_usd = Some(decimal_to_audit_string(timeout_loss_estimate_usd));
+    event.pulse_score_bps = pulse_score_bps;
+    event.claim_price_move_bps = claim_price_move_bps;
+    event.fair_claim_move_bps = fair_claim_move_bps;
+    event.cex_mid_move_bps = cex_mid_move_bps;
+    event.swept_notional_usd = decimal_to_audit_string(filled_notional_usd);
+    event.swept_levels_count = swept_levels_count;
+    event.post_pulse_depth_gap_bps = post_pulse_depth_gap_bps;
+    event.min_profitable_target_distance_bps = reachability.min_profitable_target_distance_bps;
+    event.reachability_cap_bps = reachability.reachability_cap_bps;
+    event.in_gray_zone = reachability.in_gray_zone;
+    event.reachable = reachability.reachable;
+    event.target_distance_to_mid_bps = Some(selected_target.target_distance_to_mid_bps);
+    event.predicted_hit_rate = Some(selected_target.predicted_hit_rate);
+    event.maker_net_pnl_usd = Some(decimal_to_audit_string(selected_target.maker_net_pnl_usd));
+    event.timeout_net_pnl_usd = Some(decimal_to_audit_string(selected_target.timeout_net_pnl_usd));
+    event.realizable_ev_usd = Some(decimal_to_audit_string(selected_target.realizable_ev_usd));
+    event.used_exchange_ts = quality.used_exchange_ts;
+    event.native_sequence_present = quality.native_sequence_present;
+    event.post_sweep_update_count_5s = quality.post_sweep_update_count_5s;
+    event.max_interarrival_gap_ms_5s = quality.max_interarrival_gap_ms_5s;
+    event.observation_quality_score = Some(quality.observation_quality_score);
+    event.admission_eligible = quality.admission_eligible;
+}
+
 fn current_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3794,7 +3889,10 @@ fn expected_net_pnl_usd(filled_notional: Decimal, net_edge_bps: f64) -> Decimal 
     filled_notional * edge_fraction
 }
 
-fn consumed_ask_levels_for_notional(book: &OrderBookSnapshot, requested_notional: Decimal) -> usize {
+fn consumed_ask_levels_for_notional(
+    book: &OrderBookSnapshot,
+    requested_notional: Decimal,
+) -> usize {
     if requested_notional <= Decimal::ZERO {
         return 0;
     }
@@ -3882,12 +3980,10 @@ fn estimate_base_hit_rate(
     post_pulse_depth_gap_bps: f64,
     depth_fill_ratio: Decimal,
 ) -> f64 {
-    (
-        base_hit_rate_prior(target_distance_to_mid_bps)
-            + sweep_hit_rate_bonus(swept_notional_usd, swept_levels_count)
-            + depth_gap_hit_rate_bonus(post_pulse_depth_gap_bps)
-            + fill_ratio_hit_rate_adjustment(depth_fill_ratio)
-    )
+    (base_hit_rate_prior(target_distance_to_mid_bps)
+        + sweep_hit_rate_bonus(swept_notional_usd, swept_levels_count)
+        + depth_gap_hit_rate_bonus(post_pulse_depth_gap_bps)
+        + fill_ratio_hit_rate_adjustment(depth_fill_ratio))
     .clamp(0.0, 0.90)
 }
 
@@ -3905,7 +4001,8 @@ fn realizable_ev_usd(
 ) -> Decimal {
     let predicted_hit_rate =
         Decimal::from_f64_retain(predicted_hit_rate.clamp(0.0, 1.0)).unwrap_or(Decimal::ZERO);
-    predicted_hit_rate * maker_net_pnl_usd + (Decimal::ONE - predicted_hit_rate) * timeout_net_pnl_usd
+    predicted_hit_rate * maker_net_pnl_usd
+        + (Decimal::ONE - predicted_hit_rate) * timeout_net_pnl_usd
 }
 
 fn opening_fill_rejection_reason(
@@ -5108,8 +5205,11 @@ mod tests {
         async fn new_btc_mode_case(snapback_symbol: &str, deep_symbol: &str) -> Self {
             let fixture = runtime_fixture_for_asset(PulseAsset::Btc);
             let mut settings = fixture.settings.clone();
-            settings.strategy.pulse_arb.session.opening_request_notional_usd =
-                Some(UsdNotional(Decimal::new(400, 0)));
+            settings
+                .strategy
+                .pulse_arb
+                .session
+                .opening_request_notional_usd = Some(UsdNotional(Decimal::new(400, 0)));
             let now_ms = current_time_ms();
             let settlement_timestamp = (now_ms / 1_000) + 3_600;
             let anchor_provider = Arc::new(StaticAnchorProvider::new(btc_anchor_snapshot(
@@ -5230,7 +5330,8 @@ mod tests {
             &mut self,
             asset: PulseAsset,
         ) -> std::result::Result<Option<EntryCandidate>, String> {
-            self.runtime.best_entry_candidate(asset, self.now_ms + 1_500)
+            self.runtime
+                .best_entry_candidate(asset, self.now_ms + 1_500)
         }
     }
 
@@ -6623,7 +6724,10 @@ mod tests {
             signal_sample_timestamp_ms(samples.front().expect("retained sample")),
             2_000
         );
-        assert_eq!(samples.front().expect("retained sample").value, Decimal::new(42, 2));
+        assert_eq!(
+            samples.front().expect("retained sample").value,
+            Decimal::new(42, 2)
+        );
     }
 
     #[tokio::test]
@@ -7000,8 +7104,12 @@ mod tests {
             .build()
             .await
             .expect("build runtime");
-        runtime.settings.strategy.pulse_arb.session.min_expected_net_pnl_usd =
-            Some(UsdNotional(Decimal::new(100, 0)));
+        runtime
+            .settings
+            .strategy
+            .pulse_arb
+            .session
+            .min_expected_net_pnl_usd = Some(UsdNotional(Decimal::new(100, 0)));
 
         drive_btc_pulse_entry_attempt(&mut runtime, now_ms).await;
 
@@ -7217,7 +7325,10 @@ mod tests {
             signal_events[0].rejection_reason.as_deref(),
             Some("pulse_confirmation_rejected")
         );
-        assert_eq!(signal_events[0].provider_id.as_deref(), Some("deribit_primary"));
+        assert_eq!(
+            signal_events[0].provider_id.as_deref(),
+            Some("deribit_primary")
+        );
         assert_eq!(signal_events[0].poly_yes_sequence_ref, Some(1));
         assert_eq!(signal_events[0].poly_no_sequence_ref, Some(1));
         assert_eq!(signal_events[0].cex_sequence_ref, Some(1));
