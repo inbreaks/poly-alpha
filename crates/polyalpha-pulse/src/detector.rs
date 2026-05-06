@@ -112,7 +112,8 @@ impl PulseDetector {
                 should_trade: false,
             };
         };
-        let required_with_margin = required_hit_rate + self.config.hit_rate_safety_margin_pp / 100.0;
+        let required_with_margin =
+            required_hit_rate + self.config.hit_rate_safety_margin_pp / 100.0;
 
         if input.timeout_loss_estimate_usd > self.config.max_timeout_loss_usd
             || required_hit_rate > self.config.max_required_hit_rate

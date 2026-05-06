@@ -504,17 +504,13 @@ fn default_market_update_kind() -> String {
     "snapshot".to_owned()
 }
 
-fn book_levels_equal(
-    left: &[PulseBookLevelAuditRow],
-    right: &[PulseBookLevelAuditRow],
-) -> bool {
+fn book_levels_equal(left: &[PulseBookLevelAuditRow], right: &[PulseBookLevelAuditRow]) -> bool {
     left.len() == right.len()
         && left
             .iter()
             .zip(right.iter())
             .all(|(left_level, right_level)| {
-                left_level.price == right_level.price
-                    && left_level.quantity == right_level.quantity
+                left_level.price == right_level.price && left_level.quantity == right_level.quantity
             })
 }
 
@@ -1188,7 +1184,10 @@ mod tests {
         assert_eq!(decoded.mode, "live_mock");
         assert_eq!(decoded.routes.len(), 2);
         assert_eq!(decoded.routes[0].anchor_provider, "deribit_primary");
-        assert_eq!(decoded.hedge_venue_for_asset("eth"), Some("binance_usdm_perp"));
+        assert_eq!(
+            decoded.hedge_venue_for_asset("eth"),
+            Some("binance_usdm_perp")
+        );
         assert_eq!(decoded.min_open_fill_ratio.as_deref(), Some("0.05"));
         assert!(decoded.require_nonzero_hedge);
     }

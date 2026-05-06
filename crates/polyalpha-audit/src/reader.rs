@@ -167,8 +167,8 @@ mod tests {
 
     use super::AuditReader;
     use crate::{
-        AuditAnomalyEvent, AuditEventKind, AuditEventPayload, AuditSessionManifest,
-        AuditSeverity, AuditWriter, NewAuditEvent,
+        AuditAnomalyEvent, AuditEventKind, AuditEventPayload, AuditSessionManifest, AuditSeverity,
+        AuditWriter, NewAuditEvent,
     };
 
     #[test]
@@ -184,8 +184,8 @@ mod tests {
             market_count: 1,
             markets: vec!["test-market".to_owned()],
         };
-        let mut writer = AuditWriter::create(&root, manifest, 1_024 * 1_024)
-            .expect("create writer");
+        let mut writer =
+            AuditWriter::create(&root, manifest, 1_024 * 1_024).expect("create writer");
         for idx in 1..=3_u64 {
             writer
                 .append_event(NewAuditEvent {
@@ -220,10 +220,7 @@ mod tests {
 
         assert_eq!(
             summaries,
-            vec![
-                (2, "event-2".to_owned()),
-                (3, "event-3".to_owned()),
-            ]
+            vec![(2, "event-2".to_owned()), (3, "event-3".to_owned()),]
         );
 
         let _ = fs::remove_dir_all(root);

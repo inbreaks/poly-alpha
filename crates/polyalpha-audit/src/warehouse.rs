@@ -357,9 +357,8 @@ mod tests {
 
     use super::AuditWarehouse;
     use crate::{
-        AuditAnomalyEvent, AuditEvent, AuditEventKind, AuditEventPayload, AuditPaths,
-        AuditReader, AuditSessionManifest, AuditSeverity, AuditWriter, NewAuditEvent,
-        PulseSessionSummaryRow,
+        AuditAnomalyEvent, AuditEvent, AuditEventKind, AuditEventPayload, AuditPaths, AuditReader,
+        AuditSessionManifest, AuditSeverity, AuditWriter, NewAuditEvent, PulseSessionSummaryRow,
     };
 
     #[test]

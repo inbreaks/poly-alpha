@@ -103,7 +103,8 @@ mod tests {
     fn write_json_line_treats_broken_pipe_as_clean_stop() {
         let mut writer = BrokenPipeWriter;
 
-        let written = write_json_line(&mut writer, "{\"ok\":true}").expect("broken pipe is tolerated");
+        let written =
+            write_json_line(&mut writer, "{\"ok\":true}").expect("broken pipe is tolerated");
 
         assert!(!written);
     }
